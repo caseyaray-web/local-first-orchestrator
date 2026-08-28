@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -55,11 +56,21 @@ class DeterministicValidator:
         if argv not in allowed_commands:
             return CommandEvidence(argv,self.NOT_ALLOWLISTED_RETURN_CODE,0.0,"","verification command rejected: not allowlisted")
         env={key: os.environ[key] for key in self.environment_allowlist if key in os.environ}
+        process: subprocess.Popen[str] | None = None
         try:
-            completed=subprocess.run(argv,cwd=cwd,env=env,text=True,capture_output=True,timeout=timeout_seconds,check=False)
-            raw_out,raw_err=completed.stdout,completed.stderr; code=completed.returncode
+            process=subprocess.Popen(argv,cwd=cwd,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+            raw_out,raw_err=process.communicate(timeout=timeout_seconds); code=process.returncode
         except subprocess.TimeoutExpired as exc:
             raw_out=exc.stdout if isinstance(exc.stdout,str) else ""; raw_err=exc.stderr if isinstance(exc.stderr,str) else "verification command timed out"; code=self.TIMEOUT_RETURN_CODE
+            if process is not None:
+                try: os.killpg(process.pid,signal.SIGTERM)
+                except ProcessLookupError: pass
+                try: process.communicate(timeout=.5)
+                except subprocess.TimeoutExpired:
+                    try: os.killpg(process.pid,signal.SIGKILL)
+                    except ProcessLookupError: pass
+                    try: process.communicate(timeout=.5)
+                    except subprocess.TimeoutExpired: raw_err="verification cleanup failed"
         except OSError as exc:
             raw_out=""; raw_err=f"verification launch failed: {type(exc).__name__}"; code=self.LAUNCH_FAILURE_RETURN_CODE
         truncated=len(raw_out)>output_limit or len(raw_err)>output_limit
