@@ -2,7 +2,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from local_first_orchestrator.comment_delivery import CommentDeliveryWorker, CommentDeliveryPolicy
+from local_first_orchestrator.comment_delivery import AmbiguousCommentDelivery, CommentDeliveryWorker, CommentDeliveryPolicy
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.states import CanonicalState
 class Remote:
@@ -11,7 +11,7 @@ class Remote:
  def find_comment_marker(self, task, marker): self.lookups+=1; return 'found' if any(marker in comment for comment in self.comments.get(task,[])) else 'not_found'
  def deliver_comment(self, task, comment, *, idempotency_key):
   self.sends+=1; self.comments.setdefault(task,[]).append(comment)
-  if self.ambiguous: raise RuntimeError('ambiguous accepted')
+  if self.ambiguous: raise AmbiguousCommentDelivery('accepted but response unknown')
 class ReconcileTests(unittest.TestCase):
  def setUp(self): self.t=TemporaryDirectory(); self.l=Ledger(Path(self.t.name)/'x.db'); self.l.migrate(); self.tid=self.l.create_ticket(title='x',state=CanonicalState.READY_LOCAL); self.op=self.l.enqueue_evidence_comment(self.tid,1,'x'); self.r=Remote(); self.w=CommentDeliveryWorker(self.l,self.r,CommentDeliveryPolicy(base_retry_delay=0),worker_id='w',clock=lambda:10)
  def tearDown(self): self.l.close(); self.t.cleanup()

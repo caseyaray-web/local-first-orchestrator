@@ -1,9 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Callable, Literal, Protocol
 
 from .ledger import Ledger
+
+
+class MarkerLookup(StrEnum):
+    FOUND = "found"
+    NOT_FOUND = "not_found"
+    UNAVAILABLE = "unavailable"
+    UNSUPPORTED = "unsupported"
+
+
+class AmbiguousCommentDelivery(RuntimeError):
+    """The remote may have accepted the persisted marker; reconcile first."""
 
 
 class CommentAdapter(Protocol):
@@ -70,14 +82,13 @@ class CommentDeliveryWorker:
         attempt_count = int(row["attempt_count"])
         marker = f"<!-- local-first-comment:{operation_id} -->"
         try:
-            lookup = self.adapter.find_comment_marker(str(row["external_task_id"]), marker)
-        except Exception as exc:
-            self.ledger.mark_comment_retryable(operation_id, self.worker_id, f"reconciliation lookup failed: {exc}", next_attempt_at=now + self.policy.base_retry_delay, now=now, error_limit=self.policy.error_length_limit)
-            return CommentDeliveryResult("reconciliation_deferred", operation_id, attempt_count, now + self.policy.base_retry_delay)
-        if lookup == "found":
+            lookup = MarkerLookup(self.adapter.find_comment_marker(str(row["external_task_id"]), marker))
+        except (Exception, ValueError):
+            lookup = MarkerLookup.UNAVAILABLE
+        if lookup is MarkerLookup.FOUND:
             self.ledger.mark_comment_delivered(operation_id, self.worker_id, now=now)
             return CommentDeliveryResult("reconciled_delivered", operation_id, attempt_count)
-        if lookup != "not_found":
+        if lookup is not MarkerLookup.NOT_FOUND:
             self.ledger.mark_comment_retryable(operation_id, self.worker_id, f"reconciliation unavailable: {lookup}", next_attempt_at=now + self.policy.base_retry_delay, now=now, error_limit=self.policy.error_length_limit)
             return CommentDeliveryResult("reconciliation_deferred", operation_id, attempt_count, now + self.policy.base_retry_delay)
         try:
@@ -86,15 +97,20 @@ class CommentDeliveryWorker:
                 str(row["payload"]),
                 idempotency_key=str(row["idempotency_key"]),
             )
+        except AmbiguousCommentDelivery as exc:
+            error = str(exc)
+            bounded_error = Ledger._safe_comment_error(error, limit=self.policy.error_length_limit)
+            next_attempt_at = now + self.policy.base_retry_delay
+            self.ledger.mark_comment_retryable(operation_id, self.worker_id, error, next_attempt_at=next_attempt_at, now=now, error_limit=self.policy.error_length_limit)
+            return CommentDeliveryResult("reconciliation_deferred", operation_id, attempt_count, next_attempt_at, bounded_error)
         except Exception as exc:
             error = str(exc)
-            ambiguous = "ambiguous" in error.lower()
             bounded_error = Ledger._safe_comment_error(error, limit=self.policy.error_length_limit)
             if attempt_count < self.policy.max_attempts:
                 delay = min(self.policy.max_retry_delay, self.policy.base_retry_delay * (2 ** (attempt_count - 1)))
                 next_attempt_at = now + delay
                 self.ledger.mark_comment_retryable(operation_id, self.worker_id, error, next_attempt_at=next_attempt_at, now=now, error_limit=self.policy.error_length_limit)
-                return CommentDeliveryResult("reconciliation_deferred" if ambiguous else "retry_scheduled", operation_id, attempt_count, next_attempt_at, bounded_error)
+                return CommentDeliveryResult("retry_scheduled", operation_id, attempt_count, next_attempt_at, bounded_error)
             self.ledger.mark_comment_permanently_failed(operation_id, self.worker_id, error, now=now, error_limit=self.policy.error_length_limit)
             return CommentDeliveryResult("permanently_failed", operation_id, attempt_count, error=bounded_error)
 
