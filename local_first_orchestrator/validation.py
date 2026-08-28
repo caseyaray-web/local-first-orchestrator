@@ -24,6 +24,7 @@ class CommandEvidence:
     duration_seconds: float
     stdout_summary: str
     stderr_summary: str
+    truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -41,8 +42,28 @@ class DeterministicValidator:
     default_secret_assignment_patterns = (
         re.compile(r"(?im)^\s*(?:[A-Za-z][A-Za-z0-9_-]*[_-])?(?:api[_-]?key|secret|password|token|private[_-]?key)\s*[:=]\s*(?:['\"][^'\"]+['\"]|[^\s#]{8,})"),
     )
+    TIMEOUT_RETURN_CODE = -124
+    LAUNCH_FAILURE_RETURN_CODE = -127
+    NOT_ALLOWLISTED_RETURN_CODE = -126
+
     def __init__(self, *, artifact_root: Path, environment_allowlist: tuple[str, ...] = ("PATH",), secret_patterns: tuple[str, ...] = ()) -> None:
         self.artifact_root, self.environment_allowlist, self.secret_patterns = Path(artifact_root), environment_allowlist, secret_patterns
+
+    def run_verification_command(self, argv: tuple[str, ...], *, allowed_commands: tuple[tuple[str, ...], ...], cwd: Path, timeout_seconds: int, output_limit: int) -> CommandEvidence:
+        """Return evidence always: -124 timeout, -127 launch, -126 rejected."""
+        started=time.monotonic()
+        if argv not in allowed_commands:
+            return CommandEvidence(argv,self.NOT_ALLOWLISTED_RETURN_CODE,0.0,"","verification command rejected: not allowlisted")
+        env={key: os.environ[key] for key in self.environment_allowlist if key in os.environ}
+        try:
+            completed=subprocess.run(argv,cwd=cwd,env=env,text=True,capture_output=True,timeout=timeout_seconds,check=False)
+            raw_out,raw_err=completed.stdout,completed.stderr; code=completed.returncode
+        except subprocess.TimeoutExpired as exc:
+            raw_out=exc.stdout if isinstance(exc.stdout,str) else ""; raw_err=exc.stderr if isinstance(exc.stderr,str) else "verification command timed out"; code=self.TIMEOUT_RETURN_CODE
+        except OSError as exc:
+            raw_out=""; raw_err=f"verification launch failed: {type(exc).__name__}"; code=self.LAUNCH_FAILURE_RETURN_CODE
+        truncated=len(raw_out)>output_limit or len(raw_err)>output_limit
+        return CommandEvidence(argv,code,time.monotonic()-started,self._redact(raw_out[:output_limit]),self._redact(raw_err[:output_limit]),truncated)
 
     def _git(self, path: Path, *args: str) -> str:
         """Run bounded, non-interactive internal Git inspection only."""
@@ -115,11 +136,9 @@ class DeterministicValidator:
             if worktree not in run_cwd.parents and run_cwd != worktree:
                 raise ValidationError("verification working directory escapes worktree")
             for argv in ticket.verification.commands:
-                started = time.monotonic()
-                completed = subprocess.run(argv, cwd=run_cwd, env=env, text=True, capture_output=True, timeout=ticket.verification.timeout_seconds, check=False)
-                stdout, stderr = self._redact(completed.stdout[:ticket.verification.output_limit]), self._redact(completed.stderr[:ticket.verification.output_limit])
-                records.append(CommandEvidence(argv, completed.returncode, time.monotonic() - started, stdout, stderr))
-                if completed.returncode: errors.append(f"verification command failed: {' '.join(argv)}")
+                evidence=self.run_verification_command(argv,allowed_commands=ticket.verification.commands,cwd=run_cwd,timeout_seconds=ticket.verification.timeout_seconds,output_limit=ticket.verification.output_limit)
+                records.append(evidence)
+                if evidence.returncode: errors.append(f"verification command failed: {' '.join(argv)}")
         compact_parts = errors or ["validation passed"]
         if scope_unverified:
             compact_parts.append("scope_unverified: symbol analysis unavailable; review/checkpoint policy required")
