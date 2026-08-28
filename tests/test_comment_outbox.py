@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -131,9 +132,9 @@ class CommentOutboxTests(unittest.TestCase):
 
     def test_retry_and_permanent_failure(self):
         op = self.l.enqueue_evidence_comment(self.ticket, 7, "a")["operation_id"]
-        self.l.claim_comment(op, "one", lease_seconds=1, now=1)
+        self.l.claim_comment(op, "one", lease_seconds=2, now=1)
         self.assertTrue(self.l.mark_comment_retryable(op, "one", "token=abc", now=2))
-        self.assertTrue(self.l.claim_comment(op, "two", lease_seconds=1, now=2))
+        self.assertTrue(self.l.claim_comment(op, "two", lease_seconds=2, now=2))
         self.assertTrue(self.l.mark_comment_permanently_failed(op, "two", "bad", now=3))
         self.assertFalse(self.l.claim_comment(op, "x", lease_seconds=1, now=4))
         self.assertEqual(self.l.comment_outbox(op)["attempt_count"], 2)
@@ -144,7 +145,94 @@ class CommentOutboxTests(unittest.TestCase):
         self.assertTrue(self.l.claim_comment(op, "worker", lease_seconds=60, now=10))
         self.assertEqual(self.l.comment_outbox(op)["status"], "delivering")
         self.assertTrue(self.l.mark_comment_delivered(op, "worker", now=11))
-        self.assertEqual(self.l.comment_outbox(op)["status"], "delivered")
+        row = self.l.comment_outbox(op)
+        self.assertEqual(row["status"], "delivered")
+        self.assertIsNone(row["lease_owner"])
+        self.assertIsNone(row["lease_expires_at"])
+        self.assertIsNone(row["next_attempt_at"])
+        self.assertIsNone(row["last_error"])
+        self.assertTrue(self.l.mark_comment_delivered(op, "worker", now=12))
+        self.assertFalse(self.l.mark_comment_delivered(op, "other-worker", now=12))
+        self.assertFalse(self.l.claim_comment(op, "other-worker", now=12))
+
+    def test_retry_schedule_redacts_and_requires_eligible_claim(self):
+        op = self.l.enqueue_evidence_comment(self.ticket, 7, "evidence")["operation_id"]
+        self.assertTrue(self.l.claim_comment(op, "worker-a", now=10))
+        self.assertTrue(self.l.mark_comment_retryable(op, "worker-a", "password=secret token=abc", next_attempt_at=20, now=11))
+        row = self.l.comment_outbox(op)
+        self.assertEqual(row["status"], "retryable")
+        self.assertEqual(row["next_attempt_at"], 20)
+        self.assertEqual(row["attempt_count"], 1)
+        self.assertNotIn("secret", row["last_error"])
+        self.assertNotIn("abc", row["last_error"])
+        self.assertFalse(self.l.claim_comment(op, "worker-b", now=19))
+        self.assertTrue(self.l.claim_comment(op, "worker-b", now=20))
+        self.assertEqual(self.l.comment_outbox(op)["attempt_count"], 2)
+
+    def test_expired_owner_cannot_finalize_and_recovery_is_idempotent(self):
+        op = self.l.enqueue_evidence_comment(self.ticket, 7, "evidence")["operation_id"]
+        self.assertTrue(self.l.claim_comment(op, "worker-a", lease_seconds=5, now=10))
+        self.assertFalse(self.l.mark_comment_delivered(op, "worker-a", now=15))
+        self.assertFalse(self.l.mark_comment_retryable(op, "worker-a", "x", now=15))
+        self.assertFalse(self.l.mark_comment_permanently_failed(op, "worker-a", "x", now=15))
+        self.assertEqual(self.l.recover_expired_comment_leases(now=15), [op])
+        self.assertEqual(self.l.recover_expired_comment_leases(now=15), [])
+        self.assertTrue(self.l.claim_comment(op, "worker-b", now=15))
+        self.assertFalse(self.l.mark_comment_delivered(op, "worker-a", now=16))
+
+    def test_active_lease_is_not_recovered_and_wrong_owner_cannot_finalize(self):
+        op = self.l.enqueue_evidence_comment(self.ticket, 7, "evidence")["operation_id"]
+        self.assertTrue(self.l.claim_comment(op, "worker-a", lease_seconds=10, now=10))
+        self.assertEqual(self.l.recover_expired_comment_leases(now=19), [])
+        self.assertFalse(self.l.mark_comment_retryable(op, "worker-b", "bad", now=19))
+        self.assertFalse(self.l.mark_comment_permanently_failed(op, "worker-b", "bad", now=19))
+        self.assertTrue(self.l.mark_comment_retryable(op, "worker-a", "authorization=Bearer secret", next_attempt_at=30, now=19))
+        self.assertTrue(self.l.claim_comment(op, "worker-b", now=30))
+        self.assertFalse(self.l.mark_comment_permanently_failed(op, "worker-a", "bad", now=31))
+
+    def test_transition_persists_across_close_and_reopen(self):
+        op = self.l.enqueue_evidence_comment(self.ticket, 7, "evidence")["operation_id"]
+        self.assertTrue(self.l.claim_comment(op, "worker", now=10))
+        self.assertTrue(self.l.mark_comment_retryable(op, "worker", "secret=hidden", next_attempt_at=20, now=11))
+        self.l.close()
+        self.l = Ledger(self.p)
+        self.l.migrate()
+        row = self.l.comment_outbox(op)
+        self.assertEqual(row["status"], "retryable")
+        self.assertEqual(row["attempt_count"], 1)
+        self.assertEqual(row["next_attempt_at"], 20)
+        self.assertNotIn("hidden", row["last_error"])
+
+    def test_permanent_failure_is_idempotent_and_terminal(self):
+        op = self.l.enqueue_evidence_comment(self.ticket, 7, "evidence")["operation_id"]
+        self.assertTrue(self.l.claim_comment(op, "worker", now=10))
+        self.assertTrue(self.l.mark_comment_permanently_failed(op, "worker", "token=abc", now=11))
+        self.assertTrue(self.l.mark_comment_permanently_failed(op, "worker", "ignored", now=12))
+        self.assertFalse(self.l.mark_comment_permanently_failed(op, "other", "bad", now=12))
+        row = self.l.comment_outbox(op)
+        self.assertEqual(row["status"], "permanently_failed")
+        self.assertIsNone(row["next_attempt_at"])
+        self.assertFalse(self.l.claim_comment(op, "other", now=20))
+
+    def test_two_connections_have_exactly_one_claimant(self):
+        self.l.close()
+        first = Ledger(self.p); first.migrate()
+        second = Ledger(self.p); second.migrate()
+        op = first.enqueue_evidence_comment(self.ticket, 7, "evidence")["operation_id"]
+        results = []
+        barrier = threading.Barrier(2)
+
+        def claim(ledger, owner):
+            barrier.wait()
+            results.append(ledger.claim_comment(op, owner, now=10))
+
+        threads = [threading.Thread(target=claim, args=(first, "worker-a")), threading.Thread(target=claim, args=(second, "worker-b"))]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(timeout=5)
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), 1)
+        first.close(); second.close()
+        self.l = Ledger(self.p); self.l.migrate()
 
     def test_pre_slice_database_migrates_and_preserves_existing_data(self):
         self.l.close()
@@ -157,7 +245,7 @@ class CommentOutboxTests(unittest.TestCase):
         migrated = Ledger(self.p)
         migrated.migrate()
         columns = {row["name"] for row in migrated.connection.execute("PRAGMA table_info(evidence_comment_outbox)")}
-        self.assertEqual(columns, {"operation_id", "ticket_id", "event_id", "external_task_id", "operation_kind", "idempotency_key", "payload", "status", "attempt_count", "lease_owner", "lease_expires_at", "next_attempt_at", "last_error", "created_at", "updated_at", "delivered_at"})
+        self.assertEqual(columns, {"operation_id", "ticket_id", "event_id", "external_task_id", "operation_kind", "idempotency_key", "payload", "status", "attempt_count", "lease_owner", "lease_expires_at", "next_attempt_at", "last_error", "created_at", "updated_at", "delivered_at", "terminal_owner"})
         self.assertEqual(self._rows(migrated.connection, "tickets")[0][:8], tuple(snapshots["tickets"].values()))
         for table, row in snapshots.items():
             migrated_row = self._row_dict(migrated.connection, table)
@@ -192,9 +280,9 @@ class CommentOutboxTests(unittest.TestCase):
         self.assertIsNone(after["next_attempt_at"])
         schema_after_first_migration = self._rows(migrated.connection, "sqlite_master")
         with self.assertRaises(sqlite3.IntegrityError):
-            migrated.connection.execute("INSERT INTO evidence_comment_outbox VALUES ('op-2','ticket-1',1,'external-1','evidence_comment','key-2','p','pending',0,NULL,NULL,NULL,NULL,110,110,NULL)")
+            migrated.connection.execute("INSERT INTO evidence_comment_outbox VALUES ('op-2','ticket-1',1,'external-1','evidence_comment','key-2','p','pending',0,NULL,NULL,NULL,NULL,110,110,NULL,NULL)")
         with self.assertRaises(sqlite3.IntegrityError):
-            migrated.connection.execute("INSERT INTO evidence_comment_outbox VALUES ('op-3','ticket-1',2,'external-1','evidence_comment','key-1','p','pending',0,NULL,NULL,NULL,NULL,110,110,NULL)")
+            migrated.connection.execute("INSERT INTO evidence_comment_outbox VALUES ('op-3','ticket-1',2,'external-1','evidence_comment','key-1','p','pending',0,NULL,NULL,NULL,NULL,110,110,NULL,NULL)")
         migrated.close()
         reopened = Ledger(self.p)
         reopened.migrate()
