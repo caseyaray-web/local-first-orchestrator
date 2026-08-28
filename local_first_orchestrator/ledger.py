@@ -202,6 +202,13 @@ CREATE TABLE IF NOT EXISTS model_stage_artifacts (
     base_sha TEXT NOT NULL, diff_hash TEXT NOT NULL, completed_at INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'completed', UNIQUE(ticket_id, attempt_number, stage)
 );
+CREATE TABLE IF NOT EXISTS evidence_comment_outbox (
+    operation_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), event_id INTEGER NOT NULL,
+    external_task_id TEXT NOT NULL, operation_kind TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
+    payload TEXT NOT NULL, status TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0,
+    lease_owner TEXT, lease_expires_at INTEGER, next_attempt_at INTEGER, last_error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, delivered_at INTEGER,
+    UNIQUE(ticket_id, event_id, operation_kind)
+);
 CREATE TABLE IF NOT EXISTS evidence_comments (
     ticket_id TEXT PRIMARY KEY REFERENCES tickets(id), comment TEXT NOT NULL,
     artifact_location TEXT, created_at INTEGER NOT NULL
@@ -266,6 +273,9 @@ class Ledger:
         for name in ("base_sha", "branch", "worktree_path", "pre_diff_hash", "post_diff_hash", "accepted_commit_sha"):
             if name not in attempt_columns:
                 self.connection.execute(f"ALTER TABLE attempts ADD COLUMN {name} TEXT")
+        comment_columns={row["name"] for row in self.connection.execute("PRAGMA table_info(evidence_comment_outbox)")}
+        for name,definition in {"lease_expires_at":"INTEGER","next_attempt_at":"INTEGER"}.items():
+            if name not in comment_columns: self.connection.execute(f"ALTER TABLE evidence_comment_outbox ADD COLUMN {name} {definition}")
         self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_model_calls_reservation ON model_calls(reservation_id)")
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)",
@@ -421,6 +431,52 @@ class Ledger:
 
     def stage_rows(self, ticket_id: str) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? ORDER BY attempt_number, completed_at", (ticket_id,))]
+
+    def enqueue_evidence_comment(self, ticket_id: str, event_id: int, evidence: str) -> dict[str, Any]:
+        import re
+        row=self.get_ticket(ticket_id); now=self._now(); key=f"evidence-comment:{ticket_id}:{event_id}"
+        operation_id=hashlib.sha256(key.encode()).hexdigest()[:32]
+        safe=re.sub(r"(?i)(password|token|secret|api[_-]?key)\s*[:=]\s*\S+",r"\1=[REDACTED]",evidence)[:800]
+        payload=(f"Local-first ticket {ticket_id} | state={row['state']} | {safe}\n<!-- local-first-comment:{operation_id} -->")[:1000]
+        with self._transaction() as conn:
+            conn.execute("INSERT OR IGNORE INTO evidence_comment_outbox(operation_id,ticket_id,event_id,external_task_id,operation_kind,idempotency_key,payload,status,created_at,updated_at) VALUES (?,?,?,?,? ,?,?, 'pending',?,?)",(operation_id,ticket_id,event_id,str(row.get('external_id') or ticket_id),'evidence_comment',key,payload,now,now))
+        return self.comment_outbox(operation_id)
+
+    def comment_outbox(self, operation_id: str) -> dict[str, Any]:
+        row=self.connection.execute("SELECT * FROM evidence_comment_outbox WHERE operation_id=?",(operation_id,)).fetchone()
+        if row is None: raise KeyError(operation_id)
+        return dict(row)
+
+    def claim_comment(self, operation_id: str, owner: str, *, lease_seconds: int = 60, now: int | None = None) -> bool:
+        now=self._now() if now is None else now
+        with self._transaction() as conn:
+            changed=conn.execute("UPDATE evidence_comment_outbox SET status='delivering',lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE operation_id=? AND status IN ('pending','retryable') AND (next_attempt_at IS NULL OR next_attempt_at<=?)",(owner,now+lease_seconds,now,operation_id,now))
+            return changed.rowcount==1
+
+    def mark_comment_delivered(self, operation_id: str, owner: str, *, now: int | None = None) -> bool:
+        now=self._now() if now is None else now
+        with self._transaction() as conn:
+            row=conn.execute("SELECT status,lease_owner FROM evidence_comment_outbox WHERE operation_id=?",(operation_id,)).fetchone()
+            if row is None or (row['status']=='delivered'): return row is not None
+            if row['status']!='delivering' or row['lease_owner']!=owner: return False
+            return conn.execute("UPDATE evidence_comment_outbox SET status='delivered',delivered_at=?,updated_at=?,lease_owner=NULL,lease_expires_at=NULL WHERE operation_id=?",(now,now,operation_id)).rowcount==1
+
+    def mark_comment_retryable(self, operation_id: str, owner: str, error: str, *, now: int | None = None) -> bool:
+        now=self._now() if now is None else now
+        with self._transaction() as conn:
+            return conn.execute("UPDATE evidence_comment_outbox SET status='retryable',last_error=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=?,updated_at=? WHERE operation_id=? AND status='delivering' AND lease_owner=?",(error[:500],now,now,operation_id,owner)).rowcount==1
+
+    def mark_comment_permanently_failed(self, operation_id: str, owner: str, error: str, *, now: int | None = None) -> bool:
+        now=self._now() if now is None else now
+        with self._transaction() as conn:
+            return conn.execute("UPDATE evidence_comment_outbox SET status='permanently_failed',last_error=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE operation_id=? AND status='delivering' AND lease_owner=?",(error[:500],now,operation_id,owner)).rowcount==1
+
+    def recover_expired_comment_leases(self, *, now: int | None = None) -> list[str]:
+        now=self._now() if now is None else now
+        with self._transaction() as conn:
+            rows=conn.execute("SELECT operation_id FROM evidence_comment_outbox WHERE status='delivering' AND lease_expires_at<=?",(now,)).fetchall()
+            conn.execute("UPDATE evidence_comment_outbox SET status='retryable',lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=?,updated_at=? WHERE status='delivering' AND lease_expires_at<=?",(now,now,now))
+            return [str(row['operation_id']) for row in rows]
 
     def set_evidence_comment(self, ticket_id: str, comment: str, artifact_location: str | None = None) -> bool:
         with self._transaction() as conn:
@@ -597,17 +653,9 @@ class Ledger:
                 with self._transaction() as conn:
                     conn.execute("INSERT OR IGNORE INTO board_projections(ticket_id,event_id,state,projected_at) VALUES (?,?,?,?)",(ticket_id,event_id,outbox["state"],self._now()))
                     conn.execute("UPDATE board_projection_outbox SET acknowledged_at=? WHERE ticket_id=? AND event_id=?",(self._now(),ticket_id,event_id))
-        comment = self.evidence_comment(ticket_id)
-        if comment is None and hasattr(adapter, "add_comment"):
+        if self.evidence_comment(ticket_id) is None:
             ticket=self.get_ticket(ticket_id)
-            criteria=[dict(r) for r in self.connection.execute("SELECT criterion_id,status,evidence FROM criterion_statuses WHERE ticket_id=? ORDER BY criterion_id",(ticket_id,))]
-            accepted=self.accepted_commit(ticket_id) or "n/a"
-            text=(f"Local-first ticket {ticket_id} | state={ticket['state']} | attempts={self.attempt_count(ticket_id)} | "
-                  f"criteria={json.dumps(criteria,separators=(',',':'))} | validation={self.runtime_stage(ticket_id,'validation-1') or self.runtime_stage(ticket_id,'validation-2') or {}} | commit={accepted}")[:4000]
-            adapter.add_comment(ticket_id,text)
-            self.set_evidence_comment(ticket_id,text,str(self.database))
-            self.record_runtime_stage(ticket_id,"projection_delivered",text)
-            did_work = True
+            self.enqueue_evidence_comment(ticket_id,event_id,f"attempts={self.attempt_count(ticket_id)}; state={ticket['state']}")
         return did_work
 
     def record_accepted_evidence(self, ticket_id: str, accepted_commit_sha: str, diff_summary: str, validation_summary: str, *, local_reasoning: str | None = None) -> None:
