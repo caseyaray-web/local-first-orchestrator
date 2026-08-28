@@ -540,7 +540,7 @@ class Ledger:
             return changed.rowcount==1
 
     @staticmethod
-    def _safe_comment_error(error: str) -> str:
+    def _safe_comment_error(error: str, *, limit: int = 500) -> str:
         import re
         safe = re.sub(
             r"(?i)(password|token|secret|api[_-]?key|authorization|cookie)\s*[:=]\s*[^\s,;]+",
@@ -548,7 +548,32 @@ class Ledger:
             str(error),
         )
         safe = re.sub(r"(?i)bearer\s+[^\s,;]+", "Bearer [REDACTED]", safe)
-        return safe[:500]
+        return safe[:limit]
+
+    def claim_next_comment(self, owner: str, *, lease_seconds: int = 60, now: int | None = None) -> dict[str, Any] | None:
+        """Atomically claim the oldest pending or due retryable comment."""
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            changed = conn.execute(
+                """UPDATE evidence_comment_outbox
+                   SET status='delivering', lease_owner=?, lease_expires_at=?,
+                       attempt_count=attempt_count+1, updated_at=?
+                 WHERE operation_id = (
+                       SELECT operation_id FROM evidence_comment_outbox
+                        WHERE status IN ('pending','retryable')
+                          AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                        ORDER BY created_at, operation_id LIMIT 1)
+                   AND status IN ('pending','retryable')
+                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)""",
+                (owner, now + lease_seconds, now, now, now),
+            )
+            if changed.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM evidence_comment_outbox WHERE operation_id = (SELECT operation_id FROM evidence_comment_outbox WHERE lease_owner=? AND status='delivering' AND updated_at=? ORDER BY operation_id LIMIT 1)",
+                (owner, now),
+            ).fetchone()
+            return dict(row) if row is not None else None
 
     def mark_comment_delivered(self, operation_id: str, owner: str, *, now: int | None = None) -> bool:
         now=self._now() if now is None else now
@@ -559,19 +584,19 @@ class Ledger:
             if row['status']!='delivering' or row['lease_owner']!=owner or row['lease_expires_at'] is None or row['lease_expires_at']<=now: return False
             return conn.execute("UPDATE evidence_comment_outbox SET status='delivered',delivered_at=?,updated_at=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,last_error=NULL,terminal_owner=? WHERE operation_id=? AND status='delivering' AND lease_owner=? AND lease_expires_at>?",(now,now,owner,operation_id,owner,now)).rowcount==1
 
-    def mark_comment_retryable(self, operation_id: str, owner: str, error: str, *, next_attempt_at: int | None = None, now: int | None = None) -> bool:
+    def mark_comment_retryable(self, operation_id: str, owner: str, error: str, *, next_attempt_at: int | None = None, now: int | None = None, error_limit: int = 500) -> bool:
         now=self._now() if now is None else now
         next_attempt_at = now if next_attempt_at is None else next_attempt_at
         with self._transaction() as conn:
-            return conn.execute("UPDATE evidence_comment_outbox SET status='retryable',last_error=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=?,updated_at=?,delivered_at=NULL,terminal_owner=NULL WHERE operation_id=? AND status='delivering' AND lease_owner=? AND lease_expires_at>?",(self._safe_comment_error(error),next_attempt_at,now,operation_id,owner,now)).rowcount==1
+            return conn.execute("UPDATE evidence_comment_outbox SET status='retryable',last_error=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=?,updated_at=?,delivered_at=NULL,terminal_owner=NULL WHERE operation_id=? AND status='delivering' AND lease_owner=? AND lease_expires_at>?",(self._safe_comment_error(error, limit=error_limit),next_attempt_at,now,operation_id,owner,now)).rowcount==1
 
-    def mark_comment_permanently_failed(self, operation_id: str, owner: str, error: str, *, now: int | None = None) -> bool:
+    def mark_comment_permanently_failed(self, operation_id: str, owner: str, error: str, *, now: int | None = None, error_limit: int = 500) -> bool:
         now=self._now() if now is None else now
         with self._transaction() as conn:
             row=conn.execute("SELECT status,lease_owner,lease_expires_at,terminal_owner FROM evidence_comment_outbox WHERE operation_id=?",(operation_id,)).fetchone()
             if row is None: return False
             if row['status']=='permanently_failed': return row['terminal_owner']==owner
-            return conn.execute("UPDATE evidence_comment_outbox SET status='permanently_failed',last_error=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,updated_at=?,terminal_owner=? WHERE operation_id=? AND status='delivering' AND lease_owner=? AND lease_expires_at>?",(self._safe_comment_error(error),now,owner,operation_id,owner,now)).rowcount==1
+            return conn.execute("UPDATE evidence_comment_outbox SET status='permanently_failed',last_error=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,updated_at=?,terminal_owner=? WHERE operation_id=? AND status='delivering' AND lease_owner=? AND lease_expires_at>?",(self._safe_comment_error(error, limit=error_limit),now,owner,operation_id,owner,now)).rowcount==1
 
     def recover_expired_comment_leases(self, *, now: int | None = None, reason: str | None = None) -> list[str]:
         now=self._now() if now is None else now
