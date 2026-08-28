@@ -17,6 +17,9 @@ class FakeCommentAdapter:
         self.writes_enabled = writes_enabled
         self.calls: list[tuple[str, str, str, bool]] = []
 
+    def find_comment_marker(self, external_task_id: str, marker: str) -> str:
+        return "not_found"
+
     def deliver_comment(self, external_task_id: str, comment: str, *, idempotency_key: str) -> None:
         self.calls.append((external_task_id, comment, idempotency_key, self.ledger.connection.in_transaction))
         if self.failures:
