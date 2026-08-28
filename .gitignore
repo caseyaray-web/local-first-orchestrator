@@ -1,0 +1,23 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local credentials
+.env
+.env.*
+
+# Runtime state and generated outputs
+*.db
+*.db-wal
+*.db-shm
+artifacts/
+worktrees/
+logs/
+*.log
+
+# Editor and OS artifacts
+.DS_Store

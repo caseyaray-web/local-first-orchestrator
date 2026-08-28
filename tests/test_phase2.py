@@ -1,0 +1,177 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from local_first_orchestrator.context_packet import ContextBudgetError, ContextPacketBuilder
+from local_first_orchestrator.git_adapter import DirtyCheckoutError, GitWorktreeAdapter
+from local_first_orchestrator.local_qwen import LocalQwenAdapter
+from local_first_orchestrator.readiness import ReadinessError, validate_ticket
+from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
+from local_first_orchestrator.validation import DeterministicValidator, ValidationError
+
+
+class Phase2Tests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.repo = self.root / "fixture"
+        self.repo.mkdir()
+        self.run_git("init", "-b", "main")
+        self.run_git("config", "user.email", "fixture@example.invalid")
+        self.run_git("config", "user.name", "Fixture")
+        (self.repo / "app.py").write_text("def classify(value):\n    return 'missing'\n", encoding="utf-8")
+        (self.repo / "test_app.py").write_text("from app import classify\n\ndef test_classify():\n    assert classify(1) == 'ok'\n", encoding="utf-8")
+        self.run_git("add", ".")
+        self.run_git("commit", "-m", "fixture base")
+        self.base = self.run_git("rev-parse", "HEAD").stdout.strip()
+        self.ticket = MicroTicket(
+            ticket_id="T-1", objective="Return ok for known fixture values.", criterion_ids=("C-1",),
+            primary_symbol="app.py::classify", allowed_files=("app.py", "test_app.py"),
+            forbidden_changes=("No lockfiles.",), patch_budget=PatchBudget(max_files=2, max_changed_lines=30),
+            verification=VerificationProfile(commands=(("python", "-m", "pytest", "-q"),), working_directory="."),
+            risk="low", review_required=True, max_attempts=2, dependencies=(),
+        )
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def run_git(self, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", *args], cwd=cwd or self.repo, check=True, text=True, capture_output=True)
+
+    def test_readiness_rejects_vague_and_broad_ticket_and_accepts_bounded_contract(self) -> None:
+        self.assertEqual(validate_ticket(self.ticket).ticket_id, "T-1")
+        with self.assertRaises(ReadinessError):
+            validate_ticket(MicroTicket(**{**self.ticket.__dict__, "objective": "Improve the code."}))
+        with self.assertRaises(ReadinessError):
+            validate_ticket(MicroTicket(**{**self.ticket.__dict__, "allowed_files": ("src/", "a.py", "b.py")}))
+
+    def test_git_adapter_refuses_dirty_checkout_and_isolates_ticket_branch(self) -> None:
+        adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
+        (self.repo / "untracked.txt").write_text("dirty", encoding="utf-8")
+        with self.assertRaises(DirtyCheckoutError):
+            adapter.create_attempt(self.ticket.ticket_id, 1, self.base)
+        (self.repo / "untracked.txt").unlink()
+        attempt = adapter.create_attempt(self.ticket.ticket_id, 1, self.base)
+        self.assertNotEqual(attempt.path, self.repo)
+        self.assertEqual(self.run_git("branch", "--show-current", cwd=attempt.path).stdout.strip(), attempt.branch)
+        (attempt.path / "app.py").write_text("def classify(value):\n    return 'ok'\n", encoding="utf-8")
+        self.assertEqual(self.run_git("branch", "--show-current").stdout.strip(), "main")
+        self.assertNotEqual(attempt.branch, "main")
+        adapter.teardown(attempt)
+
+    def test_context_manifest_is_reproducible_and_required_content_cannot_exceed_budget(self) -> None:
+        builder = ContextPacketBuilder(target_tokens=100, max_tokens=140)
+        first = builder.build(self.ticket, {"app.py": (self.repo / "app.py").read_text()}, repository_rules="No network.")
+        second = builder.build(self.ticket, {"app.py": (self.repo / "app.py").read_text()}, repository_rules="No network.")
+        self.assertEqual(first.manifest, second.manifest)
+        self.assertIn("content_hash", first.manifest["sections"][0])
+        with self.assertRaises(ContextBudgetError):
+            ContextPacketBuilder(target_tokens=1, max_tokens=3).build(self.ticket, {"app.py": "x" * 100}, repository_rules="rules")
+
+    def test_context_packet_persists_deterministic_packet_and_manifest_artifacts(self) -> None:
+        builder = ContextPacketBuilder(target_tokens=100, max_tokens=140)
+        packet = builder.build(self.ticket, {"app.py": (self.repo / "app.py").read_text()}, repository_rules="No network.")
+        first = builder.write_artifacts(packet, artifact_root=self.root / "context-artifacts")
+        second = builder.write_artifacts(packet, artifact_root=self.root / "context-artifacts")
+        self.assertTrue(first.packet_path.exists())
+        self.assertTrue(first.manifest_path.exists())
+        self.assertEqual(first, second)
+        self.assertEqual(first.packet_hash, hashlib.sha256(packet.text.encode()).hexdigest())
+        self.assertEqual(first.manifest_hash, hashlib.sha256(json.dumps(packet.manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
+        self.assertEqual(json.loads(first.manifest_path.read_text(encoding="utf-8")), packet.manifest)
+
+    def test_context_packet_refuses_oversized_mandatory_content_before_writing_artifacts(self) -> None:
+        builder = ContextPacketBuilder(target_tokens=1, max_tokens=3)
+        artifact_root = self.root / "unsafe-context-artifacts"
+        with self.assertRaises(ContextBudgetError):
+            builder.build(self.ticket, {"app.py": "x" * 100}, repository_rules="rules")
+        self.assertFalse(artifact_root.exists())
+
+    def test_validator_rejects_base_mismatch_scope_and_redacts_secrets(self) -> None:
+        adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
+        attempt = adapter.create_attempt(self.ticket.ticket_id, 1, self.base)
+        (attempt.path / "outside.py").write_text("password=supersecret", encoding="utf-8")
+        validator = DeterministicValidator(artifact_root=self.root / "artifacts", environment_allowlist=("PATH",), secret_patterns=("supersecret",))
+        result = validator.validate(attempt.path, self.ticket, base_sha=self.base)
+        self.assertFalse(result.passed)
+        self.assertIn("outside.py", result.errors[0])
+        self.assertNotIn("supersecret", result.compact_evidence)
+        with self.assertRaises(ValidationError):
+            validator.validate(attempt.path, self.ticket, base_sha="0" * 40)
+        adapter.teardown(attempt)
+
+    def test_validator_only_runs_ticket_allowlisted_commands(self) -> None:
+        profile = VerificationProfile(commands=(("python", "-c", "print('allowed')"),), working_directory=".")
+        ticket = MicroTicket(**{**self.ticket.__dict__, "verification": profile})
+        adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
+        attempt = adapter.create_attempt(ticket.ticket_id, 1, self.base)
+        validator = DeterministicValidator(artifact_root=self.root / "artifacts")
+        result = validator.validate(attempt.path, ticket, base_sha=self.base)
+        self.assertTrue(result.passed)
+        self.assertEqual(result.commands[0].argv, profile.commands[0])
+        adapter.teardown(attempt)
+
+    def test_validator_rejects_secret_in_allowed_changed_file_before_commands_and_redacts_evidence(self) -> None:
+        adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
+        attempt = adapter.create_attempt(self.ticket.ticket_id, 1, self.base)
+        secret = "actual-secret-value"
+        (attempt.path / "app.py").write_text(f"credential = '{secret}'\n", encoding="utf-8")
+        marker = attempt.path / "command-ran"
+        profile = VerificationProfile(commands=(("python", "-c", "from pathlib import Path; Path('command-ran').write_text('yes')"),))
+        ticket = MicroTicket(**{**self.ticket.__dict__, "verification": profile})
+        validator = DeterministicValidator(artifact_root=self.root / "artifacts", secret_patterns=(secret,))
+        result = validator.validate(attempt.path, ticket, base_sha=self.base)
+        evidence = result.full_evidence_path.read_text(encoding="utf-8")
+        self.assertFalse(result.passed)
+        self.assertFalse(marker.exists())
+        self.assertNotIn(secret, " ".join(result.errors))
+        self.assertNotIn(secret, result.compact_evidence)
+        self.assertNotIn(secret, evidence)
+        adapter.teardown(attempt)
+
+    def test_validator_rejects_conservative_default_secret_assignment_pattern(self) -> None:
+        adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
+        attempt = adapter.create_attempt(self.ticket.ticket_id, 1, self.base)
+        (attempt.path / "app.py").write_text("API_TOKEN = 'default-secret-value'\n", encoding="utf-8")
+        result = DeterministicValidator(artifact_root=self.root / "artifacts").validate(attempt.path, self.ticket, base_sha=self.base)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.errors, ("secret material detected in changed file: app.py",))
+        self.assertNotIn("default-secret-value", result.full_evidence_path.read_text(encoding="utf-8"))
+        adapter.teardown(attempt)
+
+    def test_fake_qwen_runner_gets_fresh_explicit_command_and_no_ledger_callback(self) -> None:
+        calls: list[tuple[str, ...]] = []
+        def runner(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"changed_files": ["app.py"]}), stderr="")
+        adapter = LocalQwenAdapter(runner=runner)
+        result = adapter.invoke("implementation", "packet", artifact_dir=self.root / "model")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], ("hermes", "chat", "--provider", "custom:lm-studio", "--model", "qwen3.8-27b@iq3_s", "--query", "packet", "--quiet"))
+        self.assertNotIn("--fresh-session", calls[0])
+        self.assertNotIn("--", calls[0])
+        self.assertTrue(result.artifact_path.exists())
+        self.assertEqual(result.payload["changed_files"], ["app.py"])
+
+    def test_fixture_happy_path_commits_only_ticket_branch_and_rejects_scope(self) -> None:
+        adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
+        attempt = adapter.create_attempt(self.ticket.ticket_id, 1, self.base)
+        # This is the deterministic fake local-model edit; no model process is invoked.
+        (attempt.path / "app.py").write_text("def classify(value):\n    return 'ok'\n", encoding="utf-8")
+        ticket = MicroTicket(**{**self.ticket.__dict__, "verification": VerificationProfile(commands=(("python", "-c", "print('fixture validated')"),))})
+        validator = DeterministicValidator(artifact_root=self.root / "artifacts")
+        self.assertTrue(validator.validate(attempt.path, ticket, base_sha=self.base).passed)
+        accepted = adapter.accept(attempt, "fixture ticket accepted")
+        self.assertEqual(self.run_git("rev-parse", "HEAD", cwd=attempt.path).stdout.strip(), accepted)
+        self.assertEqual(self.run_git("rev-parse", "HEAD").stdout.strip(), self.base)
+        self.assertNotEqual(self.run_git("branch", "--show-current", cwd=attempt.path).stdout.strip(), "main")
+        adapter.teardown(attempt)
+
+
+if __name__ == "__main__":
+    unittest.main()

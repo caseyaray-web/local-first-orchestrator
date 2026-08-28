@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68,<81"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-first-orchestrator"
+version = "0.1.0"
+description = "Standalone Phase 1 local-first orchestration ledger."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+local-first-orchestrator = "local_first_orchestrator.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["local_first_orchestrator*"]

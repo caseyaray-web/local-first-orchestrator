@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from .ticket import MicroTicket
+from .symbols import enforce_symbol_scope
+
+
+class ValidationError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class CommandEvidence:
+    argv: tuple[str, ...]
+    returncode: int
+    duration_seconds: float
+    stdout_summary: str
+    stderr_summary: str
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    passed: bool
+    errors: tuple[str, ...]
+    commands: tuple[CommandEvidence, ...]
+    compact_evidence: str
+    full_evidence_path: Path
+    scope_unverified: bool = False
+
+
+class DeterministicValidator:
+    denied_suffixes = (".lock", ".pem", ".key", ".env")
+    default_secret_assignment_patterns = (
+        re.compile(r"(?im)^\s*(?:[A-Za-z][A-Za-z0-9_-]*[_-])?(?:api[_-]?key|secret|password|token|private[_-]?key)\s*[:=]\s*(?:['\"][^'\"]+['\"]|[^\s#]{8,})"),
+    )
+    def __init__(self, *, artifact_root: Path, environment_allowlist: tuple[str, ...] = ("PATH",), secret_patterns: tuple[str, ...] = ()) -> None:
+        self.artifact_root, self.environment_allowlist, self.secret_patterns = Path(artifact_root), environment_allowlist, secret_patterns
+
+    def _git(self, path: Path, *args: str) -> str:
+        """Run bounded, non-interactive internal Git inspection only."""
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat", "PAGER": "cat", "LESS": "FRX"}
+        safe_args = args
+        if args and args[0] == "diff":
+            safe_args = ("diff", "--no-ext-diff", "--no-textconv", *args[1:])
+        argv = ("git", "--no-pager", "-c", "core.pager=cat", "-c", "diff.external=false", *safe_args)
+        try:
+            completed = subprocess.run(argv, cwd=path, env=env, text=True, capture_output=True, timeout=15, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise ValidationError(f"git inspection timed out: {' '.join(args[:3])}") from exc
+        if completed.returncode:
+            detail = self._redact((completed.stderr or completed.stdout or "git command failed")[:2000]).strip()
+            raise ValidationError(f"git inspection failed: {detail}")
+        return completed.stdout[:1_000_000]
+
+    @staticmethod
+    def _validated_base_sha(base_sha: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{40}", base_sha):
+            raise ValidationError("recorded base SHA must be a full lowercase commit hash")
+        return base_sha
+
+    def _redact(self, text: str) -> str:
+        for secret in self.secret_patterns:
+            text = re.sub(re.escape(secret), "[REDACTED]", text, flags=re.I)
+        return text
+
+    def _secret_scan_error(self, worktree: Path, relative_path: str) -> str | None:
+        candidate = (worktree / relative_path).resolve()
+        if worktree not in candidate.parents or not candidate.is_file():
+            return f"unable to safely scan changed content: {relative_path}"
+        try:
+            content = candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return f"unable to safely scan changed content: {relative_path}"
+        if any(secret.casefold() in content.casefold() for secret in self.secret_patterns):
+            return f"secret material detected in changed file: {relative_path}"
+        if any(pattern.search(content) for pattern in self.default_secret_assignment_patterns):
+            return f"secret material detected in changed file: {relative_path}"
+        return None
+
+    def validate(self, worktree: Path, ticket: MicroTicket, *, base_sha: str) -> ValidationResult:
+        worktree = Path(worktree).resolve()
+        base_sha = self._validated_base_sha(base_sha)
+        # Resolve before diffing: no revision expression reaches the diff parser.
+        self._git(worktree, "rev-parse", "--verify", f"{base_sha}^{{commit}}")
+        actual_base = self._git(worktree, "merge-base", "HEAD", base_sha).strip()
+        if actual_base != base_sha:
+            raise ValidationError("worktree base SHA does not match recorded base")
+        names = [p for p in self._git(worktree, "diff", "--name-only", base_sha, "--").splitlines() if p]
+        # Untracked generated/secrets must be rejected too; git diff alone hides them.
+        for line in self._git(worktree, "status", "--porcelain=v1").splitlines():
+            candidate = line[3:]
+            if candidate and candidate not in names:
+                names.append(candidate)
+        errors = [f"changed path outside allowlist: {p}" for p in names if p not in ticket.allowed_files]
+        errors += [f"forbidden file type: {p}" for p in names if p.endswith(self.denied_suffixes)]
+        errors += [error for path in names if (error := self._secret_scan_error(worktree, path))]
+        symbol_errors, scope_unverified = enforce_symbol_scope(worktree, names, ticket, base_sha)
+        errors.extend(symbol_errors)
+        diff = self._git(worktree, "diff", "--numstat", base_sha, "--")
+        changed_lines = sum(int(a) + int(d) for a, d, *_ in (line.split("\t") for line in diff.splitlines() if line))
+        if len(names) > ticket.patch_budget.max_files: errors.append("changed file budget exceeded")
+        if changed_lines > ticket.patch_budget.max_changed_lines: errors.append("changed line budget exceeded")
+        records: list[CommandEvidence] = []
+        env = {key: os.environ[key] for key in self.environment_allowlist if key in os.environ}
+        if not errors:
+            run_cwd = (worktree / ticket.verification.working_directory).resolve()
+            if worktree not in run_cwd.parents and run_cwd != worktree:
+                raise ValidationError("verification working directory escapes worktree")
+            for argv in ticket.verification.commands:
+                started = time.monotonic()
+                completed = subprocess.run(argv, cwd=run_cwd, env=env, text=True, capture_output=True, timeout=ticket.verification.timeout_seconds, check=False)
+                stdout, stderr = self._redact(completed.stdout[:ticket.verification.output_limit]), self._redact(completed.stderr[:ticket.verification.output_limit])
+                records.append(CommandEvidence(argv, completed.returncode, time.monotonic() - started, stdout, stderr))
+                if completed.returncode: errors.append(f"verification command failed: {' '.join(argv)}")
+        compact_parts = errors or ["validation passed"]
+        if scope_unverified:
+            compact_parts.append("scope_unverified: symbol analysis unavailable; review/checkpoint policy required")
+        compact = self._redact("; ".join(compact_parts))
+        self.artifact_root.mkdir(parents=True, exist_ok=True)
+        path = self.artifact_root / f"validation-{hashlib.sha256((str(worktree)+base_sha).encode()).hexdigest()[:12]}.json"
+        path.write_text(json.dumps({"base_sha": base_sha, "changed_files": names, "changed_lines": changed_lines, "scope_unverified": scope_unverified, "errors": errors, "commands": [r.__dict__ for r in records]}, default=list, sort_keys=True), encoding="utf-8")
+        return ValidationResult(not errors, tuple(errors), tuple(records), compact, path, scope_unverified)
