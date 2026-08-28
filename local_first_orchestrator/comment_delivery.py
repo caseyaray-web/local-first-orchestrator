@@ -89,7 +89,11 @@ class CommentDeliveryWorker:
             self.ledger.mark_comment_delivered(operation_id, self.worker_id, now=now)
             return CommentDeliveryResult("reconciled_delivered", operation_id, attempt_count)
         if lookup is not MarkerLookup.NOT_FOUND:
-            self.ledger.mark_comment_retryable(operation_id, self.worker_id, f"reconciliation unavailable: {lookup}", next_attempt_at=now + self.policy.base_retry_delay, now=now, error_limit=self.policy.error_length_limit)
+            reason = f"reconciliation unavailable: {lookup}"
+            if attempt_count >= self.policy.max_attempts:
+                self.ledger.mark_comment_permanently_failed(operation_id, self.worker_id, reason, now=now, error_limit=self.policy.error_length_limit)
+                return CommentDeliveryResult("permanently_failed", operation_id, attempt_count, error=Ledger._safe_comment_error(reason, limit=self.policy.error_length_limit))
+            self.ledger.mark_comment_retryable(operation_id, self.worker_id, reason, next_attempt_at=now + self.policy.base_retry_delay, now=now, error_limit=self.policy.error_length_limit)
             return CommentDeliveryResult("reconciliation_deferred", operation_id, attempt_count, now + self.policy.base_retry_delay)
         try:
             self.adapter.deliver_comment(
