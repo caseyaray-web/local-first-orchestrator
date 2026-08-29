@@ -50,13 +50,12 @@ class Phase2Tests(unittest.TestCase):
         with self.assertRaises(ReadinessError):
             validate_ticket(MicroTicket(**{**self.ticket.__dict__, "allowed_files": ("src/", "a.py", "b.py")}))
 
-    def test_git_adapter_refuses_dirty_checkout_and_isolates_ticket_branch(self) -> None:
+    def test_git_adapter_preserves_dirty_checkout_and_isolates_ticket_branch(self) -> None:
         adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
-        (self.repo / "untracked.txt").write_text("dirty", encoding="utf-8")
-        with self.assertRaises(DirtyCheckoutError):
-            adapter.create_attempt(self.ticket.ticket_id, 1, self.base)
-        (self.repo / "untracked.txt").unlink()
+        dirty = self.repo / "untracked.txt"
+        dirty.write_text("dirty", encoding="utf-8")
         attempt = adapter.create_attempt(self.ticket.ticket_id, 1, self.base)
+        self.assertEqual(dirty.read_text(encoding="utf-8"), "dirty")
         self.assertNotEqual(attempt.path, self.repo)
         self.assertEqual(self.run_git("branch", "--show-current", cwd=attempt.path).stdout.strip(), attempt.branch)
         (attempt.path / "app.py").write_text("def classify(value):\n    return 'ok'\n", encoding="utf-8")

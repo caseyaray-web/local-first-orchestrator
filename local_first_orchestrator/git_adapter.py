@@ -40,7 +40,8 @@ class GitWorktreeAdapter:
             raise DirtyCheckoutError("primary checkout is dirty; refusing worktree creation")
 
     def create_attempt(self, ticket_id: str, attempt_number: int, base_sha: str) -> AttemptWorktree:
-        self._require_clean_primary()
+        # The canonical checkout is read-only for attempts; its user changes need not block
+        # creating a separate worktree from an immutable commit.
         resolved = self._git("rev-parse", "--verify", f"{base_sha}^{{commit}}").stdout.strip()
         branch = f"local-first/{ticket_id}/attempt-{attempt_number}"
         path = self.worktree_root / ticket_id / f"attempt-{attempt_number}"
