@@ -116,13 +116,15 @@ class Phase3Tests(unittest.TestCase):
         self.assertNotIn("implementation reasoning", packet)
         self.assertNotIn("arbitrary repository history", packet)
         calls: list[tuple[str, ...]] = []
+        kwargs_seen: list[dict[str, object]] = []
         def runner(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
-            calls.append(argv)
+            calls.append(argv); kwargs_seen.append(kwargs)
             return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"verdict": "pass", "criterion_results": [{"criterion_id": "AC-1", "status": "pass", "evidence": "ok"}], "findings": [], "suggestions": []}), stderr="")
         review = LocalReviewAdapter(LocalQwenAdapter(runner=runner)).review(self.ticket, packet, artifact_dir=self.root / "artifacts")
         self.assertEqual(review.verdict, "pass")
         self.assertEqual(calls[0][calls[0].index("--query") + 1], packet)
         self.assertNotIn("board", " ".join(calls[0]).lower())
+        self.assertNotIn("cwd", kwargs_seen[0])
 
 
 if __name__ == "__main__":

@@ -101,7 +101,8 @@ class LocalReviewAdapter:
         self.model = model
 
     def review(self, ticket: MicroTicket, packet: str, *, artifact_dir: Path, workdir: Path | None = None) -> ReviewResult:
-        return normalize_review(self.model.invoke("review", packet, artifact_dir=artifact_dir, workdir=workdir).payload, ticket)
+        # Review is packet-only: never grant the reviewer an editable worktree cwd.
+        return normalize_review(self.model.invoke("review", packet, artifact_dir=artifact_dir).payload, ticket)
 
 
 class SameTicketRepairCoordinator:

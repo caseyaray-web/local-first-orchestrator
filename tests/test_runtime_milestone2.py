@@ -25,7 +25,7 @@ class FakeBoard:
 class FakeModel:
     def __init__(self, actions): self.actions=list(actions); self.calls=[]
     def invoke(self, purpose, packet, *, artifact_dir, workdir=None):
-        self.calls.append((purpose, packet, Path(workdir)))
+        self.calls.append((purpose, packet, Path(workdir) if workdir is not None else None))
         if purpose == "implementation":
             action=self.actions.pop(0)
             action(Path(workdir))
