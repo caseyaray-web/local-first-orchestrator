@@ -61,6 +61,8 @@ class Phase4Tests(unittest.TestCase):
                 "recommended_action": "decompose",
                 "children": [self.child()],
             }, self.parent_contract, parent_depth=0)
+        with self.assertRaisesRegex(TriageError, "must not create children"):
+            normalize_triage({"classification":"architecture_gap", "root_cause_evidence":"design unknown", "recommended_action":"decompose", "children":[self.child()]}, self.parent_contract, parent_depth=0)
         with self.assertRaisesRegex(TriageError, "recommended action"):
             normalize_triage({
                 "classification": "oversized_ticket",

@@ -15,10 +15,10 @@ class TriageError(ValueError):
     pass
 
 
-_CLASSIFICATIONS_WITH_CHILDREN = {"oversized_ticket", "architecture_gap", "implementation_defect"}
+_CLASSIFICATIONS_WITH_CHILDREN = {"oversized_ticket"}
 _CLASSIFICATIONS = _CLASSIFICATIONS_WITH_CHILDREN | {
-    "missing_context", "ambiguous_requirement", "environment_failure",
-    "credential_or_service_failure", "flaky_test", "merge_conflict", "model_failure",
+    "missing_context", "architecture_gap", "environment_failure", "invalid_ticket_contract",
+    "credential_or_service_failure", "flaky_test", "merge_conflict", "model_failure", "non_convergent_defect",
 }
 
 
