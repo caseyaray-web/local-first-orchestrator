@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .comment_delivery import MarkerLookup
 from .states import CanonicalState
 
 
@@ -21,14 +24,20 @@ class HermesBoardAdapter:
     """Hermes CLI adapter. Writes require explicit opt-in; reads are always safe."""
     is_fake = False
 
-    def __init__(self, *, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run, executable: str = "hermes", allow_writes: bool = False) -> None:
-        self.runner, self.executable, self.allow_writes = runner, executable, allow_writes
+    def __init__(self, *, board: str, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run, executable: str, allow_writes: bool = False) -> None:
+        if not board or not board.replace("-", "").replace("_", "").isalnum(): raise ValueError("explicit board slug required")
+        path=Path(executable)
+        if not path.is_absolute() or not path.is_file(): raise ValueError("Hermes executable must be an absolute existing path")
+        self.runner, self.executable, self.board, self.allow_writes = runner, str(path), board, allow_writes
 
     def _run(self, *args: str) -> Any:
-        completed = self.runner((self.executable, "kanban", *args), text=True, capture_output=True, timeout=60, check=False)
-        if completed.returncode:
-            raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "Hermes Kanban CLI failed")
-        return json.loads(completed.stdout) if "--json" in args else completed.stdout
+        try:
+            completed = self.runner((self.executable, "kanban", "--board", self.board, *args), text=True, capture_output=True, timeout=15, check=False, env={**os.environ,"NO_COLOR":"1","GIT_TERMINAL_PROMPT":"0"})
+        except (OSError, subprocess.TimeoutExpired) as exc: raise RuntimeError("Hermes Kanban read unavailable") from exc
+        if completed.returncode: raise RuntimeError((completed.stderr or completed.stdout or "Hermes Kanban CLI failed")[:2000])
+        if "--json" not in args: return completed.stdout[:1_000_000]
+        try: return json.loads(completed.stdout[:1_000_000])
+        except json.JSONDecodeError as exc: raise RuntimeError("Hermes Kanban malformed JSON") from exc
 
     def get_task(self, task_id: str) -> ExternalTicket:
         payload = self._run("show", task_id, "--json")
@@ -50,6 +59,10 @@ class HermesBoardAdapter:
                 continue
             candidates.append(ExternalTicket(str(row["id"]), str(row.get("title") or ""), body, str(row.get("status") or ""), row.get("workspace_path")))
         return candidates
+
+    def find_comment_marker(self, external_task_id: str, marker: str) -> MarkerLookup:
+        """Current machine-readable Hermes reads do not expose comment bodies."""
+        return MarkerLookup.UNSUPPORTED
 
     def set_state(self, ticket_id: str, state: CanonicalState, *, idempotency_key: str) -> None:
         if not self.allow_writes:

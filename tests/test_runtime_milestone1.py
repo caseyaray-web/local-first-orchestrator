@@ -42,7 +42,7 @@ class RuntimeMilestoneTests(unittest.TestCase):
         self.ledger=Ledger(root/"ledger.db"); self.ledger.migrate()
         body="<!-- local-first-orchestrator -->\n```local-first-contract\n"+json.dumps(contract())+"\n```"
         self.fake=FakeHermes([{"id":"t1","title":"eligible","body":body,"status":"scheduled","workspace_path":None}])
-        self.board=HermesBoardAdapter(runner=self.fake)
+        self.board=HermesBoardAdapter(runner=self.fake, executable="/bin/true", board="test-board")
         self.controller=LocalFirstController(self.ledger,self.board,RuntimeConfig(root,root/"wt",root/"art"))
     def tearDown(self): self.ledger.close(); self.tmp.cleanup()
     def test_import_idempotent_and_dry_run_has_no_external_effects(self):
@@ -57,7 +57,7 @@ class RuntimeMilestoneTests(unittest.TestCase):
         missing = type("Card",(),{"id":"missing","title":"missing","body":"<!-- local-first-orchestrator -->\n```local-first-contract\n" + json.dumps(incomplete) + "\n```","status":"scheduled"})()
         with self.assertRaisesRegex(ValueError, "objective, risk"): self.controller.import_card(missing)
         self.fake.malformed=True
-        with self.assertRaises(json.JSONDecodeError): self.board.import_candidates()
+        with self.assertRaises(RuntimeError): self.board.import_candidates()
         self.fake.malformed=False; self.fake.fail=True
         with self.assertRaisesRegex(RuntimeError,"simulated failure"): self.board.import_candidates()
     def test_lease_is_exclusive_and_restart_does_not_duplicate_import(self):
