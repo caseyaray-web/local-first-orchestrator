@@ -302,8 +302,9 @@ class Ledger:
             if name not in comment_columns: self.connection.execute(f"ALTER TABLE evidence_comment_outbox ADD COLUMN {name} {definition}")
         self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_model_calls_reservation ON model_calls(reservation_id)")
         projection_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(board_projection_outbox)")}
-        if "payload_json" not in projection_columns:
-            self.connection.execute("ALTER TABLE board_projection_outbox ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'")
+        for name, definition in {"payload_json": "TEXT NOT NULL DEFAULT '{}'", "operation": "TEXT NOT NULL DEFAULT 'set_state'", "external_task_id": "TEXT", "lease_owner": "TEXT", "lease_expires_at": "INTEGER", "next_attempt_at": "INTEGER", "attempt_count": "INTEGER NOT NULL DEFAULT 0", "last_error": "TEXT"}.items():
+            if name not in projection_columns:
+                self.connection.execute(f"ALTER TABLE board_projection_outbox ADD COLUMN {name} {definition}")
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)",
             (self._now(),),
