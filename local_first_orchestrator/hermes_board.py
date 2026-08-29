@@ -24,19 +24,21 @@ class HermesBoardAdapter:
     """Hermes CLI adapter. Writes require explicit opt-in; reads are always safe."""
     is_fake = False
 
-    def __init__(self, *, board: str, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run, executable: str, allow_writes: bool = False) -> None:
+    def __init__(self, *, board: str, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run, executable: str, allow_writes: bool = False, timeout_seconds: int = 15, output_limit: int = 200_000) -> None:
+        if timeout_seconds < 1 or output_limit < 1: raise ValueError("positive process limits required")
         if not board or not board.replace("-", "").replace("_", "").isalnum(): raise ValueError("explicit board slug required")
         path=Path(executable)
         if not path.is_absolute() or not path.is_file(): raise ValueError("Hermes executable must be an absolute existing path")
-        self.runner, self.executable, self.board, self.allow_writes = runner, str(path), board, allow_writes
+        self.runner, self.executable, self.board, self.allow_writes, self.timeout_seconds, self.output_limit = runner, str(path), board, allow_writes, timeout_seconds, output_limit
 
     def _run(self, *args: str) -> Any:
         try:
-            completed = self.runner((self.executable, "kanban", "--board", self.board, *args), text=True, capture_output=True, timeout=15, check=False, env={**os.environ,"NO_COLOR":"1","GIT_TERMINAL_PROMPT":"0"})
+            completed = self.runner((self.executable, "kanban", "--board", self.board, *args), text=True, capture_output=True, timeout=self.timeout_seconds, check=False, env={**os.environ,"NO_COLOR":"1","GIT_TERMINAL_PROMPT":"0"})
         except (OSError, subprocess.TimeoutExpired) as exc: raise RuntimeError("Hermes Kanban read unavailable") from exc
+        if len(completed.stdout or "") > self.output_limit or len(completed.stderr or "") > self.output_limit: raise RuntimeError("Hermes Kanban output exceeded bound")
         if completed.returncode: raise RuntimeError((completed.stderr or completed.stdout or "Hermes Kanban CLI failed")[:2000])
-        if "--json" not in args: return completed.stdout[:1_000_000]
-        try: return json.loads(completed.stdout[:1_000_000])
+        if "--json" not in args: return completed.stdout[:self.output_limit]
+        try: return json.loads(completed.stdout[:self.output_limit])
         except json.JSONDecodeError as exc: raise RuntimeError("Hermes Kanban malformed JSON") from exc
 
     def get_task(self, task_id: str) -> ExternalTicket:

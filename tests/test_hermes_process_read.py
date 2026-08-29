@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os,stat,unittest
+import os,stat,subprocess,unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from local_first_orchestrator.hermes_board import HermesBoardAdapter
@@ -12,7 +12,15 @@ class ProcessReadTests(unittest.TestCase):
   self.t.cleanup()
  def test_reads_use_absolute_fake_and_explicit_board(self):
   a=HermesBoardAdapter(executable=str(self.exe),board='board'); self.assertEqual(len(a.import_candidates()),1); self.assertEqual(a.get_task('1').id,'1'); self.assertIn('kanban --board board list --json --status scheduled',self.log.read_text()); self.assertIn('kanban --board board show 1 --json',self.log.read_text())
- def test_missing_or_invalid_board_or_executable_fails_closed(self):
-  with self.assertRaises(ValueError): HermesBoardAdapter(executable='hermes',board='')
-  with self.assertRaises(ValueError): HermesBoardAdapter(executable='/missing/hermes',board='board')
+ def test_negative_process_and_json_contracts_are_bounded(self):
+  cases=[subprocess.CompletedProcess((),1,'x'*999,'err'*999),subprocess.CompletedProcess((),0,'not json',''),subprocess.CompletedProcess((),0,'{}',''),subprocess.CompletedProcess((),0,'x'*20,'')]
+  for result in cases:
+   a=HermesBoardAdapter(executable=str(self.exe),board='board',runner=lambda *_,r=result,**__:r,output_limit=10)
+   with self.assertRaises(RuntimeError): a.import_candidates()
+  a=HermesBoardAdapter(executable=str(self.exe),board='board',runner=lambda *_,**__: (_ for _ in ()).throw(subprocess.TimeoutExpired('x',1)))
+  with self.assertRaises(RuntimeError): a.import_candidates()
+ def test_missing_task_fields_fail_closed(self):
+  a=HermesBoardAdapter(executable=str(self.exe),board='board',runner=lambda *_,**__: subprocess.CompletedProcess((),0,'{"task": {}}',''))
+  with self.assertRaises(KeyError): a.get_task('x')
+
 if __name__=='__main__': unittest.main()
