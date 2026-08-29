@@ -1,0 +1,182 @@
+"""Governed, proposal-only decomposition planning.
+
+The ``hermes chat`` executable is only a transport used by an explicitly
+trusted planner constructed with ``cost_class='local'``.  Its executable name
+does not determine cost policy; paid planners must be paid-model adapters.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Protocol
+
+from .decomposition import (
+    DecompositionPlan,
+    FeatureContract,
+    PlanValidationResult,
+    PlanValidator,
+    activate_validated_plan,
+)
+from .decomposition_planner import PlannerError, LocalDecompositionPlanner, packet, parse
+from .paid_model import PaidInvocationError, PaidModelAdapter
+from .repository_snapshot import RepositoryPlanValidator, RepositorySnapshot, snapshot
+from .usage_governor import PaidPurpose
+from .controller import RuntimeConfig
+from .ledger import Ledger
+
+
+class Planner(Protocol):
+    cost_class: str
+
+
+@dataclass(frozen=True)
+class PlanningOutcome:
+    status: str
+    feature_id: str
+    request_key: str | None = None
+    snapshot_hash: str | None = None
+    plan_id: str | None = None
+    activated_ticket_ids: tuple[str, ...] = ()
+    reasons: tuple[str, ...] = ()
+
+
+class PlanningCoordinator:
+    """Coordinates proposal-only planning; it never projects or executes tickets."""
+
+    def __init__(
+        self,
+        ledger: Ledger,
+        config: RuntimeConfig,
+        planner: Planner,
+        *,
+        artifact_root: Path | None = None,
+        plan_validator: PlanValidator | None = None,
+        repository_validator: RepositoryPlanValidator | None = None,
+        planner_identity: str | None = None,
+    ) -> None:
+        self.ledger = ledger
+        self.config = config
+        self.planner = planner
+        self.artifact_root = Path(artifact_root or config.artifact_root)
+        self.plan_validator = plan_validator or PlanValidator()
+        self.repository_validator = repository_validator or RepositoryPlanValidator()
+        self.planner_identity = planner_identity or type(planner).__name__
+
+    def _cost_class(self) -> str:
+        value = getattr(self.planner, "cost_class", "unknown")
+        return value if value in {"local", "paid", "unknown"} else "unknown"
+
+    def _request_key(self, feature: FeatureContract, snap: RepositorySnapshot) -> str:
+        material = {
+            "architecture_purpose": PaidPurpose.ARCHITECTURE.value,
+            "feature_id": feature.id,
+            "contract_hash": feature.contract_hash,
+            "repo_base_sha": snap.base_sha,
+            "repo_snapshot_hash": snap.snapshot_hash,
+            "planner_identity": self.planner_identity,
+        }
+        return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def _artifact_dir(self, feature: FeatureContract, request_key: str) -> Path:
+        return self.artifact_root / feature.id / request_key
+
+    @staticmethod
+    def _plan_json(plan: DecompositionPlan) -> str:
+        return json.dumps(asdict(plan), sort_keys=True, separators=(",", ":"))
+
+    def _record(self, request_key: str, feature: FeatureContract, snap: RepositorySnapshot, *, status: str, artifact: Path | None = None, structural: tuple[str, ...] = (), repository: tuple[str, ...] = (), plan_id: str | None = None, ticket_ids: tuple[str, ...] = ()) -> None:
+        now = self.ledger._now()
+        with self.ledger._transaction() as conn:
+            conn.execute(
+                """INSERT INTO planning_runs(request_key,feature_id,contract_hash,repo_base_sha,repo_snapshot_hash,planner_identity,cost_class,status,response_artifact,structural_reasons_json,repository_reasons_json,plan_id,ticket_ids_json,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(request_key) DO UPDATE SET status=excluded.status,response_artifact=excluded.response_artifact,structural_reasons_json=excluded.structural_reasons_json,repository_reasons_json=excluded.repository_reasons_json,plan_id=excluded.plan_id,ticket_ids_json=excluded.ticket_ids_json,updated_at=excluded.updated_at""",
+                (request_key, feature.id, feature.contract_hash, snap.base_sha, snap.snapshot_hash, self.planner_identity, self._cost_class(), status, str(artifact) if artifact else None, json.dumps(structural), json.dumps(repository), plan_id, json.dumps(ticket_ids), now, now),
+            )
+
+    def _existing_activated(self, feature: FeatureContract, snap: RepositorySnapshot) -> PlanningOutcome | None:
+        rows = self.ledger.connection.execute("SELECT * FROM decomposition_plans WHERE feature_id=? AND status='active' ORDER BY activated_at", (feature.id,)).fetchall()
+        for row in rows:
+            try:
+                stored = json.loads(row["plan_json"])
+                plan = parse(json.dumps(stored["plan"], sort_keys=True, separators=(",", ":")))
+            except (PlannerError, KeyError, TypeError, ValueError):
+                continue
+            if plan.feature_contract_hash == feature.contract_hash and plan.repo_base_sha == snap.base_sha and plan.repo_snapshot_hash == snap.snapshot_hash:
+                ids = tuple(r["id"] for r in self.ledger.connection.execute("SELECT t.id FROM tickets t JOIN tranches tr ON tr.id=t.tranche_id WHERE t.feature_id=? AND tr.ordinal=0 ORDER BY t.id", (feature.id,)))
+                return PlanningOutcome("already_activated", feature.id, snapshot_hash=snap.snapshot_hash, plan_id=str(row["id"]), activated_ticket_ids=ids)
+        return None
+
+    @staticmethod
+    def _proposal_text(value: dict[str, Any]) -> str:
+        candidate = value.get("plan", value)
+        return json.dumps(candidate, sort_keys=True, separators=(",", ":"))
+
+    def plan(self, feature: FeatureContract, *, repository: Path | None = None, feature_terms: tuple[str, ...] = ()) -> PlanningOutcome:
+        cost_class = self._cost_class()
+        if cost_class == "unknown":
+            return PlanningOutcome("unknown_cost_class", feature.id, reasons=("planner cost class is not trusted",))
+        try:
+            # The configured exact allowlist root is the authority, never a board workspace_path.
+            repo = self.config.canonical_repository(self.config.repository)
+            if repository is not None and self.config.canonical_repository(repository) != repo:
+                raise ValueError("repository is not the controller-approved canonical repository")
+            base = feature.source_revision.strip() or subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+            snap = snapshot(repo, base, feature, feature_terms)
+        except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+            return PlanningOutcome("planner_failed", feature.id, reasons=(str(exc),))
+        already = self._existing_activated(feature, snap)
+        if already:
+            return already
+        request_key = self._request_key(feature, snap)
+        artifact_dir = self._artifact_dir(feature, request_key)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        request_path = artifact_dir / "planner-request.json"
+        response_path = artifact_dir / "planner-response.json"
+        request_payload = {"feature_id": feature.id, "contract_hash": feature.contract_hash, "repo_base_sha": snap.base_sha, "repo_snapshot_hash": snap.snapshot_hash, "planner_identity": self.planner_identity, "purpose": PaidPurpose.ARCHITECTURE.value}
+        request_path.write_text(json.dumps(request_payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+
+        prior = self.ledger.connection.execute("SELECT * FROM planning_runs WHERE request_key=?", (request_key,)).fetchone()
+        proposal: DecompositionPlan
+        try:
+            if prior is not None and prior["status"] in {"structural_rejected", "repository_rejected", "completed"} and prior["response_artifact"] and Path(prior["response_artifact"]).exists():
+                proposal = parse(Path(prior["response_artifact"]).read_text(encoding="utf-8"))
+            elif cost_class == "local":
+                if not isinstance(self.planner, LocalDecompositionPlanner):
+                    proposal = self.planner.propose(feature, snap, artifact_dir=artifact_dir)  # type: ignore[attr-defined]
+                else:
+                    proposal = self.planner.propose(feature, snap, artifact_dir=artifact_dir)
+                if not response_path.exists(): response_path.write_text(self._plan_json(proposal), encoding="utf-8")
+            else:
+                packet_value = {"request": request_payload, "prompt": packet(feature, snap)}
+                result = self.planner.invoke(feature.id, PaidPurpose.ARCHITECTURE, request_key, packet_value)  # type: ignore[attr-defined]
+                response_path.write_text(self._proposal_text(result), encoding="utf-8")
+                proposal = parse(response_path.read_text(encoding="utf-8"))
+        except PaidInvocationError as exc:
+            message = str(exc)
+            status = "budget_exhausted" if "budget exhausted" in message else "planner_ambiguous"
+            return PlanningOutcome(status, feature.id, request_key, snap.snapshot_hash, reasons=(message,))
+        except PlannerError as exc:
+            status = "planner_timeout" if "timeout" in str(exc) else "planner_failed"
+            return PlanningOutcome(status, feature.id, request_key, snap.snapshot_hash, reasons=(str(exc),))
+        except TimeoutError as exc:
+            return PlanningOutcome("planner_timeout", feature.id, request_key, snap.snapshot_hash, reasons=(str(exc),))
+        except (OSError, TypeError, ValueError, KeyError) as exc:
+            return PlanningOutcome("planner_failed", feature.id, request_key, snap.snapshot_hash, reasons=(str(exc),))
+
+        structural: PlanValidationResult = self.plan_validator.validate(feature, proposal)
+        if not structural.passed:
+            self._record(request_key, feature, snap, status="structural_rejected", artifact=response_path, structural=structural.reasons)
+            return PlanningOutcome("structural_rejected", feature.id, request_key, snap.snapshot_hash, reasons=structural.reasons)
+        repository_validation = self.repository_validator.validate(proposal, snap)
+        if not repository_validation.passed:
+            self._record(request_key, feature, snap, status="repository_rejected", artifact=response_path, repository=repository_validation.reasons)
+            return PlanningOutcome("repository_rejected", feature.id, request_key, snap.snapshot_hash, reasons=repository_validation.reasons)
+        self._record(request_key, feature, snap, status="completed", artifact=response_path)
+        plan_id, ticket_ids = activate_validated_plan(self.ledger, feature, proposal, structural, repository_validation)
+        self._record(request_key, feature, snap, status="activated", artifact=response_path, plan_id=plan_id, ticket_ids=ticket_ids)
+        return PlanningOutcome("activated", feature.id, request_key, snap.snapshot_hash, plan_id, ticket_ids)

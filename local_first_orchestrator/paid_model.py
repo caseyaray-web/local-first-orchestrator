@@ -22,6 +22,7 @@ class PaidInvocationError(RuntimeError):
 class InjectedPaidModelAdapter:
     """Test-only adapter. The injected callable is the sole possible invocation path."""
     is_paid = True
+    cost_class = "paid"
 
     def __init__(self, ledger: Ledger, governor: UsageGovernor, runner: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
         self.ledger, self.governor, self.runner = ledger, governor, runner

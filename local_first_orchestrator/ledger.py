@@ -256,6 +256,13 @@ class Ledger:
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS feature_contracts (feature_id TEXT PRIMARY KEY, contract_hash TEXT NOT NULL, contract_json TEXT NOT NULL, created_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS decomposition_plans (id TEXT PRIMARY KEY, feature_id TEXT NOT NULL, fingerprint TEXT NOT NULL UNIQUE, plan_json TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, activated_at INTEGER, UNIQUE(feature_id, fingerprint));
+        CREATE TABLE IF NOT EXISTS planning_runs (
+            request_key TEXT PRIMARY KEY, feature_id TEXT NOT NULL, contract_hash TEXT NOT NULL,
+            repo_base_sha TEXT NOT NULL, repo_snapshot_hash TEXT NOT NULL, planner_identity TEXT NOT NULL,
+            cost_class TEXT NOT NULL, status TEXT NOT NULL, response_artifact TEXT,
+            structural_reasons_json TEXT NOT NULL DEFAULT '[]', repository_reasons_json TEXT NOT NULL DEFAULT '[]',
+            plan_id TEXT, ticket_ids_json TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS tranche_criteria (tranche_id TEXT NOT NULL, criterion_id TEXT NOT NULL, PRIMARY KEY(tranche_id, criterion_id));
         CREATE TABLE IF NOT EXISTS ticket_criteria (ticket_id TEXT NOT NULL, criterion_id TEXT NOT NULL, PRIMARY KEY(ticket_id, criterion_id));
         """)
