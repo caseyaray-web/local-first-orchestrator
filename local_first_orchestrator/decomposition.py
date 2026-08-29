@@ -53,8 +53,8 @@ class PlanValidator:
   if plan.scope_change_proposals and any('scope-change' in t.objective for t in active.microtickets):r.append('scope_expansion')
   if plan.unresolved_questions and active.microtickets:r.append('unresolved_choice')
   return PlanValidationResult(not r,tuple(sorted(set(r))))
-def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:DecompositionPlan,validation:PlanValidationResult)->tuple[str,tuple[str,...]]:
- if not validation.passed: raise ValueError('rejected plan cannot activate')
+def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:DecompositionPlan,validation:PlanValidationResult,repository_validation:object|None=None)->tuple[str,tuple[str,...]]:
+ if not validation.passed or repository_validation is None or not getattr(repository_validation,'passed',False): raise ValueError('rejected plan cannot activate')
  raw=json.dumps({"feature":feature.__dict__,"plan":plan.__dict__},default=lambda x:x.__dict__ if hasattr(x,'__dict__') else list(x),sort_keys=True,separators=(',',':')); fp=hashlib.sha256(raw.encode()).hexdigest(); pid='plan-'+fp[:16]; now=int(time.time())
  with ledger._transaction() as c:
   old=c.execute('SELECT contract_hash FROM feature_contracts WHERE feature_id=?',(feature.id,)).fetchone()
