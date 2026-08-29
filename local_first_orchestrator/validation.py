@@ -122,6 +122,9 @@ class DeterministicValidator:
         base_sha = self._validated_base_sha(base_sha)
         # Resolve before diffing: no revision expression reaches the diff parser.
         self._git(worktree, "rev-parse", "--verify", f"{base_sha}^{{commit}}")
+        head = self._git(worktree, "rev-parse", "HEAD").strip()
+        if head != base_sha:
+            raise ValidationError("unexpected_head_movement: worktree HEAD differs from recorded base")
         actual_base = self._git(worktree, "merge-base", "HEAD", base_sha).strip()
         if actual_base != base_sha:
             raise ValidationError("worktree base SHA does not match recorded base")
@@ -131,7 +134,8 @@ class DeterministicValidator:
             candidate = line[3:]
             if candidate and candidate not in names:
                 names.append(candidate)
-        errors = [f"changed path outside allowlist: {p}" for p in names if p not in ticket.allowed_files]
+        errors = ["no_changes: model produced no effective diff"] if not names else []
+        errors += [f"changed path outside allowlist: {p}" for p in names if p not in ticket.allowed_files]
         errors += [f"forbidden file type: {p}" for p in names if p.endswith(self.denied_suffixes)]
         errors += [error for path in names if (error := self._secret_scan_error(worktree, path))]
         symbol_errors, scope_unverified = enforce_symbol_scope(worktree, names, ticket, base_sha)

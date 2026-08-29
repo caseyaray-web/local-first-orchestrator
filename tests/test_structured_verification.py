@@ -22,6 +22,7 @@ class StructuredVerificationTests(unittest.TestCase):
         self.base=subprocess.run(("git","rev-parse","HEAD"),cwd=self.root,text=True,capture_output=True,check=True).stdout.strip()
     def tearDown(self): self.temp.cleanup()
     def validate(self, commands, *, timeout=1, limit=8):
+        (self.root/"app.py").write_text("def value(): return 'changed'\n")
         ticket=MicroTicket("t","Use fixture result.",("C",),"app.py::value",("app.py",),("no api",),PatchBudget(1,10),VerificationProfile(tuple(commands),timeout_seconds=timeout,output_limit=limit),"low",True,2,())
         return DeterministicValidator(artifact_root=self.root/"artifacts").validate(self.root,ticket,base_sha=self.base)
     def test_success_preserves_bounded_evidence(self):

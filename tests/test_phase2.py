@@ -104,11 +104,28 @@ class Phase2Tests(unittest.TestCase):
             validator.validate(attempt.path, self.ticket, base_sha="0" * 40)
         adapter.teardown(attempt)
 
+    def test_validator_rejects_no_changes(self) -> None:
+        adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
+        attempt = adapter.create_attempt(self.ticket.ticket_id, 1, self.base)
+        result = DeterministicValidator(artifact_root=self.root / "artifacts").validate(attempt.path, self.ticket, base_sha=self.base)
+        self.assertFalse(result.passed); self.assertIn("no_changes", result.errors[0])
+        adapter.teardown(attempt)
+
+    def test_validator_rejects_unexpected_head_movement(self) -> None:
+        adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
+        attempt = adapter.create_attempt(self.ticket.ticket_id, 1, self.base)
+        (attempt.path / "app.py").write_text("def classify(value):\n    return 'moved'\n", encoding="utf-8")
+        self.run_git("add", "app.py", cwd=attempt.path); self.run_git("commit", "-m", "worker commit", cwd=attempt.path)
+        with self.assertRaisesRegex(ValidationError, "unexpected_head_movement"):
+            DeterministicValidator(artifact_root=self.root / "artifacts").validate(attempt.path, self.ticket, base_sha=self.base)
+        adapter.teardown(attempt)
+
     def test_validator_only_runs_ticket_allowlisted_commands(self) -> None:
         profile = VerificationProfile(commands=(("python", "-c", "print('allowed')"),), working_directory=".")
         ticket = MicroTicket(**{**self.ticket.__dict__, "verification": profile})
         adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
         attempt = adapter.create_attempt(ticket.ticket_id, 1, self.base)
+        (attempt.path / "app.py").write_text("def classify(value):\n    return 'allowed'\n", encoding="utf-8")
         validator = DeterministicValidator(artifact_root=self.root / "artifacts")
         result = validator.validate(attempt.path, ticket, base_sha=self.base)
         self.assertTrue(result.passed)
