@@ -78,6 +78,14 @@ class HermesBoardAdapter:
             # controller owns execution and avoids racing the gateway dispatcher.
             self._run("schedule", ticket_id, f"local-first projection {state.value} ({idempotency_key})")
 
+    def create_microticket(self, title: str, body: str, *, idempotency_key: str) -> str:
+        if not self.allow_writes:
+            raise PermissionError("real board writes require --allow-board-writes")
+        payload = self._run("create", title, "--body", body, "--workspace", "scratch", "--idempotency-key", idempotency_key, "--initial-status", "blocked", "--json")
+        if not isinstance(payload, dict) or not isinstance(payload.get("id"), str) or not payload["id"]:
+            raise RuntimeError("Hermes create JSON missing task id")
+        return payload["id"]
+
     def add_comment(self, ticket_id: str, comment: str) -> None:
         if not self.allow_writes:
             raise PermissionError("real board writes require --allow-board-writes")
