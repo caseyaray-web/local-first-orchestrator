@@ -3,6 +3,8 @@ import hashlib,json
 from dataclasses import dataclass
 from .readiness import validate_ticket
 from .ticket import MicroTicket
+from .ledger import Ledger
+import time
 @dataclass(frozen=True)
 class Criterion: id:str; statement:str; verification_hint:str=""
 @dataclass(frozen=True)
@@ -51,3 +53,22 @@ class PlanValidator:
   if plan.scope_change_proposals and any('scope-change' in t.objective for t in active.microtickets):r.append('scope_expansion')
   if plan.unresolved_questions and active.microtickets:r.append('unresolved_choice')
   return PlanValidationResult(not r,tuple(sorted(set(r))))
+def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:DecompositionPlan,validation:PlanValidationResult)->tuple[str,tuple[str,...]]:
+ if not validation.passed: raise ValueError('rejected plan cannot activate')
+ raw=json.dumps({"feature":feature.__dict__,"plan":plan.__dict__},default=lambda x:x.__dict__ if hasattr(x,'__dict__') else list(x),sort_keys=True,separators=(',',':')); fp=hashlib.sha256(raw.encode()).hexdigest(); pid='plan-'+fp[:16]; now=int(time.time())
+ with ledger._transaction() as c:
+  old=c.execute('SELECT contract_hash FROM feature_contracts WHERE feature_id=?',(feature.id,)).fetchone()
+  if old and old['contract_hash']!=feature.contract_hash: raise ValueError('conflicting feature contract')
+  existing=c.execute('SELECT id FROM decomposition_plans WHERE fingerprint=?',(fp,)).fetchone()
+  if existing:return str(existing['id']),tuple(r['id'] for r in c.execute('SELECT id FROM tickets WHERE feature_id=? AND tranche_id IN (SELECT id FROM tranches WHERE feature_id=? AND ordinal=0)',(feature.id,feature.id)))
+  c.execute('INSERT OR IGNORE INTO features(id,title,objective,status,created_at,updated_at) VALUES (?,?,?,"planned",?,?)',(feature.id,feature.title,feature.objective,now,now)); c.execute('INSERT INTO feature_contracts VALUES (?,?,?,?)',(feature.id,feature.contract_hash,json.dumps(feature.__dict__,default=lambda x:x.__dict__,sort_keys=True),now)); c.execute('INSERT INTO decomposition_plans VALUES (?,?,?,?,?,?,?)',(pid,feature.id,fp,raw,'active',now,now))
+  active=[]
+  for tr in plan.tranches:
+   c.execute('INSERT INTO tranches(id,feature_id,ordinal,status,integration_commands_json) VALUES (?,?,?, ?,"[]")',(tr.id,feature.id,tr.ordinal,'active' if tr.ordinal==0 else 'planned'))
+   for cid in tr.criterion_ids:c.execute('INSERT INTO tranche_criteria VALUES (?,?)',(tr.id,cid))
+   if tr.ordinal:
+    continue
+   for t in tr.microtickets:
+    q=t.contract(); c.execute('INSERT INTO tickets(id,feature_id,tranche_id,title,objective,criterion_ids_json,primary_symbol,allowed_files_json,forbidden_changes_json,patch_budget_json,verification_json,risk,review_required,max_attempts,dependencies_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(t.ticket_id,feature.id,tr.id,t.ticket_id,q['objective'],json.dumps(q['criterion_ids']),q['primary_symbol'],json.dumps(q['allowed_files']),json.dumps(q['forbidden_changes']),json.dumps(q['patch_budget']),json.dumps(q['verification']),q['risk'],int(t.review_required),t.max_attempts,json.dumps(q['dependencies']),'draft',now,now)); active.append(t.ticket_id)
+    for cid in t.criterion_ids:c.execute('INSERT INTO ticket_criteria VALUES (?,?)',(t.ticket_id,cid))
+ return pid,tuple(active)

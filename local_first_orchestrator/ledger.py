@@ -253,6 +253,12 @@ class Ledger:
 
     def migrate(self) -> None:
         self.connection.executescript(_SCHEMA)
+        self.connection.executescript("""
+        CREATE TABLE IF NOT EXISTS feature_contracts (feature_id TEXT PRIMARY KEY, contract_hash TEXT NOT NULL, contract_json TEXT NOT NULL, created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS decomposition_plans (id TEXT PRIMARY KEY, feature_id TEXT NOT NULL, fingerprint TEXT NOT NULL UNIQUE, plan_json TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, activated_at INTEGER, UNIQUE(feature_id, fingerprint));
+        CREATE TABLE IF NOT EXISTS tranche_criteria (tranche_id TEXT NOT NULL, criterion_id TEXT NOT NULL, PRIMARY KEY(tranche_id, criterion_id));
+        CREATE TABLE IF NOT EXISTS ticket_criteria (ticket_id TEXT NOT NULL, criterion_id TEXT NOT NULL, PRIMARY KEY(ticket_id, criterion_id));
+        """)
         # Phase 2 is additive: preserve Phase 1 ledgers already created.
         ticket_columns = {
             "criterion_ids_json": "TEXT NOT NULL DEFAULT '[]'",
