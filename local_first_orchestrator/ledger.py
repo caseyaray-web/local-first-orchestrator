@@ -770,6 +770,25 @@ class Ledger:
             conn.execute("UPDATE controller_state SET paused = ?, updated_at = ? WHERE id = 1", (int(paused), self._now()))
             self._append_event(conn, entity_type="controller", entity_id="controller", event_type="paused" if paused else "resumed", actor_id=actor_id, payload={"reason": reason})
 
+    def enqueue_generated_create_projection(self, ticket_id: str, event_id: int, payload: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
+        with self._transaction() as conn:
+            row=conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",(ticket_id,event_id)).fetchone()
+            encoded=json.dumps(payload,sort_keys=True,separators=(',',':'))
+            if row:
+                if row['operation']!='create_microticket' or row['payload_json']!=encoded or row['idempotency_key']!=idempotency_key: raise ValueError('create projection conflicts')
+                return dict(row)
+            conn.execute("INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,operation) VALUES (?,?,?,?,?,?, 'create_microticket')",(ticket_id,event_id,'draft',encoded,idempotency_key,self._now()))
+            return dict(conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",(ticket_id,event_id)).fetchone())
+
+    def claim_next_generated_create_projection(self, owner: str, *, lease_seconds: int=60, now: int|None=None) -> dict[str, Any]|None:
+        now=self._now() if now is None else now
+        with self._transaction() as conn:
+            row=conn.execute("SELECT ticket_id,event_id FROM board_projection_outbox WHERE operation='create_microticket' AND acknowledged_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) AND (lease_expires_at IS NULL OR lease_expires_at<=?) ORDER BY queued_at LIMIT 1",(now,now)).fetchone()
+            if not row:return None
+            changed=conn.execute("UPDATE board_projection_outbox SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1 WHERE ticket_id=? AND event_id=? AND acknowledged_at IS NULL AND (lease_expires_at IS NULL OR lease_expires_at<=?)",(owner,now+lease_seconds,row['ticket_id'],row['event_id'],now))
+            if not changed.rowcount:return None
+            return dict(conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",(row['ticket_id'],row['event_id'])).fetchone())
+
     def status(self) -> dict[str, Any]:
         paused = self.connection.execute("SELECT paused FROM controller_state WHERE id = 1").fetchone()
         states = self.connection.execute("SELECT state, COUNT(*) AS count FROM tickets GROUP BY state ORDER BY state").fetchall()
