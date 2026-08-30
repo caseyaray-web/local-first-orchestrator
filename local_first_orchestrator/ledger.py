@@ -789,6 +789,24 @@ class Ledger:
             if not changed.rowcount:return None
             return dict(conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",(row['ticket_id'],row['event_id'])).fetchone())
 
+    def retry_generated_create_projection(self, ticket_id: str, event_id: int, owner: str, *, error: str, next_attempt_at: int, now: int | None = None) -> None:
+        now=self._now() if now is None else now
+        with self._transaction() as conn:
+            changed=conn.execute("UPDATE board_projection_outbox SET last_error=?,next_attempt_at=?,lease_owner=NULL,lease_expires_at=NULL WHERE ticket_id=? AND event_id=? AND operation='create_microticket' AND acknowledged_at IS NULL AND lease_owner=? AND lease_expires_at>?",(error[:2000],next_attempt_at,ticket_id,event_id,owner,now))
+            if not changed.rowcount: raise PermissionError('create projection lease not owned')
+
+    def complete_generated_create_projection(self, ticket_id: str, event_id: int, owner: str, external_task_id: str, *, now: int | None = None) -> None:
+        if not isinstance(external_task_id,str) or not external_task_id: raise ValueError('external task id required')
+        now=self._now() if now is None else now
+        with self._transaction() as conn:
+            row=conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",(ticket_id,event_id)).fetchone()
+            if row is None or row['operation']!='create_microticket': raise KeyError('create projection')
+            if row['acknowledged_at'] is not None:
+                if row['external_task_id']!=external_task_id: raise ValueError('external task id conflicts')
+                return
+            changed=conn.execute("UPDATE board_projection_outbox SET external_task_id=?,acknowledged_at=?,lease_owner=NULL,lease_expires_at=NULL WHERE ticket_id=? AND event_id=? AND lease_owner=? AND lease_expires_at>?",(external_task_id,now,ticket_id,event_id,owner,now))
+            if not changed.rowcount: raise PermissionError('create projection lease not owned')
+
     def status(self) -> dict[str, Any]:
         paused = self.connection.execute("SELECT paused FROM controller_state WHERE id = 1").fetchone()
         states = self.connection.execute("SELECT state, COUNT(*) AS count FROM tickets GROUP BY state ORDER BY state").fetchall()
