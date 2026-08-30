@@ -770,15 +770,30 @@ class Ledger:
             conn.execute("UPDATE controller_state SET paused = ?, updated_at = ? WHERE id = 1", (int(paused), self._now()))
             self._append_event(conn, entity_type="controller", entity_id="controller", event_type="paused" if paused else "resumed", actor_id=actor_id, payload={"reason": reason})
 
+    def _enqueue_generated_create_projection_in_transaction(self, conn: sqlite3.Connection, *, ticket_id: str, event_id: int, payload: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
+        """Enqueue a generated-card intent using the caller's transaction."""
+        ticket = conn.execute("SELECT id FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+        if ticket is None:
+            raise KeyError(ticket_id)
+        event = conn.execute("SELECT entity_type, entity_id, event_type FROM events WHERE id=?", (event_id,)).fetchone()
+        if event is None or (event["entity_type"], event["entity_id"], event["event_type"]) != ("ticket", ticket_id, "generated_microticket_created"):
+            raise ValueError("event is not a generated microticket creation")
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        existing_key = conn.execute("SELECT * FROM board_projection_outbox WHERE idempotency_key=?", (idempotency_key,)).fetchone()
+        if existing_key is not None and (existing_key["ticket_id"], int(existing_key["event_id"])) != (ticket_id, event_id):
+            raise ValueError("create projection conflicts")
+        row = conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()
+        if row is not None:
+            if (row["operation"], row["payload_json"], row["idempotency_key"]) != ("create_microticket", encoded, idempotency_key):
+                raise ValueError("create projection conflicts")
+            return dict(row)
+        conn.execute("INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,operation) VALUES (?,?,?,?,?,?, 'create_microticket')", (ticket_id, event_id, "draft", encoded, idempotency_key, self._now()))
+        self._inject_failure("after_generated_projection")
+        return dict(conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone())
+
     def enqueue_generated_create_projection(self, ticket_id: str, event_id: int, payload: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
         with self._transaction() as conn:
-            row=conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",(ticket_id,event_id)).fetchone()
-            encoded=json.dumps(payload,sort_keys=True,separators=(',',':'))
-            if row:
-                if row['operation']!='create_microticket' or row['payload_json']!=encoded or row['idempotency_key']!=idempotency_key: raise ValueError('create projection conflicts')
-                return dict(row)
-            conn.execute("INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,operation) VALUES (?,?,?,?,?,?, 'create_microticket')",(ticket_id,event_id,'draft',encoded,idempotency_key,self._now()))
-            return dict(conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",(ticket_id,event_id)).fetchone())
+            return self._enqueue_generated_create_projection_in_transaction(conn, ticket_id=ticket_id, event_id=event_id, payload=payload, idempotency_key=idempotency_key)
 
     def claim_next_generated_create_projection(self, owner: str, *, lease_seconds: int=60, now: int|None=None) -> dict[str, Any]|None:
         now=self._now() if now is None else now

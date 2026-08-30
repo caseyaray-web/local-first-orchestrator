@@ -53,6 +53,38 @@ class PlanValidator:
   if plan.scope_change_proposals and any('scope-change' in t.objective for t in active.microtickets):r.append('scope_expansion')
   if plan.unresolved_questions and active.microtickets:r.append('unresolved_choice')
   return PlanValidationResult(not r,tuple(sorted(set(r))))
+
+_LOCAL_FIRST_MARKER = "<!-- local-first-orchestrator -->"
+_LOCAL_FIRST_CONTRACT = "local-first-contract"
+
+
+def generated_projection_key(ticket_id: str) -> str:
+ """Return the stable Hermes idempotency key for a generated ticket."""
+ return f"board-create:v1:{ticket_id}"
+
+
+def generated_card_payload(feature: FeatureContract, tranche: Tranche, ticket: MicroTicket) -> dict[str, str]:
+ """Serialize the immutable generated-card contract and projection payload."""
+ projection_key = generated_projection_key(ticket.ticket_id)
+ contract = {
+  "kind": "microticket",
+  "orchestrator_ticket_id": ticket.ticket_id,
+  "feature_id": feature.id,
+  "tranche_id": tranche.id,
+  "projection_key": projection_key,
+  **ticket.contract(),
+ }
+ encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"))
+ body = f"{_LOCAL_FIRST_MARKER}\\n```{_LOCAL_FIRST_CONTRACT}\\n{encoded}\\n```"
+ return {
+  "title": ticket.ticket_id,
+  "body": body,
+  "orchestrator_ticket_id": ticket.ticket_id,
+  "feature_id": feature.id,
+  "tranche_id": tranche.id,
+  "projection_key": projection_key,
+ }
+
 def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:DecompositionPlan,validation:PlanValidationResult,repository_validation:object|None=None)->tuple[str,tuple[str,...]]:
  if not validation.passed or repository_validation is None or not getattr(repository_validation,'passed',False): raise ValueError('rejected plan cannot activate')
  raw=json.dumps({"feature":feature.__dict__,"plan":plan.__dict__},default=lambda x:x.__dict__ if hasattr(x,'__dict__') else list(x),sort_keys=True,separators=(',',':')); fp=hashlib.sha256(raw.encode()).hexdigest(); pid='plan-'+fp[:16]; now=int(time.time())
@@ -60,7 +92,21 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
   old=c.execute('SELECT contract_hash FROM feature_contracts WHERE feature_id=?',(feature.id,)).fetchone()
   if old and old['contract_hash']!=feature.contract_hash: raise ValueError('conflicting feature contract')
   existing=c.execute('SELECT id FROM decomposition_plans WHERE fingerprint=?',(fp,)).fetchone()
-  if existing:return str(existing['id']),tuple(r['id'] for r in c.execute('SELECT id FROM tickets WHERE feature_id=? AND tranche_id IN (SELECT id FROM tranches WHERE feature_id=? AND ordinal=0)',(feature.id,feature.id)))
+  if existing:
+   active_tranche=next(tr for tr in plan.tranches if tr.ordinal == 0)
+   for generated in active_tranche.microtickets:
+    expected=generated_card_payload(feature, active_tranche, generated)
+    ticket_row=c.execute('SELECT id FROM tickets WHERE id=? AND feature_id=? AND tranche_id=? AND state=?',(generated.ticket_id,feature.id,active_tranche.id,'draft')).fetchone()
+    event_row=c.execute("SELECT id FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='generated_microticket_created' ORDER BY id DESC LIMIT 1",(generated.ticket_id,)).fetchone()
+    projection=c.execute('SELECT operation,payload_json,idempotency_key FROM board_projection_outbox WHERE ticket_id=? AND event_id=?',(generated.ticket_id,event_row['id'] if event_row else -1)).fetchone()
+    if ticket_row is None or event_row is None or projection is None or (projection['operation'],projection['payload_json'],projection['idempotency_key']) != ('create_microticket',json.dumps(expected,sort_keys=True,separators=(',',':')),expected['projection_key']):
+     raise ValueError('create projection conflicts')
+   return str(existing['id']),tuple(r['id'] for r in c.execute('SELECT id FROM tickets WHERE feature_id=? AND tranche_id IN (SELECT id FROM tranches WHERE feature_id=? AND ordinal=0)',(feature.id,feature.id)))
+  for tr in plan.tranches:
+   if tr.ordinal == 0:
+    for generated in tr.microtickets:
+     if c.execute('SELECT 1 FROM tickets WHERE id=?',(generated.ticket_id,)).fetchone() is not None:
+      raise ValueError('conflicting activated plan')
   c.execute('INSERT OR IGNORE INTO features(id,title,objective,status,created_at,updated_at) VALUES (?,?,?,"planned",?,?)',(feature.id,feature.title,feature.objective,now,now)); c.execute('INSERT INTO feature_contracts VALUES (?,?,?,?)',(feature.id,feature.contract_hash,json.dumps(feature.__dict__,default=lambda x:x.__dict__,sort_keys=True),now)); c.execute('INSERT INTO decomposition_plans VALUES (?,?,?,?,?,?,?)',(pid,feature.id,fp,raw,'active',now,now))
   active=[]
   for tr in plan.tranches:
@@ -71,4 +117,8 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
    for t in tr.microtickets:
     q=t.contract(); c.execute('INSERT INTO tickets(id,feature_id,tranche_id,title,objective,criterion_ids_json,primary_symbol,allowed_files_json,forbidden_changes_json,patch_budget_json,verification_json,risk,review_required,max_attempts,dependencies_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(t.ticket_id,feature.id,tr.id,t.ticket_id,q['objective'],json.dumps(q['criterion_ids']),q['primary_symbol'],json.dumps(q['allowed_files']),json.dumps(q['forbidden_changes']),json.dumps(q['patch_budget']),json.dumps(q['verification']),q['risk'],int(t.review_required),t.max_attempts,json.dumps(q['dependencies']),'draft',now,now)); active.append(t.ticket_id)
     for cid in t.criterion_ids:c.execute('INSERT INTO ticket_criteria VALUES (?,?)',(t.ticket_id,cid))
+    ledger._inject_failure('after_generated_ticket')
+    projection = generated_card_payload(feature, tr, t)
+    event_id = ledger._append_event(c, entity_type='ticket', entity_id=t.ticket_id, event_type='generated_microticket_created', actor_id='controller', to_state='draft', payload={'feature_id': feature.id, 'tranche_id': tr.id, 'projection_key': projection['projection_key']})
+    ledger._enqueue_generated_create_projection_in_transaction(c, ticket_id=t.ticket_id, event_id=event_id, payload=projection, idempotency_key=projection['projection_key'])
  return pid,tuple(active)
