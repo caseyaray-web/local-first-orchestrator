@@ -770,6 +770,24 @@ class Ledger:
             conn.execute("UPDATE controller_state SET paused = ?, updated_at = ? WHERE id = 1", (int(paused), self._now()))
             self._append_event(conn, entity_type="controller", entity_id="controller", event_type="paused" if paused else "resumed", actor_id=actor_id, payload={"reason": reason})
 
+    def generated_projection_identity(self, ticket_id: str, event_id: int) -> dict[str, Any]:
+        """Return authoritative identity for one generated-ticket create event."""
+        row = self.connection.execute("""
+            SELECT t.id AS ticket_id, t.feature_id AS feature_id, t.tranche_id AS tranche_id,
+                   tr.feature_id AS tranche_feature_id, f.id AS resolved_feature_id,
+                   e.entity_type, e.entity_id, e.event_type
+            FROM tickets t
+            JOIN tranches tr ON tr.id=t.tranche_id
+            JOIN features f ON f.id=t.feature_id
+            JOIN events e ON e.id=?
+            WHERE t.id=?
+        """, (event_id, ticket_id)).fetchone()
+        if row is None or (row["entity_type"], row["entity_id"], row["event_type"]) != ("ticket", ticket_id, "generated_microticket_created"):
+            raise KeyError("authoritative generated projection identity missing")
+        if row["feature_id"] != row["tranche_feature_id"] or row["feature_id"] != row["resolved_feature_id"]:
+            raise ValueError("authoritative generated projection identity conflicts")
+        return {"ticket_id": str(row["ticket_id"]), "feature_id": str(row["feature_id"]), "tranche_id": str(row["tranche_id"])}
+
     def _enqueue_generated_create_projection_in_transaction(self, conn: sqlite3.Connection, *, ticket_id: str, event_id: int, payload: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
         """Enqueue a generated-card intent using the caller's transaction."""
         ticket = conn.execute("SELECT id FROM tickets WHERE id=?", (ticket_id,)).fetchone()

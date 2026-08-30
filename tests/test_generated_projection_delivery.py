@@ -186,6 +186,32 @@ class GeneratedProjectionDeliveryTests(unittest.TestCase):
         self.assertEqual(self.worker().deliver_one().status, "terminal_failed")
         self.assertEqual(self.calls(), [])
 
+    def test_payload_feature_and_tranche_mismatches_fail_before_hermes_create(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        original = self.ledger.connection.execute("SELECT payload_json FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()["payload_json"]
+        for field in ("feature_id", "tranche_id"):
+            with self.subTest(field=field):
+                self.log.unlink(missing_ok=True)
+                payload = json.loads(original)
+                payload[field] = "tampered"
+                self.ledger.connection.execute("UPDATE board_projection_outbox SET payload_json=? WHERE ticket_id=? AND event_id=?", (json.dumps(payload, sort_keys=True, separators=(",", ":")), ticket_id, event_id))
+                self.assertEqual(self.worker().deliver_one().status, "terminal_failed")
+                self.assertEqual(self.calls(), [])
+                self.ledger.connection.execute("UPDATE board_projection_outbox SET payload_json=?, terminal_error=NULL, last_error=NULL WHERE ticket_id=? AND event_id=?", (original, ticket_id, event_id))
+
+    def test_tampered_durable_projection_key_and_missing_ticket_relationship_fail_before_hermes_create(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        original = self.ledger.connection.execute("SELECT payload_json FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()["payload_json"]
+        payload = json.loads(original)
+        payload["projection_key"] = "tampered-key"
+        self.ledger.connection.execute("UPDATE board_projection_outbox SET idempotency_key=?, payload_json=? WHERE ticket_id=? AND event_id=?", ("tampered-key", json.dumps(payload, sort_keys=True, separators=(",", ":")), ticket_id, event_id))
+        self.assertEqual(self.worker().deliver_one().status, "terminal_failed")
+        self.assertEqual(self.calls(), [])
+        self.ledger.connection.execute("UPDATE board_projection_outbox SET terminal_error=NULL, last_error=NULL, idempotency_key=?, payload_json=? WHERE ticket_id=? AND event_id=?", ("board-create:v1:" + ticket_id, original, ticket_id, event_id))
+        self.ledger.connection.execute("UPDATE tickets SET feature_id=NULL WHERE id=?", (ticket_id,))
+        self.assertEqual(self.worker().deliver_one().status, "terminal_failed")
+        self.assertEqual(self.calls(), [])
+
     def test_shown_marker_and_each_required_provenance_identity_mismatch_are_terminal(self) -> None:
         for mode in ("shown_id_mismatch", "marker_mismatch", "contract_mismatch:orchestrator_ticket_id=other", "contract_mismatch:feature_id=other", "contract_mismatch:tranche_id=other", "contract_mismatch:projection_key=other"):
             with self.subTest(mode=mode):

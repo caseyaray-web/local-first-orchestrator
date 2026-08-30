@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Protocol
 
+from .decomposition import generated_projection_key
 from .ledger import Ledger
 
 
@@ -76,7 +77,7 @@ def _contract_from_body(body: str) -> dict[str, Any]:
     return raw
 
 
-def _canonical_payload(row: dict[str, Any]) -> dict[str, str]:
+def _canonical_payload(row: dict[str, Any], identity: dict[str, str]) -> dict[str, str]:
     try:
         raw = json.loads(str(row["payload_json"]))
     except (TypeError, json.JSONDecodeError) as exc:
@@ -86,9 +87,14 @@ def _canonical_payload(row: dict[str, Any]) -> dict[str, str]:
     required = ("title", "body", "orchestrator_ticket_id", "feature_id", "tranche_id", "projection_key")
     if any(not isinstance(raw.get(name), str) or not raw[name] for name in required):
         raise DeterministicProjectionError("generated projection payload is incomplete")
-    if raw["orchestrator_ticket_id"] != row["ticket_id"]:
+    expected_key = generated_projection_key(identity["ticket_id"])
+    if row["ticket_id"] != identity["ticket_id"] or raw["orchestrator_ticket_id"] != identity["ticket_id"]:
         raise DeterministicProjectionError("generated projection ticket identity mismatch")
-    if raw["projection_key"] != row["idempotency_key"]:
+    if raw["feature_id"] != identity["feature_id"]:
+        raise DeterministicProjectionError("generated projection feature identity mismatch")
+    if raw["tranche_id"] != identity["tranche_id"]:
+        raise DeterministicProjectionError("generated projection tranche identity mismatch")
+    if (raw["projection_key"], row["idempotency_key"], expected_key) != (expected_key, expected_key, expected_key):
         raise DeterministicProjectionError("generated projection key mismatch")
     return {name: raw[name] for name in required}
 
@@ -144,9 +150,10 @@ class GeneratedProjectionWorker:
         if row is None:
             return GeneratedProjectionDeliveryResult("no_work")
         try:
-            payload = _canonical_payload(row)
-        except DeterministicProjectionError as exc:
-            return self._terminal(row, exc, int(self.clock()))
+            identity = self.ledger.generated_projection_identity(str(row["ticket_id"]), int(row["event_id"]))
+            payload = _canonical_payload(row, identity)
+        except (DeterministicProjectionError, KeyError, ValueError) as exc:
+            return self._terminal(row, DeterministicProjectionError(str(exc)), int(self.clock()))
         try:
             task_id = self.adapter.create_microticket(payload["title"], payload["body"], idempotency_key=payload["projection_key"])
             self._fault("after_create")
