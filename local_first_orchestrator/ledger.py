@@ -302,7 +302,7 @@ class Ledger:
             if name not in comment_columns: self.connection.execute(f"ALTER TABLE evidence_comment_outbox ADD COLUMN {name} {definition}")
         self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_model_calls_reservation ON model_calls(reservation_id)")
         projection_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(board_projection_outbox)")}
-        for name, definition in {"payload_json": "TEXT NOT NULL DEFAULT '{}'", "operation": "TEXT NOT NULL DEFAULT 'set_state'", "external_task_id": "TEXT", "lease_owner": "TEXT", "lease_expires_at": "INTEGER", "next_attempt_at": "INTEGER", "attempt_count": "INTEGER NOT NULL DEFAULT 0", "last_error": "TEXT"}.items():
+        for name, definition in {"payload_json": "TEXT NOT NULL DEFAULT '{}'", "operation": "TEXT NOT NULL DEFAULT 'set_state'", "external_task_id": "TEXT", "lease_owner": "TEXT", "lease_expires_at": "INTEGER", "next_attempt_at": "INTEGER", "attempt_count": "INTEGER NOT NULL DEFAULT 0", "last_error": "TEXT", "terminal_error": "TEXT"}.items():
             if name not in projection_columns:
                 self.connection.execute(f"ALTER TABLE board_projection_outbox ADD COLUMN {name} {definition}")
         self.connection.execute(
@@ -798,9 +798,9 @@ class Ledger:
     def claim_next_generated_create_projection(self, owner: str, *, lease_seconds: int=60, now: int|None=None) -> dict[str, Any]|None:
         now=self._now() if now is None else now
         with self._transaction() as conn:
-            row=conn.execute("SELECT ticket_id,event_id FROM board_projection_outbox WHERE operation='create_microticket' AND acknowledged_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) AND (lease_expires_at IS NULL OR lease_expires_at<=?) ORDER BY queued_at LIMIT 1",(now,now)).fetchone()
+            row=conn.execute("SELECT ticket_id,event_id FROM board_projection_outbox WHERE operation='create_microticket' AND terminal_error IS NULL AND acknowledged_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) AND (lease_expires_at IS NULL OR lease_expires_at<=?) ORDER BY queued_at LIMIT 1",(now,now)).fetchone()
             if not row:return None
-            changed=conn.execute("UPDATE board_projection_outbox SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1 WHERE ticket_id=? AND event_id=? AND acknowledged_at IS NULL AND (lease_expires_at IS NULL OR lease_expires_at<=?)",(owner,now+lease_seconds,row['ticket_id'],row['event_id'],now))
+            changed=conn.execute("UPDATE board_projection_outbox SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1 WHERE ticket_id=? AND event_id=? AND operation='create_microticket' AND terminal_error IS NULL AND acknowledged_at IS NULL AND (lease_expires_at IS NULL OR lease_expires_at<=?)",(owner,now+lease_seconds,row['ticket_id'],row['event_id'],now))
             if not changed.rowcount:return None
             return dict(conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",(row['ticket_id'],row['event_id'])).fetchone())
 
@@ -808,6 +808,13 @@ class Ledger:
         now=self._now() if now is None else now
         with self._transaction() as conn:
             changed=conn.execute("UPDATE board_projection_outbox SET last_error=?,next_attempt_at=?,lease_owner=NULL,lease_expires_at=NULL WHERE ticket_id=? AND event_id=? AND operation='create_microticket' AND acknowledged_at IS NULL AND lease_owner=? AND lease_expires_at>?",(error[:2000],next_attempt_at,ticket_id,event_id,owner,now))
+            if not changed.rowcount: raise PermissionError('create projection lease not owned')
+
+    def fail_generated_create_projection(self, ticket_id: str, event_id: int, owner: str, *, error: str, now: int | None = None) -> None:
+        """Terminally fail a deterministic create-projection conflict."""
+        now=self._now() if now is None else now
+        with self._transaction() as conn:
+            changed=conn.execute("UPDATE board_projection_outbox SET terminal_error=?,last_error=?,lease_owner=NULL,lease_expires_at=NULL WHERE ticket_id=? AND event_id=? AND operation='create_microticket' AND terminal_error IS NULL AND acknowledged_at IS NULL AND lease_owner=? AND lease_expires_at>?",(error[:2000],error[:2000],ticket_id,event_id,owner,now))
             if not changed.rowcount: raise PermissionError('create projection lease not owned')
 
     def complete_generated_create_projection(self, ticket_id: str, event_id: int, owner: str, external_task_id: str, *, now: int | None = None) -> None:
