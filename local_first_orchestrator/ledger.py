@@ -7,12 +7,19 @@ import time
 import uuid
 from threading import RLock
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Iterator
 
 from .adapters import BoardAdapter
 from .readiness import ReadinessError, validate_ticket
 from .states import CanonicalState, validate_transition
 from .ticket import MicroTicket
+
+
+@dataclass(frozen=True)
+class TicketReadinessResult:
+    status: str
+    unresolved_dependency_ids: tuple[str, ...] = ()
 
 
 _SCHEMA = """
@@ -508,6 +515,33 @@ class Ledger:
         row = self.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
         if row is None: raise KeyError(f"no runtime binding for {ticket_id}")
         return dict(row)
+
+    def evaluate_ticket_readiness(self, ticket_id: str) -> TicketReadinessResult:
+        row = self.connection.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+        if row is None: return TicketReadinessResult("missing_ticket")
+        if row["state"] == CanonicalState.READY_LOCAL.value: return TicketReadinessResult("ready")
+        if row["state"] != CanonicalState.DRAFT.value: return TicketReadinessResult("wrong_state")
+        binding=self.connection.execute("SELECT repository_path,starting_sha FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
+        if binding is None: return TicketReadinessResult("missing_runtime_binding")
+        if not binding["repository_path"] or not binding["starting_sha"]: return TicketReadinessResult("invalid_runtime_binding")
+        try:
+            from .controller import ticket_from_ledger
+            validate_ticket(ticket_from_ledger(dict(row)))
+        except Exception: return TicketReadinessResult("invalid_ticket")
+        dependencies=tuple(sorted(set(json.loads(row["dependencies_json"]))))
+        if ticket_id in dependencies: return TicketReadinessResult("invalid_ticket")
+        unresolved=[]
+        for dependency in dependencies:
+            dep=self.connection.execute("SELECT state FROM tickets WHERE id=?", (dependency,)).fetchone()
+            if dep is None: return TicketReadinessResult("missing_dependency", (dependency,))
+            if dep["state"] != CanonicalState.ACCEPTED.value: unresolved.append(dependency)
+        return TicketReadinessResult("waiting_on_dependencies", tuple(unresolved)) if unresolved else TicketReadinessResult("ready")
+
+    def admit_ticket_if_ready(self, ticket_id: str) -> TicketReadinessResult:
+        result=self.evaluate_ticket_readiness(ticket_id)
+        if result.status != "ready" or self.get_ticket(ticket_id)["state"] == CanonicalState.READY_LOCAL.value: return result
+        self.transition(ticket_id, CanonicalState.READY_LOCAL, actor_id="readiness", payload={"reason":"dependencies_satisfied"})
+        return TicketReadinessResult("ready")
 
     def record_runtime_stage(self, ticket_id: str, stage: str, detail: str) -> bool:
         with self._transaction() as conn:
