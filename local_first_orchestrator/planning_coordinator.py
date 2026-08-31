@@ -11,6 +11,7 @@ import hashlib
 import json
 import subprocess
 from dataclasses import asdict, dataclass
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -77,6 +78,7 @@ class PlanningCoordinator:
             "contract_hash": feature.contract_hash,
             "repo_base_sha": snap.base_sha,
             "repo_snapshot_hash": snap.snapshot_hash,
+            "repository_identity": snap.repository_id,
             "planner_identity": self.planner_identity,
         }
         return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -92,10 +94,10 @@ class PlanningCoordinator:
         now = self.ledger._now()
         with self.ledger._transaction() as conn:
             conn.execute(
-                """INSERT INTO planning_runs(request_key,feature_id,contract_hash,repo_base_sha,repo_snapshot_hash,planner_identity,cost_class,status,response_artifact,structural_reasons_json,repository_reasons_json,plan_id,ticket_ids_json,created_at,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """INSERT INTO planning_runs(request_key,feature_id,contract_hash,repo_base_sha,repo_snapshot_hash,planner_identity,cost_class,status,response_artifact,structural_reasons_json,repository_reasons_json,plan_id,ticket_ids_json,created_at,updated_at,repository_identity,repo_snapshot_manifest_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(request_key) DO UPDATE SET status=excluded.status,response_artifact=excluded.response_artifact,structural_reasons_json=excluded.structural_reasons_json,repository_reasons_json=excluded.repository_reasons_json,plan_id=excluded.plan_id,ticket_ids_json=excluded.ticket_ids_json,updated_at=excluded.updated_at""",
-                (request_key, feature.id, feature.contract_hash, snap.base_sha, snap.snapshot_hash, self.planner_identity, self._cost_class(), status, str(artifact) if artifact else None, json.dumps(structural), json.dumps(repository), plan_id, json.dumps(ticket_ids), now, now),
+                (request_key, feature.id, feature.contract_hash, snap.base_sha, snap.snapshot_hash, self.planner_identity, self._cost_class(), status, str(artifact) if artifact else None, json.dumps(structural), json.dumps(repository), plan_id, json.dumps(ticket_ids), now, now, snap.repository_id, snap.manifest_json),
             )
 
     def _existing_activated(self, feature: FeatureContract, snap: RepositorySnapshot) -> PlanningOutcome | None:
@@ -106,7 +108,7 @@ class PlanningCoordinator:
                 plan = parse(json.dumps(stored["plan"], sort_keys=True, separators=(",", ":")))
             except (PlannerError, KeyError, TypeError, ValueError):
                 continue
-            if plan.feature_contract_hash == feature.contract_hash and plan.repo_base_sha == snap.base_sha and plan.repo_snapshot_hash == snap.snapshot_hash:
+            if (plan.feature_contract_hash == feature.contract_hash and plan.repository_identity == snap.repository_id and plan.repo_base_sha == snap.base_sha and plan.repo_snapshot_hash == snap.snapshot_hash and plan.repo_snapshot_manifest_json == snap.manifest_json and row["repository_identity"] == snap.repository_id and row["repo_base_sha"] == snap.base_sha and row["repo_snapshot_hash"] == snap.snapshot_hash and row["repo_snapshot_manifest_json"] == snap.manifest_json):
                 ids = tuple(r["id"] for r in self.ledger.connection.execute("SELECT t.id FROM tickets t JOIN tranches tr ON tr.id=t.tranche_id WHERE t.feature_id=? AND tr.ordinal=0 ORDER BY t.id", (feature.id,)))
                 return PlanningOutcome("already_activated", feature.id, snapshot_hash=snap.snapshot_hash, plan_id=str(row["id"]), activated_ticket_ids=ids)
         return None
@@ -137,7 +139,7 @@ class PlanningCoordinator:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         request_path = artifact_dir / "planner-request.json"
         response_path = artifact_dir / "planner-response.json"
-        request_payload = {"feature_id": feature.id, "contract_hash": feature.contract_hash, "repo_base_sha": snap.base_sha, "repo_snapshot_hash": snap.snapshot_hash, "planner_identity": self.planner_identity, "purpose": PaidPurpose.ARCHITECTURE.value}
+        request_payload = {"feature_id": feature.id, "contract_hash": feature.contract_hash, "repo_base_sha": snap.base_sha, "repo_snapshot_hash": snap.snapshot_hash, "repository_identity": snap.repository_id, "repo_snapshot_manifest_json": snap.manifest_json, "planner_identity": self.planner_identity, "purpose": PaidPurpose.ARCHITECTURE.value}
         request_path.write_text(json.dumps(request_payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
 
         prior = self.ledger.connection.execute("SELECT * FROM planning_runs WHERE request_key=?", (request_key,)).fetchone()
@@ -168,6 +170,9 @@ class PlanningCoordinator:
         except (OSError, TypeError, ValueError, KeyError) as exc:
             return PlanningOutcome("planner_failed", feature.id, request_key, snap.snapshot_hash, reasons=(str(exc),))
 
+        # Planner output is proposal-only. Provenance is normalized from the
+        # controller-created snapshot before any validation or persistence.
+        proposal = replace(proposal, repository_identity=snap.repository_id, repo_base_sha=snap.base_sha, repo_snapshot_hash=snap.snapshot_hash, repo_snapshot_manifest_json=snap.manifest_json)
         structural: PlanValidationResult = self.plan_validator.validate(feature, proposal)
         if not structural.passed:
             self._record(request_key, feature, snap, status="structural_rejected", artifact=response_path, structural=structural.reasons)

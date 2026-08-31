@@ -13,7 +13,7 @@ def parse(raw:str)->DecompositionPlan:
  try:x=json.loads(raw)
  except json.JSONDecodeError as e:raise PlannerError('malformed planner JSON') from e
  try:
-  return DecompositionPlan(x['plan_version'],x['feature_id'],x['feature_contract_hash'],x['repo_base_sha'],x['repo_snapshot_hash'],tuple(x['architecture_decisions']),{k:tuple(v) for k,v in x['criterion_coverage'].items()},tuple(Tranche(t['id'],t['ordinal'],t['objective'],tuple(t['capabilities']),tuple(t['criterion_ids']),tuple(_ticket(y) for y in t.get('microtickets',()))) for t in x['tranches']),tuple(x.get('scope_change_proposals',())),tuple(x.get('unresolved_questions',())))
+  return DecompositionPlan(x['plan_version'],x['feature_id'],x['feature_contract_hash'],x['repo_base_sha'],x['repo_snapshot_hash'],tuple(x['architecture_decisions']),{k:tuple(v) for k,v in x['criterion_coverage'].items()},tuple(Tranche(t['id'],t['ordinal'],t['objective'],tuple(t['capabilities']),tuple(t['criterion_ids']),tuple(_ticket(y) for y in t.get('microtickets',()))) for t in x['tranches']),tuple(x.get('scope_change_proposals',())),tuple(x.get('unresolved_questions',())),x.get('repository_identity',''),x.get('repo_snapshot_manifest_json',''))
  except (KeyError,TypeError,ValueError) as e:raise PlannerError('invalid planner schema') from e
 class LocalDecompositionPlanner:
  def __init__(self,runner=subprocess.run,executable='hermes',cost_class:str='unknown'):

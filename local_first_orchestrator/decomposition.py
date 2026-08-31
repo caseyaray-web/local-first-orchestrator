@@ -19,7 +19,7 @@ class Tranche:
  id:str; ordinal:int; objective:str; capabilities:tuple[str,...]; criterion_ids:tuple[str,...]; microtickets:tuple[MicroTicket,...]=()
 @dataclass(frozen=True)
 class DecompositionPlan:
- plan_version:int; feature_id:str; feature_contract_hash:str; repo_base_sha:str; repo_snapshot_hash:str; architecture_decisions:tuple[str,...]; criterion_coverage:dict[str,tuple[str,...]]; tranches:tuple[Tranche,...]; scope_change_proposals:tuple[str,...]=(); unresolved_questions:tuple[str,...]=()
+ plan_version:int; feature_id:str; feature_contract_hash:str; repo_base_sha:str; repo_snapshot_hash:str; architecture_decisions:tuple[str,...]; criterion_coverage:dict[str,tuple[str,...]]; tranches:tuple[Tranche,...]; scope_change_proposals:tuple[str,...]=(); unresolved_questions:tuple[str,...]=(); repository_identity:str=""; repo_snapshot_manifest_json:str=""
 @dataclass(frozen=True)
 class PlanValidationResult: passed:bool; reasons:tuple[str,...]
 class PlanValidator:
@@ -87,12 +87,27 @@ def generated_card_payload(feature: FeatureContract, tranche: Tranche, ticket: M
 
 def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:DecompositionPlan,validation:PlanValidationResult,repository_validation:object|None=None)->tuple[str,tuple[str,...]]:
  if not validation.passed or repository_validation is None or not getattr(repository_validation,'passed',False): raise ValueError('rejected plan cannot activate')
+ repository_identity=getattr(repository_validation,'repository_identity',None)
+ repo_base_sha=getattr(repository_validation,'base_sha',None)
+ repo_snapshot_hash=getattr(repository_validation,'snapshot_hash',None)
+ repo_snapshot_manifest_json=getattr(repository_validation,'manifest_json',None)
+ if not all((repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json)):
+  raise ValueError('repository provenance required')
+ try:
+  manifest=json.loads(repo_snapshot_manifest_json)
+ except (TypeError, json.JSONDecodeError) as exc:
+  raise ValueError('repository provenance conflicts') from exc
+ if (manifest.get('repository_identity'),manifest.get('repo_base_sha')) != (repository_identity,repo_base_sha) or hashlib.sha256(repo_snapshot_manifest_json.encode()).hexdigest()!=repo_snapshot_hash:
+  raise ValueError('repository provenance conflicts')
+ if (plan.repository_identity,plan.repo_base_sha,plan.repo_snapshot_hash,plan.repo_snapshot_manifest_json)!=(repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json):
+  raise ValueError('repository provenance conflicts')
  raw=json.dumps({"feature":feature.__dict__,"plan":plan.__dict__},default=lambda x:x.__dict__ if hasattr(x,'__dict__') else list(x),sort_keys=True,separators=(',',':')); fp=hashlib.sha256(raw.encode()).hexdigest(); pid='plan-'+fp[:16]; now=int(time.time())
  with ledger._transaction() as c:
   old=c.execute('SELECT contract_hash FROM feature_contracts WHERE feature_id=?',(feature.id,)).fetchone()
   if old and old['contract_hash']!=feature.contract_hash: raise ValueError('conflicting feature contract')
-  existing=c.execute('SELECT id FROM decomposition_plans WHERE fingerprint=?',(fp,)).fetchone()
+  existing=c.execute('SELECT * FROM decomposition_plans WHERE fingerprint=?',(fp,)).fetchone()
   if existing:
+   if tuple(existing[x] for x in ('repository_identity','repo_base_sha','repo_snapshot_hash','repo_snapshot_manifest_json')) != (repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json): raise ValueError('repository provenance conflicts')
    active_tranche=next(tr for tr in plan.tranches if tr.ordinal == 0)
    for generated in active_tranche.microtickets:
     expected=generated_card_payload(feature, active_tranche, generated)
@@ -107,7 +122,7 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
     for generated in tr.microtickets:
      if c.execute('SELECT 1 FROM tickets WHERE id=?',(generated.ticket_id,)).fetchone() is not None:
       raise ValueError('conflicting activated plan')
-  c.execute('INSERT OR IGNORE INTO features(id,title,objective,status,created_at,updated_at) VALUES (?,?,?,"planned",?,?)',(feature.id,feature.title,feature.objective,now,now)); c.execute('INSERT INTO feature_contracts VALUES (?,?,?,?)',(feature.id,feature.contract_hash,json.dumps(feature.__dict__,default=lambda x:x.__dict__,sort_keys=True),now)); c.execute('INSERT INTO decomposition_plans VALUES (?,?,?,?,?,?,?)',(pid,feature.id,fp,raw,'active',now,now))
+  c.execute('INSERT OR IGNORE INTO features(id,title,objective,status,created_at,updated_at) VALUES (?,?,?,"planned",?,?)',(feature.id,feature.title,feature.objective,now,now)); c.execute('INSERT INTO feature_contracts VALUES (?,?,?,?)',(feature.id,feature.contract_hash,json.dumps(feature.__dict__,default=lambda x:x.__dict__,sort_keys=True),now)); c.execute('INSERT INTO decomposition_plans(id,feature_id,fingerprint,plan_json,status,created_at,activated_at,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)',(pid,feature.id,fp,raw,'active',now,now,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json))
   active=[]
   for tr in plan.tranches:
    c.execute('INSERT INTO tranches(id,feature_id,ordinal,status,integration_commands_json) VALUES (?,?,?, ?,"[]")',(tr.id,feature.id,tr.ordinal,'active' if tr.ordinal==0 else 'planned'))

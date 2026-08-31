@@ -75,7 +75,7 @@ class MultilanguageEvidenceTests(unittest.TestCase):
         feature = FeatureContract("f", "Payment", "calculate payment", (Criterion("A", "payment"),), (), (), (), sha)
         snap = snapshot(self.repo, sha, feature, limit=1)
         ticket = MicroTicket("T", "Change calculate payment behavior.", ("A",), "other.ts::unrelated", ("other.ts",), ("No API changes.",), PatchBudget(1, 20), VerificationProfile((("python", "-c", "print('ok')"),)), "low", True, 1, ())
-        plan = DecompositionPlan(1, "f", feature.contract_hash, sha, snap.snapshot_hash, (), {"A": ("T",)}, (Tranche("tr", 0, "implement", (), ("A",), (ticket,)),))
+        plan = DecompositionPlan(1, "f", feature.contract_hash, sha, snap.snapshot_hash, (), {"A": ("T",)}, (Tranche("tr", 0, "implement", (), ("A",), (ticket,)),), repository_identity=snap.repository_id, repo_snapshot_manifest_json=snap.manifest_json)
         validation = RepositoryPlanValidator().validate(plan, snap)
         self.assertEqual(validation.reasons, ("insufficient_repository_evidence",))
         unknown = MicroTicket(**{**ticket.__dict__, "primary_symbol": "payment.ts::missing", "allowed_files": ("payment.ts",)})

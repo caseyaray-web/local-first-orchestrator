@@ -255,7 +255,7 @@ class Ledger:
         self.connection.executescript(_SCHEMA)
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS feature_contracts (feature_id TEXT PRIMARY KEY, contract_hash TEXT NOT NULL, contract_json TEXT NOT NULL, created_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS decomposition_plans (id TEXT PRIMARY KEY, feature_id TEXT NOT NULL, fingerprint TEXT NOT NULL UNIQUE, plan_json TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, activated_at INTEGER, UNIQUE(feature_id, fingerprint));
+        CREATE TABLE IF NOT EXISTS decomposition_plans (id TEXT PRIMARY KEY, feature_id TEXT NOT NULL, fingerprint TEXT NOT NULL UNIQUE, plan_json TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, activated_at INTEGER, repository_identity TEXT, repo_base_sha TEXT, repo_snapshot_hash TEXT, repo_snapshot_manifest_json TEXT, UNIQUE(feature_id, fingerprint));
         CREATE TABLE IF NOT EXISTS planning_runs (
             request_key TEXT PRIMARY KEY, feature_id TEXT NOT NULL, contract_hash TEXT NOT NULL,
             repo_base_sha TEXT NOT NULL, repo_snapshot_hash TEXT NOT NULL, planner_identity TEXT NOT NULL,
@@ -266,6 +266,14 @@ class Ledger:
         CREATE TABLE IF NOT EXISTS tranche_criteria (tranche_id TEXT NOT NULL, criterion_id TEXT NOT NULL, PRIMARY KEY(tranche_id, criterion_id));
         CREATE TABLE IF NOT EXISTS ticket_criteria (ticket_id TEXT NOT NULL, criterion_id TEXT NOT NULL, PRIMARY KEY(ticket_id, criterion_id));
         """)
+        plan_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(decomposition_plans)")}
+        for name in ("repository_identity", "repo_base_sha", "repo_snapshot_hash", "repo_snapshot_manifest_json"):
+            if name not in plan_columns:
+                self.connection.execute(f"ALTER TABLE decomposition_plans ADD COLUMN {name} TEXT")
+        run_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(planning_runs)")}
+        for name in ("repository_identity", "repo_snapshot_manifest_json"):
+            if name not in run_columns:
+                self.connection.execute(f"ALTER TABLE planning_runs ADD COLUMN {name} TEXT")
         # Phase 2 is additive: preserve Phase 1 ledgers already created.
         ticket_columns = {
             "criterion_ids_json": "TEXT NOT NULL DEFAULT '[]'",
