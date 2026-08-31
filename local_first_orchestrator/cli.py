@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .controller import LocalFirstController, RuntimeConfig
+from .generated_projection import GeneratedProjectionWorker
 from .hermes_board import HermesBoardAdapter
 from .ledger import Ledger
 
@@ -31,6 +32,7 @@ def main(argv: list[str] | None=None) -> int:
     imported=commands.add_parser("import"); imported.add_argument("--task-id",required=True)
     run=commands.add_parser("run-once"); run.add_argument("--task-id",required=True); run.add_argument("--dry-run",action="store_true",default=True); run.add_argument("--execute",action="store_true"); run.add_argument("--allow-board-writes",action="store_true")
     inspect=commands.add_parser("inspect"); inspect.add_argument("--task-id",required=True)
+    generated=commands.add_parser("project-generated"); generated.add_argument("--allow-board-writes",action="store_true"); generated.add_argument("--hermes-executable"); generated.add_argument("--board")
     args=parser.parse_args(argv); ledger=_ledger(args.database)
     try:
         if args.command=="migrate": pass
@@ -46,6 +48,12 @@ def main(argv: list[str] | None=None) -> int:
             elif not args.allow_board_writes: raise PermissionError("--execute requires --allow-board-writes; no write-enabled execution without both")
             else: print(json.dumps({"executed":ctl.execute(args.task_id,repository=Path(args.repository),allow_board_writes=True)}))
         elif args.command=="inspect": print(json.dumps(ledger.get_ticket(args.task_id),sort_keys=True))
+        elif args.command=="project-generated":
+            if not args.allow_board_writes: raise PermissionError("project-generated requires --allow-board-writes")
+            if not args.hermes_executable or not args.board: raise ValueError("project-generated requires --hermes-executable and --board")
+            board=HermesBoardAdapter(executable=args.hermes_executable,board=args.board,allow_writes=True)
+            result=GeneratedProjectionWorker(ledger,board,worker_id="local-first-cli").deliver_one()
+            print(json.dumps(result.__dict__,sort_keys=True))
     finally: ledger.close()
     return 0
 
