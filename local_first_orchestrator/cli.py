@@ -22,8 +22,13 @@ def _controller(ledger: Ledger, args: argparse.Namespace, *, allow_board_writes:
     return LocalFirstController(ledger,HermesBoardAdapter(allow_writes=allow_board_writes),RuntimeConfig(root,root/".hermes/local-first-worktrees",root/".hermes/local-first-artifacts",repository_allowlist=allowlist))
 
 
-def main(argv: list[str] | None=None) -> int:
-    parser=argparse.ArgumentParser(description="Local-first Kanban controller; dry-run is default")
+def register_cli(parser: argparse.ArgumentParser) -> None:
+    """Add the standalone CLI's arguments to *parser*.
+
+    Hermes invokes this through ``ctx.register_cli_command`` so the native
+    ``hermes local-first-orchestrator`` command and the installed standalone
+    ``local-first-orchestrator`` command share one parser contract.
+    """
     parser.add_argument("--database",required=True,help="separate ledger database; never Hermes kanban.db")
     parser.add_argument("--repository",default=".",help="canonical repository root (required for import/run-once)")
     parser.add_argument("--allow-repository",action="append",default=[],help="exact canonical repository root allowed for imports/execution; repeatable")
@@ -35,7 +40,11 @@ def main(argv: list[str] | None=None) -> int:
     inspect=commands.add_parser("inspect"); inspect.add_argument("--task-id",required=True)
     generated=commands.add_parser("project-generated"); generated.add_argument("--allow-board-writes",action="store_true"); generated.add_argument("--hermes-executable"); generated.add_argument("--board")
     activate=commands.add_parser("activate-generated"); activate.add_argument("ticket_id")
-    args=parser.parse_args(argv); ledger=_ledger(args.database)
+
+
+def run_command(args: argparse.Namespace) -> int:
+    """Run a parsed standalone or native Hermes CLI command."""
+    ledger=_ledger(args.database)
     try:
         if args.command=="migrate": pass
         elif args.command=="status":
@@ -63,5 +72,11 @@ def main(argv: list[str] | None=None) -> int:
             print(json.dumps(result.__dict__,sort_keys=True))
     finally: ledger.close()
     return 0
+
+
+def main(argv: list[str] | None=None) -> int:
+    parser=argparse.ArgumentParser(description="Local-first Kanban controller; dry-run is default")
+    register_cli(parser)
+    return run_command(parser.parse_args(argv))
 
 if __name__=="__main__": raise SystemExit(main())
