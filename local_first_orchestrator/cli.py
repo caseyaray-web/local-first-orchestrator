@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .controller import LocalFirstController, RuntimeConfig
+from .generated_activation import GeneratedActivationError, activate_generated_ticket
 from .generated_projection import GeneratedProjectionWorker
 from .hermes_board import HermesBoardAdapter
 from .ledger import Ledger
@@ -33,6 +34,7 @@ def main(argv: list[str] | None=None) -> int:
     run=commands.add_parser("run-once"); run.add_argument("--task-id",required=True); run.add_argument("--dry-run",action="store_true",default=True); run.add_argument("--execute",action="store_true"); run.add_argument("--allow-board-writes",action="store_true")
     inspect=commands.add_parser("inspect"); inspect.add_argument("--task-id",required=True)
     generated=commands.add_parser("project-generated"); generated.add_argument("--allow-board-writes",action="store_true"); generated.add_argument("--hermes-executable"); generated.add_argument("--board")
+    activate=commands.add_parser("activate-generated"); activate.add_argument("ticket_id")
     args=parser.parse_args(argv); ledger=_ledger(args.database)
     try:
         if args.command=="migrate": pass
@@ -48,6 +50,11 @@ def main(argv: list[str] | None=None) -> int:
             elif not args.allow_board_writes: raise PermissionError("--execute requires --allow-board-writes; no write-enabled execution without both")
             else: print(json.dumps({"executed":ctl.execute(args.task_id,repository=Path(args.repository),allow_board_writes=True)}))
         elif args.command=="inspect": print(json.dumps(ledger.get_ticket(args.task_id),sort_keys=True))
+        elif args.command=="activate-generated":
+            root=Path(args.repository).resolve(); allowlist=tuple(Path(item).resolve() for item in args.allow_repository) or (root,)
+            config=RuntimeConfig(root,root/".hermes/local-first-worktrees",root/".hermes/local-first-artifacts",repository_allowlist=allowlist)
+            result=activate_generated_ticket(args.ticket_id,config,ledger)
+            print(json.dumps({**result.__dict__,"repository_path":str(result.repository_path) if result.repository_path else None},sort_keys=True))
         elif args.command=="project-generated":
             if not args.allow_board_writes: raise PermissionError("project-generated requires --allow-board-writes")
             if not args.hermes_executable or not args.board: raise ValueError("project-generated requires --hermes-executable and --board")
