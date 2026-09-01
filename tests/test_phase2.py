@@ -160,19 +160,30 @@ class Phase2Tests(unittest.TestCase):
         self.assertNotIn("default-secret-value", result.full_evidence_path.read_text(encoding="utf-8"))
         adapter.teardown(attempt)
 
-    def test_fake_qwen_runner_gets_fresh_explicit_command_and_no_ledger_callback(self) -> None:
-        calls: list[tuple[str, ...]] = []
+    def test_fake_qwen_runner_gets_pinned_agentic_workspace(self) -> None:
+        calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
         def runner(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
-            calls.append(argv)
+            calls.append((argv, dict(kwargs)))
             return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"changed_files": ["app.py"]}), stderr="")
-        adapter = LocalQwenAdapter(runner=runner)
-        result = adapter.invoke("implementation", "packet", artifact_dir=self.root / "model")
+        attempt=self.root / "attempt"; attempt.mkdir()
+        adapter = LocalQwenAdapter(runner=runner, hermes_home=self.root / "local-coder-home")
+        result = adapter.invoke("implementation", "packet", artifact_dir=self.root / "model", workdir=attempt)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0], ("hermes", "chat", "--provider", "custom:lm-studio", "--model", "qwen3.8-27b@iq3_s", "--query", "packet", "--quiet"))
-        self.assertNotIn("--fresh-session", calls[0])
-        self.assertNotIn("--", calls[0])
+        argv, kwargs=calls[0]
+        self.assertEqual(argv, ("hermes", "chat", "--toolsets", "file,terminal", "--in", str(attempt), "--provider", "custom:lm-studio", "--model", "qwen3.8-27b@iq3_s", "--query", "packet", "--quiet"))
+        self.assertEqual(kwargs["cwd"],str(attempt))
+        self.assertEqual(kwargs["env"]["HERMES_HOME"],str((self.root / "local-coder-home").resolve()))
+        self.assertEqual(kwargs["env"]["TERMINAL_CWD"],str(attempt))
+        self.assertNotIn("--fresh-session", argv)
         self.assertTrue(result.artifact_path.exists())
         self.assertEqual(result.payload["changed_files"], ["app.py"])
+
+    def test_review_does_not_grant_implementation_tools(self) -> None:
+        calls=[]
+        runner=lambda argv, **kwargs: (calls.append(argv) or subprocess.CompletedProcess(argv,0,stdout=json.dumps({"verdict":"pass"}),stderr=""))
+        LocalQwenAdapter(runner=runner).invoke("review", "packet", artifact_dir=self.root / "review", workdir=self.root)
+        self.assertNotIn("--toolsets",calls[0])
+        self.assertNotIn("--in",calls[0])
 
     def test_implementation_allows_successful_hermes_text_while_review_remains_structured(self) -> None:
         runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="edited app.py", stderr="")
