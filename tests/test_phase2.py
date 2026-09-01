@@ -174,6 +174,14 @@ class Phase2Tests(unittest.TestCase):
         self.assertTrue(result.artifact_path.exists())
         self.assertEqual(result.payload["changed_files"], ["app.py"])
 
+    def test_implementation_allows_successful_hermes_text_while_review_remains_structured(self) -> None:
+        runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="edited app.py", stderr="")
+        adapter=LocalQwenAdapter(runner=runner)
+        result=adapter.invoke("implementation", "packet", artifact_dir=self.root / "model-text")
+        self.assertEqual(result.payload, {})
+        with self.assertRaisesRegex(ValueError, "did not return JSON"):
+            adapter.invoke("review", "packet", artifact_dir=self.root / "review-text")
+
     def test_tranche_integration_head_uses_compare_and_swap(self) -> None:
         adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
         self.assertEqual(adapter.resolve_execution_base("tranche-a", self.base), self.base)

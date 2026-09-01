@@ -38,7 +38,12 @@ class LocalQwenAdapter:
         try:
             payload = json.loads(completed.stdout or "{}")
         except json.JSONDecodeError as exc:
-            raise ValueError("local model did not return JSON") from exc
+            # Hermes chat emits ordinary text after a successful implementation
+            # tool run. The worktree diff, not the narration, is authoritative.
+            if purpose == "implementation":
+                payload = {}
+            else:
+                raise ValueError("local model did not return JSON") from exc
         if not isinstance(payload, dict):
             raise ValueError("local model result must be an object")
         return ModelResult(payload, artifact, argv)
