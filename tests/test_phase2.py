@@ -8,7 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.context_packet import ContextBudgetError, ContextPacketBuilder
-from local_first_orchestrator.git_adapter import DirtyCheckoutError, GitWorktreeAdapter
+from local_first_orchestrator.git_adapter import DirtyCheckoutError, GitWorktreeAdapter, IntegrationHeadConflictError
 from local_first_orchestrator.local_qwen import LocalQwenAdapter
 from local_first_orchestrator.readiness import ReadinessError, validate_ticket
 from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
@@ -173,6 +173,20 @@ class Phase2Tests(unittest.TestCase):
         self.assertNotIn("--", calls[0])
         self.assertTrue(result.artifact_path.exists())
         self.assertEqual(result.payload["changed_files"], ["app.py"])
+
+    def test_tranche_integration_head_uses_compare_and_swap(self) -> None:
+        adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
+        self.assertEqual(adapter.resolve_execution_base("tranche-a", self.base), self.base)
+        ref = "refs/local-first/tranches/tranche-a/integration-head"
+        self.assertEqual(self.run_git("rev-parse", ref).stdout.strip(), self.base)
+        attempt = adapter.create_attempt("T-1", 1, self.base)
+        (attempt.path / "app.py").write_text("def classify(value):\n    return 'ok'\n", encoding="utf-8")
+        accepted = adapter.accept(attempt, "fixture ticket accepted")
+        self.assertEqual(adapter.advance_integration_head("tranche-a", self.base, accepted), accepted)
+        self.assertEqual(adapter.resolve_execution_base("tranche-a", self.base), accepted)
+        with self.assertRaisesRegex(IntegrationHeadConflictError, "integration head changed concurrently"):
+            adapter.advance_integration_head("tranche-a", self.base, accepted)
+        self.assertEqual(self.run_git("rev-parse", ref).stdout.strip(), accepted)
 
     def test_fixture_happy_path_commits_only_ticket_branch_and_rejects_scope(self) -> None:
         adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")

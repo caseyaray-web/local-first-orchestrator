@@ -335,6 +335,61 @@ class GeneratedMicroticketEndToEndTests(unittest.TestCase):
             ).fetchone()[0],
             0,
         )
+    def test_generated_dependency_uses_rolling_head_without_rebinding_planning_root(self) -> None:
+        (self.repo / "a.py").write_text("def alpha():\n    return 'base'\n", encoding="utf-8")
+        (self.repo / "b.py").write_text("def beta():\n    return 'base'\n", encoding="utf-8")
+        self.git("add", "a.py", "b.py")
+        self.git("commit", "-m", "dependency fixture")
+        base_sha = self.git("rev-parse", "HEAD").stdout.strip()
+        feature = FeatureContract(
+            "feature-dependency", "Serialize generated dependency", "Run beta from alpha's accepted ancestry.",
+            (Criterion("AC-A", "alpha is accepted", "assert alpha"), Criterion("AC-B", "beta is accepted", "assert beta")),
+            ("No API expansion.",), ("Only fixture files change.",), (), base_sha,
+        )
+        repository_snapshot = snapshot(self.repo, base_sha, feature)
+        a_ticket = MicroTicket("generated-a", "Make the alpha fixture return accepted.", ("AC-A",), "a.py::alpha", ("a.py",), ("No API change.",), PatchBudget(1, 10), VerificationProfile((("python", "-c", "from a import alpha; assert alpha() == 'accepted'"),)), "low", True, 1, ())
+        b_ticket = MicroTicket("generated-b", "Make the beta fixture return accepted.", ("AC-B",), "b.py::beta", ("b.py",), ("No API change.",), PatchBudget(1, 10), VerificationProfile((("python", "-c", "from b import beta; assert beta() == 'accepted'"),)), "low", True, 1, (a_ticket.ticket_id,))
+        tranche = Tranche("serialized", 0, "Serialize dependent fixture changes", ("alpha", "beta"), ("AC-A", "AC-B"), (a_ticket, b_ticket))
+        plan = DecompositionPlan(1, feature.id, feature.contract_hash, repository_snapshot.base_sha, repository_snapshot.snapshot_hash, ("Use the rolling integration head.",), {"active": ("AC-A", "AC-B")}, (tranche,), repository_identity=repository_snapshot.repository_id, repo_snapshot_manifest_json=repository_snapshot.manifest_json)
+        plan_validation = PlanValidator().validate(feature, plan)
+        repository_validation = RepositoryPlanValidator().validate(plan, repository_snapshot)
+        self.assertTrue(plan_validation.passed, plan_validation.reasons)
+        _, materialized = activate_validated_plan(self.ledger, feature, plan, plan_validation, repository_validation)
+        self.assertEqual(materialized, (a_ticket.ticket_id, b_ticket.ticket_id))
+        adapter = HermesBoardAdapter(executable=str(self.fake_hermes), board="board", allow_writes=True, timeout_seconds=2)
+        worker = GeneratedProjectionWorker(self.ledger, adapter, GeneratedProjectionDeliveryPolicy(lease_seconds=15, retry_delay=5), worker_id="projection-worker", clock=lambda: 100)
+        self.assertEqual(worker.deliver_one().status, "delivered")
+        self.assertEqual(worker.deliver_one().status, "delivered")
+        self.assertEqual(activate_generated_ticket(a_ticket.ticket_id, self.config, self.ledger).status, "activated_ready")
+        self.assertEqual(activate_generated_ticket(b_ticket.ticket_id, self.config, self.ledger).status, "activated_waiting")
+        self.assertEqual(self.ledger.runtime_binding(a_ticket.ticket_id)["starting_sha"], base_sha)
+        self.assertEqual(self.ledger.runtime_binding(b_ticket.ticket_id)["starting_sha"], base_sha)
+
+        def implement_a(path: Path) -> None:
+            (path / "a.py").write_text("def alpha():\n    return 'accepted'\n", encoding="utf-8")
+
+        def implement_b(path: Path) -> None:
+            self.assertIn("'accepted'", (path / "a.py").read_text(encoding="utf-8"))
+            (path / "b.py").write_text("def beta():\n    return 'accepted'\n", encoding="utf-8")
+
+        reviews = [
+            {"verdict": "pass", "criterion_results": [{"criterion_id": "AC-A", "status": "pass", "evidence": "A verified"}], "findings": [], "suggestions": []},
+            {"verdict": "pass", "criterion_results": [{"criterion_id": "AC-B", "status": "pass", "evidence": "B verified"}], "findings": [], "suggestions": []},
+        ]
+        controller = LocalFirstController(self.ledger, FakeBoard(), self.config, local_model=SequencedRepairModel([implement_a, implement_b], reviews))
+        self.assertTrue(controller.execute(a_ticket.ticket_id, repository=self.repo, allow_board_writes=True))
+        a_commit = self.ledger.accepted_commit(a_ticket.ticket_id)
+        self.assertIsNotNone(a_commit)
+        self.assertEqual(self.ledger.admit_ticket_if_ready(b_ticket.ticket_id).status, "ready")
+        self.assertTrue(controller.execute(b_ticket.ticket_id, repository=self.repo, allow_board_writes=True))
+        b_commit = self.ledger.accepted_commit(b_ticket.ticket_id)
+        self.assertIsNotNone(b_commit)
+        assert a_commit is not None and b_commit is not None
+        self.assertEqual(self.git("rev-parse", f"{b_commit}^").stdout.strip(), a_commit)
+        self.assertEqual(self.git("rev-parse", "refs/local-first/tranches/serialized/integration-head").stdout.strip(), b_commit)
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), base_sha)
+        self.assertEqual((self.repo / "a.py").read_text(encoding="utf-8"), "def alpha():\n    return 'base'\n")
+        self.assertEqual((self.repo / "b.py").read_text(encoding="utf-8"), "def beta():\n    return 'base'\n")
 
 
 if __name__ == "__main__":

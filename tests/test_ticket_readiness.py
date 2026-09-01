@@ -14,6 +14,12 @@ class ReadinessTests(unittest.TestCase):
   x=self.l.create_ticket(title='x',state=state,contract=contract(deps));self.l.bind_runtime(x,'/repo','a'*40);return x
  def test_admission_dependencies_and_replay_are_atomic(self):
   b=self.ticket();a=self.ticket((b,));self.assertEqual(self.l.evaluate_ticket_readiness(a).status,'waiting_on_dependencies');self.l.transition(b,CanonicalState.READY_LOCAL);self.l.transition(b,CanonicalState.IMPLEMENTING);self.l.transition(b,CanonicalState.VERIFYING);self.l.transition(b,CanonicalState.ACCEPTED);self.assertEqual(self.l.evaluate_ticket_readiness(a).status,'ready');self.l.admit_ticket_if_ready(a);self.l.admit_ticket_if_ready(a);self.assertEqual(self.l.get_ticket(a)['state'],'ready_local');self.assertEqual(len([e for e in self.l.events_for(a) if e['to_state']=='ready_local']),1);self.assertEqual(self.l.connection.execute("select count(*) from board_projection_outbox where ticket_id=?",(a,)).fetchone()[0],1);self.assertEqual(self.l.attempt_count(a),0)
+ def test_done_dependency_requires_accepted_commit_evidence(self):
+  dependency=self.ticket(); dependent=self.ticket((dependency,));self.l.transition(dependency,CanonicalState.READY_LOCAL);self.l.transition(dependency,CanonicalState.IMPLEMENTING);self.l.transition(dependency,CanonicalState.VERIFYING);self.l.transition(dependency,CanonicalState.ACCEPTED);self.l.transition(dependency,CanonicalState.DONE)
+  self.assertEqual(self.l.evaluate_ticket_readiness(dependent).status,'waiting_on_dependencies')
+  self.l.record_accepted_evidence(dependency,'a'*40,'accepted','validated')
+  self.assertEqual(self.l.evaluate_ticket_readiness(dependent).status,'ready')
+
  def test_missing_multiple_and_self_dependencies_fail_closed(self):
   a=self.ticket(('z','a'));self.l.connection.execute("update tickets set dependencies_json=? where id=?",('["z","'+a+'"]',a));self.assertEqual(self.l.evaluate_ticket_readiness(a).status,'invalid_ticket');b=self.ticket(('z','y'));self.assertEqual(self.l.evaluate_ticket_readiness(b).status,'missing_dependency')
  def test_missing_invalid_binding_and_origin_equivalence(self):

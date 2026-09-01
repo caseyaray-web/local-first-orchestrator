@@ -105,7 +105,9 @@ class LocalFirstController:
         state=CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
         if state == CanonicalState.READY_LOCAL and not self.ledger.claim_specific(ticket_id,owner,self.config.lease_seconds): return False
         if state in {CanonicalState.NEEDS_TRIAGE,CanonicalState.BLOCKED,CanonicalState.DONE}: return False
-        base=str(binding["starting_sha"]); worktrees=GitWorktreeAdapter(repo,self.config.worktree_root)
+        planning_base=str(binding["starting_sha"]); worktrees=GitWorktreeAdapter(repo,self.config.worktree_root)
+        base=worktrees.resolve_execution_base(self.ledger.get_ticket(ticket_id)["tranche_id"] or None, planning_base)
+        self.ledger.record_runtime_stage(ticket_id, "execution_base", base)
         attempt_number=max([int(r["attempt_number"]) for r in self.ledger.connection.execute("SELECT attempt_number FROM attempts WHERE ticket_id=?",(ticket_id,))] or [1])
         persisted = self.ledger.connection.execute("SELECT attempt_number FROM model_stage_artifacts WHERE ticket_id=? AND stage='implementation' ORDER BY attempt_number DESC LIMIT 1", (ticket_id,)).fetchone()
         if persisted is not None:
@@ -158,7 +160,9 @@ class LocalFirstController:
                         self.ledger.transition(ticket_id,CanonicalState.DONE)
                     break
                 self.ledger.record_runtime_stage(ticket_id,"accepted_commit_created", "pending")
-                commit=worktrees.accept(attempt,f"local-first: {self.ledger.get_ticket(ticket_id)['title']}"); self.ledger.record_accepted_evidence(ticket_id,commit,"accepted ticket diff",validation.compact_evidence); self.ledger.record_runtime_stage(ticket_id,"accepted_commit_created",commit); self._crash("accepted_commit_created"); self.ledger.transition(ticket_id,CanonicalState.DONE); break
+                commit=worktrees.accept(attempt,f"local-first: {self.ledger.get_ticket(ticket_id)['title']}")
+                worktrees.advance_integration_head(self.ledger.get_ticket(ticket_id)["tranche_id"] or None, base, commit)
+                self.ledger.record_accepted_evidence(ticket_id,commit,"accepted ticket diff",validation.compact_evidence); self.ledger.record_runtime_stage(ticket_id,"accepted_commit_created",commit); self._crash("accepted_commit_created"); self.ledger.transition(ticket_id,CanonicalState.DONE); break
             self.ledger.project_ticket(ticket_id,self.board); return True
         except Exception as exc:
             current=CanonicalState(self.ledger.get_ticket(ticket_id)["state"])

@@ -14,6 +14,10 @@ class DirtyCheckoutError(GitAdapterError):
     pass
 
 
+class IntegrationHeadConflictError(GitAdapterError):
+    """The controller lost the CAS race to advance a tranche head."""
+
+
 @dataclass(frozen=True)
 class AttemptWorktree:
     ticket_id: str
@@ -38,6 +42,48 @@ class GitWorktreeAdapter:
         status = self._git("status", "--porcelain=v1").stdout
         if status.strip():
             raise DirtyCheckoutError("primary checkout is dirty; refusing worktree creation")
+
+    def integration_head_ref(self, tranche_id: str) -> str:
+        """Return the controller-owned, repository-local anchor for a tranche."""
+        ref = f"refs/local-first/tranches/{tranche_id}/integration-head"
+        if not tranche_id or self._git("check-ref-format", ref, check=False).returncode:
+            raise ValueError("invalid tranche id for integration head")
+        return ref
+
+    def resolve_execution_base(self, tranche_id: str | None, planning_base: str) -> str:
+        """Anchor a tranche once and return its current serialized execution base.
+
+        Tickets retain their immutable planning binding.  Only this controller ref
+        moves, so a dependent ticket can begin from the accepted ancestry without
+        rewriting the binding used to validate the original plan.
+        """
+        planning_base = self._git("rev-parse", "--verify", f"{planning_base}^{{commit}}").stdout.strip()
+        if tranche_id is None:
+            return planning_base
+        ref = self.integration_head_ref(tranche_id)
+        current = self._git("show-ref", "--verify", "--hash", ref, check=False)
+        if current.returncode == 0:
+            return self._git("rev-parse", "--verify", f"{current.stdout.strip()}^{{commit}}").stdout.strip()
+        created = self._git("update-ref", ref, planning_base, "0" * 40, check=False)
+        if created.returncode == 0:
+            return planning_base
+        # A concurrent controller may have created the anchor between our read
+        # and CAS.  It is safe to use the resulting anchor, never the stale plan.
+        current = self._git("show-ref", "--verify", "--hash", ref, check=False)
+        if current.returncode == 0:
+            return self._git("rev-parse", "--verify", f"{current.stdout.strip()}^{{commit}}").stdout.strip()
+        raise GitAdapterError("unable to create tranche integration head")
+
+    def advance_integration_head(self, tranche_id: str | None, expected_base: str, accepted_commit: str) -> str:
+        """CAS-advance a tranche anchor after an accepted isolated commit."""
+        if tranche_id is None:
+            return accepted_commit
+        expected = self._git("rev-parse", "--verify", f"{expected_base}^{{commit}}").stdout.strip()
+        accepted = self._git("rev-parse", "--verify", f"{accepted_commit}^{{commit}}").stdout.strip()
+        result = self._git("update-ref", self.integration_head_ref(tranche_id), accepted, expected, check=False)
+        if result.returncode != 0:
+            raise IntegrationHeadConflictError("integration head changed concurrently")
+        return accepted
 
     def create_attempt(self, ticket_id: str, attempt_number: int, base_sha: str) -> AttemptWorktree:
         # The canonical checkout is read-only for attempts; its user changes need not block

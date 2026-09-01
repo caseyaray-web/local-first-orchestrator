@@ -534,7 +534,14 @@ class Ledger:
         for dependency in dependencies:
             dep=self.connection.execute("SELECT state FROM tickets WHERE id=?", (dependency,)).fetchone()
             if dep is None: return TicketReadinessResult("missing_dependency", (dependency,))
-            if dep["state"] != CanonicalState.ACCEPTED.value: unresolved.append(dependency)
+            if dep["state"] == CanonicalState.ACCEPTED.value:
+                continue
+            # Controllers project a locally accepted commit through DONE.  A
+            # generated dependent may proceed only when that terminal state has
+            # durable accepted evidence, never merely because a ticket is done.
+            if dep["state"] == CanonicalState.DONE.value and self.accepted_commit(dependency):
+                continue
+            unresolved.append(dependency)
         return TicketReadinessResult("waiting_on_dependencies", tuple(unresolved)) if unresolved else TicketReadinessResult("ready")
 
     def admit_ticket_if_ready(self, ticket_id: str) -> TicketReadinessResult:
