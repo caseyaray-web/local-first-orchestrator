@@ -139,7 +139,19 @@ class LocalFirstController:
                     path=artifacts_root/"review-result.json"; path.write_text(json.dumps({"payload":result.raw},sort_keys=True),encoding="utf-8")
                     self.ledger.record_model_stage(ticket_id,attempt_number,"review",purpose="review",adapter=type(self.local_model).__name__,request_hash=hashlib.sha256(review_packet.encode()).hexdigest(),response_artifact=str(path),worktree_path=str(attempt.path),base_sha=base,diff_hash=worktrees.diff_hash(attempt.path)); self.ledger.record_runtime_stage(ticket_id,"review_completed",str(path)); self._crash("review_completed"); review=result
                 outcome=SameTicketRepairCoordinator(self.ledger).apply(ticket_id,attempt_number,review)
-                if outcome=="repair": repair_evidence="; ".join(f"{f.criterion_id}: {f.evidence}; repair: {f.minimal_repair}" for f in review.findings); self.ledger.transition(ticket_id,CanonicalState.IMPLEMENTING); attempt_number+=1; continue
+                if outcome=="repair":
+                    repair_evidence="; ".join(f"{f.criterion_id}: {f.evidence}; repair: {f.minimal_repair}" for f in review.findings)
+                    self.ledger.transition(ticket_id,CanonicalState.IMPLEMENTING)
+                    next_attempt=attempt_number+1
+                    # A review repair is a new model attempt on the same isolated diff,
+                    # not a fresh worktree that loses the implementation under review.
+                    self.ledger.ensure_attempt(ticket_id,next_attempt)
+                    self.ledger.connection.execute(
+                        "UPDATE attempts SET base_sha=?, branch=?, worktree_path=?, pre_diff_hash=? WHERE ticket_id=? AND attempt_number=?",
+                        (base,attempt.branch,str(attempt.path),worktrees.diff_hash(attempt.path),ticket_id,next_attempt),
+                    )
+                    attempt_number=next_attempt
+                    continue
                 if outcome=="triage": break
                 if self.ledger.accepted_commit(ticket_id):
                     if CanonicalState(self.ledger.get_ticket(ticket_id)["state"]) == CanonicalState.ACCEPTED:

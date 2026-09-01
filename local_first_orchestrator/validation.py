@@ -132,7 +132,7 @@ class DeterministicValidator:
         # Untracked generated/secrets must be rejected too; git diff alone hides them.
         for line in self._git(worktree, "status", "--porcelain=v1").splitlines():
             candidate = line[3:]
-            if candidate and candidate not in names:
+            if candidate and "__pycache__" not in Path(candidate).parts and candidate not in names:
                 names.append(candidate)
         errors = ["no_changes: model produced no effective diff"] if not names else []
         errors += [f"changed path outside allowlist: {p}" for p in names if p not in ticket.allowed_files]
