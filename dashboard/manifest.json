@@ -1,0 +1,10 @@
+{
+  "name": "local-first-orchestrator",
+  "label": "Local First",
+  "description": "Minimal operator controls for the separate local-first ledger.",
+  "icon": "Shield",
+  "version": "0.1.0",
+  "tab": { "path": "/local-first", "position": "after:kanban" },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

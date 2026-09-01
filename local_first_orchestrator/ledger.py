@@ -692,6 +692,9 @@ class Ledger:
     def claim_specific(self, ticket_id: str, owner: str, lease_seconds: int, now: int | None = None) -> bool:
         now = self._now() if now is None else now
         with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id = 1").fetchone()
+            if paused is None or paused["paused"]:
+                return False
             changed = conn.execute("UPDATE tickets SET state=?, lease_owner=?, lease_expires_at=?, updated_at=? WHERE id=? AND state=? AND (lease_expires_at IS NULL OR lease_expires_at<=?)", (CanonicalState.IMPLEMENTING.value, owner, now+lease_seconds, now, ticket_id, CanonicalState.READY_LOCAL.value, now))
             if changed.rowcount != 1: return False
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="lease_claimed", actor_id=owner, from_state=CanonicalState.READY_LOCAL.value, to_state=CanonicalState.IMPLEMENTING.value, payload={"lease_expires_at":now+lease_seconds})
@@ -905,6 +908,33 @@ class Ledger:
         paused = self.connection.execute("SELECT paused FROM controller_state WHERE id = 1").fetchone()
         states = self.connection.execute("SELECT state, COUNT(*) AS count FROM tickets GROUP BY state ORDER BY state").fetchall()
         return {"paused": bool(paused["paused"]) if paused else False, "tickets": {row["state"]: row["count"] for row in states}}
+
+    def operator_status(self) -> dict[str, int | bool]:
+        """Return the dashboard's deliberately small, non-identifying read model."""
+        paused = self.connection.execute("SELECT paused FROM controller_state WHERE id = 1").fetchone()
+        ready_local = self.connection.execute(
+            "SELECT COUNT(*) FROM tickets WHERE state = ?", (CanonicalState.READY_LOCAL.value,)
+        ).fetchone()[0]
+        running = self.connection.execute(
+            "SELECT COUNT(*) FROM tickets WHERE state IN (?, ?, ?, ?)",
+            (
+                CanonicalState.IMPLEMENTING.value,
+                CanonicalState.VERIFYING.value,
+                CanonicalState.LOCAL_REVIEW.value,
+                CanonicalState.REPAIRING.value,
+            ),
+        ).fetchone()[0]
+        outbox_pending = self.connection.execute(
+            "SELECT "
+            "(SELECT COUNT(*) FROM board_projection_outbox WHERE acknowledged_at IS NULL) + "
+            "(SELECT COUNT(*) FROM evidence_comment_outbox WHERE status IN ('pending', 'retryable', 'delivering'))"
+        ).fetchone()[0]
+        return {
+            "paused": bool(paused["paused"]) if paused else False,
+            "ready_local": int(ready_local),
+            "running": int(running),
+            "outbox_pending": int(outbox_pending),
+        }
 
     def plan_projection(self, ticket_id: str, *, evidence: str | None = None, state_payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """Plan a projection without adapters or external commands."""

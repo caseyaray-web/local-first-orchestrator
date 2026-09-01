@@ -71,5 +71,10 @@ class Milestone2(unittest.TestCase):
         self.assertEqual(calls,len(ctl.local_model.calls)); self.assertEqual(commit,self.ledger.accepted_commit(ticket)); self.assertEqual(len(self.board.writes),1)
     def test_duplicate_claim_is_exclusive(self):
         ctl=self.controller([self.good]); ticket=ctl.import_card(self.card()); self.assertTrue(self.ledger.claim_specific(ticket,"one",60)); self.assertFalse(self.ledger.claim_specific(ticket,"two",60))
+    def test_pause_blocks_execute_admission_without_interrupting_existing_work(self):
+        ctl=self.controller([self.good]); ticket=ctl.import_card(self.card()); self.ledger.pause("operator", reason="maintenance")
+        self.assertFalse(ctl.execute(ticket,repository=self.repo,allow_board_writes=True))
+        self.assertEqual(ctl.local_model.calls,[])
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"],"ready_local")
 
 if __name__ == "__main__": unittest.main()

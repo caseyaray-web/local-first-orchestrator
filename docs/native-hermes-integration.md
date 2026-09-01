@@ -52,10 +52,10 @@ A fresh CLI process sees a default-profile enablement change immediately.
 Restart a gateway or begin a new chat session before expecting an enabled
 plugin to load there.
 
-## Dashboard extension plan (not implemented)
+## Dashboard extension
 
-Do not add a dashboard until the ledger has a deliberate read-model API.
-When that is needed, keep it inside this same repository at:
+The in-place user-plugin dashboard mechanism supports an operator tab, so this
+repository includes:
 
 ```text
 dashboard/
@@ -64,10 +64,19 @@ dashboard/
   plugin_api.py
 ```
 
-Use a new `/local-first-orchestrator` tab or a page-scoped slot, with the
-published dashboard IIFE SDK.  `plugin_api.py` should expose read-only,
-validated summaries from the configured separate ledger database under
-`/api/plugins/local-first-orchestrator/`; it must not open or mutate Hermes'
-Kanban database.  Any future operator action must retain the controller's
-explicit write flags and use a retryable projection/outbox boundary rather
-than a direct dashboard-to-board write.
+The `Local First` tab uses the published dashboard IIFE SDK and calls the
+authenticated, plugin-scoped API at `/api/plugins/local-first-orchestrator/`.
+It asks the operator for an existing separate-ledger path and exposes only:
+
+- `GET /status` — bounded `paused`, `ready_local`, `running`, and
+  `outbox_pending` counts; never ticket IDs, evidence, or board data.
+- `POST /pause` and `POST /resume` — persist the admission flag in the ledger
+  with a bounded operator reason.
+
+Pause denies new `ready_local` claims, including the generic controller
+`execute()` admission path.  It does not interrupt tickets already in an
+active execution state.  The API never opens or mutates Hermes' Kanban
+database, writes a board, registers an LLM tool, or invokes a model.
+
+Dashboard assets and backend routes are loaded only after this user plugin is
+enabled; restart/rescan the dashboard after enabling it.
