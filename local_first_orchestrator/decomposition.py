@@ -24,6 +24,24 @@ class DecompositionPlan:
 class PlanValidationResult: passed:bool; reasons:tuple[str,...]
 class PlanValidator:
  def __init__(self,*,max_active_tickets:int=4,max_files:int=3,max_lines:int=200): self.max_active_tickets,self.max_files,self.max_lines=max_active_tickets,max_files,max_lines
+ def validate_tranche(self,feature:FeatureContract,tranche:Tranche,coarse:Tranche)->PlanValidationResult:
+  r=[]; criteria={c.id for c in feature.acceptance_criteria}; allowed=set(coarse.criterion_ids)
+  if not tranche.microtickets:r.append('invalid_microticket')
+  if not set(tranche.criterion_ids)<=allowed:r.append('tranche_scope_expanded')
+  ids={x.ticket_id for x in tranche.microtickets}
+  for t in tranche.microtickets:
+   try: validate_ticket(t)
+   except Exception:r.append('invalid_microticket'); continue
+   if not set(t.criterion_ids)<=allowed or not set(t.criterion_ids)<=criteria:r.append('criterion_scope_expanded')
+   if t.patch_budget.max_files>self.max_files or t.patch_budget.max_changed_lines>self.max_lines:r.append('patch_budget_exceeded')
+   if not set(t.dependencies)<=ids or t.ticket_id in t.dependencies:r.append('invalid_dependency')
+  graph={t.ticket_id:set(t.dependencies) for t in tranche.microtickets}; seen=set(); visiting=set()
+  def dfs(n):
+   if n in visiting:return True
+   if n in seen:return False
+   seen.add(n); visiting.add(n); bad=any(dfs(x) for x in graph.get(n,())) ; visiting.remove(n); return bad
+  if any(dfs(n) for n in graph):r.append('dependency_cycle')
+  return PlanValidationResult(not r,tuple(sorted(set(r))))
  def validate(self,feature:FeatureContract,plan:DecompositionPlan)->PlanValidationResult:
   r=[]; criteria={c.id for c in feature.acceptance_criteria}
   if plan.feature_id!=feature.id:r.append('feature_mismatch')
@@ -125,7 +143,7 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
   c.execute('INSERT OR IGNORE INTO features(id,title,objective,status,created_at,updated_at) VALUES (?,?,?,"planned",?,?)',(feature.id,feature.title,feature.objective,now,now)); c.execute('INSERT INTO feature_contracts VALUES (?,?,?,?)',(feature.id,feature.contract_hash,json.dumps(feature.__dict__,default=lambda x:x.__dict__,sort_keys=True),now)); c.execute('INSERT INTO decomposition_plans(id,feature_id,fingerprint,plan_json,status,created_at,activated_at,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)',(pid,feature.id,fp,raw,'active',now,now,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json))
   active=[]
   for tr in plan.tranches:
-   c.execute('INSERT INTO tranches(id,feature_id,ordinal,status,integration_commands_json) VALUES (?,?,?, ?,"[]")',(tr.id,feature.id,tr.ordinal,'active' if tr.ordinal==0 else 'planned'))
+   c.execute('INSERT INTO tranches(id,feature_id,ordinal,status,base_sha,integration_commands_json) VALUES (?,?,?, ?,?,"[]")',(tr.id,feature.id,tr.ordinal,'active' if tr.ordinal==0 else 'planned',plan.repo_base_sha))
    for cid in tr.criterion_ids:c.execute('INSERT INTO tranche_criteria VALUES (?,?)',(tr.id,cid))
    if tr.ordinal:
     continue

@@ -118,6 +118,42 @@ class PlanningCoordinator:
         candidate = value.get("plan", value)
         return json.dumps(candidate, sort_keys=True, separators=(",", ":"))
 
+    def materialize_next_tranche(self, feature_id: str) -> PlanningOutcome:
+        """Complete the active tranche and materialize exactly the next coarse tranche."""
+        from .tranche_completion import TrancheNotComplete, completion_evidence
+        row = self.ledger.connection.execute("SELECT * FROM feature_contracts WHERE feature_id=?", (feature_id,)).fetchone()
+        stored_plan = self.ledger.connection.execute("SELECT * FROM decomposition_plans WHERE feature_id=? ORDER BY created_at LIMIT 1", (feature_id,)).fetchone()
+        if row is None or stored_plan is None: return PlanningOutcome("planner_failed", feature_id, reasons=("feature plan missing",))
+        raw = json.loads(row["contract_json"])
+        from .decomposition import Criterion
+        feature = FeatureContract(raw["id"], raw["title"], raw["objective"], tuple(Criterion(x["id"], x["statement"], x.get("verification_hint", "")) for x in raw["acceptance_criteria"]), tuple(raw["non_goals"]), tuple(raw["invariants"]), tuple(raw["constraints"]), raw["source_revision"])
+        stored = json.loads(stored_plan["plan_json"]); coarse_plan = parse(json.dumps(stored["plan"], sort_keys=True, separators=(",", ":")))
+        active_row = self.ledger.connection.execute("SELECT * FROM tranches WHERE feature_id=? AND status='active' ORDER BY ordinal", (feature_id,)).fetchone()
+        if active_row is None: return PlanningOutcome("planner_failed", feature_id, reasons=("active tranche missing",))
+        if int(active_row["ordinal"]) > 0: return PlanningOutcome("already_materialized", feature_id, plan_id=str(stored_plan["id"]))
+        active = next(t for t in coarse_plan.tranches if t.id == active_row["id"])
+        try: completion = completion_evidence(self.ledger, self.config.canonical_repository(self.config.repository), active.id)
+        except (TrancheNotComplete, OSError, subprocess.CalledProcessError) as exc: return PlanningOutcome("waiting_not_complete", feature_id, reasons=(str(exc),))
+        next_coarse = next((t for t in coarse_plan.tranches if t.ordinal == active.ordinal + 1), None)
+        if next_coarse is None:
+            self.ledger.record_tranche_completion(completion)
+            return PlanningOutcome("feature_complete_candidate", feature_id, reasons=("no later coarse tranche",))
+        final = completion["final_integration_sha"]
+        snap = snapshot(self.config.canonical_repository(self.config.repository), final, feature)
+        artifact_dir = self._artifact_dir(feature, self._request_key(feature, snap) + "-" + next_coarse.id); artifact_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            proposer = getattr(self.planner, "propose_next", None) or getattr(self.planner, "propose")
+            proposal = proposer(feature, snap, coarse_tranche=next_coarse, completion_evidence=completion, artifact_dir=artifact_dir) if getattr(self.planner, "propose_next", None) else proposer(feature, snap, artifact_dir=artifact_dir)
+        except TypeError:
+            proposal = self.planner.propose(feature, snap, artifact_dir=artifact_dir)  # type: ignore[attr-defined]
+        proposal = replace(proposal, feature_id=feature.id, feature_contract_hash=feature.contract_hash, repository_identity=snap.repository_id, repo_base_sha=snap.base_sha, repo_snapshot_hash=snap.snapshot_hash, repo_snapshot_manifest_json=snap.manifest_json, tranches=(replace(proposal.tranches[0], id=next_coarse.id, ordinal=0),))
+        validation = self.plan_validator.validate_tranche(feature, proposal.tranches[0], next_coarse)
+        repository_validation = self.repository_validator.validate(proposal, snap)
+        if not validation.passed: return PlanningOutcome("structural_rejected", feature_id, reasons=validation.reasons)
+        if not repository_validation.passed: return PlanningOutcome("repository_rejected", feature_id, reasons=repository_validation.reasons)
+        created = self.ledger.materialize_next_tranche(feature=feature, tranche=proposal.tranches[0], plan=proposal, completion=completion)
+        return PlanningOutcome("activated", feature_id, snapshot_hash=snap.snapshot_hash, plan_id=str(stored_plan["id"]), activated_ticket_ids=created)
+
     def plan(self, feature: FeatureContract, *, repository: Path | None = None, feature_terms: tuple[str, ...] = ()) -> PlanningOutcome:
         cost_class = self._cost_class()
         if cost_class == "unknown":

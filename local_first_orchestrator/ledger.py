@@ -226,6 +226,11 @@ CREATE TABLE IF NOT EXISTS accepted_evidence (
     ticket_id TEXT PRIMARY KEY REFERENCES tickets(id), accepted_commit_sha TEXT NOT NULL,
     diff_summary TEXT NOT NULL, validation_summary TEXT NOT NULL, created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tranche_completion_evidence (
+    tranche_id TEXT PRIMARY KEY REFERENCES tranches(id), root_planning_sha TEXT NOT NULL,
+    final_integration_sha TEXT NOT NULL, accepted_ticket_ids_json TEXT NOT NULL,
+    accepted_commit_shas_json TEXT NOT NULL, evidence_hash TEXT NOT NULL, completed_at INTEGER NOT NULL
+);
 CREATE TRIGGER IF NOT EXISTS events_immutable_update
 BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'events are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS events_immutable_delete
@@ -945,3 +950,50 @@ class Ledger:
                 (ticket_id, accepted_commit_sha, diff_summary, validation_summary, self._now()),
             )
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="accepted_evidence_recorded", actor_id="controller", payload={"commit_sha": accepted_commit_sha})
+
+    def tranche_completion(self, tranche_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM tranche_completion_evidence WHERE tranche_id=?", (tranche_id,)).fetchone()
+        return dict(row) if row else None
+
+    def record_tranche_completion(self, completion: dict[str, Any]) -> None:
+        now = self._now()
+        with self._transaction() as conn:
+            existing = conn.execute("SELECT * FROM tranche_completion_evidence WHERE tranche_id=?", (completion["tranche_id"],)).fetchone()
+            keys = ("tranche_id", "root_planning_sha", "final_integration_sha", "accepted_ticket_ids_json", "accepted_commit_shas_json", "evidence_hash")
+            values = tuple(completion[k] for k in keys)
+            if existing:
+                if tuple(existing[k] for k in keys) != values: raise ValueError("conflicting tranche completion evidence")
+                return
+            conn.execute("INSERT INTO tranche_completion_evidence(tranche_id,root_planning_sha,final_integration_sha,accepted_ticket_ids_json,accepted_commit_shas_json,evidence_hash,completed_at) VALUES (?,?,?,?,?,?,?)", (*values, now))
+
+    def materialize_next_tranche(self, *, feature: Any, tranche: Any, plan: Any, completion: dict[str, Any]) -> tuple[str, ...]:
+        """Atomically freeze completion and create next-tranche draft tickets."""
+        from .decomposition import generated_card_payload
+        now = self._now()
+        with self._transaction() as conn:
+            active = conn.execute("SELECT * FROM tranches WHERE feature_id=? AND status='active' ORDER BY ordinal", (feature.id,)).fetchall()
+            if len(active) != 1 or int(active[0]["ordinal"]) + 1 != int(conn.execute("SELECT ordinal FROM tranches WHERE id=?", (tranche.id,)).fetchone()[0]):
+                raise ValueError("active tranche handoff conflict")
+            existing = conn.execute("SELECT * FROM tranche_completion_evidence WHERE tranche_id=?", (active[0]["id"],)).fetchone()
+            keys = ("tranche_id", "root_planning_sha", "final_integration_sha", "accepted_ticket_ids_json", "accepted_commit_shas_json", "evidence_hash")
+            values = (active[0]["id"], completion["root_planning_sha"], completion["final_integration_sha"], completion["accepted_ticket_ids_json"], completion["accepted_commit_shas_json"], completion["evidence_hash"])
+            if existing:
+                if tuple(existing[k] for k in keys) != values: raise ValueError("conflicting tranche completion evidence")
+            else:
+                conn.execute("INSERT INTO tranche_completion_evidence(tranche_id,root_planning_sha,final_integration_sha,accepted_ticket_ids_json,accepted_commit_shas_json,evidence_hash,completed_at) VALUES (?,?,?,?,?,?,?)", (*values, now))
+            conn.execute("UPDATE tranches SET status='completed' WHERE id=?", (active[0]["id"],))
+            target = conn.execute("SELECT * FROM tranches WHERE feature_id=? AND id=?", (feature.id, tranche.id)).fetchone()
+            if target is None or int(target["ordinal"]) != int(active[0]["ordinal"]) + 1 or target["status"] not in {"planned", "active"}: raise ValueError("next tranche is missing or conflicting")
+            conn.execute("UPDATE tranches SET status='active', base_sha=? WHERE id=?", (plan.repo_base_sha, tranche.id))
+            created = []
+            for t in tranche.microtickets:
+                existing_ticket = conn.execute("SELECT id FROM tickets WHERE id=?", (t.ticket_id,)).fetchone()
+                if existing_ticket: continue
+                q = t.contract()
+                conn.execute("INSERT INTO tickets(id,feature_id,tranche_id,title,objective,criterion_ids_json,primary_symbol,allowed_files_json,forbidden_changes_json,patch_budget_json,verification_json,risk,review_required,max_attempts,dependencies_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (t.ticket_id, feature.id, tranche.id, t.ticket_id, q["objective"], json.dumps(q["criterion_ids"]), q["primary_symbol"], json.dumps(q["allowed_files"]), json.dumps(q["forbidden_changes"]), json.dumps(q["patch_budget"]), json.dumps(q["verification"]), q["risk"], int(t.review_required), t.max_attempts, json.dumps(q["dependencies"]), "draft", now, now))
+                for cid in t.criterion_ids: conn.execute("INSERT INTO ticket_criteria VALUES (?,?)", (t.ticket_id, cid))
+                payload = generated_card_payload(feature, tranche, t)
+                event_id = self._append_event(conn, entity_type="ticket", entity_id=t.ticket_id, event_type="generated_microticket_created", actor_id="controller", to_state="draft", payload={"feature_id": feature.id, "tranche_id": tranche.id, "projection_key": payload["projection_key"]})
+                self._enqueue_generated_create_projection_in_transaction(conn, ticket_id=t.ticket_id, event_id=event_id, payload=payload, idempotency_key=payload["projection_key"])
+                created.append(t.ticket_id)
+            return tuple(created)
