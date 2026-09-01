@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -188,6 +190,23 @@ class Phase2Tests(unittest.TestCase):
         LocalQwenAdapter(review_llm=StructuredLlm()).invoke("review", "packet", artifact_dir=self.root / "review", workdir=self.root)
         self.assertNotIn("workdir",calls[0])
         self.assertNotIn("tools",calls[0])
+
+    def test_review_uses_standalone_profile_worker_without_global_env_mutation(self) -> None:
+        calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+        old_home = os.environ.get("HERMES_HOME")
+        def runner(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append((argv, dict(kwargs)))
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"content_type": "json", "parsed": {"verdict": "pass", "criterion_results": [], "findings": [], "suggestions": []}}), stderr="")
+        worker_home = self.root / "worker-code-local"
+        result = LocalQwenAdapter(runner=runner, hermes_home=worker_home).invoke("review", "packet", artifact_dir=self.root / "review-worker", workdir=self.root / "must-not-pass")
+        self.assertEqual(result.payload["verdict"], "pass")
+        self.assertEqual(len(calls), 1)
+        argv, kwargs = calls[0]
+        self.assertEqual(argv, (sys.executable, "-m", "local_first_orchestrator.review_worker"))
+        self.assertEqual(json.loads(kwargs["input"]), {"packet": "packet", "provider": "custom:lm-studio", "model": "qwen3.8-27b@iq3_s"})
+        self.assertEqual(kwargs["env"]["HERMES_HOME"], str(worker_home.resolve()))
+        self.assertNotIn("TERMINAL_CWD", kwargs["env"])
+        self.assertEqual(os.environ.get("HERMES_HOME"), old_home)
 
     def test_review_uses_host_structured_inference_with_local_qwen_and_no_cli_tool_loop(self) -> None:
         calls: list[dict[str, object]] = []

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -89,34 +90,56 @@ class LocalQwenAdapter:
         self.hermes_home = Path(hermes_home or Path.home() / ".hermes" / "profiles" / "worker-code-local").resolve()
         self.review_llm = review_llm
 
-    def _review_llm(self) -> Any:
-        if self.review_llm is not None:
-            return self.review_llm
-        # Import only for the review invocation: standalone ledger operations
-        # remain importable without Hermes core on PYTHONPATH.
-        from agent.plugin_llm import PluginLlm
-        self.review_llm = PluginLlm(plugin_id="local-first-orchestrator")
-        return self.review_llm
-
     def _invoke_review(self, packet: str, artifact_dir: Path) -> ModelResult:
-        response = self._review_llm().complete_structured(
-            instructions=("Perform an isolated local code review. Return only the review proposal; "
-                          "do not call tools or request additional context."),
-            input=[{"type": "text", "text": packet}],
-            json_schema=REVIEW_JSON_SCHEMA,
-            json_mode=True,
-            schema_name="local_first_review",
-            provider=self.provider,
-            model=self.model,
-            temperature=0,
-            purpose="local_first_review",
-        )
-        if getattr(response, "content_type", None) != "json":
+        if self.review_llm is not None:
+            # Injection is intentionally in-process so unit tests never need a
+            # configured Hermes profile. Production always uses the worker.
+            response = self.review_llm.complete_structured(
+                instructions=("Perform an isolated local code review. Return only the review proposal; "
+                              "do not call tools or request additional context."),
+                input=[{"type": "text", "text": packet}],
+                json_schema=REVIEW_JSON_SCHEMA,
+                json_mode=True,
+                schema_name="local_first_review",
+                provider=self.provider,
+                model=self.model,
+                temperature=0,
+                purpose="local_first_review",
+            )
+            content_type, parsed, argv = getattr(response, "content_type", None), getattr(response, "parsed", None), ()
+        else:
+            # A review is one isolated structured inference process, rooted at
+            # the narrow worker profile. No environment is mutated globally;
+            # no project workdir or agent/tool loop is passed to the child.
+            argv = (sys.executable, "-m", "local_first_orchestrator.review_worker")
+            completed = self.runner(
+                argv,
+                input=json.dumps({"packet": packet, "provider": self.provider, "model": self.model}),
+                text=True,
+                capture_output=True,
+                timeout=300,
+                check=False,
+                cwd=str(Path(__file__).resolve().parent.parent),
+                env={
+                    **{key: value for key, value in os.environ.items() if key not in {"TERMINAL_CWD", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK"}},
+                    "HERMES_HOME": str(self.hermes_home),
+                },
+            )
+            if completed.returncode:
+                raise RuntimeError(f"local structured review exited {completed.returncode}: {completed.stderr.strip()}")
+            try:
+                result = json.loads(completed.stdout)
+            except json.JSONDecodeError as exc:
+                raise ValueError("local review did not return structured JSON") from exc
+            if not isinstance(result, dict) or set(result) != {"content_type", "parsed"}:
+                raise ValueError("local review did not return structured JSON")
+            content_type, parsed = result["content_type"], result["parsed"]
+        if content_type != "json":
             raise ValueError("local review did not return structured JSON")
-        payload = _require_exact_review_payload(getattr(response, "parsed", None))
+        payload = _require_exact_review_payload(parsed)
         artifact = artifact_dir / "review-result.json"
         artifact.write_text(json.dumps({"provider": self.provider, "model": self.model, "payload": payload}, sort_keys=True), encoding="utf-8")
-        return ModelResult(payload, artifact, ())
+        return ModelResult(payload, artifact, tuple(argv))
 
     def invoke(self, purpose: str, packet: str, *, artifact_dir: Path, workdir: Path | None = None) -> ModelResult:
         if purpose not in {"implementation", "review"}:
