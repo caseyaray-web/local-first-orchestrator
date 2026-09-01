@@ -166,5 +166,9 @@ class LocalFirstController:
             self.ledger.project_ticket(ticket_id,self.board); return True
         except Exception as exc:
             current=CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
-            if not isinstance(exc, InjectedCrash) and current in {CanonicalState.IMPLEMENTING,CanonicalState.VERIFYING,CanonicalState.REPAIRING,CanonicalState.LOCAL_REVIEW}: self.ledger.transition(ticket_id,CanonicalState.BLOCKED,payload={"runtime_error":"execution failed; reconciliation required"})
+            if not isinstance(exc, InjectedCrash):
+                if current == CanonicalState.LOCAL_REVIEW:
+                    self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"runtime_error":"malformed local review; reconciliation required"})
+                elif current in {CanonicalState.IMPLEMENTING,CanonicalState.VERIFYING,CanonicalState.REPAIRING}:
+                    self.ledger.transition(ticket_id,CanonicalState.BLOCKED,payload={"runtime_error":"execution failed; reconciliation required"})
             raise

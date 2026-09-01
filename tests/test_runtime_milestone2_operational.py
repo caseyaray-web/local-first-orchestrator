@@ -49,4 +49,11 @@ class OperationalMilestone2(unittest.TestCase):
     def test_out_of_scope_finding_is_nonblocking(self):
         m=Model([self.good],[{'verdict':'repair','criterion_results':[{'criterion_id':'AC-1','status':'pass','evidence':'ok'}],'findings':[{'severity':'blocking','criterion_id':'OTHER','file':'evil.py','symbol':'x','evidence':'x','minimal_repair':'x','verification':'x','fingerprint_input':'x'}],'suggestions':[]}]); ctl,tid=self.make_controller(m); ctl.execute(tid,repository=self.r,allow_board_writes=True); self.assertEqual(self.l.get_ticket(tid)['state'],'done')
 
+    def test_malformed_local_review_routes_to_triage_via_legal_transition(self):
+        m=Model([self.good],[{'verdict':'pass','criterion_results':[],'findings':[],'suggestions':[]}])
+        ctl,tid=self.make_controller(m)
+        with self.assertRaisesRegex(ValueError,'every criterion'):
+            ctl.execute(tid,repository=self.r,allow_board_writes=True)
+        self.assertEqual(self.l.get_ticket(tid)['state'],'needs_triage')
+
 if __name__=='__main__': unittest.main()

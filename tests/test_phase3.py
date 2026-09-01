@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -111,20 +112,20 @@ class Phase3Tests(unittest.TestCase):
         payload["findings"][0]["fingerprint_input"] = "other bug"  # type: ignore[index]
         self.assertEqual(coordinator.apply(ticket_id, 2, normalize_review(payload, self.ticket)), "triage")
 
-    def test_fresh_review_packet_excludes_implementation_history_and_fake_runner_only(self) -> None:
+    def test_fresh_review_packet_excludes_implementation_history_and_uses_structured_input_only(self) -> None:
         packet = ReviewPacketBuilder().build(self.ticket, diff="diff", selected_files={"app.py": "def classify(): pass"}, validation_evidence="tests pass")
         self.assertNotIn("implementation reasoning", packet)
         self.assertNotIn("arbitrary repository history", packet)
-        calls: list[tuple[str, ...]] = []
         kwargs_seen: list[dict[str, object]] = []
-        def runner(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
-            calls.append(argv); kwargs_seen.append(kwargs)
-            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"verdict": "pass", "criterion_results": [{"criterion_id": "AC-1", "status": "pass", "evidence": "ok"}], "findings": [], "suggestions": []}), stderr="")
-        review = LocalReviewAdapter(LocalQwenAdapter(runner=runner)).review(self.ticket, packet, artifact_dir=self.root / "artifacts")
+        class StructuredLlm:
+            def complete_structured(self, **kwargs: object) -> object:
+                kwargs_seen.append(kwargs)
+                return SimpleNamespace(parsed={"verdict": "pass", "criterion_results": [{"criterion_id": "AC-1", "status": "pass", "evidence": "ok"}], "findings": [], "suggestions": []}, content_type="json")
+        review = LocalReviewAdapter(LocalQwenAdapter(review_llm=StructuredLlm())).review(self.ticket, packet, artifact_dir=self.root / "artifacts")
         self.assertEqual(review.verdict, "pass")
-        self.assertEqual(calls[0][calls[0].index("--query") + 1], packet)
-        self.assertNotIn("board", " ".join(calls[0]).lower())
-        self.assertNotIn("cwd", kwargs_seen[0])
+        self.assertEqual(kwargs_seen[0]["input"], [{"type": "text", "text": packet}])
+        self.assertNotIn("board", str(kwargs_seen[0]).lower())
+        self.assertNotIn("workdir", kwargs_seen[0])
 
 
 if __name__ == "__main__":

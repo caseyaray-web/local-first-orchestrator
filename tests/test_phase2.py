@@ -4,6 +4,7 @@ import hashlib
 import json
 import subprocess
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -180,17 +181,58 @@ class Phase2Tests(unittest.TestCase):
 
     def test_review_does_not_grant_implementation_tools(self) -> None:
         calls=[]
-        runner=lambda argv, **kwargs: (calls.append(argv) or subprocess.CompletedProcess(argv,0,stdout=json.dumps({"verdict":"pass"}),stderr=""))
-        LocalQwenAdapter(runner=runner).invoke("review", "packet", artifact_dir=self.root / "review", workdir=self.root)
-        self.assertNotIn("--toolsets",calls[0])
-        self.assertNotIn("--in",calls[0])
+        class StructuredLlm:
+            def complete_structured(self, **kwargs: object) -> object:
+                calls.append(kwargs)
+                return SimpleNamespace(parsed={"verdict":"pass","criterion_results":[],"findings":[],"suggestions":[]},content_type="json")
+        LocalQwenAdapter(review_llm=StructuredLlm()).invoke("review", "packet", artifact_dir=self.root / "review", workdir=self.root)
+        self.assertNotIn("workdir",calls[0])
+        self.assertNotIn("tools",calls[0])
+
+    def test_review_uses_host_structured_inference_with_local_qwen_and_no_cli_tool_loop(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class StructuredLlm:
+            def complete_structured(self, **kwargs: object) -> object:
+                calls.append(kwargs)
+                return SimpleNamespace(
+                    parsed={"verdict": "pass", "criterion_results": [], "findings": [], "suggestions": []},
+                    content_type="json",
+                )
+
+        def no_cli(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            self.fail("review must not invoke the Hermes CLI or a tool loop")
+
+        result = LocalQwenAdapter(runner=no_cli, review_llm=StructuredLlm()).invoke(
+            "review", "packet", artifact_dir=self.root / "review-structured"
+        )
+        self.assertEqual(result.payload["verdict"], "pass")
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call["provider"], "custom:lm-studio")
+        self.assertEqual(call["model"], "qwen3.8-27b@iq3_s")
+        self.assertEqual(call["input"], [{"type": "text", "text": "packet"}])
+        self.assertEqual(call["json_schema"]["additionalProperties"], False)
+        self.assertEqual(call["json_schema"]["required"], ["verdict", "criterion_results", "findings", "suggestions"])
+        self.assertNotIn("tools", call)
+
+    def test_review_rejects_non_json_structured_response_without_text_extraction(self) -> None:
+        class TextLlm:
+            def complete_structured(self, **kwargs: object) -> object:
+                return SimpleNamespace(parsed=None, content_type="text", text='{"verdict":"pass"}')
+
+        with self.assertRaisesRegex(ValueError, "structured JSON"):
+            LocalQwenAdapter(review_llm=TextLlm()).invoke("review", "packet", artifact_dir=self.root / "review-text")
 
     def test_implementation_allows_successful_hermes_text_while_review_remains_structured(self) -> None:
         runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="edited app.py", stderr="")
-        adapter=LocalQwenAdapter(runner=runner)
+        class TextLlm:
+            def complete_structured(self, **kwargs: object) -> object:
+                return SimpleNamespace(parsed=None,content_type="text",text="edited app.py")
+        adapter=LocalQwenAdapter(runner=runner,review_llm=TextLlm())
         result=adapter.invoke("implementation", "packet", artifact_dir=self.root / "model-text")
         self.assertEqual(result.payload, {})
-        with self.assertRaisesRegex(ValueError, "did not return JSON"):
+        with self.assertRaisesRegex(ValueError, "structured JSON"):
             adapter.invoke("review", "packet", artifact_dir=self.root / "review-text")
 
     def test_tranche_integration_head_uses_compare_and_swap(self) -> None:
