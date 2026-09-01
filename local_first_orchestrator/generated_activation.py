@@ -66,3 +66,32 @@ def resolve_generated_activation_context(ticket_id: str, runtime_config: Runtime
     except subprocess.CalledProcessError as exc: raise GeneratedActivationError('missing_base_commit') from exc
     if sha != row['repo_base_sha']: raise GeneratedActivationError('base_sha_mismatch')
     return GeneratedActivationContext(ticket_id,str(row['feature_id']),str(row['tranche_id']),str(row['plan_id']),row['external_task_id'],row['repository_identity'],repository,sha,row['repo_snapshot_hash'])
+
+
+@dataclass(frozen=True)
+class GeneratedActivationResult:
+    status: str
+    ticket_id: str
+    repository_path: Path | None = None
+    starting_sha: str | None = None
+    readiness_status: str | None = None
+
+
+def activate_generated_ticket(ticket_id: str, runtime_config: RuntimeConfig, ledger: Ledger) -> GeneratedActivationResult:
+    """Bind one validated generated ticket, then reuse shared readiness admission."""
+    try:
+        context = resolve_generated_activation_context(ticket_id, runtime_config, ledger)
+    except GeneratedActivationError:
+        raise
+    existing = ledger.connection.execute("SELECT repository_path,starting_sha FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
+    expected = (str(context.repository_path), context.starting_sha)
+    if existing is None:
+        ledger.bind_runtime(ticket_id, *expected)
+    elif (existing['repository_path'], existing['starting_sha']) != expected:
+        return GeneratedActivationResult('binding_conflict', ticket_id, context.repository_path, context.starting_sha)
+    readiness = ledger.admit_ticket_if_ready(ticket_id)
+    if ledger.get_ticket(ticket_id)['state'] == 'ready_local':
+        return GeneratedActivationResult('already_activated' if existing is not None else 'activated_ready', ticket_id, context.repository_path, context.starting_sha, readiness.status)
+    if readiness.status == 'waiting_on_dependencies':
+        return GeneratedActivationResult('activated_waiting', ticket_id, context.repository_path, context.starting_sha, readiness.status)
+    return GeneratedActivationResult('readiness_failed', ticket_id, context.repository_path, context.starting_sha, readiness.status)
