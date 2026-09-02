@@ -150,6 +150,40 @@ class LocalFirstController:
             if not (attempt_path / relative).is_file():
                 raise RuntimeError("allowed_file_missing_before_inference")
 
+    def effective_runtime_identity(self) -> dict[str, object]:
+        repository, worktree_root, artifact_root = self.config.validate_execution_roots()
+        return {"canonical_repository": str(repository), "worktree_root": str(worktree_root), "artifact_root": str(artifact_root), "implementation_timeout_seconds": self.config.implementation_timeout_seconds, "provider": str(getattr(self.local_model, "provider", type(self.local_model).__name__)), "model": str(getattr(self.local_model, "model", type(self.local_model).__name__))}
+
+    def reconcile_failed_attempt(self, ticket_id: str, *, operator_id: str, classification: str, forensic_artifact_paths: tuple[Path, ...] = ()) -> dict[str, object]:
+        """Retire failed history without cleanup or a subsequent model invocation."""
+        binding = self.ledger.runtime_binding(ticket_id)
+        repository, worktree_root, _ = self.config.validate_execution_roots()
+        if str(repository) != binding["repository_path"]:
+            raise ValueError("repository mismatch with imported binding")
+        base = GitWorktreeAdapter(repository, worktree_root).existing_execution_base(self.ledger.get_ticket(ticket_id)["tranche_id"] or None, str(binding["starting_sha"]))
+        paths = tuple(str(Path(path).expanduser().resolve()) for path in forensic_artifact_paths)
+        return self.ledger.reconcile_failed_attempt(ticket_id, operator_id=operator_id, classification=classification, retry_base_sha=base, runtime_identity=self.effective_runtime_identity(), forensic_artifact_paths=paths)
+
+    def confirm_retired_attempt_cleanup(self, ticket_id: str, *, operator_id: str) -> dict[str, object]:
+        """Verify separately-authorized physical cleanup; never performs it."""
+        reconciliation = self.ledger.failed_attempt_reconciliation(ticket_id)
+        if reconciliation is None: raise ValueError("ticket has no retired attempt")
+        retired = int(reconciliation["retired_attempt_number"])
+        attempt = self.ledger.connection.execute("SELECT worktree_path, branch FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, retired)).fetchone()
+        if attempt is None: raise RuntimeError("retired attempt history missing")
+        repository, worktree_root, _ = self.config.validate_execution_roots()
+        binding = self.ledger.runtime_binding(ticket_id)
+        if str(repository) != binding["repository_path"]: raise ValueError("repository mismatch with imported binding")
+        worktree_path = Path(attempt["worktree_path"])
+        artifact_paths = tuple(Path(value) for value in json.loads(reconciliation["forensic_artifact_paths_json"]))
+        remaining = [path for path in (worktree_path, *artifact_paths) if path.exists()]
+        adapter = GitWorktreeAdapter(repository, worktree_root)
+        if remaining or (attempt["branch"] and adapter.branch_exists(str(attempt["branch"]))):
+            raise RuntimeError("retired attempt cleanup is incomplete")
+        checked_values = [str(worktree_path), *(str(path) for path in artifact_paths)]
+        if attempt["branch"]: checked_values.append(f"git-ref:{str(attempt['branch'])}")
+        return self.ledger.confirm_retired_attempt_cleanup(ticket_id, retired_attempt_number=retired, operator_id=operator_id, checked_paths=tuple(checked_values))
+
     def execute(self, ticket_id: str, *, repository: Path, allow_board_writes: bool, owner: str="local-first-controller") -> bool:
         if not allow_board_writes: return False
         binding=self.ledger.runtime_binding(ticket_id); raw_repository=Path(repository).resolve(strict=True)
@@ -161,19 +195,34 @@ class LocalFirstController:
         if self.ledger.accepted_commit(ticket_id): self.ledger.project_ticket(ticket_id,self.board); return True
         if self.ledger.incomplete_model_invocations(ticket_id):
             raise RuntimeError("execution_reconciliation_required: incomplete model invocation")
+        reconciliation = self.ledger.failed_attempt_reconciliation(ticket_id)
+        if reconciliation is not None and bool(reconciliation["cleanup_required"]) and not self.ledger.cleanup_confirmed(ticket_id, int(reconciliation["retired_attempt_number"])):
+            raise RuntimeError("retired attempt cleanup confirmation required before retry execution")
         state=CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
         if state == CanonicalState.READY_LOCAL and not self.ledger.claim_specific(ticket_id,owner,self.config.lease_seconds): return False
         if state in {CanonicalState.NEEDS_TRIAGE,CanonicalState.BLOCKED,CanonicalState.DONE}: return False
         planning_base=str(binding["starting_sha"]); worktrees=GitWorktreeAdapter(repo,worktree_root)
         base=worktrees.resolve_execution_base(self.ledger.get_ticket(ticket_id)["tranche_id"] or None, planning_base)
         self.ledger.record_runtime_stage(ticket_id, "execution_base", base)
-        attempt_number=max([int(r["attempt_number"]) for r in self.ledger.connection.execute("SELECT attempt_number FROM attempts WHERE ticket_id=?",(ticket_id,))] or [1])
-        persisted = self.ledger.connection.execute("SELECT attempt_number FROM model_stage_artifacts WHERE ticket_id=? AND stage='implementation' ORDER BY attempt_number DESC LIMIT 1", (ticket_id,)).fetchone()
-        if persisted is not None:
-            attempt_number = int(persisted["attempt_number"])
+        reconciliation = self.ledger.failed_attempt_reconciliation(ticket_id)
+        if reconciliation is not None:
+            attempt_number = int(reconciliation["prospective_next_attempt_number"])
+            if self.ledger.connection.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone():
+                raise RuntimeError("reconciliation-authorized attempt already exists; reconciliation required")
+            attempt_limit = attempt_number
+        else:
+            latest = self.ledger.connection.execute("SELECT attempt_number, worktree_path FROM attempts WHERE ticket_id=? ORDER BY attempt_number DESC LIMIT 1", (ticket_id,)).fetchone()
+            # A crash or same-ticket repair may already own the highest historical
+            # attempt's isolated worktree. Resume it; only a retired/reconciled
+            # failure is allowed to consume a fresh historical number here.
+            if latest is not None and latest["worktree_path"]:
+                attempt_number = int(latest["attempt_number"])
+            else:
+                attempt_number = self.ledger.next_attempt_number(ticket_id)
+            attempt_limit = ticket.max_attempts
         repair_evidence=""
         try:
-            while attempt_number <= ticket.max_attempts:
+            while attempt_number <= attempt_limit:
                 existing_attempt=self.ledger.connection.execute("SELECT worktree_path FROM attempts WHERE ticket_id=? AND attempt_number=?",(ticket_id,attempt_number)).fetchone()
                 fresh_attempt = not bool(existing_attempt and existing_attempt["worktree_path"])
                 self.ledger.ensure_attempt(ticket_id,attempt_number); attempt=self._attempt(worktrees,ticket_id,attempt_number,base)

@@ -219,6 +219,23 @@ CREATE TABLE IF NOT EXISTS model_invocations (
     UNIQUE(ticket_id, attempt_number, stage)
 );
 CREATE INDEX IF NOT EXISTS idx_model_invocations_incomplete ON model_invocations(status, ticket_id);
+CREATE TABLE IF NOT EXISTS failed_attempt_reconciliations (
+    ticket_id TEXT NOT NULL REFERENCES tickets(id), retired_attempt_number INTEGER NOT NULL,
+    classification TEXT NOT NULL, previous_ticket_state TEXT NOT NULL, resulting_ticket_state TEXT NOT NULL,
+    operator_id TEXT NOT NULL, runtime_identity_json TEXT NOT NULL, retry_base_sha TEXT NOT NULL,
+    prospective_next_attempt_number INTEGER NOT NULL, cleanup_required INTEGER NOT NULL CHECK(cleanup_required IN (0,1)),
+    forensic_artifact_paths_json TEXT NOT NULL DEFAULT '[]', reconciled_at INTEGER NOT NULL,
+    PRIMARY KEY(ticket_id, retired_attempt_number),
+    UNIQUE(ticket_id, prospective_next_attempt_number)
+);
+CREATE INDEX IF NOT EXISTS idx_failed_attempt_reconciliations_ticket ON failed_attempt_reconciliations(ticket_id, reconciled_at);
+CREATE TABLE IF NOT EXISTS retired_attempt_cleanup_confirmations (
+    ticket_id TEXT NOT NULL REFERENCES tickets(id), retired_attempt_number INTEGER NOT NULL,
+    operator_id TEXT NOT NULL, checked_paths_json TEXT NOT NULL, confirmed_at INTEGER NOT NULL,
+    PRIMARY KEY(ticket_id, retired_attempt_number),
+    FOREIGN KEY(ticket_id, retired_attempt_number)
+        REFERENCES failed_attempt_reconciliations(ticket_id, retired_attempt_number)
+);
 CREATE TABLE IF NOT EXISTS evidence_comment_outbox (
     operation_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), event_id INTEGER NOT NULL,
     external_task_id TEXT NOT NULL, operation_kind TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
@@ -295,6 +312,9 @@ class Ledger:
         for name in ("repository_identity", "repo_snapshot_manifest_json"):
             if name not in run_columns:
                 self.connection.execute(f"ALTER TABLE planning_runs ADD COLUMN {name} TEXT")
+        reconciliation_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(failed_attempt_reconciliations)")}
+        if "forensic_artifact_paths_json" not in reconciliation_columns:
+            self.connection.execute("ALTER TABLE failed_attempt_reconciliations ADD COLUMN forensic_artifact_paths_json TEXT NOT NULL DEFAULT '[]'")
         # Phase 2 is additive: preserve Phase 1 ledgers already created.
         ticket_columns = {
             "criterion_ids_json": "TEXT NOT NULL DEFAULT '[]'",
@@ -521,6 +541,105 @@ class Ledger:
 
     def attempt_count(self, ticket_id: str) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM attempts WHERE ticket_id = ?", (ticket_id,)).fetchone()[0])
+
+    def next_attempt_number(self, ticket_id: str) -> int:
+        """Historical attempts, including retired failures, are never reused."""
+        return int(self.connection.execute("SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM attempts WHERE ticket_id=?", (ticket_id,)).fetchone()[0])
+
+    def failed_attempt_reconciliation(self, ticket_id: str, retired_attempt_number: int | None = None) -> dict[str, Any] | None:
+        query = "SELECT * FROM failed_attempt_reconciliations WHERE ticket_id=?"
+        values: tuple[Any, ...] = (ticket_id,)
+        if retired_attempt_number is not None:
+            query += " AND retired_attempt_number=?"; values += (retired_attempt_number,)
+        query += " ORDER BY retired_attempt_number DESC LIMIT 1"
+        row = self.connection.execute(query, values).fetchone()
+        return dict(row) if row else None
+
+    def reconciliation_status(self, ticket_id: str) -> dict[str, Any] | None:
+        row = self.failed_attempt_reconciliation(ticket_id)
+        if row is None: return None
+        confirmed = self.connection.execute(
+            "SELECT confirmed_at FROM retired_attempt_cleanup_confirmations WHERE ticket_id=? AND retired_attempt_number=?",
+            (ticket_id, row["retired_attempt_number"]),
+        ).fetchone()
+        return {"retired_attempt": int(row["retired_attempt_number"]), "next_attempt": int(row["prospective_next_attempt_number"]), "cleanup_required": bool(row["cleanup_required"]), "cleanup_confirmed": confirmed is not None, "classification": str(row["classification"]), "retry_base_sha": str(row["retry_base_sha"]), "forensic_artifact_paths": json.loads(row["forensic_artifact_paths_json"])}
+
+    def cleanup_prerequisites(self) -> list[dict[str, Any]]:
+        """Read-only operator view of reconciled attempts awaiting verified cleanup."""
+        rows = self.connection.execute(
+            "SELECT r.ticket_id, r.retired_attempt_number, r.prospective_next_attempt_number, "
+            "r.cleanup_required, r.forensic_artifact_paths_json, a.worktree_path, a.branch, "
+            "c.confirmed_at FROM failed_attempt_reconciliations r "
+            "JOIN attempts a ON a.ticket_id=r.ticket_id AND a.attempt_number=r.retired_attempt_number "
+            "LEFT JOIN retired_attempt_cleanup_confirmations c "
+            "ON c.ticket_id=r.ticket_id AND c.retired_attempt_number=r.retired_attempt_number "
+            "WHERE r.cleanup_required=1 ORDER BY r.reconciled_at, r.ticket_id"
+        )
+        return [{**dict(row), "forensic_artifact_paths": json.loads(row["forensic_artifact_paths_json"]), "cleanup_confirmed": row["confirmed_at"] is not None} for row in rows]
+
+    def cleanup_confirmed(self, ticket_id: str, retired_attempt_number: int) -> bool:
+        return self.connection.execute(
+            "SELECT 1 FROM retired_attempt_cleanup_confirmations WHERE ticket_id=? AND retired_attempt_number=?",
+            (ticket_id, retired_attempt_number),
+        ).fetchone() is not None
+
+    def reconcile_failed_attempt(self, ticket_id: str, *, operator_id: str, classification: str, retry_base_sha: str, runtime_identity: dict[str, Any], forensic_artifact_paths: tuple[str, ...] = ()) -> dict[str, Any]:
+        """Explicitly retire one failed attempt without cleanup or evidence deletion."""
+        allowed = {"runtime_infrastructure_failure", "model_timeout", "process_error", "validation_failure", "review_exhaustion"}
+        if classification not in allowed:
+            raise ValueError("unsupported_failed_attempt_classification")
+        if not isinstance(operator_id, str) or not operator_id.strip() or not isinstance(retry_base_sha, str) or not retry_base_sha:
+            raise ValueError("invalid_failed_attempt_reconciliation")
+        if not all(isinstance(path, str) and path for path in forensic_artifact_paths):
+            raise ValueError("invalid_forensic_artifact_paths")
+        encoded_identity = json.dumps(runtime_identity, sort_keys=True, separators=(",", ":"))
+        encoded_artifacts = json.dumps(sorted(set(forensic_artifact_paths)), separators=(",", ":"))
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not paused["paused"]: raise PermissionError("failed-attempt reconciliation requires Local First paused")
+            ticket = conn.execute("SELECT state FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None: raise KeyError(ticket_id)
+            attempt = conn.execute("SELECT * FROM attempts WHERE ticket_id=? ORDER BY attempt_number DESC LIMIT 1", (ticket_id,)).fetchone()
+            if attempt is None: raise ValueError("failed-attempt reconciliation requires historical attempt")
+            retired = int(attempt["attempt_number"])
+            existing = conn.execute("SELECT * FROM failed_attempt_reconciliations WHERE ticket_id=? AND retired_attempt_number=?", (ticket_id, retired)).fetchone()
+            if existing is not None:
+                if (existing["classification"], existing["retry_base_sha"], existing["runtime_identity_json"], existing["forensic_artifact_paths_json"]) != (classification, retry_base_sha, encoded_identity, encoded_artifacts):
+                    raise ValueError("failed-attempt reconciliation conflicts with durable evidence")
+                if ticket["state"] != CanonicalState.READY_LOCAL.value:
+                    raise ValueError("reconciled ticket state drift requires investigation")
+                return {**dict(existing), "status": "already_reconciled"}
+            if ticket["state"] != CanonicalState.BLOCKED.value: raise ValueError("failed-attempt reconciliation requires blocked ticket")
+            if conn.execute("SELECT 1 FROM accepted_evidence WHERE ticket_id=?", (ticket_id,)).fetchone(): raise ValueError("accepted ticket cannot retire an attempt")
+            if conn.execute("SELECT 1 FROM model_invocations WHERE ticket_id=? AND status='started'", (ticket_id,)).fetchone(): raise ValueError("incomplete model invocation requires explicit resolution")
+            if attempt["outcome"] not in {None, "failed"}: raise ValueError("attempt is not eligible for failed-attempt reconciliation")
+            next_attempt = self.next_attempt_number(ticket_id)
+            now = self._now()
+            conn.execute("UPDATE attempts SET outcome='failed_retired' WHERE ticket_id=? AND attempt_number=?", (ticket_id, retired))
+            conn.execute("INSERT INTO failed_attempt_reconciliations(ticket_id,retired_attempt_number,classification,previous_ticket_state,resulting_ticket_state,operator_id,runtime_identity_json,retry_base_sha,prospective_next_attempt_number,cleanup_required,forensic_artifact_paths_json,reconciled_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (ticket_id,retired,classification,CanonicalState.BLOCKED.value,CanonicalState.READY_LOCAL.value,operator_id,encoded_identity,retry_base_sha,next_attempt,1,encoded_artifacts,now))
+            conn.execute("UPDATE tickets SET state=?, lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE id=? AND state=?", (CanonicalState.READY_LOCAL.value,now,ticket_id,CanonicalState.BLOCKED.value))
+            reconciliation_event = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="failed_attempt_reconciled", actor_id=operator_id, payload={"retired_attempt":retired,"classification":classification,"next_attempt":next_attempt,"retry_base_sha":retry_base_sha,"cleanup_required":True,"forensic_artifact_paths":json.loads(encoded_artifacts),"runtime_identity":runtime_identity})
+            transition_event = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="state_transition", actor_id=operator_id, from_state=CanonicalState.BLOCKED.value, to_state=CanonicalState.READY_LOCAL.value, payload={"reason":"failed_attempt_reconciled","retired_attempt":retired,"next_attempt":next_attempt,"cleanup_required":True})
+            self._enqueue_projection_bundle_in_transaction(conn, ticket_id=ticket_id, event_id=transition_event, evidence=f"failed attempt {retired} retired; cleanup required before attempt {next_attempt}")
+            return {"ticket_id":ticket_id,"retired_attempt_number":retired,"prospective_next_attempt_number":next_attempt,"retry_base_sha":retry_base_sha,"cleanup_required":True,"status":"reconciled","event_id":reconciliation_event}
+
+    def confirm_retired_attempt_cleanup(self, ticket_id: str, *, retired_attempt_number: int, operator_id: str, checked_paths: tuple[str, ...]) -> dict[str, Any]:
+        """Persist a separate operator attestation after controller-side absence checks."""
+        if not operator_id.strip() or not all(isinstance(path, str) and path for path in checked_paths):
+            raise ValueError("invalid_cleanup_confirmation")
+        encoded_paths = json.dumps(sorted(set(checked_paths)), separators=(",", ":"))
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not paused["paused"]: raise PermissionError("cleanup confirmation requires Local First paused")
+            reconciliation = conn.execute("SELECT * FROM failed_attempt_reconciliations WHERE ticket_id=? AND retired_attempt_number=?", (ticket_id, retired_attempt_number)).fetchone()
+            if reconciliation is None: raise ValueError("attempt is not retired")
+            existing = conn.execute("SELECT * FROM retired_attempt_cleanup_confirmations WHERE ticket_id=? AND retired_attempt_number=?", (ticket_id, retired_attempt_number)).fetchone()
+            if existing is not None:
+                if existing["checked_paths_json"] != encoded_paths: raise ValueError("cleanup confirmation conflicts with durable evidence")
+                return {**dict(existing), "status":"already_confirmed"}
+            conn.execute("INSERT INTO retired_attempt_cleanup_confirmations(ticket_id,retired_attempt_number,operator_id,checked_paths_json,confirmed_at) VALUES (?,?,?,?,?)", (ticket_id,retired_attempt_number,operator_id,encoded_paths,self._now()))
+            event_id = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="retired_attempt_cleanup_confirmed", actor_id=operator_id, payload={"retired_attempt":retired_attempt_number,"checked_paths":json.loads(encoded_paths)})
+            return {"ticket_id":ticket_id,"retired_attempt_number":retired_attempt_number,"status":"confirmed","event_id":event_id}
 
     def bind_runtime(self, ticket_id: str, repository_path: str, starting_sha: str) -> None:
         with self._transaction() as conn:
@@ -1059,6 +1178,13 @@ class Ledger:
             "(SELECT COUNT(*) FROM board_projection_outbox WHERE acknowledged_at IS NULL) + "
             "(SELECT COUNT(*) FROM evidence_comment_outbox WHERE status IN ('pending', 'retryable', 'delivering'))"
         ).fetchone()[0]
+        reconciliations = [{**dict(row), "cleanup_confirmed": row["cleanup_confirmed_at"] is not None} for row in self.connection.execute(
+            "SELECT r.ticket_id, r.retired_attempt_number AS retired_attempt, r.prospective_next_attempt_number AS next_attempt, "
+            "r.cleanup_required, r.classification, r.retry_base_sha, c.confirmed_at AS cleanup_confirmed_at "
+            "FROM failed_attempt_reconciliations r LEFT JOIN retired_attempt_cleanup_confirmations c "
+            "ON c.ticket_id=r.ticket_id AND c.retired_attempt_number=r.retired_attempt_number "
+            "ORDER BY r.reconciled_at DESC, r.ticket_id LIMIT ?", (active_limit,)
+        )]
         return {
             "paused": bool(paused["paused"]) if paused else False,
             "ready_local": state_counts.get(CanonicalState.READY_LOCAL.value, 0),
@@ -1068,6 +1194,7 @@ class Ledger:
             "active": active,
             "active_truncated": len(active) == active_limit and sum(state_counts.get(state, 0) for state in active_states) > active_limit,
             "outbox_pending": int(outbox_pending),
+            "failed_attempt_reconciliations": reconciliations,
         }
 
     def plan_projection(self, ticket_id: str, *, evidence: str | None = None, state_payload: dict[str, Any] | None = None) -> dict[str, Any] | None:

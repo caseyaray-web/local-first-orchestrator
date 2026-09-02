@@ -78,6 +78,7 @@ class OperatorApiTests(unittest.TestCase):
         self.assertEqual(body["done"], 1)
         self.assertEqual(body["active"], [{"ticket_id": self.running_ticket, "state": "implementing", "feature_id": "F", "tranche_id": "T"}])
         self.assertFalse(body["active_truncated"])
+        self.assertEqual(body["failed_attempt_reconciliations"], [])
         self.assertEqual(body["configuration"], {
             "canonical_repository": str(self.repository.resolve()),
             "repository_allowlist": [str(self.repository.resolve())],

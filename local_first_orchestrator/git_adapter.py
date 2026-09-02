@@ -81,6 +81,19 @@ class GitWorktreeAdapter:
             return self._git("rev-parse", "--verify", f"{current.stdout.strip()}^{{commit}}").stdout.strip()
         raise GitAdapterError("unable to create tranche integration head")
 
+    def existing_execution_base(self, tranche_id: str | None, planning_base: str) -> str:
+        """Read an already-established integration anchor without creating or moving it."""
+        planning_base = self._git("rev-parse", "--verify", f"{planning_base}^{{commit}}").stdout.strip()
+        if tranche_id is None:
+            return planning_base
+        current = self._git("show-ref", "--verify", "--hash", self.integration_head_ref(tranche_id), check=False)
+        if current.returncode != 0:
+            raise GitAdapterError("integration_head_missing_reconciliation_required")
+        return self._git("rev-parse", "--verify", f"{current.stdout.strip()}^{{commit}}").stdout.strip()
+
+    def branch_exists(self, branch: str) -> bool:
+        return self._git("show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0
+
     def advance_integration_head(self, tranche_id: str | None, expected_base: str, accepted_commit: str) -> str:
         """CAS-advance a tranche anchor after an accepted isolated commit."""
         if tranche_id is None:
