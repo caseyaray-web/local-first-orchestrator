@@ -2,10 +2,11 @@
 
 This is deliberately separate from request data: the dashboard backend loads one
 local registration and never accepts a ledger or runtime configuration path over
-HTTP.
+HTTP.  Older registrations remain readable, but cannot construct execution.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import asdict, dataclass
@@ -13,11 +14,25 @@ from pathlib import Path
 
 
 _CONFIG_ENV = "LOCAL_FIRST_OPERATOR_CONFIG"
+_LEGACY_FIELDS = frozenset({"ledger_path", "canonical_repository", "repository_allowlist", "implementation", "review"})
+_RUNTIME_FIELDS = frozenset({"worktree_root", "artifact_root", "implementation_timeout_seconds"})
 
 
 def default_config_path() -> Path:
     value = os.environ.get(_CONFIG_ENV)
     return Path(value).expanduser() if value else Path.home() / ".hermes" / "local-first-orchestrator" / "operator-config.json"
+
+
+def stable_repository_identity(repository: Path) -> str:
+    """Stable, non-basename namespace for controller-owned external paths."""
+    canonical = str(Path(repository).expanduser().resolve(strict=True))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+
+
+def default_execution_roots(repository: Path) -> tuple[Path, Path]:
+    identity = stable_repository_identity(repository)
+    root = Path.home() / ".hermes" / "local-first-orchestrator"
+    return root / "worktrees" / identity, root / "artifacts" / identity
 
 
 @dataclass(frozen=True)
@@ -43,6 +58,9 @@ class OperatorConfig:
     repository_allowlist: tuple[Path, ...]
     implementation: ModelRegistration
     review: ModelRegistration
+    worktree_root: Path | None = None
+    artifact_root: Path | None = None
+    implementation_timeout_seconds: int | None = None
 
     def validated(self, *, require_ledger: bool) -> "OperatorConfig":
         ledger = self.ledger_path.expanduser().resolve(strict=require_ledger)
@@ -54,15 +72,39 @@ class OperatorConfig:
             raise ValueError("canonical repository must be an exact allowlisted root")
         if not (repository / ".git").exists() or any(not (path / ".git").exists() for path in allowlist):
             raise ValueError("canonical repository and allowlist entries must be Git checkouts")
-        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review)
+        runtime = (self.worktree_root, self.artifact_root, self.implementation_timeout_seconds)
+        if any(value is not None for value in runtime) and any(value is None for value in runtime):
+            raise ValueError("execution_runtime_not_configured")
+        if self.worktree_root is not None and (not isinstance(self.worktree_root, Path) or not isinstance(self.artifact_root, Path) or not isinstance(self.implementation_timeout_seconds, int)):
+            raise ValueError("execution_runtime_not_configured")
+        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review, self.worktree_root, self.artifact_root, self.implementation_timeout_seconds)
+
+    @property
+    def execution_configured(self) -> bool:
+        return self.worktree_root is not None and self.artifact_root is not None and self.implementation_timeout_seconds is not None
+
+    def runtime_config(self):
+        """Build the sole execution configuration or fail closed for legacy data."""
+        if not self.execution_configured:
+            raise ValueError("execution_runtime_not_configured")
+        from .controller import RuntimeConfig
+        assert self.worktree_root is not None and self.artifact_root is not None and self.implementation_timeout_seconds is not None
+        config = RuntimeConfig(self.canonical_repository, self.worktree_root, self.artifact_root, self.repository_allowlist, implementation_timeout_seconds=self.implementation_timeout_seconds)
+        config.validate_execution_roots()
+        return config
 
     def as_json(self) -> dict[str, object]:
+        if not self.execution_configured:
+            raise ValueError("execution_runtime_not_configured")
         return {
             "ledger_path": str(self.ledger_path),
             "canonical_repository": str(self.canonical_repository),
             "repository_allowlist": [str(path) for path in self.repository_allowlist],
             "implementation": asdict(self.implementation),
             "review": asdict(self.review),
+            "worktree_root": str(self.worktree_root),
+            "artifact_root": str(self.artifact_root),
+            "implementation_timeout_seconds": self.implementation_timeout_seconds,
         }
 
 
@@ -74,18 +116,27 @@ def load_operator_config(path: Path | None = None) -> OperatorConfig:
         raise ValueError("operator dashboard is not registered") from exc
     except json.JSONDecodeError as exc:
         raise ValueError("operator registration is not valid JSON") from exc
-    if not isinstance(raw, dict) or set(raw) != {"ledger_path", "canonical_repository", "repository_allowlist", "implementation", "review"}:
+    if not isinstance(raw, dict) or set(raw) not in {_LEGACY_FIELDS, _LEGACY_FIELDS | _RUNTIME_FIELDS}:
         raise ValueError("operator registration has unexpected fields")
     paths = raw["repository_allowlist"]
     if not isinstance(paths, list) or not paths or not all(isinstance(item, str) for item in paths):
         raise ValueError("repository_allowlist must be a non-empty list of paths")
     if not isinstance(raw["ledger_path"], str) or not isinstance(raw["canonical_repository"], str):
         raise ValueError("ledger_path and canonical_repository must be paths")
-    return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review")).validated(require_ledger=True)
+    if _RUNTIME_FIELDS <= set(raw):
+        if not isinstance(raw["worktree_root"], str) or not isinstance(raw["artifact_root"], str) or not isinstance(raw["implementation_timeout_seconds"], int):
+            raise ValueError("execution_runtime_not_configured")
+        runtime = (Path(raw["worktree_root"]), Path(raw["artifact_root"]), raw["implementation_timeout_seconds"])
+    else:
+        runtime = (None, None, None)
+    return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review"), *runtime).validated(require_ledger=True)
 
 
 def save_operator_config(config: OperatorConfig, path: Path | None = None) -> Path:
     checked = config.validated(require_ledger=True)
+    # Registration is an execution-authority write, so it uses the same resolved
+    # containment and timeout gate as the production runtime constructor.
+    checked.runtime_config()
     config_path = path or default_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = config_path.with_suffix(config_path.suffix + ".tmp")

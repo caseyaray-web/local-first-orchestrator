@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from local_first_orchestrator.ledger import Ledger
-from local_first_orchestrator.operator_config import ModelRegistration, OperatorConfig, save_operator_config
+from local_first_orchestrator.operator_config import ModelRegistration, OperatorConfig, default_execution_roots, save_operator_config
 from local_first_orchestrator.states import CanonicalState
 
 
@@ -35,6 +35,7 @@ class OperatorApiTests(unittest.TestCase):
                 (self.repository,),
                 ModelRegistration("impl-profile", "impl-provider", "impl-model"),
                 ModelRegistration("review-profile", "review-provider", "review-model"),
+                root / "worktrees", root / "artifacts", 1800,
             ),
             config_path,
         )
@@ -82,6 +83,9 @@ class OperatorApiTests(unittest.TestCase):
             "repository_allowlist": [str(self.repository.resolve())],
             "implementation": {"profile": "impl-profile", "provider": "impl-provider", "model": "impl-model"},
             "review": {"profile": "review-profile", "provider": "review-provider", "model": "review-model"},
+            "worktree_root": str((Path(self.tempdir.name) / "worktrees").resolve()),
+            "artifact_root": str((Path(self.tempdir.name) / "artifacts").resolve()),
+            "implementation_timeout_seconds": 1800,
         })
 
         paused = self.client.post("/api/plugins/local-first-orchestrator/pause", json={"reason": "maintenance"})

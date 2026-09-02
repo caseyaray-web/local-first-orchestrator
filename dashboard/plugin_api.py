@@ -52,6 +52,9 @@ def _status() -> dict[str, Any]:
             "repository_allowlist": [str(path) for path in config.repository_allowlist],
             "implementation": config.implementation.__dict__,
             "review": config.review.__dict__,
+            "worktree_root": str(config.worktree_root) if config.worktree_root is not None else None,
+            "artifact_root": str(config.artifact_root) if config.artifact_root is not None else None,
+            "implementation_timeout_seconds": config.implementation_timeout_seconds,
         }
         return status
     finally:

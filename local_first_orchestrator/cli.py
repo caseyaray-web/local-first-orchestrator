@@ -10,7 +10,7 @@ from .generated_projection import GeneratedProjectionWorker
 from .hermes_board import HermesBoardAdapter
 from .ledger import Ledger
 from .local_qwen import LOCAL_QWEN_MODEL, LOCAL_QWEN_PROVIDER
-from .operator_config import ModelRegistration, OperatorConfig, save_operator_config
+from .operator_config import ModelRegistration, OperatorConfig, default_execution_roots, save_operator_config
 
 
 def _ledger(path: str) -> Ledger:
@@ -21,7 +21,10 @@ def _controller(ledger: Ledger, args: argparse.Namespace, *, allow_board_writes:
     root=Path(args.repository).resolve()
     allowlist=tuple(Path(item).resolve() for item in args.allow_repository)
     if not allowlist: allowlist=(root,)
-    return LocalFirstController(ledger,HermesBoardAdapter(allow_writes=allow_board_writes),RuntimeConfig(root,root/".hermes/local-first-worktrees",root/".hermes/local-first-artifacts",repository_allowlist=allowlist))
+    worktree_root, artifact_root = default_execution_roots(root)
+    if args.worktree_root: worktree_root = Path(args.worktree_root).expanduser()
+    if args.artifact_root: artifact_root = Path(args.artifact_root).expanduser()
+    return LocalFirstController(ledger,HermesBoardAdapter(allow_writes=allow_board_writes),RuntimeConfig(root,worktree_root,artifact_root,repository_allowlist=allowlist,implementation_timeout_seconds=args.implementation_timeout_seconds))
 
 
 def register_cli(parser: argparse.ArgumentParser) -> None:
@@ -34,6 +37,9 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--database",required=True,help="separate ledger database; never Hermes kanban.db")
     parser.add_argument("--repository",default=".",help="canonical repository root (required for import/run-once)")
     parser.add_argument("--allow-repository",action="append",default=[],help="exact canonical repository root allowed for imports/execution; repeatable")
+    parser.add_argument("--worktree-root", help="external worktree root; defaults to stable ~/.hermes namespace")
+    parser.add_argument("--artifact-root", help="external artifact root; defaults to stable ~/.hermes namespace")
+    parser.add_argument("--implementation-timeout-seconds", type=int, default=300, help="implementation timeout (1..21600 seconds)")
     commands=parser.add_subparsers(dest="command",required=True)
     commands.add_parser("migrate")
     status=commands.add_parser("status"); status.add_argument("--active",action="store_true")
@@ -72,18 +78,25 @@ def run_command(args: argparse.Namespace) -> int:
         elif args.command=="register-dashboard":
             root=Path(args.repository).resolve(strict=True)
             allowlist=tuple(Path(item).resolve(strict=True) for item in args.allow_repository) or (root,)
+            worktree_root, artifact_root = default_execution_roots(root)
+            if args.worktree_root: worktree_root = Path(args.worktree_root).expanduser()
+            if args.artifact_root: artifact_root = Path(args.artifact_root).expanduser()
             config=OperatorConfig(
                 ledger_path=Path(args.database),
                 canonical_repository=root,
                 repository_allowlist=allowlist,
                 implementation=ModelRegistration(args.implementation_profile, args.implementation_provider, args.implementation_model),
                 review=ModelRegistration(args.review_profile, args.review_provider, args.review_model),
+                worktree_root=worktree_root,
+                artifact_root=artifact_root,
+                implementation_timeout_seconds=args.implementation_timeout_seconds,
             )
             path=save_operator_config(config, Path(args.config_path) if args.config_path else None)
             print(json.dumps({"registered": str(path)}, sort_keys=True))
         elif args.command=="activate-generated":
             root=Path(args.repository).resolve(); allowlist=tuple(Path(item).resolve() for item in args.allow_repository) or (root,)
-            config=RuntimeConfig(root,root/".hermes/local-first-worktrees",root/".hermes/local-first-artifacts",repository_allowlist=allowlist)
+            worktree_root, artifact_root = default_execution_roots(root)
+            config=RuntimeConfig(root,worktree_root,artifact_root,repository_allowlist=allowlist,implementation_timeout_seconds=args.implementation_timeout_seconds)
             result=activate_generated_ticket(args.ticket_id,config,ledger)
             print(json.dumps({**result.__dict__,"repository_path":str(result.repository_path) if result.repository_path else None},sort_keys=True))
         elif args.command=="project-generated":

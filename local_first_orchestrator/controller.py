@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -157,6 +159,8 @@ class LocalFirstController:
         ticket=ticket_from_ledger(self.ledger.get_ticket(ticket_id))
         if ticket.risk != "low": raise PermissionError("only low-risk tickets may execute locally")
         if self.ledger.accepted_commit(ticket_id): self.ledger.project_ticket(ticket_id,self.board); return True
+        if self.ledger.incomplete_model_invocations(ticket_id):
+            raise RuntimeError("execution_reconciliation_required: incomplete model invocation")
         state=CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
         if state == CanonicalState.READY_LOCAL and not self.ledger.claim_specific(ticket_id,owner,self.config.lease_seconds): return False
         if state in {CanonicalState.NEEDS_TRIAGE,CanonicalState.BLOCKED,CanonicalState.DONE}: return False
@@ -182,8 +186,24 @@ class LocalFirstController:
                     artifacts=ContextPacketBuilder().write_artifacts(packet,artifact_root=artifacts_root); request_hash=hashlib.sha256(packet.text.encode()).hexdigest()
                     if hasattr(self.local_model, "implementation_timeout_seconds"):
                         self.local_model.implementation_timeout_seconds = self.config.implementation_timeout_seconds
-                    result=self.local_model.invoke("implementation",packet.text,artifact_dir=artifacts_root,workdir=attempt.path)
+                    invocation_id = uuid.uuid4().hex
+                    provider = str(getattr(self.local_model, "provider", type(self.local_model).__name__))
+                    model = str(getattr(self.local_model, "model", type(self.local_model).__name__))
+                    self.ledger.start_model_invocation(invocation_id=invocation_id,ticket_id=ticket_id,attempt_number=attempt_number,stage="implementation",provider=provider,model=model,packet_hash=request_hash,worktree_path=str(attempt.path),timeout_seconds=self.config.implementation_timeout_seconds)
+                    # This is the persistence boundary: the launch record is committed
+                    # before the subprocess-capable adapter is entered.
+                    self._crash("implementation_invocation_started")
+                    started = time.monotonic()
+                    try:
+                        result=self.local_model.invoke("implementation",packet.text,artifact_dir=artifacts_root,workdir=attempt.path)
+                    except subprocess.TimeoutExpired as exc:
+                        self.ledger.finish_model_invocation(invocation_id,status="timeout",duration_seconds=time.monotonic()-started,error={"type":"TimeoutExpired","timeout_seconds":self.config.implementation_timeout_seconds,"process":str(exc)[:1000]})
+                        raise
+                    except Exception as exc:
+                        self.ledger.finish_model_invocation(invocation_id,status="process_error",duration_seconds=time.monotonic()-started,error={"type":type(exc).__name__,"message":str(exc)[:1000]})
+                        raise
                     response_path=getattr(result,"artifact_path",artifacts_root/"implementation-result.json")
+                    self.ledger.finish_model_invocation(invocation_id,status="completed",duration_seconds=time.monotonic()-started,model_artifact=str(response_path))
                     self.ledger.record_model_stage(ticket_id,attempt_number,"implementation",purpose="implementation",adapter=type(self.local_model).__name__,request_hash=request_hash,response_artifact=str(response_path),worktree_path=str(attempt.path),base_sha=base,diff_hash=worktrees.diff_hash(attempt.path))
                     self.ledger.record_runtime_stage(ticket_id,f"implementation-{attempt_number}",str(response_path)); self.ledger.record_runtime_stage(ticket_id,"implementation_completed",str(response_path)); self._crash("implementation_completed")
                 else:

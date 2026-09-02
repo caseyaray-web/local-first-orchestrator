@@ -210,6 +210,15 @@ CREATE TABLE IF NOT EXISTS model_stage_artifacts (
     base_sha TEXT NOT NULL, diff_hash TEXT NOT NULL, completed_at INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'completed', UNIQUE(ticket_id, attempt_number, stage)
 );
+CREATE TABLE IF NOT EXISTS model_invocations (
+    invocation_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    attempt_number INTEGER NOT NULL, stage TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+    packet_hash TEXT NOT NULL, worktree_path TEXT NOT NULL, timeout_seconds INTEGER NOT NULL,
+    started_at INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('started','completed','timeout','process_error')),
+    completed_at INTEGER, duration_seconds REAL, error_json TEXT, model_artifact TEXT,
+    UNIQUE(ticket_id, attempt_number, stage)
+);
+CREATE INDEX IF NOT EXISTS idx_model_invocations_incomplete ON model_invocations(status, ticket_id);
 CREATE TABLE IF NOT EXISTS evidence_comment_outbox (
     operation_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), event_id INTEGER NOT NULL,
     external_task_id TEXT NOT NULL, operation_kind TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
@@ -577,6 +586,53 @@ class Ledger:
             except sqlite3.IntegrityError:
                 return False
             return True
+
+    def start_model_invocation(self, *, invocation_id: str, ticket_id: str, attempt_number: int, stage: str, provider: str, model: str, packet_hash: str, worktree_path: str, timeout_seconds: int) -> dict[str, Any]:
+        """Durably record launch intent before a subprocess can be started."""
+        if not all(isinstance(value, str) and value for value in (invocation_id, ticket_id, stage, provider, model, packet_hash, worktree_path)) or not isinstance(timeout_seconds, int) or timeout_seconds < 1:
+            raise ValueError("invalid_model_invocation")
+        with self._transaction() as conn:
+            existing = conn.execute("SELECT * FROM model_invocations WHERE ticket_id=? AND attempt_number=? AND stage=?", (ticket_id, attempt_number, stage)).fetchone()
+            if existing is not None:
+                if existing["invocation_id"] != invocation_id or existing["status"] != "started":
+                    raise RuntimeError("model_invocation_reconciliation_required")
+                return dict(existing)
+            conn.execute("INSERT INTO model_invocations(invocation_id,ticket_id,attempt_number,stage,provider,model,packet_hash,worktree_path,timeout_seconds,started_at,status) VALUES (?,?,?,?,?,?,?,?,?,?, 'started')", (invocation_id,ticket_id,attempt_number,stage,provider,model,packet_hash,worktree_path,timeout_seconds,self._now()))
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="model_invocation_started", actor_id="controller", payload={"invocation_id":invocation_id,"attempt_number":attempt_number,"stage":stage})
+        return self.model_invocation(invocation_id)
+
+    def finish_model_invocation(self, invocation_id: str, *, status: str, duration_seconds: float, error: dict[str, Any] | None = None, model_artifact: str | None = None) -> dict[str, Any]:
+        if status not in {"completed", "timeout", "process_error"}:
+            raise ValueError("invalid_model_invocation_status")
+        if duration_seconds < 0:
+            raise ValueError("invalid_model_invocation_duration")
+        encoded = json.dumps(error, sort_keys=True) if error is not None else None
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM model_invocations WHERE invocation_id=?", (invocation_id,)).fetchone()
+            if row is None: raise KeyError(invocation_id)
+            if row["status"] != "started":
+                if (row["status"], row["model_artifact"], row["error_json"]) != (status, model_artifact, encoded):
+                    raise RuntimeError("conflicting_model_invocation_result")
+                return dict(row)
+            conn.execute("UPDATE model_invocations SET status=?, completed_at=?, duration_seconds=?, error_json=?, model_artifact=? WHERE invocation_id=? AND status='started'", (status,self._now(),duration_seconds,encoded,model_artifact,invocation_id))
+            self._append_event(conn, entity_type="ticket", entity_id=str(row["ticket_id"]), event_type="model_invocation_finished", actor_id="controller", payload={"invocation_id":invocation_id,"attempt_number":row["attempt_number"],"stage":row["stage"],"status":status})
+        return self.model_invocation(invocation_id)
+
+    def model_invocation(self, invocation_id: str) -> dict[str, Any]:
+        row = self.connection.execute("SELECT * FROM model_invocations WHERE invocation_id=?", (invocation_id,)).fetchone()
+        if row is None: raise KeyError(invocation_id)
+        return dict(row)
+
+    def incomplete_model_invocations(self, ticket_id: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM model_invocations WHERE status='started'"
+        values: tuple[Any, ...] = ()
+        if ticket_id is not None:
+            query += " AND ticket_id=?"; values = (ticket_id,)
+        return [dict(row) for row in self.connection.execute(query + " ORDER BY started_at, invocation_id", values)]
+
+    def invocation_for_stage(self, ticket_id: str, attempt_number: int, stage: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM model_invocations WHERE ticket_id=? AND attempt_number=? AND stage=?", (ticket_id, attempt_number, stage)).fetchone()
+        return dict(row) if row else None
 
     def stage_rows(self, ticket_id: str) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? ORDER BY attempt_number, completed_at", (ticket_id,))]
