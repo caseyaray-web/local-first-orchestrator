@@ -909,21 +909,30 @@ class Ledger:
         states = self.connection.execute("SELECT state, COUNT(*) AS count FROM tickets GROUP BY state ORDER BY state").fetchall()
         return {"paused": bool(paused["paused"]) if paused else False, "tickets": {row["state"]: row["count"] for row in states}}
 
-    def operator_status(self) -> dict[str, int | bool]:
-        """Return the dashboard's deliberately small, non-identifying read model."""
+    def operator_status(self, *, active_limit: int = 25) -> dict[str, Any]:
+        """Return a bounded, non-evidence dashboard read model.
+
+        IDs are limited to active tickets so an operator can identify the current
+        stage and feature/tranche without exposing contracts, artifacts, or an
+        unbounded history.
+        """
+        if not 1 <= active_limit <= 100:
+            raise ValueError("active_limit must be between 1 and 100")
         paused = self.connection.execute("SELECT paused FROM controller_state WHERE id = 1").fetchone()
-        ready_local = self.connection.execute(
-            "SELECT COUNT(*) FROM tickets WHERE state = ?", (CanonicalState.READY_LOCAL.value,)
-        ).fetchone()[0]
-        running = self.connection.execute(
-            "SELECT COUNT(*) FROM tickets WHERE state IN (?, ?, ?, ?)",
-            (
-                CanonicalState.IMPLEMENTING.value,
-                CanonicalState.VERIFYING.value,
-                CanonicalState.LOCAL_REVIEW.value,
-                CanonicalState.REPAIRING.value,
-            ),
-        ).fetchone()[0]
+        state_counts = {row["state"]: int(row["count"]) for row in self.connection.execute(
+            "SELECT state, COUNT(*) AS count FROM tickets GROUP BY state"
+        )}
+        active_states = (
+            CanonicalState.IMPLEMENTING.value,
+            CanonicalState.VERIFYING.value,
+            CanonicalState.LOCAL_REVIEW.value,
+            CanonicalState.REPAIRING.value,
+        )
+        active = [dict(row) for row in self.connection.execute(
+            "SELECT id AS ticket_id, state, feature_id, tranche_id FROM tickets "
+            "WHERE state IN (?, ?, ?, ?) ORDER BY updated_at, id LIMIT ?",
+            (*active_states, active_limit),
+        )]
         outbox_pending = self.connection.execute(
             "SELECT "
             "(SELECT COUNT(*) FROM board_projection_outbox WHERE acknowledged_at IS NULL) + "
@@ -931,8 +940,12 @@ class Ledger:
         ).fetchone()[0]
         return {
             "paused": bool(paused["paused"]) if paused else False,
-            "ready_local": int(ready_local),
-            "running": int(running),
+            "ready_local": state_counts.get(CanonicalState.READY_LOCAL.value, 0),
+            "running": sum(state_counts.get(state, 0) for state in active_states),
+            "needs_triage": state_counts.get(CanonicalState.NEEDS_TRIAGE.value, 0),
+            "done": state_counts.get(CanonicalState.DONE.value, 0),
+            "active": active,
+            "active_truncated": len(active) == active_limit and sum(state_counts.get(state, 0) for state in active_states) > active_limit,
             "outbox_pending": int(outbox_pending),
         }
 

@@ -1,25 +1,23 @@
-"""Minimal authenticated operator API for the separate local-first ledger.
+"""Authenticated operator API for one registered local-first ledger.
 
-The Hermes dashboard mounts this router at
-``/api/plugins/local-first-orchestrator``.  It never imports Hermes board
-state, registers model tools, or invokes a model.
+The dashboard mounts this router at ``/api/plugins/local-first-orchestrator``.
+No HTTP parameter can choose a database, repository, provider, or model.
 """
-
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-# Dashboard backend modules are loaded directly from this directory.  Make the
-# trusted, installed plugin root importable without depending on dashboard CWD.
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
 from local_first_orchestrator.ledger import Ledger
+from local_first_orchestrator.operator_config import OperatorConfig, load_operator_config
 
 router = APIRouter()
 
@@ -28,47 +26,59 @@ class OperatorAction(BaseModel):
     reason: str = Field(default="operator action", max_length=240)
 
 
-def _ledger(database: str) -> Ledger:
-    path = Path(database).expanduser()
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="ledger database does not exist")
+def _config() -> OperatorConfig:
     try:
-        ledger = Ledger(path)
-        ledger.migrate()
-        return ledger
+        return load_operator_config()
     except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=f"invalid ledger database: {exc}") from exc
+        raise HTTPException(status_code=503, detail=f"operator dashboard unavailable: {exc}") from exc
 
 
-def _status(database: str) -> dict[str, int | bool]:
-    ledger = _ledger(database)
+def _ledger() -> tuple[Ledger, OperatorConfig]:
+    config = _config()
     try:
-        return ledger.operator_status()
+        ledger = Ledger(config.ledger_path)
+        ledger.migrate()
+        return ledger, config
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=f"registered ledger unavailable: {exc}") from exc
+
+
+def _status() -> dict[str, Any]:
+    ledger, config = _ledger()
+    try:
+        status = ledger.operator_status(active_limit=25)
+        status["configuration"] = {
+            "canonical_repository": str(config.canonical_repository),
+            "repository_allowlist": [str(path) for path in config.repository_allowlist],
+            "implementation": config.implementation.__dict__,
+            "review": config.review.__dict__,
+        }
+        return status
     finally:
         ledger.close()
 
 
 @router.get("/status")
-def status(database: str = Query(..., min_length=1)) -> dict[str, int | bool]:
-    """Read bounded operator state only; ticket IDs and evidence stay private."""
-    return _status(database)
+def status() -> dict[str, Any]:
+    """Read bounded operator status from the single registered ledger."""
+    return _status()
 
 
 @router.post("/pause")
-def pause(action: OperatorAction, database: str = Query(..., min_length=1)) -> dict[str, int | bool]:
-    ledger = _ledger(database)
+def pause(action: OperatorAction) -> dict[str, Any]:
+    ledger, _ = _ledger()
     try:
         ledger.pause("dashboard-operator", reason=action.reason)
-        return ledger.operator_status()
     finally:
         ledger.close()
+    return _status()
 
 
 @router.post("/resume")
-def resume(action: OperatorAction, database: str = Query(..., min_length=1)) -> dict[str, int | bool]:
-    ledger = _ledger(database)
+def resume(action: OperatorAction) -> dict[str, Any]:
+    ledger, _ = _ledger()
     try:
         ledger.resume("dashboard-operator", reason=action.reason)
-        return ledger.operator_status()
     finally:
         ledger.close()
+    return _status()

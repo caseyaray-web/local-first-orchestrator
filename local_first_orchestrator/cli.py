@@ -9,6 +9,8 @@ from .generated_activation import GeneratedActivationError, activate_generated_t
 from .generated_projection import GeneratedProjectionWorker
 from .hermes_board import HermesBoardAdapter
 from .ledger import Ledger
+from .local_qwen import LOCAL_QWEN_MODEL, LOCAL_QWEN_PROVIDER
+from .operator_config import ModelRegistration, OperatorConfig, save_operator_config
 
 
 def _ledger(path: str) -> Ledger:
@@ -40,6 +42,14 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     inspect=commands.add_parser("inspect"); inspect.add_argument("--task-id",required=True)
     generated=commands.add_parser("project-generated"); generated.add_argument("--allow-board-writes",action="store_true"); generated.add_argument("--hermes-executable"); generated.add_argument("--board")
     activate=commands.add_parser("activate-generated"); activate.add_argument("ticket_id")
+    register=commands.add_parser("register-dashboard", help="persist the dashboard's one safe ledger/runtime registration")
+    register.add_argument("--config-path", help="operator registration path (default: ~/.hermes/local-first-orchestrator/operator-config.json)")
+    register.add_argument("--implementation-profile", default="worker-code-local")
+    register.add_argument("--implementation-provider", default=LOCAL_QWEN_PROVIDER)
+    register.add_argument("--implementation-model", default=LOCAL_QWEN_MODEL)
+    register.add_argument("--review-profile", default="worker-code-local")
+    register.add_argument("--review-provider", default=LOCAL_QWEN_PROVIDER)
+    register.add_argument("--review-model", default=LOCAL_QWEN_MODEL)
 
 
 def run_command(args: argparse.Namespace) -> int:
@@ -59,6 +69,18 @@ def run_command(args: argparse.Namespace) -> int:
             elif not args.allow_board_writes: raise PermissionError("--execute requires --allow-board-writes; no write-enabled execution without both")
             else: print(json.dumps({"executed":ctl.execute(args.task_id,repository=Path(args.repository),allow_board_writes=True)}))
         elif args.command=="inspect": print(json.dumps(ledger.get_ticket(args.task_id),sort_keys=True))
+        elif args.command=="register-dashboard":
+            root=Path(args.repository).resolve(strict=True)
+            allowlist=tuple(Path(item).resolve(strict=True) for item in args.allow_repository) or (root,)
+            config=OperatorConfig(
+                ledger_path=Path(args.database),
+                canonical_repository=root,
+                repository_allowlist=allowlist,
+                implementation=ModelRegistration(args.implementation_profile, args.implementation_provider, args.implementation_model),
+                review=ModelRegistration(args.review_profile, args.review_provider, args.review_model),
+            )
+            path=save_operator_config(config, Path(args.config_path) if args.config_path else None)
+            print(json.dumps({"registered": str(path)}, sort_keys=True))
         elif args.command=="activate-generated":
             root=Path(args.repository).resolve(); allowlist=tuple(Path(item).resolve() for item in args.allow_repository) or (root,)
             config=RuntimeConfig(root,root/".hermes/local-first-worktrees",root/".hermes/local-first-artifacts",repository_allowlist=allowlist)
