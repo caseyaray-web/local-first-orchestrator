@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .source_languages import is_supported_source, is_test_path, normalized_repository_path
 from .ticket import MicroTicket
 
 
@@ -16,10 +17,15 @@ def validate_ticket(ticket: MicroTicket) -> MicroTicket:
         raise ReadinessError("objective is missing, vague, or unsafe")
     if not ticket.criterion_ids or not ticket.primary_symbol or "::" not in ticket.primary_symbol:
         raise ReadinessError("criterion IDs and a bounded primary symbol are required")
-    if not ticket.allowed_files or len(ticket.allowed_files) > ticket.patch_budget.max_files:
-        raise ReadinessError("allowed files exceed bounded patch budget")
-    if any(not path or path.startswith("/") or path.endswith("/") or ".." in path for path in ticket.allowed_files):
-        raise ReadinessError("allowed files must be explicit repository-relative files")
+    paths = (*ticket.allowed_files, *ticket.new_test_files)
+    if not paths or len(set(paths)) != len(paths) or len(paths) > ticket.patch_budget.max_files:
+        raise ReadinessError("declared files exceed bounded patch budget")
+    if any(normalized_repository_path(path) is None for path in paths):
+        raise ReadinessError("declared files must be explicit normalized repository-relative files")
+    if set(ticket.allowed_files) & set(ticket.new_test_files):
+        raise ReadinessError("existing and new test file declarations must not overlap")
+    if any(not is_supported_source(path) or not is_test_path(path) for path in ticket.new_test_files):
+        raise ReadinessError("new files must be supported test artifacts")
     if not ticket.forbidden_changes or not ticket.verification.commands:
         raise ReadinessError("forbidden changes and allowlisted verification commands are required")
     if ticket.risk not in {"low", "medium", "high"} or not 1 <= ticket.max_attempts <= 2:

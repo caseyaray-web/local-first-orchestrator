@@ -160,6 +160,10 @@ def enforce_symbol_scope(repository: Path, changed_paths: list[str], ticket: Mic
     except ValueError:
         return ("invalid primary symbol",), True
     for path in changed_paths:
+        if path in ticket.new_test_files:
+            # There is no base symbol table for an authorized newly-created test.
+            # File-level authorization is the bounded scope proof for this path.
+            continue
         changed = changed_symbols(repository, path, base_sha)
         if changed is None:
             unverified = True

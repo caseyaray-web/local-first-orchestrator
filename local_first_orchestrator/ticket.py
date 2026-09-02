@@ -32,9 +32,12 @@ class MicroTicket:
     review_required: bool
     max_attempts: int
     dependencies: tuple[str, ...]
+    # Additive: absent from legacy serialized contracts when empty so their
+    # canonical JSON and historical hashes remain unchanged.
+    new_test_files: tuple[str, ...] = ()
 
     def contract(self) -> dict[str, object]:
-        return {
+        contract: dict[str, object] = {
             "ticket_id": self.ticket_id, "objective": self.objective,
             "criterion_ids": list(self.criterion_ids), "primary_symbol": self.primary_symbol,
             "allowed_files": list(self.allowed_files), "forbidden_changes": list(self.forbidden_changes),
@@ -44,3 +47,6 @@ class MicroTicket:
             }, "risk": self.risk, "review_required": self.review_required,
             "max_attempts": self.max_attempts, "dependencies": list(self.dependencies),
         }
+        if self.new_test_files:
+            contract["new_test_files"] = list(self.new_test_files)
+        return contract

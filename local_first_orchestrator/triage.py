@@ -57,6 +57,7 @@ def _ticket_from_contract(raw: object) -> MicroTicket:
             ),
             risk=str(raw["risk"]), review_required=bool(raw["review_required"]),
             max_attempts=int(raw["max_attempts"]), dependencies=tuple(raw["dependencies"]),
+            new_test_files=tuple(raw.get("new_test_files", [])),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise TriageError("child ticket contract is incomplete") from exc

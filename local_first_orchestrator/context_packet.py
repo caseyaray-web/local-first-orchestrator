@@ -74,7 +74,11 @@ class ContextPacketBuilder:
         for symbol in (*selection.dependencies, *selection.callers, *selection.tests):
             selected.setdefault(symbol.path, "")
             selected[symbol.path] += ("\n" if selected[symbol.path] else "") + symbol.text
-        packet = self.build(ticket, selected, repository_rules=repository_rules, failure_evidence=failure_evidence)
+        packet = self.build(
+            ticket, selected,
+            repository_rules=(repository_rules + "\nNew test files are absent from the base and must be created exactly at: " + ", ".join(ticket.new_test_files)) if ticket.new_test_files else repository_rules,
+            failure_evidence=failure_evidence,
+        )
         packet.manifest["scope_verification"] = "verified"
         for section in packet.manifest["sections"]:
             if section["kind"] == "source_file":

@@ -291,6 +291,7 @@ class Ledger:
             "criterion_ids_json": "TEXT NOT NULL DEFAULT '[]'",
             "primary_symbol": "TEXT",
             "allowed_files_json": "TEXT NOT NULL DEFAULT '[]'",
+            "new_test_files_json": "TEXT NOT NULL DEFAULT '[]'",
             "forbidden_changes_json": "TEXT NOT NULL DEFAULT '[]'",
             "patch_budget_json": "TEXT NOT NULL DEFAULT '{}'",
             "verification_json": "TEXT NOT NULL DEFAULT '{}'",
@@ -361,8 +362,8 @@ class Ledger:
         with self._transaction() as conn:
             contract = contract or {}
             conn.execute(
-                "INSERT INTO tickets(id, external_id, title, objective, criterion_ids_json, primary_symbol, allowed_files_json, forbidden_changes_json, patch_budget_json, verification_json, risk, review_required, max_attempts, dependencies_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ticket_id, external_id, title, contract.get("objective"), json.dumps(contract.get("criterion_ids", [])), contract.get("primary_symbol"), json.dumps(contract.get("allowed_files", [])), json.dumps(contract.get("forbidden_changes", [])), json.dumps(contract.get("patch_budget", {})), json.dumps(contract.get("verification", {})), contract.get("risk"), int(contract.get("review_required", True)), contract.get("max_attempts", 2), json.dumps(contract.get("dependencies", [])), state.value, now, now),
+                "INSERT INTO tickets(id, external_id, title, objective, criterion_ids_json, primary_symbol, allowed_files_json, new_test_files_json, forbidden_changes_json, patch_budget_json, verification_json, risk, review_required, max_attempts, dependencies_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ticket_id, external_id, title, contract.get("objective"), json.dumps(contract.get("criterion_ids", [])), contract.get("primary_symbol"), json.dumps(contract.get("allowed_files", [])), json.dumps(contract.get("new_test_files", [])), json.dumps(contract.get("forbidden_changes", [])), json.dumps(contract.get("patch_budget", {})), json.dumps(contract.get("verification", {})), contract.get("risk"), int(contract.get("review_required", True)), contract.get("max_attempts", 2), json.dumps(contract.get("dependencies", [])), state.value, now, now),
             )
         return ticket_id
 
@@ -804,8 +805,8 @@ class Ledger:
                 contract = child_ticket.contract()
                 child_id = uuid.uuid4().hex
                 conn.execute(
-                    "INSERT INTO tickets(id, parent_ticket_id, depth, title, objective, criterion_ids_json, primary_symbol, allowed_files_json, forbidden_changes_json, patch_budget_json, verification_json, risk, review_required, max_attempts, dependencies_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (child_id, parent_ticket_id, int(parent["depth"]) + 1, title, contract.get("objective"), json.dumps(contract.get("criterion_ids", [])), contract.get("primary_symbol"), json.dumps(contract.get("allowed_files", [])), json.dumps(contract.get("forbidden_changes", [])), json.dumps(contract.get("patch_budget", {})), json.dumps(contract.get("verification", {})), contract.get("risk"), int(contract.get("review_required", True)), contract.get("max_attempts", 2), json.dumps(contract.get("dependencies", [])), CanonicalState.READY_LOCAL.value, now, now),
+                    "INSERT INTO tickets(id, parent_ticket_id, depth, title, objective, criterion_ids_json, primary_symbol, allowed_files_json, new_test_files_json, forbidden_changes_json, patch_budget_json, verification_json, risk, review_required, max_attempts, dependencies_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (child_id, parent_ticket_id, int(parent["depth"]) + 1, title, contract.get("objective"), json.dumps(contract.get("criterion_ids", [])), contract.get("primary_symbol"), json.dumps(contract.get("allowed_files", [])), json.dumps(contract.get("new_test_files", [])), json.dumps(contract.get("forbidden_changes", [])), json.dumps(contract.get("patch_budget", {})), json.dumps(contract.get("verification", {})), contract.get("risk"), int(contract.get("review_required", True)), contract.get("max_attempts", 2), json.dumps(contract.get("dependencies", [])), CanonicalState.READY_LOCAL.value, now, now),
                 )
                 conn.execute(
                     "INSERT INTO triage_children(parent_ticket_id, child_ticket_id, fingerprint, created_at) VALUES (?, ?, ?, ?)",
@@ -1033,7 +1034,7 @@ class Ledger:
                 existing_ticket = conn.execute("SELECT id FROM tickets WHERE id=?", (t.ticket_id,)).fetchone()
                 if existing_ticket: continue
                 q = t.contract()
-                conn.execute("INSERT INTO tickets(id,feature_id,tranche_id,title,objective,criterion_ids_json,primary_symbol,allowed_files_json,forbidden_changes_json,patch_budget_json,verification_json,risk,review_required,max_attempts,dependencies_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (t.ticket_id, feature.id, tranche.id, t.ticket_id, q["objective"], json.dumps(q["criterion_ids"]), q["primary_symbol"], json.dumps(q["allowed_files"]), json.dumps(q["forbidden_changes"]), json.dumps(q["patch_budget"]), json.dumps(q["verification"]), q["risk"], int(t.review_required), t.max_attempts, json.dumps(q["dependencies"]), "draft", now, now))
+                conn.execute("INSERT INTO tickets(id,feature_id,tranche_id,title,objective,criterion_ids_json,primary_symbol,allowed_files_json,new_test_files_json,forbidden_changes_json,patch_budget_json,verification_json,risk,review_required,max_attempts,dependencies_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (t.ticket_id, feature.id, tranche.id, t.ticket_id, q["objective"], json.dumps(q["criterion_ids"]), q["primary_symbol"], json.dumps(q["allowed_files"]), json.dumps(q.get("new_test_files", [])), json.dumps(q["forbidden_changes"]), json.dumps(q["patch_budget"]), json.dumps(q["verification"]), q["risk"], int(t.review_required), t.max_attempts, json.dumps(q["dependencies"]), "draft", now, now))
                 for cid in t.criterion_ids: conn.execute("INSERT INTO ticket_criteria VALUES (?,?)", (t.ticket_id, cid))
                 payload = generated_card_payload(feature, tranche, t)
                 event_id = self._append_event(conn, entity_type="ticket", entity_id=t.ticket_id, event_type="generated_microticket_created", actor_id="controller", to_state="draft", payload={"feature_id": feature.id, "tranche_id": tranche.id, "projection_key": payload["projection_key"]})

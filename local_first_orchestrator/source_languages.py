@@ -2,6 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+
+
+def normalized_repository_path(path: str) -> str | None:
+    """Return a canonical repo-relative file path, or None when unsafe."""
+    if not isinstance(path, str) or not path or "\\" in path:
+        return None
+    candidate = PurePosixPath(path)
+    if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+        return None
+    normalized = candidate.as_posix()
+    return normalized if normalized == path and not normalized.endswith("/") else None
 import re
 
 
@@ -21,7 +32,7 @@ class SourceLanguage:
 
 _LANGUAGES = (
     SourceLanguage("python", (".py",), (re.compile(r"^test_"), re.compile(r"_test\.py$"))),
-    SourceLanguage("javascript", (".js", ".jsx"), (re.compile(r"\.test\.[^.]+$"), re.compile(r"\.spec\.[^.]+$"))),
+    SourceLanguage("javascript", (".js", ".jsx", ".mjs"), (re.compile(r"^test-"), re.compile(r"\.test\.[^.]+$"), re.compile(r"\.spec\.[^.]+$"))),
     SourceLanguage("typescript", (".ts", ".tsx"), (re.compile(r"\.test\.[^.]+$"), re.compile(r"\.spec\.[^.]+$"))),
 )
 
@@ -32,6 +43,11 @@ def language_for(path: str) -> SourceLanguage | None:
 
 def is_supported_source(path: str) -> bool:
     return language_for(path) is not None
+
+
+def is_supported_repository_file(path: str) -> bool:
+    """Files eligible for immutable manifest evidence and ordinary edit scope."""
+    return is_supported_source(path) or path == "package.json"
 
 
 def is_test_path(path: str) -> bool:

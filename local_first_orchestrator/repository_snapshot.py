@@ -3,7 +3,7 @@ import hashlib,json,re,subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from .decomposition import DecompositionPlan,FeatureContract
-from .source_languages import is_supported_source,is_test_path
+from .source_languages import is_supported_repository_file,is_supported_source,is_test_path,normalized_repository_path
 from .symbols import symbols_for
 _STOP={'the','and','for','with','from','that','this','into','only','must','shall','are','not'}
 @dataclass(frozen=True)
@@ -26,7 +26,7 @@ def terms(feature:FeatureContract|None,extra:tuple[str,...])->tuple[str,...]:
  return tuple(sorted({x.lower() for x in re.findall(r'[A-Za-z_][A-Za-z_0-9]{2,}',text) if x.lower() not in _STOP}))
 def snapshot(repository:Path,requested_sha:str,feature:FeatureContract|None=None,feature_terms:tuple[str,...]=(),limit:int=32)->RepositorySnapshot:
  repo=Path(repository).resolve(); run=lambda *a:subprocess.run(('git',*a),cwd=repo,text=True,capture_output=True,check=True).stdout
- base=run('rev-parse','--verify',requested_sha+'^{commit}').strip(); paths=[p for p in run('ls-tree','-r','--name-only',base).splitlines() if is_supported_source(p)]
+ base=run('rev-parse','--verify',requested_sha+'^{commit}').strip(); paths=[p for p in run('ls-tree','-r','--name-only',base).splitlines() if is_supported_repository_file(p)]
  manifest=tuple(ManifestEntry(p,'test' if is_test_path(p) else 'source') for p in paths); q=terms(feature,feature_terms); candidates=[]
  for m in manifest:
   data=run('show',base+':'+m.path); lower=data.lower(); score=sum(3 for x in q if x in Path(m.path).name.lower())+sum(1 for x in q if x in lower)
@@ -49,7 +49,11 @@ class RepositoryPlanValidator:
   if active:
    for t in active.microtickets:
     for p in t.allowed_files:
-     if p.startswith('/') or '..' in Path(p).parts or p not in manifest:r.append('unknown_file')
+     if normalized_repository_path(p) is None or p not in manifest:r.append('unknown_file')
+    for p in t.new_test_files:
+     if normalized_repository_path(p) is None:r.append('invalid_new_test_file')
+     elif p in manifest:r.append('new_test_file_already_exists')
+     elif not is_supported_source(p) or not is_test_path(p):r.append('new_test_file_not_test')
     p=''; n=''
     try:p,n=t.primary_symbol.split('::',1)
     except ValueError: pass

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .ticket import MicroTicket
+from .source_languages import is_supported_source, is_test_path, normalized_repository_path
 from .symbols import enforce_symbol_scope
 
 
@@ -105,7 +106,8 @@ class DeterministicValidator:
 
     def _secret_scan_error(self, worktree: Path, relative_path: str) -> str | None:
         candidate = (worktree / relative_path).resolve()
-        if worktree not in candidate.parents or not candidate.is_file():
+        raw_candidate = worktree / relative_path
+        if worktree not in candidate.parents or raw_candidate.is_symlink() or not candidate.is_file():
             return f"unable to safely scan changed content: {relative_path}"
         try:
             content = candidate.read_text(encoding="utf-8")
@@ -132,16 +134,45 @@ class DeterministicValidator:
         # Untracked generated/secrets must be rejected too; git diff alone hides them.
         for line in self._git(worktree, "status", "--porcelain=v1").splitlines():
             candidate = line[3:]
-            if candidate and "__pycache__" not in Path(candidate).parts and candidate not in names:
+            if not candidate or "__pycache__" in Path(candidate).parts:
+                continue
+            raw = worktree / candidate
+            if raw.is_dir() and not raw.is_symlink():
+                for child in sorted(raw.rglob("*")):
+                    if child.is_file() and not child.is_symlink():
+                        relative = child.relative_to(worktree).as_posix()
+                        if "__pycache__" not in child.parts and relative not in names:
+                            names.append(relative)
+            elif candidate not in names:
                 names.append(candidate)
         errors = ["no_changes: model produced no effective diff"] if not names else []
-        errors += [f"changed path outside allowlist: {p}" for p in names if p not in ticket.allowed_files]
+        allowed = set(ticket.allowed_files)
+        declared_new = set(ticket.new_test_files)
+        errors += [f"changed path outside allowlist: {p}" for p in names if p not in allowed and p not in declared_new]
+        for path in names:
+            if path not in declared_new:
+                continue
+            if not is_supported_source(path) or not is_test_path(path):
+                errors.append(f"declared new path is not a supported test artifact: {path}")
+            candidate = (worktree / path).resolve()
+            raw_candidate = worktree / path
+            if worktree not in candidate.parents or raw_candidate.is_symlink() or not candidate.is_file():
+                errors.append(f"declared new test file is unsafe or missing: {path}")
+            if self._git(worktree, "ls-tree", "-r", "--name-only", base_sha, "--", path).strip() == path:
+                errors.append(f"declared new test file existed at base: {path}")
         errors += [f"forbidden file type: {p}" for p in names if p.endswith(self.denied_suffixes)]
         errors += [error for path in names if (error := self._secret_scan_error(worktree, path))]
         symbol_errors, scope_unverified = enforce_symbol_scope(worktree, names, ticket, base_sha)
         errors.extend(symbol_errors)
         diff = self._git(worktree, "diff", "--numstat", base_sha, "--")
         changed_lines = sum(int(a) + int(d) for a, d, *_ in (line.split("\t") for line in diff.splitlines() if line))
+        for path in declared_new & set(names):
+            candidate = worktree / path
+            try:
+                content = candidate.read_text(encoding="utf-8")
+                changed_lines += content.count("\n") + int(bool(content) and not content.endswith("\n"))
+            except (OSError, UnicodeDecodeError):
+                pass
         if len(names) > ticket.patch_budget.max_files: errors.append("changed file budget exceeded")
         if changed_lines > ticket.patch_budget.max_changed_lines: errors.append("changed line budget exceeded")
         records: list[CommandEvidence] = []
