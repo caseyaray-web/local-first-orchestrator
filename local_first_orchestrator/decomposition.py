@@ -81,7 +81,7 @@ def generated_projection_key(ticket_id: str) -> str:
  return f"board-create:v1:{ticket_id}"
 
 
-def generated_card_payload(feature: FeatureContract, tranche: Tranche, ticket: MicroTicket) -> dict[str, str]:
+def generated_card_payload(feature: FeatureContract, tranche: Tranche, ticket: MicroTicket, *, repository_identity: str, repo_base_sha: str, repo_snapshot_hash: str) -> dict[str, str]:
  """Serialize the immutable generated-card contract and projection payload."""
  projection_key = generated_projection_key(ticket.ticket_id)
  contract = {
@@ -90,6 +90,9 @@ def generated_card_payload(feature: FeatureContract, tranche: Tranche, ticket: M
   "feature_id": feature.id,
   "tranche_id": tranche.id,
   "projection_key": projection_key,
+  "repository_identity": repository_identity,
+  "repo_base_sha": repo_base_sha,
+  "repo_snapshot_hash": repo_snapshot_hash,
   **ticket.contract(),
  }
  encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"))
@@ -128,7 +131,7 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
    if tuple(existing[x] for x in ('repository_identity','repo_base_sha','repo_snapshot_hash','repo_snapshot_manifest_json')) != (repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json): raise ValueError('repository provenance conflicts')
    active_tranche=next(tr for tr in plan.tranches if tr.ordinal == 0)
    for generated in active_tranche.microtickets:
-    expected=generated_card_payload(feature, active_tranche, generated)
+    expected=generated_card_payload(feature, active_tranche, generated, repository_identity=str(repository_identity), repo_base_sha=str(repo_base_sha), repo_snapshot_hash=str(repo_snapshot_hash))
     ticket_row=c.execute('SELECT id FROM tickets WHERE id=? AND feature_id=? AND tranche_id=? AND state=?',(generated.ticket_id,feature.id,active_tranche.id,'draft')).fetchone()
     event_row=c.execute("SELECT id FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='generated_microticket_created' ORDER BY id DESC LIMIT 1",(generated.ticket_id,)).fetchone()
     projection=c.execute('SELECT operation,payload_json,idempotency_key FROM board_projection_outbox WHERE ticket_id=? AND event_id=?',(generated.ticket_id,event_row['id'] if event_row else -1)).fetchone()
@@ -151,7 +154,7 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
     q=t.contract(); c.execute('INSERT INTO tickets(id,feature_id,tranche_id,title,objective,criterion_ids_json,primary_symbol,allowed_files_json,new_test_files_json,forbidden_changes_json,patch_budget_json,verification_json,risk,review_required,max_attempts,dependencies_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(t.ticket_id,feature.id,tr.id,t.ticket_id,q['objective'],json.dumps(q['criterion_ids']),q['primary_symbol'],json.dumps(q['allowed_files']),json.dumps(q.get('new_test_files',[])),json.dumps(q['forbidden_changes']),json.dumps(q['patch_budget']),json.dumps(q['verification']),q['risk'],int(t.review_required),t.max_attempts,json.dumps(q['dependencies']),'draft',now,now)); active.append(t.ticket_id)
     for cid in t.criterion_ids:c.execute('INSERT INTO ticket_criteria VALUES (?,?)',(t.ticket_id,cid))
     ledger._inject_failure('after_generated_ticket')
-    projection = generated_card_payload(feature, tr, t)
+    projection = generated_card_payload(feature, tr, t, repository_identity=str(repository_identity), repo_base_sha=str(repo_base_sha), repo_snapshot_hash=str(repo_snapshot_hash))
     event_id = ledger._append_event(c, entity_type='ticket', entity_id=t.ticket_id, event_type='generated_microticket_created', actor_id='controller', to_state='draft', payload={'feature_id': feature.id, 'tranche_id': tr.id, 'projection_key': projection['projection_key']})
     ledger._enqueue_generated_create_projection_in_transaction(c, ticket_id=t.ticket_id, event_id=event_id, payload=projection, idempotency_key=projection['projection_key'])
  return pid,tuple(active)

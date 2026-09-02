@@ -144,6 +144,7 @@ class GeneratedProjectionDeliveryTests(unittest.TestCase):
     def test_delivers_canonical_projection_after_create_show_and_contract_verification(self) -> None:
         ticket_id, event_id = self.activate_one()
         row = self.ledger.connection.execute("SELECT idempotency_key FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()
+        plan = self.ledger.connection.execute("SELECT repository_identity, repo_base_sha, repo_snapshot_hash FROM decomposition_plans WHERE feature_id='F' AND status='active'").fetchone()
 
         result = self.worker().deliver_one()
 
@@ -156,6 +157,84 @@ class GeneratedProjectionDeliveryTests(unittest.TestCase):
             self.ledger.runtime_binding(ticket_id)
         self.assertEqual(self.calls()[0][10], row["idempotency_key"])
         self.assertEqual([call[3] for call in self.calls()], ["create", "show"])
+        body = json.loads(self.state.read_text())["tasks"]["1"]["body"]
+        contract = json.loads(body.split("```local-first-contract\\n", 1)[1].split("\\n```", 1)[0])
+        self.assertEqual(contract["repository_identity"], plan["repository_identity"])
+        self.assertEqual(contract["repo_base_sha"], plan["repo_base_sha"])
+        self.assertEqual(contract["repo_snapshot_hash"], plan["repo_snapshot_hash"])
+
+    def test_missing_or_mismatched_projected_provenance_fails_before_hermes_create(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        original = self.ledger.connection.execute("SELECT payload_json FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()["payload_json"]
+        cases = (("repository_identity", None), ("repo_base_sha", None), ("repo_snapshot_hash", None), ("repository_identity", "wrong-repository"), ("repo_base_sha", "wrong-base"), ("repo_snapshot_hash", "wrong-snapshot"))
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                self.log.unlink(missing_ok=True)
+                payload = json.loads(original)
+                prefix, encoded = payload["body"].split("```local-first-contract\\n", 1)
+                raw, suffix = encoded.split("\\n```", 1)
+                contract = json.loads(raw)
+                if value is None:
+                    contract.pop(field, None)
+                else:
+                    contract[field] = value
+                payload["body"] = prefix + "```local-first-contract\\n" + json.dumps(contract, sort_keys=True, separators=(",", ":")) + "\\n```" + suffix
+                self.ledger.connection.execute("UPDATE board_projection_outbox SET payload_json=? WHERE ticket_id=? AND event_id=?", (json.dumps(payload, sort_keys=True, separators=(",", ":")), ticket_id, event_id))
+                self.assertEqual(self.worker().deliver_one().status, "terminal_failed")
+                self.assertEqual(self.calls(), [])
+                self.ledger.connection.execute("UPDATE board_projection_outbox SET payload_json=?, terminal_error=NULL, last_error=NULL, acknowledged_at=NULL, external_task_id=NULL, lease_owner=NULL, lease_expires_at=NULL WHERE ticket_id=? AND event_id=?", (original, ticket_id, event_id))
+
+    def test_reconciles_legacy_unacknowledged_projection_from_persisted_provenance_without_board_io(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        row = self.ledger.connection.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()
+        legacy = json.loads(row["payload_json"])
+        prefix, encoded = legacy["body"].split("```local-first-contract\\n", 1)
+        raw, suffix = encoded.split("\\n```", 1)
+        contract = json.loads(raw)
+        for field in ("repository_identity", "repo_base_sha", "repo_snapshot_hash"):
+            contract.pop(field, None)
+        legacy["body"] = prefix + "```local-first-contract\\n" + json.dumps(contract, sort_keys=True, separators=(",", ":")) + "\\n```" + suffix
+        self.ledger.connection.execute("UPDATE board_projection_outbox SET payload_json=? WHERE ticket_id=? AND event_id=?", (json.dumps(legacy, sort_keys=True, separators=(",", ":")), ticket_id, event_id))
+        before = self.ledger.connection.execute("SELECT event_id,operation,idempotency_key,acknowledged_at,external_task_id,attempt_count,lease_owner,lease_expires_at FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()
+        plan = self.ledger.connection.execute("SELECT repository_identity,repo_base_sha,repo_snapshot_hash FROM decomposition_plans WHERE feature_id='F' AND status='active'").fetchone()
+
+        reconciled = self.ledger.reconcile_generated_projection(ticket_id, event_id)
+
+        after = self.ledger.connection.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()
+        body = json.loads(after["payload_json"])["body"]
+        repaired = json.loads(body.split("```local-first-contract\\n", 1)[1].split("\\n```", 1)[0])
+        self.assertEqual(reconciled["orchestrator_ticket_id"], ticket_id)
+        self.assertEqual((after["event_id"], after["operation"], after["idempotency_key"], after["acknowledged_at"], after["external_task_id"], after["attempt_count"], after["lease_owner"], after["lease_expires_at"]), tuple(before))
+        self.assertEqual(repaired["repository_identity"], plan["repository_identity"])
+        self.assertEqual(repaired["repo_base_sha"], plan["repo_base_sha"])
+        self.assertEqual(repaired["repo_snapshot_hash"], plan["repo_snapshot_hash"])
+        self.assertEqual(self.calls(), [])
+
+    def test_reconciliation_refuses_unsafe_or_unqualifiable_rows_without_rewriting_body(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        original = self.ledger.connection.execute("SELECT payload_json FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()["payload_json"]
+        cases = (
+            ("acknowledged", "UPDATE board_projection_outbox SET acknowledged_at=1 WHERE ticket_id=? AND event_id=?"),
+            ("external_task_id", "UPDATE board_projection_outbox SET external_task_id='existing' WHERE ticket_id=? AND event_id=?"),
+            ("operation", "UPDATE board_projection_outbox SET operation='other' WHERE ticket_id=? AND event_id=?"),
+            ("active_ticket", "UPDATE tickets SET state='implementing' WHERE id=?"),
+            ("missing_plan_provenance", "UPDATE decomposition_plans SET repo_base_sha=NULL WHERE feature_id='F' AND status='active'"),
+        )
+        for name, statement in cases:
+            with self.subTest(name=name):
+                if statement.count('?') == 2:
+                    self.ledger.connection.execute(statement, (ticket_id, event_id))
+                elif statement.count('?') == 1:
+                    self.ledger.connection.execute(statement, (ticket_id,))
+                else:
+                    self.ledger.connection.execute(statement)
+                with self.assertRaises(ValueError):
+                    self.ledger.reconcile_generated_projection(ticket_id, event_id)
+                self.assertEqual(self.ledger.connection.execute("SELECT payload_json FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()["payload_json"], original)
+                self.assertEqual(self.calls(), [])
+                self.ledger.connection.execute("UPDATE board_projection_outbox SET acknowledged_at=NULL, external_task_id=NULL, operation='create_microticket' WHERE ticket_id=? AND event_id=?", (ticket_id, event_id))
+                self.ledger.connection.execute("UPDATE tickets SET state='draft' WHERE id=?", (ticket_id,))
+                self.ledger.connection.execute("UPDATE decomposition_plans SET repo_base_sha='a' WHERE feature_id='F' AND status='active'")
 
     def test_retryable_create_and_show_failures_release_the_lease_with_a_schedule(self) -> None:
         ticket_id, event_id = self.activate_one()

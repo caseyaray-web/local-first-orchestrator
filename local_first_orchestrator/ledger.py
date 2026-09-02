@@ -833,10 +833,12 @@ class Ledger:
         row = self.connection.execute("""
             SELECT t.id AS ticket_id, t.feature_id AS feature_id, t.tranche_id AS tranche_id,
                    tr.feature_id AS tranche_feature_id, f.id AS resolved_feature_id,
+                   p.repository_identity, p.repo_base_sha, p.repo_snapshot_hash,
                    e.entity_type, e.entity_id, e.event_type
             FROM tickets t
             JOIN tranches tr ON tr.id=t.tranche_id
             JOIN features f ON f.id=t.feature_id
+            JOIN decomposition_plans p ON p.feature_id=t.feature_id AND p.status='active'
             JOIN events e ON e.id=?
             WHERE t.id=?
         """, (event_id, ticket_id)).fetchone()
@@ -844,7 +846,69 @@ class Ledger:
             raise KeyError("authoritative generated projection identity missing")
         if row["feature_id"] != row["tranche_feature_id"] or row["feature_id"] != row["resolved_feature_id"]:
             raise ValueError("authoritative generated projection identity conflicts")
-        return {"ticket_id": str(row["ticket_id"]), "feature_id": str(row["feature_id"]), "tranche_id": str(row["tranche_id"])}
+        provenance = (row["repository_identity"], row["repo_base_sha"], row["repo_snapshot_hash"])
+        if not all(isinstance(value, str) and value for value in provenance):
+            raise ValueError("authoritative generated projection provenance missing")
+        return {"ticket_id": str(row["ticket_id"]), "feature_id": str(row["feature_id"]), "tranche_id": str(row["tranche_id"]),
+                "repository_identity": str(row["repository_identity"]), "repo_base_sha": str(row["repo_base_sha"]), "repo_snapshot_hash": str(row["repo_snapshot_hash"])}
+
+    def reconcile_generated_projection(self, ticket_id: str, event_id: int) -> dict[str, Any]:
+        """Refresh one never-attempted generated projection from persisted ledger truth.
+
+        This is deliberately narrower than delivery: it cannot claim, create, show,
+        acknowledge, or alter an attempted/leased projection.
+        """
+        from .decomposition import generated_card_payload, generated_projection_key
+        from .generated_projection import DeterministicProjectionError, _canonical_payload
+        from .ticket import MicroTicket, PatchBudget, VerificationProfile
+
+        with self._transaction() as conn:
+            row = conn.execute("""
+                SELECT b.*, t.id AS resolved_ticket_id, t.state AS ticket_state, t.feature_id, t.tranche_id,
+                       t.objective, t.criterion_ids_json, t.primary_symbol, t.allowed_files_json, t.new_test_files_json,
+                       t.forbidden_changes_json, t.patch_budget_json, t.verification_json, t.risk, t.review_required,
+                       t.max_attempts, t.dependencies_json, p.repository_identity, p.repo_base_sha, p.repo_snapshot_hash,
+                       e.entity_type, e.entity_id, e.event_type
+                FROM board_projection_outbox b
+                JOIN tickets t ON t.id=b.ticket_id
+                JOIN decomposition_plans p ON p.feature_id=t.feature_id AND p.status='active'
+                JOIN events e ON e.id=b.event_id
+                WHERE b.ticket_id=? AND b.event_id=?
+            """, (ticket_id, event_id)).fetchone()
+            if row is None:
+                raise ValueError("generated projection reconciliation target missing")
+            if (row["operation"], row["entity_type"], row["entity_id"], row["event_type"]) != ("create_microticket", "ticket", ticket_id, "generated_microticket_created"):
+                raise ValueError("generated projection reconciliation provenance is ineligible")
+            if row["acknowledged_at"] is not None or row["external_task_id"] is not None:
+                raise ValueError("generated projection reconciliation requires no external effect")
+            if row["lease_owner"] is not None or row["lease_expires_at"] is not None:
+                raise ValueError("generated projection reconciliation requires an unleased row")
+            if row["terminal_error"] is not None or row["next_attempt_at"] is not None or int(row["attempt_count"] or 0) != 0:
+                raise ValueError("generated projection reconciliation requires a never-attempted row")
+            if row["ticket_state"] != "draft":
+                raise ValueError("generated projection reconciliation requires a draft ticket")
+            expected_key = generated_projection_key(ticket_id)
+            if row["idempotency_key"] != expected_key:
+                raise ValueError("generated projection reconciliation idempotency mismatch")
+            provenance = (row["repository_identity"], row["repo_base_sha"], row["repo_snapshot_hash"])
+            if not all(isinstance(value, str) and value for value in provenance):
+                raise ValueError("generated projection reconciliation provenance missing")
+            verification = json.loads(row["verification_json"])
+            ticket = MicroTicket(ticket_id, row["objective"], tuple(json.loads(row["criterion_ids_json"])), row["primary_symbol"], tuple(json.loads(row["allowed_files_json"])), tuple(json.loads(row["forbidden_changes_json"])), PatchBudget(**json.loads(row["patch_budget_json"])), VerificationProfile(tuple(tuple(command) for command in verification["commands"]), verification.get("working_directory", "."), int(verification.get("timeout_seconds", 60)), int(verification.get("output_limit", 20000))), row["risk"], bool(row["review_required"]), int(row["max_attempts"]), tuple(json.loads(row["dependencies_json"])), tuple(json.loads(row["new_test_files_json"] or "[]")))
+            feature = type("PersistedFeature", (), {"id": str(row["feature_id"])})()
+            tranche = type("PersistedTranche", (), {"id": str(row["tranche_id"])})()
+            payload = generated_card_payload(feature, tranche, ticket, repository_identity=str(row["repository_identity"]), repo_base_sha=str(row["repo_base_sha"]), repo_snapshot_hash=str(row["repo_snapshot_hash"]))
+            candidate = dict(row)
+            candidate["payload_json"] = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            identity = {"ticket_id": ticket_id, "feature_id": str(row["feature_id"]), "tranche_id": str(row["tranche_id"]), "repository_identity": str(row["repository_identity"]), "repo_base_sha": str(row["repo_base_sha"]), "repo_snapshot_hash": str(row["repo_snapshot_hash"])}
+            try:
+                _canonical_payload(candidate, identity)
+            except DeterministicProjectionError as exc:
+                raise ValueError("generated projection reconciliation qualification failed") from exc
+            changed = conn.execute("UPDATE board_projection_outbox SET payload_json=? WHERE ticket_id=? AND event_id=? AND operation='create_microticket' AND acknowledged_at IS NULL AND external_task_id IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND terminal_error IS NULL AND next_attempt_at IS NULL AND attempt_count=0", (candidate["payload_json"], ticket_id, event_id)).rowcount
+            if changed != 1:
+                raise ValueError("generated projection reconciliation lost eligibility")
+            return payload
 
     def _enqueue_generated_create_projection_in_transaction(self, conn: sqlite3.Connection, *, ticket_id: str, event_id: int, payload: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
         """Enqueue a generated-card intent using the caller's transaction."""
@@ -1028,6 +1092,9 @@ class Ledger:
             conn.execute("UPDATE tranches SET status='completed' WHERE id=?", (active[0]["id"],))
             target = conn.execute("SELECT * FROM tranches WHERE feature_id=? AND id=?", (feature.id, tranche.id)).fetchone()
             if target is None or int(target["ordinal"]) != int(active[0]["ordinal"]) + 1 or target["status"] not in {"planned", "active"}: raise ValueError("next tranche is missing or conflicting")
+            provenance = conn.execute("SELECT repository_identity, repo_base_sha, repo_snapshot_hash FROM decomposition_plans WHERE feature_id=? AND status='active'", (feature.id,)).fetchone()
+            if provenance is None or not all(isinstance(provenance[key], str) and provenance[key] for key in ("repository_identity", "repo_base_sha", "repo_snapshot_hash")):
+                raise ValueError("active plan repository provenance missing")
             conn.execute("UPDATE tranches SET status='active', base_sha=? WHERE id=?", (plan.repo_base_sha, tranche.id))
             created = []
             for t in tranche.microtickets:
@@ -1036,7 +1103,7 @@ class Ledger:
                 q = t.contract()
                 conn.execute("INSERT INTO tickets(id,feature_id,tranche_id,title,objective,criterion_ids_json,primary_symbol,allowed_files_json,new_test_files_json,forbidden_changes_json,patch_budget_json,verification_json,risk,review_required,max_attempts,dependencies_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (t.ticket_id, feature.id, tranche.id, t.ticket_id, q["objective"], json.dumps(q["criterion_ids"]), q["primary_symbol"], json.dumps(q["allowed_files"]), json.dumps(q.get("new_test_files", [])), json.dumps(q["forbidden_changes"]), json.dumps(q["patch_budget"]), json.dumps(q["verification"]), q["risk"], int(t.review_required), t.max_attempts, json.dumps(q["dependencies"]), "draft", now, now))
                 for cid in t.criterion_ids: conn.execute("INSERT INTO ticket_criteria VALUES (?,?)", (t.ticket_id, cid))
-                payload = generated_card_payload(feature, tranche, t)
+                payload = generated_card_payload(feature, tranche, t, repository_identity=str(provenance["repository_identity"]), repo_base_sha=str(provenance["repo_base_sha"]), repo_snapshot_hash=str(provenance["repo_snapshot_hash"]))
                 event_id = self._append_event(conn, entity_type="ticket", entity_id=t.ticket_id, event_type="generated_microticket_created", actor_id="controller", to_state="draft", payload={"feature_id": feature.id, "tranche_id": tranche.id, "projection_key": payload["projection_key"]})
                 self._enqueue_generated_create_projection_in_transaction(conn, ticket_id=t.ticket_id, event_id=event_id, payload=payload, idempotency_key=payload["projection_key"])
                 created.append(t.ticket_id)

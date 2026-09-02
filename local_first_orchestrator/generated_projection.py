@@ -77,6 +77,25 @@ def _contract_from_body(body: str) -> dict[str, Any]:
     return raw
 
 
+def _expected_contract_identity(payload: dict[str, str], identity: dict[str, str]) -> dict[str, str]:
+    return {
+        "kind": "microticket",
+        "orchestrator_ticket_id": payload["orchestrator_ticket_id"],
+        "feature_id": payload["feature_id"],
+        "tranche_id": payload["tranche_id"],
+        "projection_key": payload["projection_key"],
+        "repository_identity": identity["repository_identity"],
+        "repo_base_sha": identity["repo_base_sha"],
+        "repo_snapshot_hash": identity["repo_snapshot_hash"],
+    }
+
+
+def _verify_contract_identity(contract: dict[str, Any], payload: dict[str, str], identity: dict[str, str]) -> None:
+    for name, value in _expected_contract_identity(payload, identity).items():
+        if contract.get(name) != value:
+            raise DeterministicProjectionError(f"projected local-first contract {name} mismatch")
+
+
 def _canonical_payload(row: dict[str, Any], identity: dict[str, str]) -> dict[str, str]:
     try:
         raw = json.loads(str(row["payload_json"]))
@@ -96,23 +115,14 @@ def _canonical_payload(row: dict[str, Any], identity: dict[str, str]) -> dict[st
         raise DeterministicProjectionError("generated projection tranche identity mismatch")
     if (raw["projection_key"], row["idempotency_key"], expected_key) != (expected_key, expected_key, expected_key):
         raise DeterministicProjectionError("generated projection key mismatch")
+    _verify_contract_identity(_contract_from_body(raw["body"]), {name: raw[name] for name in required}, identity)
     return {name: raw[name] for name in required}
 
 
-def _verify_shown_task(task_id: str, shown: Any, payload: dict[str, str]) -> None:
+def _verify_shown_task(task_id: str, shown: Any, payload: dict[str, str], identity: dict[str, str]) -> None:
     if str(getattr(shown, "id", "")) != task_id:
         raise DeterministicProjectionError("shown task identity mismatch")
-    contract = _contract_from_body(str(getattr(shown, "body", "")))
-    expected = {
-        "kind": "microticket",
-        "orchestrator_ticket_id": payload["orchestrator_ticket_id"],
-        "feature_id": payload["feature_id"],
-        "tranche_id": payload["tranche_id"],
-        "projection_key": payload["projection_key"],
-    }
-    for name, value in expected.items():
-        if contract.get(name) != value:
-            raise DeterministicProjectionError(f"shown local-first contract {name} mismatch")
+    _verify_contract_identity(_contract_from_body(str(getattr(shown, "body", ""))), payload, identity)
 
 
 class GeneratedProjectionWorker:
@@ -163,7 +173,7 @@ class GeneratedProjectionWorker:
         except Exception as exc:
             return self._retry(row, exc, int(self.clock()))
         try:
-            _verify_shown_task(str(task_id), shown, payload)
+            _verify_shown_task(str(task_id), shown, payload, identity)
         except DeterministicProjectionError as exc:
             return self._terminal(row, exc, int(self.clock()))
         self.ledger.complete_generated_create_projection(str(row["ticket_id"]), int(row["event_id"]), self.worker_id, str(task_id), now=int(self.clock()))
