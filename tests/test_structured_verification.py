@@ -40,13 +40,21 @@ class StructuredVerificationTests(unittest.TestCase):
         result=self.validate(((sys.executable,"-c",helper,str(pids)),),timeout=1,limit=128)
         self.assertEqual(result.commands[0].returncode,DeterministicValidator.TIMEOUT_RETURN_CODE)
         parent,child=(int(value) for value in pids.read_text().split())
+        # The process group is terminated together, but PID disappearance is
+        # independently observable and can be staggered while init reaps the
+        # killed parent/descendant.  Poll each PID through the bounded window;
+        # do not let disappearance of either one short-circuit the other.
         deadline=time.monotonic()+2
-        while time.monotonic()<deadline:
-            try: os.kill(parent,0); os.kill(child,0)
-            except ProcessLookupError: break
-            time.sleep(.02)
-        for pid in (parent,child):
-            with self.assertRaises(ProcessLookupError): os.kill(pid,0)
+        remaining={parent, child}
+        while remaining and time.monotonic()<deadline:
+            for pid in tuple(remaining):
+                try:
+                    os.kill(pid,0)
+                except ProcessLookupError:
+                    remaining.remove(pid)
+            if remaining:
+                time.sleep(.02)
+        self.assertEqual(remaining,set(),f"timeout cleanup left PIDs alive: {sorted(remaining)}")
     def test_missing_executable_is_structured(self):
         result=self.validate((("missing-command",),))
         self.assertFalse(result.passed); self.assertEqual(result.commands[0].returncode,DeterministicValidator.LAUNCH_FAILURE_RETURN_CODE)
