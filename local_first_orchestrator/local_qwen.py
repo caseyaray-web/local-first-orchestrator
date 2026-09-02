@@ -85,10 +85,13 @@ def _require_exact_review_payload(payload: object) -> dict[str, object]:
 
 class LocalQwenAdapter:
     """Pure invocation boundary; callers alone may update the ledger or board."""
-    def __init__(self, *, runner: Runner = subprocess.run, executable: str = "hermes", provider: str = LOCAL_QWEN_PROVIDER, model: str = LOCAL_QWEN_MODEL, hermes_home: Path | None = None, review_llm: Any | None = None) -> None:
+    def __init__(self, *, runner: Runner = subprocess.run, executable: str = "hermes", provider: str = LOCAL_QWEN_PROVIDER, model: str = LOCAL_QWEN_MODEL, hermes_home: Path | None = None, review_llm: Any | None = None, implementation_timeout_seconds: int = 300) -> None:
+        if not isinstance(implementation_timeout_seconds, int) or not 1 <= implementation_timeout_seconds <= 21_600:
+            raise ValueError("invalid_implementation_timeout_seconds")
         self.runner, self.executable, self.provider, self.model = runner, executable, provider, model
         self.hermes_home = Path(hermes_home or Path.home() / ".hermes" / "profiles" / "worker-code-local").resolve()
         self.review_llm = review_llm
+        self.implementation_timeout_seconds = implementation_timeout_seconds
 
     def _invoke_review(self, packet: str, artifact_dir: Path) -> ModelResult:
         if self.review_llm is not None:
@@ -148,7 +151,7 @@ class LocalQwenAdapter:
         if purpose == "review":
             return self._invoke_review(packet, artifact_dir)
         argv = [self.executable, "chat", "--provider", self.provider, "--model", self.model, "--query", packet, "--quiet"]
-        kwargs = {"text": True, "capture_output": True, "timeout": 300, "check": False}
+        kwargs = {"text": True, "capture_output": True, "timeout": self.implementation_timeout_seconds, "check": False}
         if workdir is not None:
             attempt = Path(workdir).resolve()
             kwargs["cwd"] = str(attempt)

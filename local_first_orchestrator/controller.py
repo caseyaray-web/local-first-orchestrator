@@ -25,6 +25,7 @@ class RuntimeConfig:
     artifact_root: Path
     repository_allowlist: tuple[Path, ...] = ()
     lease_seconds: int = 1800
+    implementation_timeout_seconds: int = 300
 
     def canonical_repository(self, candidate: Path) -> Path:
         path = Path(candidate).resolve(strict=True)
@@ -32,6 +33,32 @@ class RuntimeConfig:
         if path not in roots: raise ValueError("repository is not an exact configured allowlist root")
         if not (path / ".git").exists(): raise ValueError("repository must be a Git checkout, not a broad directory")
         return path
+
+    @staticmethod
+    def _inside(candidate: Path, parent: Path) -> bool:
+        try:
+            candidate.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
+    def validate_execution_roots(self) -> tuple[Path, Path, Path]:
+        """Resolve and reject controller-owned output beneath the canonical repo.
+
+        ``Path.resolve`` canonicalizes ``..`` and follows extant symlink aliases;
+        containment is therefore structural rather than a fragile string prefix.
+        This check intentionally runs before any output directory is created.
+        """
+        repository = self.canonical_repository(self.repository)
+        worktree_root = Path(self.worktree_root).expanduser().resolve()
+        artifact_root = Path(self.artifact_root).expanduser().resolve()
+        if self._inside(worktree_root, repository):
+            raise ValueError("unsafe_worktree_root: must resolve outside canonical_repository")
+        if self._inside(artifact_root, repository):
+            raise ValueError("unsafe_artifact_root: must resolve outside canonical_repository")
+        if not isinstance(self.implementation_timeout_seconds, int) or not 1 <= self.implementation_timeout_seconds <= 21_600:
+            raise ValueError("invalid_implementation_timeout_seconds")
+        return repository, worktree_root, artifact_root
 
 
 def ticket_from_ledger(row: dict[str, Any]) -> MicroTicket:
@@ -95,17 +122,45 @@ class LocalFirstController:
         self.ledger.connection.execute("UPDATE attempts SET base_sha=?, branch=?, worktree_path=?, pre_diff_hash=? WHERE ticket_id=? AND attempt_number=?",(base,attempt.branch,str(attempt.path),attempt.pre_diff_hash,ticket_id,number))
         return attempt
 
+    def _assert_pre_inference_isolation(self, *, repository: Path, attempt: AttemptWorktree, base_sha: str, ticket: MicroTicket, admission_sha: str) -> None:
+        """Fail closed before artifacts or inference can observe an unsafe attempt."""
+        attempt_path = attempt.path.resolve()
+        try:
+            attempt_path.relative_to(repository)
+        except ValueError:
+            pass
+        else:
+            raise RuntimeError("unsafe_worktree_root: attempt resolves inside canonical_repository")
+        def git(path: Path, *args: str) -> str:
+            return subprocess.run(("git", *args), cwd=path, text=True, capture_output=True, check=True).stdout.strip()
+        if git(attempt_path, "rev-parse", "--show-toplevel") != str(attempt_path):
+            raise RuntimeError("attempt_worktree_identity_mismatch")
+        if git(attempt_path, "rev-parse", "HEAD") != base_sha:
+            raise RuntimeError("attempt_base_mismatch")
+        if git(repository, "rev-parse", "HEAD") != admission_sha:
+            raise RuntimeError("canonical_head_moved_since_admission")
+        if git(attempt_path, "status", "--porcelain=v1"):
+            raise RuntimeError("attempt_not_clean_before_inference")
+        for relative in ticket.new_test_files:
+            if (attempt_path / relative).exists():
+                raise RuntimeError("new_test_file_present_before_inference")
+        for relative in ticket.allowed_files:
+            if not (attempt_path / relative).is_file():
+                raise RuntimeError("allowed_file_missing_before_inference")
+
     def execute(self, ticket_id: str, *, repository: Path, allow_board_writes: bool, owner: str="local-first-controller") -> bool:
         if not allow_board_writes: return False
         binding=self.ledger.runtime_binding(ticket_id); raw_repository=Path(repository).resolve(strict=True)
         if str(raw_repository) != binding["repository_path"]: raise ValueError("repository mismatch with imported binding")
-        repo=self.config.canonical_repository(raw_repository); ticket=ticket_from_ledger(self.ledger.get_ticket(ticket_id))
+        repo, worktree_root, artifact_root = self.config.validate_execution_roots()
+        if repo != raw_repository: raise ValueError("repository mismatch with configured canonical repository")
+        ticket=ticket_from_ledger(self.ledger.get_ticket(ticket_id))
         if ticket.risk != "low": raise PermissionError("only low-risk tickets may execute locally")
         if self.ledger.accepted_commit(ticket_id): self.ledger.project_ticket(ticket_id,self.board); return True
         state=CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
         if state == CanonicalState.READY_LOCAL and not self.ledger.claim_specific(ticket_id,owner,self.config.lease_seconds): return False
         if state in {CanonicalState.NEEDS_TRIAGE,CanonicalState.BLOCKED,CanonicalState.DONE}: return False
-        planning_base=str(binding["starting_sha"]); worktrees=GitWorktreeAdapter(repo,self.config.worktree_root)
+        planning_base=str(binding["starting_sha"]); worktrees=GitWorktreeAdapter(repo,worktree_root)
         base=worktrees.resolve_execution_base(self.ledger.get_ticket(ticket_id)["tranche_id"] or None, planning_base)
         self.ledger.record_runtime_stage(ticket_id, "execution_base", base)
         attempt_number=max([int(r["attempt_number"]) for r in self.ledger.connection.execute("SELECT attempt_number FROM attempts WHERE ticket_id=?",(ticket_id,))] or [1])
@@ -115,16 +170,24 @@ class LocalFirstController:
         repair_evidence=""
         try:
             while attempt_number <= ticket.max_attempts:
+                existing_attempt=self.ledger.connection.execute("SELECT worktree_path FROM attempts WHERE ticket_id=? AND attempt_number=?",(ticket_id,attempt_number)).fetchone()
+                fresh_attempt = not bool(existing_attempt and existing_attempt["worktree_path"])
                 self.ledger.ensure_attempt(ticket_id,attempt_number); attempt=self._attempt(worktrees,ticket_id,attempt_number,base)
-                artifacts_root=self.config.artifact_root/ticket_id/str(attempt_number); artifacts_root.mkdir(parents=True,exist_ok=True)
                 impl=self.ledger.model_stage(ticket_id,attempt_number,"implementation")
                 if not impl:
+                    if fresh_attempt:
+                        self._assert_pre_inference_isolation(repository=repo,attempt=attempt,base_sha=base,ticket=ticket,admission_sha=planning_base)
+                    artifacts_root=artifact_root/ticket_id/str(attempt_number); artifacts_root.mkdir(parents=True,exist_ok=True)
                     packet=ContextPacketBuilder().build_from_repository(ticket,attempt.path,repository_rules="Edit only allowed files. Return JSON only.",failure_evidence=repair_evidence)
                     artifacts=ContextPacketBuilder().write_artifacts(packet,artifact_root=artifacts_root); request_hash=hashlib.sha256(packet.text.encode()).hexdigest()
+                    if hasattr(self.local_model, "implementation_timeout_seconds"):
+                        self.local_model.implementation_timeout_seconds = self.config.implementation_timeout_seconds
                     result=self.local_model.invoke("implementation",packet.text,artifact_dir=artifacts_root,workdir=attempt.path)
                     response_path=getattr(result,"artifact_path",artifacts_root/"implementation-result.json")
                     self.ledger.record_model_stage(ticket_id,attempt_number,"implementation",purpose="implementation",adapter=type(self.local_model).__name__,request_hash=request_hash,response_artifact=str(response_path),worktree_path=str(attempt.path),base_sha=base,diff_hash=worktrees.diff_hash(attempt.path))
                     self.ledger.record_runtime_stage(ticket_id,f"implementation-{attempt_number}",str(response_path)); self.ledger.record_runtime_stage(ticket_id,"implementation_completed",str(response_path)); self._crash("implementation_completed")
+                else:
+                    artifacts_root=artifact_root/ticket_id/str(attempt_number)
                 self.ledger.transition(ticket_id,CanonicalState.VERIFYING) if CanonicalState(self.ledger.get_ticket(ticket_id)["state"]) == CanonicalState.IMPLEMENTING else None
                 validation=DeterministicValidator(artifact_root=artifacts_root).validate(attempt.path,ticket,base_sha=base)
                 self.ledger.record_runtime_stage(ticket_id,f"validation-{attempt_number}",validation.compact_evidence); self.ledger.record_runtime_stage(ticket_id,"validation_completed",validation.compact_evidence); self._crash("validation_completed")

@@ -32,6 +32,13 @@ class GitWorktreeAdapter:
     def __init__(self, primary_checkout: Path, worktree_root: Path) -> None:
         self.primary_checkout, self.worktree_root = Path(primary_checkout).resolve(), Path(worktree_root).resolve()
 
+    def _require_safe_worktree_root(self) -> None:
+        try:
+            self.worktree_root.relative_to(self.primary_checkout)
+        except ValueError:
+            return
+        raise GitAdapterError("unsafe_worktree_root: must resolve outside canonical_repository")
+
     def _git(self, *args: str, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
         try:
             return subprocess.run(("git", *args), cwd=cwd or self.primary_checkout, text=True, capture_output=True, timeout=30, check=check)
@@ -88,6 +95,7 @@ class GitWorktreeAdapter:
     def create_attempt(self, ticket_id: str, attempt_number: int, base_sha: str) -> AttemptWorktree:
         # The canonical checkout is read-only for attempts; its user changes need not block
         # creating a separate worktree from an immutable commit.
+        self._require_safe_worktree_root()
         resolved = self._git("rev-parse", "--verify", f"{base_sha}^{{commit}}").stdout.strip()
         branch = f"local-first/{ticket_id}/attempt-{attempt_number}"
         path = self.worktree_root / ticket_id / f"attempt-{attempt_number}"
@@ -97,7 +105,12 @@ class GitWorktreeAdapter:
             raise GitAdapterError("attempt branch already exists; refusing to reuse it")
         path.parent.mkdir(parents=True, exist_ok=True)
         self._git("worktree", "add", "-b", branch, str(path), resolved)
-        return AttemptWorktree(ticket_id, attempt_number, resolved, branch, path, self.diff_hash(path))
+        resolved_path = path.resolve()
+        try:
+            resolved_path.relative_to(self.primary_checkout)
+        except ValueError:
+            return AttemptWorktree(ticket_id, attempt_number, resolved, branch, resolved_path, self.diff_hash(resolved_path))
+        raise GitAdapterError("unsafe_worktree_root: concrete attempt resolves inside canonical_repository")
 
     def diff_hash(self, attempt: Path) -> str:
         diff = self._git("diff", "--binary", "--no-ext-diff", "HEAD", cwd=attempt).stdout
