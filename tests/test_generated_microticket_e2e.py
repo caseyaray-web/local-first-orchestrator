@@ -179,6 +179,7 @@ class GeneratedMicroticketEndToEndTests(unittest.TestCase):
         self.assertEqual([purpose for purpose, _, _ in model.calls], ["implementation", "review"])
         self.assertNotEqual(model.calls[0][1], model.calls[1][1])
         self.assertEqual([state for _, state, _ in controller_board.writes], ["done"])
+        self.assertEqual([target for target, _, _ in controller_board.writes], ["1"])
         validation_stage = self.ledger.runtime_stage(ticket.ticket_id, "validation-1")
         self.assertIsNotNone(validation_stage)
         assert validation_stage is not None
@@ -310,6 +311,7 @@ class GeneratedMicroticketEndToEndTests(unittest.TestCase):
         self.assertIn("return 'Hello'", review_packets[0])
         self.assertIn("Hello, {name}", review_packets[1])
         self.assertEqual([state for _, state, _ in controller_board.writes], ["done"])
+        self.assertEqual([target for target, _, _ in controller_board.writes], ["1"])
         self.assertEqual(self.ledger.runtime_stage(ticket.ticket_id, "validation-1")["detail"], "validation passed")
         self.assertEqual(self.ledger.runtime_stage(ticket.ticket_id, "validation-2")["detail"], "validation passed")
         findings = self.ledger.connection.execute(

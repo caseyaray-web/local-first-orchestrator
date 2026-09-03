@@ -14,6 +14,7 @@ from local_first_orchestrator.generated_projection import (
 )
 from local_first_orchestrator.hermes_board import HermesBoardAdapter
 from local_first_orchestrator.ledger import Ledger
+from local_first_orchestrator.states import CanonicalState
 from tests.test_decomposition import Plans
 
 
@@ -82,6 +83,10 @@ elif len(command) == 3 and command[0] == "show" and command[2] == "--json":
         contract[field] = value
         shown["body"] = prefix + marker + json.dumps(contract, sort_keys=True, separators=(",", ":")) + "\\n```" + suffix
     print(json.dumps({"task": shown}))
+elif command and command[0] in {"schedule", "block", "complete"}:
+    if len(command) < 2 or command[1] not in data["tasks"]:
+        sys.exit(3)
+    print("ok")
 else:
     sys.exit(9)
 '''
@@ -335,6 +340,44 @@ class GeneratedProjectionDeliveryTests(unittest.TestCase):
         self.ledger.complete_generated_create_projection(ticket_id, event_id, "worker-b", "verified", now=110)
         self.assertEqual(self.worker(now=111).deliver_one().status, "no_work")
         self.assertEqual(self.calls(), [])
+
+    def test_generated_external_identity_missing_or_conflicting_fails_closed(self) -> None:
+        ticket_id, _ = self.activate_one()
+        with self.assertRaisesRegex(ValueError, "external_projection_identity_missing"):
+            self.ledger.resolve_external_task_id(ticket_id)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.worker().deliver_one().external_task_id, "1")
+        with self.ledger._transaction() as conn:
+            event_id = self.ledger._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="generated_microticket_created", actor_id="test")
+            conn.execute("INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,operation,external_task_id,acknowledged_at) VALUES (?,?,?,?,?,?,?,?,?)", (ticket_id,event_id,"draft","{}",f"board-create:v1:{ticket_id}:conflict",1,"create_microticket","conflicting-task",1))
+        with self.assertRaisesRegex(ValueError, "external_projection_identity_conflict"):
+            self.ledger.resolve_external_task_id(ticket_id)
+
+    def test_state_projection_uses_acknowledged_external_task_id_not_internal_ticket_id(self) -> None:
+        ticket_id, _ = self.activate_one()
+        self.assertEqual(self.worker().deliver_one().external_task_id, "1")
+        adapter = HermesBoardAdapter(executable=str(self.executable), board="board", allow_writes=True, timeout_seconds=2)
+        evidence = self.ledger.enqueue_evidence_comment(ticket_id, 99, "evidence")
+        self.assertEqual(evidence["external_task_id"], "1")
+        self.ledger.connection.execute("UPDATE evidence_comment_outbox SET external_task_id=? WHERE operation_id=?", (ticket_id, evidence["operation_id"]))
+        self.assertTrue(self.ledger.claim_comment(evidence["operation_id"], "replay-worker"))
+        self.assertEqual(self.ledger.resolve_claimed_comment_target(evidence["operation_id"], "replay-worker"), "1")
+        self.ledger.transition(ticket_id, CanonicalState.READY_LOCAL)
+        ready_event = self.ledger.connection.execute("SELECT id FROM events WHERE entity_id=? AND to_state='ready_local' ORDER BY id DESC LIMIT 1", (ticket_id,)).fetchone()["id"]
+        self.ledger.connection.execute("UPDATE board_projection_outbox SET external_task_id=NULL WHERE ticket_id=? AND event_id=?", (ticket_id, ready_event))
+        self.assertTrue(self.ledger.project_ticket(ticket_id, adapter))
+        self.ledger.connection.execute("UPDATE board_projection_outbox SET external_task_id=NULL WHERE ticket_id=? AND event_id=?", (ticket_id, ready_event))
+        self.assertFalse(self.ledger.project_ticket(ticket_id, adapter))
+        self.assertIsNone(self.ledger.connection.execute("SELECT external_task_id FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, ready_event)).fetchone()["external_task_id"])
+        self.ledger.transition(ticket_id, CanonicalState.BLOCKED)
+        self.assertTrue(self.ledger.project_ticket(ticket_id, adapter))
+        calls = self.calls()
+        self.assertEqual([call[3] for call in calls], ["create", "show", "schedule", "block"])
+        self.assertEqual([calls[2][4], calls[3][4]], ["1", "1"])
+        self.assertNotIn(ticket_id, [calls[2][4], calls[3][4]])
+        rows = self.ledger.connection.execute("SELECT external_task_id FROM board_projection_outbox WHERE ticket_id=? AND operation='set_state' ORDER BY event_id", (ticket_id,)).fetchall()
+        self.assertEqual([row["external_task_id"] for row in rows], [None, "1"])
+        self.assertIsNone(self.ledger.get_ticket(ticket_id)["external_id"])
 
     def test_policy_rejects_a_lease_shorter_than_the_bounded_create_show_horizon(self) -> None:
         adapter = HermesBoardAdapter(executable=str(self.executable), board="board", allow_writes=True, timeout_seconds=2)

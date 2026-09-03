@@ -88,9 +88,15 @@ class CommentDeliveryWorker:
 
         operation_id = str(row["operation_id"])
         attempt_count = int(row["attempt_count"])
+        try:
+            external_task_id = self.ledger.resolve_claimed_comment_target(operation_id, self.worker_id)
+        except Exception as exc:
+            reason = Ledger._safe_comment_error(str(exc), limit=self.policy.error_length_limit)
+            self.ledger.mark_comment_permanently_failed(operation_id, self.worker_id, reason, now=now, error_limit=self.policy.error_length_limit)
+            return CommentDeliveryResult("permanently_failed", operation_id, attempt_count, error=reason)
         marker = f"<!-- local-first-comment:{operation_id} -->"
         try:
-            lookup = MarkerLookup(self.adapter.find_comment_marker(str(row["external_task_id"]), marker))
+            lookup = MarkerLookup(self.adapter.find_comment_marker(external_task_id, marker))
         except (Exception, ValueError):
             lookup = MarkerLookup.UNAVAILABLE
         if lookup is MarkerLookup.FOUND:
@@ -107,7 +113,7 @@ class CommentDeliveryWorker:
         self._fault("after_lookup_not_found")
         try:
             self.adapter.deliver_comment(
-                str(row["external_task_id"]),
+                external_task_id,
                 str(row["payload"]),
                 idempotency_key=str(row["idempotency_key"]),
             )

@@ -418,6 +418,38 @@ class Ledger:
         if self.failure_injector is not None:
             self.failure_injector(point)
 
+    def _resolve_external_task_id_in_transaction(self, conn: sqlite3.Connection, ticket_id: str) -> str:
+        """Resolve the sole board identity; generated tickets never fall back to their ledger ID."""
+        ticket = conn.execute("SELECT id, external_id FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+        if ticket is None: raise KeyError(ticket_id)
+        generated = conn.execute(
+            "SELECT e.id FROM events e WHERE e.entity_type='ticket' AND e.entity_id=? "
+            "AND e.event_type='generated_microticket_created'", (ticket_id,)
+        ).fetchall()
+        if not generated:
+            # Pre-generated/imported tickets historically persist their board ID on
+            # tickets.external_id. The final fallback keeps legacy fake/internal
+            # board fixtures working; it is never available to generated tickets.
+            return str(ticket["external_id"] or ticket_id)
+        rows = conn.execute(
+            "SELECT b.external_task_id FROM events e JOIN board_projection_outbox b "
+            "ON b.ticket_id=e.entity_id AND b.event_id=e.id "
+            "WHERE e.entity_type='ticket' AND e.entity_id=? AND e.event_type='generated_microticket_created' "
+            "AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL",
+            (ticket_id,),
+        ).fetchall()
+        ids = {str(row["external_task_id"]) for row in rows if isinstance(row["external_task_id"], str) and row["external_task_id"]}
+        if len(ids) != 1:
+            raise ValueError("external_projection_identity_missing" if not ids else "external_projection_identity_conflict")
+        external_task_id = ids.pop()
+        if ticket["external_id"] is not None and str(ticket["external_id"]) != external_task_id:
+            raise ValueError("external_projection_identity_conflict")
+        return external_task_id
+
+    def resolve_external_task_id(self, ticket_id: str) -> str:
+        """Read the deterministic board target without board scraping or mutation."""
+        return self._resolve_external_task_id_in_transaction(self.connection, ticket_id)
+
     @staticmethod
     def _comment_payload(ticket_id: str, state: str, operation_id: str, evidence: str) -> str:
         import re
@@ -433,16 +465,21 @@ class Ledger:
             raise ValueError("event is not a projectable ticket state transition")
         state = str(event["to_state"]); state_key = f"ticket-event:{event_id}"
         state_payload_json = json.dumps(state_payload or {}, sort_keys=True, separators=(",", ":"))
+        resolved_task_id = self._resolve_external_task_id_in_transaction(conn, ticket_id)
+        if external_task_id is not None and external_task_id != resolved_task_id:
+            raise ValueError("external_projection_identity_conflict")
         existing_state = conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()
         if existing_state is not None:
             if (existing_state["state"], existing_state["idempotency_key"], existing_state["payload_json"]) != (state, state_key, state_payload_json):
                 raise ValueError("projection state intent conflicts with persisted intent")
+            if existing_state["external_task_id"] not in {None, resolved_task_id}:
+                raise ValueError("external_projection_identity_conflict")
         else:
-            conn.execute("INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at) VALUES (?,?,?,?,?,?)", (ticket_id, event_id, state, state_payload_json, state_key, self._now()))
+            conn.execute("INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,external_task_id) VALUES (?,?,?,?,?,?,?)", (ticket_id, event_id, state, state_payload_json, state_key, self._now(), resolved_task_id))
         self._inject_failure("after_state_intent")
         comment_key = f"evidence-comment:{ticket_id}:{event_id}"; comment_id = hashlib.sha256(comment_key.encode()).hexdigest()[:32]
         payload = self._comment_payload(ticket_id, state, comment_id, evidence)
-        task_id = str(external_task_id or ticket["external_id"] or ticket_id)
+        task_id = resolved_task_id
         existing_comment = conn.execute("SELECT * FROM evidence_comment_outbox WHERE operation_id=?", (comment_id,)).fetchone()
         if existing_comment is not None:
             if (existing_comment["ticket_id"], int(existing_comment["event_id"]), existing_comment["external_task_id"], existing_comment["idempotency_key"], existing_comment["payload"]) != (ticket_id, event_id, task_id, comment_key, payload):
@@ -769,13 +806,24 @@ class Ledger:
         safe=re.sub(r"(?i)(password|token|secret|api[_-]?key)\s*[:=]\s*\S+",r"\1=[REDACTED]",evidence)[:800]
         payload=(f"Local-first ticket {ticket_id} | state={row['state']} | {safe}\n<!-- local-first-comment:{operation_id} -->")[:1000]
         with self._transaction() as conn:
-            conn.execute("INSERT OR IGNORE INTO evidence_comment_outbox(operation_id,ticket_id,event_id,external_task_id,operation_kind,idempotency_key,payload,status,created_at,updated_at) VALUES (?,?,?,?,? ,?,?, 'pending',?,?)",(operation_id,ticket_id,event_id,str(row.get('external_id') or ticket_id),'evidence_comment',key,payload,now,now))
+            target = self._resolve_external_task_id_in_transaction(conn, ticket_id)
+            conn.execute("INSERT OR IGNORE INTO evidence_comment_outbox(operation_id,ticket_id,event_id,external_task_id,operation_kind,idempotency_key,payload,status,created_at,updated_at) VALUES (?,?,?,?,? ,?,?, 'pending',?,?)",(operation_id,ticket_id,event_id,target,'evidence_comment',key,payload,now,now))
         return self.comment_outbox(operation_id)
 
     def comment_outbox(self, operation_id: str) -> dict[str, Any]:
         row=self.connection.execute("SELECT * FROM evidence_comment_outbox WHERE operation_id=?",(operation_id,)).fetchone()
         if row is None: raise KeyError(operation_id)
         return dict(row)
+
+    def resolve_claimed_comment_target(self, operation_id: str, owner: str) -> str:
+        """Retarget replayable legacy comment rows from authoritative projection provenance."""
+        with self._transaction() as conn:
+            row = conn.execute("SELECT ticket_id,status,lease_owner FROM evidence_comment_outbox WHERE operation_id=?", (operation_id,)).fetchone()
+            if row is None: raise KeyError(operation_id)
+            if row["status"] != "delivering" or row["lease_owner"] != owner: raise PermissionError("comment delivery is not owned")
+            target = self._resolve_external_task_id_in_transaction(conn, str(row["ticket_id"]))
+            conn.execute("UPDATE evidence_comment_outbox SET external_task_id=?,updated_at=? WHERE operation_id=?", (target,self._now(),operation_id))
+            return target
 
     def claim_comment(self, operation_id: str, owner: str, *, lease_seconds: int = 60, now: int | None = None) -> bool:
         now=self._now() if now is None else now
@@ -1226,8 +1274,16 @@ class Ledger:
         existing = self.connection.execute("SELECT 1 FROM board_projections WHERE ticket_id=? AND event_id=?", (ticket_id,event_id)).fetchone()
         did_work = existing is None
         outbox = bundle["state"]
+        target = self.resolve_external_task_id(ticket_id)
+        if outbox["external_task_id"] not in {None, target}:
+            raise ValueError("external_projection_identity_conflict")
         if existing is None and outbox["acknowledged_at"] is None:
-            adapter.set_state(ticket_id, CanonicalState(outbox["state"]), idempotency_key=outbox["idempotency_key"])
+            if outbox["external_task_id"] is None:
+                with self._transaction() as conn:
+                    changed = conn.execute("UPDATE board_projection_outbox SET external_task_id=? WHERE ticket_id=? AND event_id=? AND external_task_id IS NULL AND acknowledged_at IS NULL", (target, ticket_id, event_id))
+                    if changed.rowcount != 1: raise RuntimeError("external_projection_identity_changed")
+                outbox = self.connection.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()
+            adapter.set_state(target, CanonicalState(outbox["state"]), idempotency_key=outbox["idempotency_key"])
             with self._transaction() as conn:
                 conn.execute("INSERT OR IGNORE INTO board_projections(ticket_id,event_id,state,projected_at) VALUES (?,?,?,?)",(ticket_id,event_id,outbox["state"],self._now()))
                 conn.execute("UPDATE board_projection_outbox SET acknowledged_at=? WHERE ticket_id=? AND event_id=?",(self._now(),ticket_id,event_id))

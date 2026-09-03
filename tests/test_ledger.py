@@ -84,6 +84,15 @@ class LedgerTests(unittest.TestCase):
         self.assertFalse(self.db.project_ticket(ticket, board))
         self.assertEqual(len(board.projections), 1)
 
+    def test_non_generated_projection_uses_persisted_external_id(self) -> None:
+        ticket = self.db.create_ticket(title="Imported", state=CanonicalState.DRAFT, external_id="external-42")
+        board = FakeBoardAdapter()
+        self.db.transition(ticket, CanonicalState.READY_LOCAL)
+        self.assertTrue(self.db.project_ticket(ticket, board))
+        self.assertEqual(board.states, {"external-42": CanonicalState.READY_LOCAL})
+        row = self.db.connection.execute("SELECT external_task_id FROM board_projection_outbox WHERE ticket_id=?", (ticket,)).fetchone()
+        self.assertEqual(row["external_task_id"], "external-42")
+
     def test_kanban_named_database_is_rejected_before_constructor_or_cli_mutates_it(self) -> None:
         kanban_path = Path(self.tempdir.name) / "kanban.db"
 
