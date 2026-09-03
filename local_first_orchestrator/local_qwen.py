@@ -85,13 +85,17 @@ def _require_exact_review_payload(payload: object) -> dict[str, object]:
 
 class LocalQwenAdapter:
     """Pure invocation boundary; callers alone may update the ledger or board."""
-    def __init__(self, *, runner: Runner = subprocess.run, executable: str = "hermes", provider: str = LOCAL_QWEN_PROVIDER, model: str = LOCAL_QWEN_MODEL, hermes_home: Path | None = None, review_llm: Any | None = None, implementation_timeout_seconds: int = 300) -> None:
+    def __init__(self, *, runner: Runner = subprocess.run, executable: str = "hermes", provider: str = LOCAL_QWEN_PROVIDER, model: str = LOCAL_QWEN_MODEL, hermes_home: Path | None = None, review_llm: Any | None = None, implementation_timeout_seconds: int = 300, review_timeout_seconds: int = 300) -> None:
         if not isinstance(implementation_timeout_seconds, int) or not 1 <= implementation_timeout_seconds <= 21_600:
             raise ValueError("invalid_implementation_timeout_seconds")
+        if not isinstance(review_timeout_seconds, int) or not 1 <= review_timeout_seconds <= 21_600:
+            raise ValueError("invalid_review_timeout_seconds")
         self.runner, self.executable, self.provider, self.model = runner, executable, provider, model
         self.hermes_home = Path(hermes_home or Path.home() / ".hermes" / "profiles" / "worker-code-local").resolve()
         self.review_llm = review_llm
         self.implementation_timeout_seconds = implementation_timeout_seconds
+        self.review_timeout_seconds = review_timeout_seconds
+        self.review_provider, self.review_model = provider, model
 
     def _invoke_review(self, packet: str, artifact_dir: Path) -> ModelResult:
         if self.review_llm is not None:
@@ -104,10 +108,11 @@ class LocalQwenAdapter:
                 json_schema=REVIEW_JSON_SCHEMA,
                 json_mode=True,
                 schema_name="local_first_review",
-                provider=self.provider,
-                model=self.model,
+                provider=self.review_provider,
+                model=self.review_model,
                 temperature=0,
                 purpose="local_first_review",
+                timeout=self.review_timeout_seconds,
             )
             content_type, parsed, argv = getattr(response, "content_type", None), getattr(response, "parsed", None), ()
         else:
@@ -117,10 +122,10 @@ class LocalQwenAdapter:
             argv = (sys.executable, "-m", "local_first_orchestrator.review_worker")
             completed = self.runner(
                 argv,
-                input=json.dumps({"packet": packet, "provider": self.provider, "model": self.model}),
+                input=json.dumps({"packet": packet, "provider": self.review_provider, "model": self.review_model, "timeout_seconds": self.review_timeout_seconds}),
                 text=True,
                 capture_output=True,
-                timeout=300,
+                timeout=self.review_timeout_seconds,
                 check=False,
                 cwd=str(Path(__file__).resolve().parent.parent),
                 env={
@@ -141,7 +146,7 @@ class LocalQwenAdapter:
             raise ValueError("local review did not return structured JSON")
         payload = _require_exact_review_payload(parsed)
         artifact = artifact_dir / "review-result.json"
-        artifact.write_text(json.dumps({"provider": self.provider, "model": self.model, "payload": payload}, sort_keys=True), encoding="utf-8")
+        artifact.write_text(json.dumps({"provider": self.review_provider, "model": self.review_model, "payload": payload}, sort_keys=True), encoding="utf-8")
         return ModelResult(payload, artifact, tuple(argv))
 
     def invoke(self, purpose: str, packet: str, *, artifact_dir: Path, workdir: Path | None = None) -> ModelResult:

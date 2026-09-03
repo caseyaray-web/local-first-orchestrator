@@ -35,7 +35,7 @@ class OperatorApiTests(unittest.TestCase):
                 (self.repository,),
                 ModelRegistration("impl-profile", "impl-provider", "impl-model"),
                 ModelRegistration("review-profile", "review-provider", "review-model"),
-                root / "worktrees", root / "artifacts", 1800,
+                root / "worktrees", root / "artifacts", 1800, 900,
             ),
             config_path,
         )
@@ -87,6 +87,7 @@ class OperatorApiTests(unittest.TestCase):
             "worktree_root": str((Path(self.tempdir.name) / "worktrees").resolve()),
             "artifact_root": str((Path(self.tempdir.name) / "artifacts").resolve()),
             "implementation_timeout_seconds": 1800,
+            "review_timeout_seconds": 900,
         })
 
         paused = self.client.post("/api/plugins/local-first-orchestrator/pause", json={"reason": "maintenance"})

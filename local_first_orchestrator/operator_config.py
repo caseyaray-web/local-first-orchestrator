@@ -15,7 +15,7 @@ from pathlib import Path
 
 _CONFIG_ENV = "LOCAL_FIRST_OPERATOR_CONFIG"
 _LEGACY_FIELDS = frozenset({"ledger_path", "canonical_repository", "repository_allowlist", "implementation", "review"})
-_RUNTIME_FIELDS = frozenset({"worktree_root", "artifact_root", "implementation_timeout_seconds"})
+_RUNTIME_FIELDS = frozenset({"worktree_root", "artifact_root", "implementation_timeout_seconds", "review_timeout_seconds"})
 
 
 def default_config_path() -> Path:
@@ -61,6 +61,7 @@ class OperatorConfig:
     worktree_root: Path | None = None
     artifact_root: Path | None = None
     implementation_timeout_seconds: int | None = None
+    review_timeout_seconds: int | None = None
 
     def validated(self, *, require_ledger: bool) -> "OperatorConfig":
         ledger = self.ledger_path.expanduser().resolve(strict=require_ledger)
@@ -72,24 +73,24 @@ class OperatorConfig:
             raise ValueError("canonical repository must be an exact allowlisted root")
         if not (repository / ".git").exists() or any(not (path / ".git").exists() for path in allowlist):
             raise ValueError("canonical repository and allowlist entries must be Git checkouts")
-        runtime = (self.worktree_root, self.artifact_root, self.implementation_timeout_seconds)
+        runtime = (self.worktree_root, self.artifact_root, self.implementation_timeout_seconds, self.review_timeout_seconds)
         if any(value is not None for value in runtime) and any(value is None for value in runtime):
             raise ValueError("execution_runtime_not_configured")
-        if self.worktree_root is not None and (not isinstance(self.worktree_root, Path) or not isinstance(self.artifact_root, Path) or not isinstance(self.implementation_timeout_seconds, int)):
+        if self.worktree_root is not None and (not isinstance(self.worktree_root, Path) or not isinstance(self.artifact_root, Path) or not isinstance(self.implementation_timeout_seconds, int) or not isinstance(self.review_timeout_seconds, int)):
             raise ValueError("execution_runtime_not_configured")
-        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review, self.worktree_root, self.artifact_root, self.implementation_timeout_seconds)
+        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review, self.worktree_root, self.artifact_root, self.implementation_timeout_seconds, self.review_timeout_seconds)
 
     @property
     def execution_configured(self) -> bool:
-        return self.worktree_root is not None and self.artifact_root is not None and self.implementation_timeout_seconds is not None
+        return self.worktree_root is not None and self.artifact_root is not None and self.implementation_timeout_seconds is not None and self.review_timeout_seconds is not None
 
     def runtime_config(self):
         """Build the sole execution configuration or fail closed for legacy data."""
         if not self.execution_configured:
             raise ValueError("execution_runtime_not_configured")
         from .controller import RuntimeConfig
-        assert self.worktree_root is not None and self.artifact_root is not None and self.implementation_timeout_seconds is not None
-        config = RuntimeConfig(self.canonical_repository, self.worktree_root, self.artifact_root, self.repository_allowlist, implementation_timeout_seconds=self.implementation_timeout_seconds)
+        assert self.worktree_root is not None and self.artifact_root is not None and self.implementation_timeout_seconds is not None and self.review_timeout_seconds is not None
+        config = RuntimeConfig(self.canonical_repository, self.worktree_root, self.artifact_root, self.repository_allowlist, implementation_timeout_seconds=self.implementation_timeout_seconds, review_timeout_seconds=self.review_timeout_seconds)
         config.validate_execution_roots()
         return config
 
@@ -105,6 +106,7 @@ class OperatorConfig:
             "worktree_root": str(self.worktree_root),
             "artifact_root": str(self.artifact_root),
             "implementation_timeout_seconds": self.implementation_timeout_seconds,
+            "review_timeout_seconds": self.review_timeout_seconds,
         }
 
 
@@ -124,11 +126,11 @@ def load_operator_config(path: Path | None = None) -> OperatorConfig:
     if not isinstance(raw["ledger_path"], str) or not isinstance(raw["canonical_repository"], str):
         raise ValueError("ledger_path and canonical_repository must be paths")
     if _RUNTIME_FIELDS <= set(raw):
-        if not isinstance(raw["worktree_root"], str) or not isinstance(raw["artifact_root"], str) or not isinstance(raw["implementation_timeout_seconds"], int):
+        if not isinstance(raw["worktree_root"], str) or not isinstance(raw["artifact_root"], str) or not isinstance(raw["implementation_timeout_seconds"], int) or not isinstance(raw["review_timeout_seconds"], int):
             raise ValueError("execution_runtime_not_configured")
-        runtime = (Path(raw["worktree_root"]), Path(raw["artifact_root"]), raw["implementation_timeout_seconds"])
+        runtime = (Path(raw["worktree_root"]), Path(raw["artifact_root"]), raw["implementation_timeout_seconds"], raw["review_timeout_seconds"])
     else:
-        runtime = (None, None, None)
+        runtime = (None, None, None, None)
     return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review"), *runtime).validated(require_ledger=True)
 
 

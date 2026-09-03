@@ -13,14 +13,14 @@ from typing import Any
 from .local_qwen import REVIEW_JSON_SCHEMA
 
 
-def _request() -> dict[str, str]:
+def _request() -> dict[str, Any]:
     try:
         raw: Any = json.loads(sys.stdin.read())
     except json.JSONDecodeError as exc:
         raise ValueError("review worker request must be JSON") from exc
-    if not isinstance(raw, dict) or set(raw) != {"packet", "provider", "model"}:
+    if not isinstance(raw, dict) or set(raw) != {"packet", "provider", "model", "timeout_seconds"}:
         raise ValueError("review worker request has an invalid shape")
-    if not all(isinstance(raw[key], str) and raw[key] for key in raw):
+    if not all(isinstance(raw[key], str) and raw[key] for key in ("packet", "provider", "model")) or not isinstance(raw["timeout_seconds"], int) or not 1 <= raw["timeout_seconds"] <= 21_600:
         raise ValueError("review worker request has an invalid shape")
     return raw
 
@@ -43,6 +43,7 @@ def main() -> int:
             model=request["model"],
             temperature=0,
             purpose="local_first_review",
+            timeout=request["timeout_seconds"],
         )
         print(json.dumps({"content_type": response.content_type, "parsed": response.parsed}, sort_keys=True))
         return 0

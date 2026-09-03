@@ -28,6 +28,7 @@ class RuntimeConfig:
     repository_allowlist: tuple[Path, ...] = ()
     lease_seconds: int = 1800
     implementation_timeout_seconds: int = 300
+    review_timeout_seconds: int = 300
 
     def canonical_repository(self, candidate: Path) -> Path:
         path = Path(candidate).resolve(strict=True)
@@ -60,6 +61,8 @@ class RuntimeConfig:
             raise ValueError("unsafe_artifact_root: must resolve outside canonical_repository")
         if not isinstance(self.implementation_timeout_seconds, int) or not 1 <= self.implementation_timeout_seconds <= 21_600:
             raise ValueError("invalid_implementation_timeout_seconds")
+        if not isinstance(self.review_timeout_seconds, int) or not 1 <= self.review_timeout_seconds <= 21_600:
+            raise ValueError("invalid_review_timeout_seconds")
         return repository, worktree_root, artifact_root
 
 
@@ -152,7 +155,7 @@ class LocalFirstController:
 
     def effective_runtime_identity(self) -> dict[str, object]:
         repository, worktree_root, artifact_root = self.config.validate_execution_roots()
-        return {"canonical_repository": str(repository), "worktree_root": str(worktree_root), "artifact_root": str(artifact_root), "implementation_timeout_seconds": self.config.implementation_timeout_seconds, "provider": str(getattr(self.local_model, "provider", type(self.local_model).__name__)), "model": str(getattr(self.local_model, "model", type(self.local_model).__name__))}
+        return {"canonical_repository": str(repository), "worktree_root": str(worktree_root), "artifact_root": str(artifact_root), "implementation_timeout_seconds": self.config.implementation_timeout_seconds, "review_timeout_seconds": self.config.review_timeout_seconds, "provider": str(getattr(self.local_model, "provider", type(self.local_model).__name__)), "model": str(getattr(self.local_model, "model", type(self.local_model).__name__))}
 
     def reconcile_failed_attempt(self, ticket_id: str, *, operator_id: str, classification: str, forensic_artifact_paths: tuple[Path, ...] = ()) -> dict[str, object]:
         """Retire failed history without cleanup or a subsequent model invocation."""
@@ -183,6 +186,17 @@ class LocalFirstController:
         checked_values = [str(worktree_path), *(str(path) for path in artifact_paths)]
         if attempt["branch"]: checked_values.append(f"git-ref:{str(attempt['branch'])}")
         return self.ledger.confirm_retired_attempt_cleanup(ticket_id, retired_attempt_number=retired, operator_id=operator_id, checked_paths=tuple(checked_values))
+
+    def resume_failed_review(self, ticket_id: str, *, operator_id: str) -> dict[str, object]:
+        """Authorize only a fresh review of an unchanged frozen candidate."""
+        binding=self.ledger.runtime_binding(ticket_id); repository, worktree_root, _=self.config.validate_execution_roots()
+        if str(repository) != binding["repository_path"] or self.ledger.incomplete_model_invocations(ticket_id): raise ValueError("runtime or invocation reconciliation prerequisite failed")
+        candidate=self.ledger.review_candidate(ticket_id)
+        if candidate is None: raise ValueError("validated review candidate evidence unavailable")
+        path=Path(candidate.get("worktree_path") or self.ledger.connection.execute("SELECT worktree_path FROM attempts WHERE ticket_id=? AND attempt_number=?",(ticket_id,candidate["attempt_number"])).fetchone()["worktree_path"])
+        if not path.is_dir(): raise ValueError("validated attempt worktree is missing")
+        adapter=GitWorktreeAdapter(repository,worktree_root); fingerprint=adapter.diff_hash(path)
+        return self.ledger.authorize_review_resume(ticket_id,operator_id=operator_id,candidate_fingerprint=fingerprint,runtime_identity=self.effective_runtime_identity())
 
     def execute(self, ticket_id: str, *, repository: Path, allow_board_writes: bool, owner: str="local-first-controller") -> bool:
         if not allow_board_writes: return False
@@ -264,12 +278,27 @@ class LocalFirstController:
                     if attempt_number >= ticket.max_attempts: self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"validation":validation.compact_evidence}); break
                     repair_evidence=validation.compact_evidence; self.ledger.transition(ticket_id,CanonicalState.REPAIRING,payload={"validation":repair_evidence}); self.ledger.transition(ticket_id,CanonicalState.IMPLEMENTING); attempt_number+=1; continue
                 diff=subprocess.run(("git","diff",base),cwd=attempt.path,text=True,capture_output=True,check=True).stdout
+                candidate_fingerprint=hashlib.sha256(diff.encode()).hexdigest()
                 self.ledger.transition(ticket_id,CanonicalState.LOCAL_REVIEW) if CanonicalState(self.ledger.get_ticket(ticket_id)["state"]) == CanonicalState.VERIFYING else None
+                implementation_invocation=self.ledger.invocation_for_stage(ticket_id,attempt_number,"implementation")
+                self.ledger.freeze_review_candidate(ticket_id,attempt_number,candidate_fingerprint=candidate_fingerprint,validation_evidence=validation.compact_evidence,implementation_invocation_id=str(implementation_invocation["invocation_id"]) if implementation_invocation else None,runtime_identity=self.effective_runtime_identity())
                 review_packet=ReviewPacketBuilder().build(ticket,diff=diff,selected_files={p:(attempt.path/p).read_text() for p in (*ticket.allowed_files, *ticket.new_test_files) if (attempt.path/p).exists()},validation_evidence=validation.compact_evidence)
                 review_stage=self.ledger.model_stage(ticket_id,attempt_number,"review")
                 if review_stage and Path(review_stage["response_artifact"]).exists(): review=normalize_review(json.loads(Path(review_stage["response_artifact"]).read_text()).get("payload",{}),ticket)
                 else:
-                    result=LocalReviewAdapter(self.local_model).review(ticket,review_packet,artifact_dir=artifacts_root,workdir=attempt.path); response_path=getattr(result,"raw",None)
+                    if hasattr(self.local_model,"review_timeout_seconds"): self.local_model.review_timeout_seconds=self.config.review_timeout_seconds
+                    invocation_id=uuid.uuid4().hex; provider=str(getattr(self.local_model,"review_provider",getattr(self.local_model,"provider",type(self.local_model).__name__))); model=str(getattr(self.local_model,"review_model",getattr(self.local_model,"model",type(self.local_model).__name__)))
+                    self.ledger.start_model_invocation(invocation_id=invocation_id,ticket_id=ticket_id,attempt_number=attempt_number,stage="review",provider=provider,model=model,packet_hash=hashlib.sha256(review_packet.encode()).hexdigest(),worktree_path=str(attempt.path),timeout_seconds=self.config.review_timeout_seconds)
+                    started=time.monotonic()
+                    try:
+                        result=LocalReviewAdapter(self.local_model).review(ticket,review_packet,artifact_dir=artifacts_root,workdir=attempt.path)
+                    except subprocess.TimeoutExpired as exc:
+                        self.ledger.finish_model_invocation(invocation_id,status="timeout",duration_seconds=time.monotonic()-started,error={"type":"TimeoutExpired","timeout_seconds":self.config.review_timeout_seconds,"process":str(exc)[:1000]}); self.ledger.record_review_infrastructure_failure(ticket_id,attempt_number,outcome="review_timeout"); self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"review_infrastructure":"review_timeout; reconciliation required","attempt_number":attempt_number}); raise
+                    except ValueError as exc:
+                        self.ledger.finish_model_invocation(invocation_id,status="malformed_output",duration_seconds=time.monotonic()-started,error={"type":type(exc).__name__,"message":str(exc)[:1000]}); self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"review_content":"malformed local review"}); raise
+                    except Exception as exc:
+                        self.ledger.finish_model_invocation(invocation_id,status="process_error",duration_seconds=time.monotonic()-started,error={"type":type(exc).__name__,"message":str(exc)[:1000]}); self.ledger.record_review_infrastructure_failure(ticket_id,attempt_number,outcome="review_process_error"); self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"review_infrastructure":"review_process_error; reconciliation required","attempt_number":attempt_number}); raise
+                    response_path=getattr(result,"artifact_path",artifacts_root/"review-result.json"); self.ledger.finish_model_invocation(invocation_id,status="completed",duration_seconds=time.monotonic()-started,model_artifact=str(response_path))
                     path=artifacts_root/"review-result.json"; path.write_text(json.dumps({"payload":result.raw},sort_keys=True),encoding="utf-8")
                     self.ledger.record_model_stage(ticket_id,attempt_number,"review",purpose="review",adapter=type(self.local_model).__name__,request_hash=hashlib.sha256(review_packet.encode()).hexdigest(),response_artifact=str(path),worktree_path=str(attempt.path),base_sha=base,diff_hash=worktrees.diff_hash(attempt.path)); self.ledger.record_runtime_stage(ticket_id,"review_completed",str(path)); self._crash("review_completed"); review=result
                 outcome=SameTicketRepairCoordinator(self.ledger).apply(ticket_id,attempt_number,review)

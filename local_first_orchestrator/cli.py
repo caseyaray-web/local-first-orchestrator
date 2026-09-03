@@ -26,11 +26,12 @@ def _ad_hoc_controller(ledger: Ledger, args: argparse.Namespace, *, allow_board_
     if args.worktree_root: worktree_root = Path(args.worktree_root).expanduser()
     if args.artifact_root: artifact_root = Path(args.artifact_root).expanduser()
     timeout = args.implementation_timeout_seconds or 300
-    return LocalFirstController(ledger,_board_for_cli(args,allow_board_writes),RuntimeConfig(root,worktree_root,artifact_root,repository_allowlist=allowlist,implementation_timeout_seconds=timeout))
+    review_timeout = args.review_timeout_seconds or 900
+    return LocalFirstController(ledger,_board_for_cli(args,allow_board_writes),RuntimeConfig(root,worktree_root,artifact_root,repository_allowlist=allowlist,implementation_timeout_seconds=timeout,review_timeout_seconds=review_timeout))
 
 
 def _registered_controller(ledger: Ledger, args: argparse.Namespace, *, allow_board_writes: bool=False) -> tuple[LocalFirstController, OperatorConfig]:
-    if args.worktree_root or args.artifact_root or args.implementation_timeout_seconds is not None or args.allow_repository:
+    if args.worktree_root or args.artifact_root or args.implementation_timeout_seconds is not None or args.review_timeout_seconds is not None or args.allow_repository:
         raise ValueError("registered execution forbids runtime overrides; use the persisted operator registration")
     config = load_operator_config(Path(args.operator_config_path) if args.operator_config_path else None)
     if ledger.database.resolve() != config.ledger_path.resolve():
@@ -39,7 +40,8 @@ def _registered_controller(ledger: Ledger, args: argparse.Namespace, *, allow_bo
     if requested != config.canonical_repository:
         raise ValueError("registered execution repository does not match operator registration")
     runtime = config.runtime_config()
-    model = LocalQwenAdapter(provider=config.implementation.provider, model=config.implementation.model, hermes_home=Path.home()/".hermes"/"profiles"/config.implementation.profile, implementation_timeout_seconds=runtime.implementation_timeout_seconds)
+    model = LocalQwenAdapter(provider=config.implementation.provider, model=config.implementation.model, hermes_home=Path.home()/".hermes"/"profiles"/config.implementation.profile, implementation_timeout_seconds=runtime.implementation_timeout_seconds, review_timeout_seconds=runtime.review_timeout_seconds)
+    model.review_provider, model.review_model = config.review.provider, config.review.model
     return LocalFirstController(ledger,_board_for_cli(args,allow_board_writes),runtime,local_model=model), config
 
 
@@ -76,6 +78,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--worktree-root", help="external worktree root; ad-hoc mode only")
     parser.add_argument("--artifact-root", help="external artifact root; ad-hoc mode only")
     parser.add_argument("--implementation-timeout-seconds", type=int, help="implementation timeout (1..21600); ad-hoc mode only")
+    parser.add_argument("--review-timeout-seconds", type=int, help="review timeout (1..21600); ad-hoc mode only")
     parser.add_argument("--operator-config-path", help="registered operator config for production execution")
     parser.add_argument("--ad-hoc-runtime", action="store_true", help="explicit development-only runtime composition; never uses registered defaults")
     parser.add_argument("--hermes-executable", help="Hermes executable for explicit board access")
@@ -93,6 +96,9 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     reconcile.add_argument("--classification", required=True, choices=("runtime_infrastructure_failure", "model_timeout", "process_error", "validation_failure", "review_exhaustion"))
     reconcile.add_argument("--operator-id", default="local-first-cli")
     reconcile.add_argument("--forensic-artifact-path", action="append", default=[], help="existing artifact root retained with the retired attempt; repeatable")
+    review_resume=commands.add_parser("resume-failed-review", help="authorize a review-only retry for an unchanged validated candidate")
+    review_resume.add_argument("--task-id", required=True)
+    review_resume.add_argument("--operator-id", default="local-first-cli")
     confirm_cleanup=commands.add_parser("confirm-retired-attempt-cleanup", help="verify separately-authorized cleanup; never removes files")
     confirm_cleanup.add_argument("--task-id", required=True)
     confirm_cleanup.add_argument("--operator-id", default="local-first-cli")
@@ -143,6 +149,7 @@ def run_command(args: argparse.Namespace) -> int:
                 worktree_root=worktree_root,
                 artifact_root=artifact_root,
                 implementation_timeout_seconds=args.implementation_timeout_seconds or 300,
+                review_timeout_seconds=args.review_timeout_seconds or 900,
             )
             path=save_operator_config(config, Path(args.config_path) if args.config_path else None)
             print(json.dumps({"registered": str(path)}, sort_keys=True))
@@ -150,6 +157,10 @@ def run_command(args: argparse.Namespace) -> int:
             if args.ad_hoc_runtime: raise ValueError("failed-attempt reconciliation requires registered operator runtime")
             ctl, _ = _registered_controller(ledger,args,allow_board_writes=False)
             print(json.dumps(ctl.reconcile_failed_attempt(args.task_id,operator_id=args.operator_id,classification=args.classification,forensic_artifact_paths=tuple(Path(path) for path in args.forensic_artifact_path)),sort_keys=True))
+        elif args.command=="resume-failed-review":
+            if args.ad_hoc_runtime: raise ValueError("review reconciliation requires registered operator runtime")
+            ctl, _ = _registered_controller(ledger,args,allow_board_writes=False)
+            print(json.dumps(ctl.resume_failed_review(args.task_id,operator_id=args.operator_id),sort_keys=True))
         elif args.command=="confirm-retired-attempt-cleanup":
             if args.ad_hoc_runtime: raise ValueError("cleanup confirmation requires registered operator runtime")
             ctl, _ = _registered_controller(ledger,args,allow_board_writes=False)

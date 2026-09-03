@@ -22,7 +22,7 @@ class OperatorConfigSchemaTests(unittest.TestCase):
         config = load_operator_config(self.write(self.base)); self.assertFalse(config.execution_configured)
         with self.assertRaisesRegex(ValueError, "execution_runtime_not_configured"): config.runtime_config()
     def test_new_schema_is_accepted_and_runtime_validated(self) -> None:
-        raw = {**self.base, "worktree_root": str(self.root / "worktrees"), "artifact_root": str(self.root / "artifacts"), "implementation_timeout_seconds": 1800}
+        raw = {**self.base, "worktree_root": str(self.root / "worktrees"), "artifact_root": str(self.root / "artifacts"), "implementation_timeout_seconds": 1800, "review_timeout_seconds": 900}
         config = load_operator_config(self.write(raw)); runtime = config.runtime_config()
         self.assertEqual(runtime.validate_execution_roots(), (self.repo.resolve(), (self.root / "worktrees").resolve(), (self.root / "artifacts").resolve()))
     def test_unknown_field_is_rejected_without_weakening_closed_schema(self) -> None:

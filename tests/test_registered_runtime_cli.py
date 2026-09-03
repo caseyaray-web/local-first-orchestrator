@@ -17,15 +17,16 @@ class RegisteredRuntimeCliTests(unittest.TestCase):
         subprocess.run(("git","init","-q"),cwd=self.repo,check=True)
         self.database=self.root/"ledger.db"; self.ledger=Ledger(self.database); self.ledger.migrate()
         self.config_path=self.root/"operator.json"
-        save_operator_config(OperatorConfig(self.database,self.repo,(self.repo,),ModelRegistration("registered-profile","registered-provider","registered-model"),ModelRegistration("review","review-provider","review-model"),self.root/"registered-worktrees",self.root/"registered-artifacts",1800),self.config_path)
+        save_operator_config(OperatorConfig(self.database,self.repo,(self.repo,),ModelRegistration("registered-profile","registered-provider","registered-model"),ModelRegistration("review","review-provider","review-model"),self.root/"registered-worktrees",self.root/"registered-artifacts",1800,900),self.config_path)
     def tearDown(self) -> None: self.ledger.close(); self.temp.cleanup()
     def args(self, **changes: object) -> argparse.Namespace:
-        value={"repository":".","allow_repository":[],"worktree_root":None,"artifact_root":None,"implementation_timeout_seconds":None,"operator_config_path":str(self.config_path),"ad_hoc_runtime":False}
+        value={"repository":".","allow_repository":[],"worktree_root":None,"artifact_root":None,"implementation_timeout_seconds":None,"review_timeout_seconds":None,"operator_config_path":str(self.config_path),"ad_hoc_runtime":False}
         value.update(changes); return argparse.Namespace(**value)
     def test_registered_runtime_uses_authoritative_paths_identity_and_timeout(self) -> None:
         controller, config=_registered_controller(self.ledger,self.args())
         self.assertEqual(controller.config.worktree_root,(self.root/"registered-worktrees").resolve()); self.assertEqual(controller.config.artifact_root,(self.root/"registered-artifacts").resolve()); self.assertEqual(controller.config.implementation_timeout_seconds,1800)
         self.assertEqual(controller.local_model.implementation_timeout_seconds,1800); self.assertEqual(controller.local_model.provider,"registered-provider"); self.assertEqual(controller.local_model.model,"registered-model"); self.assertEqual(config.canonical_repository,self.repo.resolve())
+        self.assertEqual(controller.config.review_timeout_seconds,900); self.assertEqual(controller.local_model.review_timeout_seconds,900)
     def test_registered_runtime_rejects_cli_override_instead_of_falling_back(self) -> None:
         with self.assertRaisesRegex(ValueError,"forbids runtime overrides"): _registered_controller(self.ledger,self.args(implementation_timeout_seconds=300))
     def test_ad_hoc_runtime_is_explicit_and_has_separate_default(self) -> None:

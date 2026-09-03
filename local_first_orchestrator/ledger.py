@@ -214,11 +214,20 @@ CREATE TABLE IF NOT EXISTS model_invocations (
     invocation_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id),
     attempt_number INTEGER NOT NULL, stage TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
     packet_hash TEXT NOT NULL, worktree_path TEXT NOT NULL, timeout_seconds INTEGER NOT NULL,
-    started_at INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('started','completed','timeout','process_error')),
-    completed_at INTEGER, duration_seconds REAL, error_json TEXT, model_artifact TEXT,
-    UNIQUE(ticket_id, attempt_number, stage)
+    started_at INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('started','completed','timeout','process_error','malformed_output')),
+    completed_at INTEGER, duration_seconds REAL, error_json TEXT, model_artifact TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_model_invocations_incomplete ON model_invocations(status, ticket_id);
+CREATE INDEX IF NOT EXISTS idx_model_invocations_attempt_stage ON model_invocations(ticket_id, attempt_number, stage, started_at);
+CREATE TABLE IF NOT EXISTS review_candidates (
+    ticket_id TEXT NOT NULL REFERENCES tickets(id), attempt_number INTEGER NOT NULL,
+    candidate_fingerprint TEXT NOT NULL, validation_evidence TEXT NOT NULL,
+    implementation_invocation_id TEXT, runtime_identity_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('review_pending','review_infrastructure_failed','review_completed')),
+    last_outcome TEXT, historical_review_attempted INTEGER NOT NULL DEFAULT 0 CHECK(historical_review_attempted IN (0,1)),
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+    PRIMARY KEY(ticket_id, attempt_number)
+);
 CREATE TABLE IF NOT EXISTS failed_attempt_reconciliations (
     ticket_id TEXT NOT NULL REFERENCES tickets(id), retired_attempt_number INTEGER NOT NULL,
     classification TEXT NOT NULL, previous_ticket_state TEXT NOT NULL, resulting_ticket_state TEXT NOT NULL,
@@ -315,6 +324,29 @@ class Ledger:
         reconciliation_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(failed_attempt_reconciliations)")}
         if "forensic_artifact_paths_json" not in reconciliation_columns:
             self.connection.execute("ALTER TABLE failed_attempt_reconciliations ADD COLUMN forensic_artifact_paths_json TEXT NOT NULL DEFAULT '[]'")
+        # Pre-review-retry ledgers keyed invocations by stage. Preserve their
+        # forensic rows while allowing multiple review transports for one
+        # implementation attempt.
+        invocation_indexes = self.connection.execute("PRAGMA index_list(model_invocations)").fetchall()
+        legacy_stage_key = any(
+            row["unique"] and [part["name"] for part in self.connection.execute(f"PRAGMA index_info({row['name']})")] == ["ticket_id", "attempt_number", "stage"]
+            for row in invocation_indexes
+        )
+        if legacy_stage_key:
+            self.connection.executescript("""
+            ALTER TABLE model_invocations RENAME TO model_invocations_legacy;
+            CREATE TABLE model_invocations (
+                invocation_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id),
+                attempt_number INTEGER NOT NULL, stage TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+                packet_hash TEXT NOT NULL, worktree_path TEXT NOT NULL, timeout_seconds INTEGER NOT NULL,
+                started_at INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('started','completed','timeout','process_error','malformed_output')),
+                completed_at INTEGER, duration_seconds REAL, error_json TEXT, model_artifact TEXT
+            );
+            INSERT INTO model_invocations SELECT * FROM model_invocations_legacy;
+            DROP TABLE model_invocations_legacy;
+            CREATE INDEX IF NOT EXISTS idx_model_invocations_incomplete ON model_invocations(status, ticket_id);
+            CREATE INDEX IF NOT EXISTS idx_model_invocations_attempt_stage ON model_invocations(ticket_id, attempt_number, stage, started_at);
+            """)
         # Phase 2 is additive: preserve Phase 1 ledgers already created.
         ticket_columns = {
             "criterion_ids_json": "TEXT NOT NULL DEFAULT '[]'",
@@ -748,7 +780,7 @@ class Ledger:
         if not all(isinstance(value, str) and value for value in (invocation_id, ticket_id, stage, provider, model, packet_hash, worktree_path)) or not isinstance(timeout_seconds, int) or timeout_seconds < 1:
             raise ValueError("invalid_model_invocation")
         with self._transaction() as conn:
-            existing = conn.execute("SELECT * FROM model_invocations WHERE ticket_id=? AND attempt_number=? AND stage=?", (ticket_id, attempt_number, stage)).fetchone()
+            existing = conn.execute("SELECT * FROM model_invocations WHERE invocation_id=?", (invocation_id,)).fetchone()
             if existing is not None:
                 if existing["invocation_id"] != invocation_id or existing["status"] != "started":
                     raise RuntimeError("model_invocation_reconciliation_required")
@@ -758,7 +790,7 @@ class Ledger:
         return self.model_invocation(invocation_id)
 
     def finish_model_invocation(self, invocation_id: str, *, status: str, duration_seconds: float, error: dict[str, Any] | None = None, model_artifact: str | None = None) -> dict[str, Any]:
-        if status not in {"completed", "timeout", "process_error"}:
+        if status not in {"completed", "timeout", "process_error", "malformed_output"}:
             raise ValueError("invalid_model_invocation_status")
         if duration_seconds < 0:
             raise ValueError("invalid_model_invocation_duration")
@@ -787,8 +819,50 @@ class Ledger:
         return [dict(row) for row in self.connection.execute(query + " ORDER BY started_at, invocation_id", values)]
 
     def invocation_for_stage(self, ticket_id: str, attempt_number: int, stage: str) -> dict[str, Any] | None:
-        row = self.connection.execute("SELECT * FROM model_invocations WHERE ticket_id=? AND attempt_number=? AND stage=?", (ticket_id, attempt_number, stage)).fetchone()
+        row = self.connection.execute("SELECT * FROM model_invocations WHERE ticket_id=? AND attempt_number=? AND stage=? ORDER BY started_at DESC, invocation_id DESC LIMIT 1", (ticket_id, attempt_number, stage)).fetchone()
         return dict(row) if row else None
+
+    def review_invocations(self, ticket_id: str, attempt_number: int) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute("SELECT * FROM model_invocations WHERE ticket_id=? AND attempt_number=? AND stage='review' ORDER BY started_at, invocation_id", (ticket_id, attempt_number))]
+
+    def freeze_review_candidate(self, ticket_id: str, attempt_number: int, *, candidate_fingerprint: str, validation_evidence: str, implementation_invocation_id: str | None, runtime_identity: dict[str, Any], historical_review_attempted: bool = False) -> dict[str, Any]:
+        if not candidate_fingerprint or not validation_evidence:
+            raise ValueError("invalid_review_candidate")
+        now = self._now(); identity = json.dumps(runtime_identity, sort_keys=True, separators=(",", ":"))
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM review_candidates WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            if row is not None:
+                if row["candidate_fingerprint"] != candidate_fingerprint or row["validation_evidence"] != validation_evidence:
+                    raise RuntimeError("review_candidate_conflicts_with_validated_evidence")
+                return dict(row)
+            conn.execute("INSERT INTO review_candidates(ticket_id,attempt_number,candidate_fingerprint,validation_evidence,implementation_invocation_id,runtime_identity_json,status,historical_review_attempted,created_at,updated_at) VALUES (?,?,?,?,?,?, 'review_pending',?,?,?)", (ticket_id,attempt_number,candidate_fingerprint,validation_evidence,implementation_invocation_id,identity,int(historical_review_attempted),now,now))
+            self._append_event(conn,entity_type="ticket",entity_id=ticket_id,event_type="validated_review_candidate_frozen",actor_id="controller",payload={"attempt_number":attempt_number,"candidate_fingerprint":candidate_fingerprint,"historical_review_attempted":historical_review_attempted})
+        return self.review_candidate(ticket_id, attempt_number) or {}
+
+    def review_candidate(self, ticket_id: str, attempt_number: int | None = None) -> dict[str, Any] | None:
+        q="SELECT * FROM review_candidates WHERE ticket_id=?"; values: tuple[Any,...]=(ticket_id,)
+        if attempt_number is not None: q += " AND attempt_number=?"; values=(ticket_id,attempt_number)
+        row=self.connection.execute(q+" ORDER BY attempt_number DESC LIMIT 1",values).fetchone()
+        return dict(row) if row else None
+
+    def record_review_infrastructure_failure(self, ticket_id: str, attempt_number: int, *, outcome: str) -> None:
+        if outcome not in {"review_timeout","review_process_error"}: raise ValueError("invalid_review_infrastructure_outcome")
+        with self._transaction() as conn:
+            changed=conn.execute("UPDATE review_candidates SET status='review_infrastructure_failed',last_outcome=?,updated_at=? WHERE ticket_id=? AND attempt_number=?",(outcome,self._now(),ticket_id,attempt_number))
+            if not changed.rowcount: raise ValueError("review candidate missing")
+
+    def authorize_review_resume(self, ticket_id: str, *, operator_id: str, candidate_fingerprint: str, runtime_identity: dict[str, Any]) -> dict[str, Any]:
+        with self._transaction() as conn:
+            paused=conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone(); row=conn.execute("SELECT * FROM review_candidates WHERE ticket_id=? ORDER BY attempt_number DESC LIMIT 1",(ticket_id,)).fetchone(); ticket=conn.execute("SELECT state FROM tickets WHERE id=?",(ticket_id,)).fetchone()
+            if paused is None or not paused["paused"]: raise PermissionError("review reconciliation requires Local First paused")
+            if row is None or ticket is None or ticket["state"] != CanonicalState.NEEDS_TRIAGE.value or row["status"] != "review_infrastructure_failed": raise ValueError("ticket is not awaiting review-infrastructure reconciliation")
+            if row["candidate_fingerprint"] != candidate_fingerprint: raise ValueError("validated candidate fingerprint mismatch")
+            if row["runtime_identity_json"] != json.dumps(runtime_identity,sort_keys=True,separators=(",", ":")): raise ValueError("runtime provenance mismatch")
+            if conn.execute("SELECT 1 FROM accepted_evidence WHERE ticket_id=?",(ticket_id,)).fetchone(): raise ValueError("accepted evidence already exists")
+            if conn.execute("SELECT 1 FROM review_results WHERE ticket_id=? AND attempt_number=?",(ticket_id,row["attempt_number"])).fetchone(): raise ValueError("valid review verdict already exists")
+            if conn.execute("SELECT 1 FROM model_invocations WHERE ticket_id=? AND status='started'",(ticket_id,)).fetchone(): raise ValueError("incomplete model invocation requires explicit resolution")
+            now=self._now(); conn.execute("UPDATE review_candidates SET status='review_pending',updated_at=? WHERE ticket_id=? AND attempt_number=?",(now,ticket_id,row["attempt_number"])); conn.execute("UPDATE tickets SET state=?,updated_at=? WHERE id=?",(CanonicalState.LOCAL_REVIEW.value,now,ticket_id)); self._append_event(conn,entity_type="ticket",entity_id=ticket_id,event_type="review_reconciliation_authorized",actor_id=operator_id,from_state=CanonicalState.NEEDS_TRIAGE.value,to_state=CanonicalState.LOCAL_REVIEW.value,payload={"attempt_number":row["attempt_number"],"candidate_fingerprint":candidate_fingerprint})
+        return self.review_candidate(ticket_id, int(row["attempt_number"])) or {}
 
     def stage_rows(self, ticket_id: str) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? ORDER BY attempt_number, completed_at", (ticket_id,))]
