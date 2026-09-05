@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 from .controller import LocalFirstController, RuntimeConfig
 from .corrections import AcceptedPredecessor, CorrectionService, CorrectionTicketSpec, SupplementalCorrectionPlan
@@ -22,6 +23,34 @@ def _correction_service(ledger: Ledger, args: argparse.Namespace) -> CorrectionS
     return CorrectionService(ledger, root)
 
 
+_MISSING = object()
+
+
+def _json_object(value: object, name: str) -> dict[str, object]:
+    if type(value) is not dict:
+        raise ValueError(f"{name} must be an object")
+    return value
+
+
+def _json_field(mapping: dict[str, object], key: str, name: str, kind: type, *, default: object = _MISSING, nullable: bool = False) -> Any:
+    value = mapping.get(key, _MISSING)
+    if value is _MISSING:
+        if default is not _MISSING:
+            return default
+        raise ValueError(f"{name}.{key} is required")
+    if value is None and nullable:
+        return None
+    if value is None or type(value) is not kind:
+        raise ValueError(f"{name}.{key} must be a {kind.__name__}")
+    return value
+
+
+def _json_string_list(value: object, name: str) -> tuple[str, ...]:
+    if type(value) is not list or not all(type(item) is str and item for item in value):
+        raise ValueError(f"{name} must be a list of non-empty strings")
+    return tuple(value)
+
+
 def _correction_plan_from_file(path: str, repository_identity: str) -> SupplementalCorrectionPlan:
     """Parse a controller-owned correction plan file (fail-closed).
 
@@ -31,8 +60,7 @@ def _correction_plan_from_file(path: str, repository_identity: str) -> Supplemen
     no board contents or model output are consulted here. Unknown keys or
     missing required fields reject the whole plan.
     """
-    raw=json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
-    if not isinstance(raw, dict): raise ValueError("correction plan file must contain a JSON object")
+    raw=_json_object(json.loads(Path(path).expanduser().read_text(encoding="utf-8")), "correction plan file")
     top_required={"feature_id","tranche_id","source_kind","source_reference","finding_fingerprint","finding_summary","predecessors","tickets","base_sha","snapshot_hash"}
     unknown=set(raw) - top_required
     if unknown: raise ValueError(f"unknown correction plan fields: {sorted(unknown)}")
@@ -40,62 +68,67 @@ def _correction_plan_from_file(path: str, repository_identity: str) -> Supplemen
     if missing: raise ValueError(f"missing correction plan fields: {sorted(missing)}")
 
     pred_raw=raw["predecessors"]
-    if not isinstance(pred_raw, list) or not pred_raw: raise ValueError("correction predecessors must be a non-empty list of {ticket_id, accepted_commit}")
+    if type(pred_raw) is not list or not pred_raw: raise ValueError("correction predecessors must be a non-empty list of objects")
     predecessors=[]
     for entry in pred_raw:
+        entry=_json_object(entry, "predecessor")
         keys=set(entry) - {"ticket_id","accepted_commit"}
         if keys: raise ValueError(f"unknown predecessor fields: {sorted(keys)}")
-        ticket=entry.get("ticket_id"); commit=entry.get("accepted_commit")
-        if not isinstance(ticket,str) or not ticket or not isinstance(commit,str): raise ValueError("predecessor requires string ticket_id and accepted_commit")
+        ticket=_json_field(entry, "ticket_id", "predecessor", str); commit=_json_field(entry, "accepted_commit", "predecessor", str)
+        if not ticket or not commit: raise ValueError("predecessor requires non-empty ticket_id and accepted_commit")
         predecessors.append(AcceptedPredecessor(ticket,commit))
 
     spec_raws=raw["tickets"]
-    if not isinstance(spec_raws, list) or not spec_raws: raise ValueError("correction tickets must be a non-empty list")
+    if type(spec_raws) is not list or not spec_raws: raise ValueError("correction tickets must be a non-empty list")
     specs=[]
     for entry in spec_raws:
+        entry=_json_object(entry, "ticket")
         keys=set(entry) - {"objective","criterion_ids","primary_symbol","allowed_existing_files","new_test_files","forbidden_changes","patch_budget","verification","risk","review_required","max_attempts","dependencies","relevant_symbols","acceptance_criteria","non_goals","red_evidence"}
         if keys: raise ValueError(f"unknown ticket fields: {sorted(keys)}")
-        patch_raw=entry.get("patch_budget",{})
-        verification_raw=entry.get("verification",{})
-        if not isinstance(patch_raw, dict) or set(patch_raw) - {"max_files", "max_changed_lines", "exception_reason"}:
+        patch_raw=_json_object(_json_field(entry, "patch_budget", "ticket", dict), "patch_budget")
+        verification_raw=_json_object(_json_field(entry, "verification", "ticket", dict), "verification")
+        if set(patch_raw) - {"max_files", "max_changed_lines", "exception_reason"}:
             raise ValueError("patch_budget must be a closed object")
-        if not isinstance(verification_raw, dict) or set(verification_raw) - {"commands", "working_directory", "timeout_seconds", "output_limit"}:
+        if set(verification_raw) - {"commands", "working_directory", "timeout_seconds", "output_limit"}:
             raise ValueError("verification must be a closed object")
-        raw_commands=verification_raw.get("commands", [])
-        if not isinstance(raw_commands, list) or not all(isinstance(command, list) and command and all(isinstance(arg, str) and arg for arg in command) for command in raw_commands):
+        raw_commands=_json_field(verification_raw, "commands", "verification", list, default=[])
+        if type(raw_commands) is not list or not all(type(command) is list and command and all(type(arg) is str and arg for arg in command) for command in raw_commands):
             raise ValueError("verification.commands must be a list of non-empty string argv lists")
         commands=[tuple(command) for command in raw_commands]
+        patch_max_files=_json_field(patch_raw, "max_files", "patch_budget", int, default=2)
+        patch_max_lines=_json_field(patch_raw, "max_changed_lines", "patch_budget", int, default=180)
+        if type(patch_max_files) is not int or type(patch_max_lines) is not int: raise ValueError("patch budget limits must be integers")
+        exception_reason=_json_field(patch_raw, "exception_reason", "patch_budget", str, default=None, nullable=True)
+        working_directory=_json_field(verification_raw, "working_directory", "verification", str, default=".")
+        timeout_seconds=_json_field(verification_raw, "timeout_seconds", "verification", int, default=60)
+        output_limit=_json_field(verification_raw, "output_limit", "verification", int, default=20_000)
         specs.append(CorrectionTicketSpec(
-            objective=str(entry.get("objective","")),
-            criterion_ids=tuple(str(x) for x in entry.get("criterion_ids",())),
-            primary_symbol=str(entry.get("primary_symbol","")),
-            allowed_existing_files=tuple(str(x) for x in entry.get("allowed_existing_files",())),
-            new_test_files=tuple(str(x) for x in entry.get("new_test_files",())),
-            forbidden_changes=tuple(str(x) for x in entry.get("forbidden_changes",())),
+            objective=_json_field(entry, "objective", "ticket", str, default=""),
+            criterion_ids=_json_string_list(_json_field(entry, "criterion_ids", "ticket", list, default=[]), "ticket.criterion_ids"),
+            primary_symbol=_json_field(entry, "primary_symbol", "ticket", str, default=""),
+            allowed_existing_files=_json_string_list(_json_field(entry, "allowed_existing_files", "ticket", list, default=[]), "ticket.allowed_existing_files"),
+            new_test_files=_json_string_list(_json_field(entry, "new_test_files", "ticket", list, default=[]), "ticket.new_test_files"),
+            forbidden_changes=_json_string_list(_json_field(entry, "forbidden_changes", "ticket", list, default=[]), "ticket.forbidden_changes"),
             patch_budget=PatchBudget(
-                max_files=int(patch_raw.get("max_files",2)),
-                max_changed_lines=int(patch_raw.get("max_changed_lines",180)),
-                exception_reason=patch_raw.get("exception_reason")),
+                max_files=patch_max_files, max_changed_lines=patch_max_lines, exception_reason=exception_reason),
             verification=VerificationProfile(
                 tuple(commands) if commands else (("true",),),
-                working_directory=str(verification_raw.get("working_directory",".")),
-                timeout_seconds=int(verification_raw.get("timeout_seconds",60)),
-                output_limit=int(verification_raw.get("output_limit",20_000))),
-            risk=str(entry.get("risk","low")),
-            review_required=bool(entry.get("review_required",True)),
-            max_attempts=max(1,int(entry.get("max_attempts",1))),
-            dependencies=tuple(str(x) for x in entry.get("dependencies",())),
-            relevant_symbols=tuple(str(x) for x in entry.get("relevant_symbols",())),
-            acceptance_criteria=tuple(str(x) for x in entry.get("acceptance_criteria",())),
-            non_goals=tuple(str(x) for x in entry.get("non_goals",())),
-            red_evidence=str(entry.get("red_evidence",""))))
+                working_directory=working_directory, timeout_seconds=timeout_seconds, output_limit=output_limit),
+            risk=_json_field(entry, "risk", "ticket", str, default="low"),
+            review_required=_json_field(entry, "review_required", "ticket", bool, default=True),
+            max_attempts=_json_field(entry, "max_attempts", "ticket", int, default=1),
+            dependencies=_json_string_list(_json_field(entry, "dependencies", "ticket", list, default=[]), "ticket.dependencies"),
+            relevant_symbols=_json_string_list(_json_field(entry, "relevant_symbols", "ticket", list, default=[]), "ticket.relevant_symbols"),
+            acceptance_criteria=_json_string_list(_json_field(entry, "acceptance_criteria", "ticket", list, default=[]), "ticket.acceptance_criteria"),
+            non_goals=_json_string_list(_json_field(entry, "non_goals", "ticket", list, default=[]), "ticket.non_goals"),
+            red_evidence=_json_field(entry, "red_evidence", "ticket", str, default="")))
 
     return SupplementalCorrectionPlan(
-        feature_id=str(raw["feature_id"]), tranche_id=str(raw["tranche_id"]),
-        source_kind=str(raw["source_kind"]), source_reference=str(raw["source_reference"]),
-        finding_fingerprint=str(raw["finding_fingerprint"]), finding_summary=str(raw["finding_summary"]),
+        feature_id=_json_field(raw, "feature_id", "correction plan", str), tranche_id=_json_field(raw, "tranche_id", "correction plan", str),
+        source_kind=_json_field(raw, "source_kind", "correction plan", str), source_reference=_json_field(raw, "source_reference", "correction plan", str),
+        finding_fingerprint=_json_field(raw, "finding_fingerprint", "correction plan", str), finding_summary=_json_field(raw, "finding_summary", "correction plan", str),
         predecessors=tuple(predecessors), tickets=tuple(specs),
-        repository_identity=repository_identity, base_sha=str(raw["base_sha"]), snapshot_hash=str(raw["snapshot_hash"]))
+        repository_identity=repository_identity, base_sha=_json_field(raw, "base_sha", "correction plan", str), snapshot_hash=_json_field(raw, "snapshot_hash", "correction plan", str))
 
 
 def _ledger(path: str) -> Ledger:
