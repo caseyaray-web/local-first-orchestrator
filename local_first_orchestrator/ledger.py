@@ -874,12 +874,16 @@ class Ledger:
         attempt = int(candidate["attempt_number"])
         invocations = self.review_invocations(ticket_id, attempt)
         latest = invocations[-1] if invocations else None
-        valid = self.has_valid_review_verdict(ticket_id, attempt)
+        valid_stage = self.connection.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='review'", (ticket_id, attempt)).fetchone()
+        applied = self.connection.execute("SELECT * FROM review_results WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt)).fetchone()
+        valid = valid_stage is not None or applied is not None
         newest = self.review_candidate(ticket_id)
         if newest is not None and int(newest["attempt_number"]) != attempt:
             classification, eligible = "ambiguous_review_history", False
-        elif valid:
-            classification, eligible = "valid_review_completed", False
+        elif applied is not None:
+            classification, eligible = "valid_review_applied", False
+        elif valid_stage is not None:
+            classification, eligible = "valid_review_stage_pending_application", False
         elif latest is None:
             classification, eligible = "no_review_attempt", True
         elif latest["status"] == "started":
@@ -938,6 +942,23 @@ class Ledger:
             conn.execute("UPDATE model_invocations SET status='process_error',completed_at=?,duration_seconds=?,error_json=? WHERE invocation_id=? AND status='started'", (now,float(now-int(row["started_at"])),json.dumps({"type":"ReviewInvocationAbandoned","message":"review invocation exceeded stale threshold"},sort_keys=True),invocation_id))
             self._append_event(conn,entity_type="ticket",entity_id=str(row["ticket_id"]),event_type="model_invocation_finished",actor_id="recovery",payload={"invocation_id":invocation_id,"attempt_number":row["attempt_number"],"stage":"review","status":"process_error","reason":"abandoned"})
             return True
+
+    def apply_persisted_review(self, ticket_id: str, attempt_number: int) -> dict[str, Any]:
+        status = self.review_reconciliation_status(ticket_id, attempt_number)
+        if status["classification"] == "valid_review_applied":
+            row = self.connection.execute("SELECT * FROM review_results WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            return {"verdict": row["verdict"], "status": "already_applied"}
+        if status["classification"] != "valid_review_stage_pending_application": raise PermissionError("persisted review application is not eligible")
+        stage = self.model_stage(ticket_id, attempt_number, "review")
+        if stage is None or stage["diff_hash"] != status["candidate"]["candidate_fingerprint"]: raise ValueError("persisted review stage conflicts with frozen candidate")
+        from pathlib import Path
+        from .controller import ticket_from_ledger
+        from .review import SameTicketRepairCoordinator, normalize_review
+        artifact = Path(stage["response_artifact"])
+        if not artifact.is_file(): raise ValueError("persisted review artifact missing")
+        review = normalize_review(json.loads(artifact.read_text(encoding="utf-8")).get("payload", {}), ticket_from_ledger(self.get_ticket(ticket_id)))
+        outcome = SameTicketRepairCoordinator(self).apply(ticket_id, attempt_number, review)
+        return {"verdict": review.verdict, "status": outcome}
 
     def freeze_review_candidate(self, ticket_id: str, attempt_number: int, *, candidate_fingerprint: str, validation_evidence: str, implementation_invocation_id: str | None, runtime_identity: dict[str, Any], historical_review_attempted: bool = False) -> dict[str, Any]:
         if not candidate_fingerprint or not validation_evidence:

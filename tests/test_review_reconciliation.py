@@ -50,7 +50,7 @@ class ReviewReconciliationTests(unittest.TestCase):
         self.failed(status="completed", artifact=str(artifact))
         self.ledger.record_model_stage(self.ticket, 2, "review", purpose="review", adapter="test", request_hash="b"*64, response_artifact=str(artifact), worktree_path="/tmp/attempt", base_sha="c"*40, diff_hash=self.fp)
         status = self.ledger.review_reconciliation_status(self.ticket, 2)
-        self.assertEqual(status["classification"], "valid_review_completed")
+        self.assertEqual(status["classification"], "valid_review_stage_pending_application")
         self.assertFalse(status["retry_eligible"])
 
     def test_reconciliation_is_idempotent_and_bounded(self):
