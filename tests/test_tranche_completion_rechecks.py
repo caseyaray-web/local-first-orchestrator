@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import sqlite3
 import subprocess
 import unittest
 
@@ -119,6 +121,64 @@ class TrancheCompletionRecheckTests(SupplementalCorrectionTests):
         self.assertEqual([row["generation"] for row in self.ledger.tranche_completion_rechecks("T")], [1])
         self.assertEqual(self.service().lifecycle_status("T")["unresolved_corrections"], 1)
         self.assertEqual(self.ledger.tranche_completion("T")["evidence_hash"], h1["evidence_hash"])
+    def test_h1_and_recheck_rows_are_database_immutable(self):
+        h1 = self.record_h1()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.ledger.connection.execute("UPDATE tranche_completion_evidence SET evidence_hash='changed' WHERE tranche_id='T'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.ledger.connection.execute("DELETE FROM tranche_completion_evidence WHERE tranche_id='T'")
+
+        plan = self.service().create_plan(self.spec("immutable"))
+        correction = self.service().materialize(plan.correction_plan_id)
+        head = self.accept_correction(correction.ticket_id)
+        row = self.recheck(head=head)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.ledger.connection.execute("UPDATE tranche_completion_rechecks SET status='changed' WHERE id=?", (row["id"],))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.ledger.connection.execute("DELETE FROM tranche_completion_rechecks WHERE id=?", (row["id"],))
+        self.assertEqual(self.ledger.tranche_completion("T"), h1)
+
+    def test_legacy_nullable_recheck_hashes_are_backfilled_and_migration_is_idempotent(self):
+        database = self.root / "legacy.db"
+        connection = sqlite3.connect(database)
+        connection.execute("""
+            CREATE TABLE tranche_completion_rechecks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, tranche_id TEXT NOT NULL, generation INTEGER NOT NULL,
+                previous_generation INTEGER NOT NULL, previous_evidence_hash TEXT NOT NULL,
+                correction_plan_ids_json TEXT NOT NULL, accepted_ticket_ids_json TEXT NOT NULL,
+                accepted_commit_shas_json TEXT NOT NULL, current_integration_sha TEXT NOT NULL,
+                repository_identity TEXT NOT NULL, repo_base_sha TEXT NOT NULL, repo_snapshot_hash TEXT NOT NULL,
+                unresolved_correction_count INTEGER NOT NULL, status TEXT NOT NULL, evidence_hash TEXT,
+                idempotency_key TEXT NOT NULL UNIQUE, recorded_at INTEGER NOT NULL,
+                UNIQUE(tranche_id, generation)
+            )
+        """)
+        values = ("T", 1, 0, "h1", '["P1"]', '["T-F1"]', '["c1"]', "head1", "/repo", "base", "snapshot", 0, "recheck_passed", None, "legacy-key", 123)
+        connection.execute("INSERT INTO tranche_completion_rechecks(tranche_id,generation,previous_generation,previous_evidence_hash,correction_plan_ids_json,accepted_ticket_ids_json,accepted_commit_shas_json,current_integration_sha,repository_identity,repo_base_sha,repo_snapshot_hash,unresolved_correction_count,status,evidence_hash,idempotency_key,recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
+        connection.commit(); connection.close()
+
+        from local_first_orchestrator.ledger import Ledger
+        migrated = Ledger(database)
+        migrated.migrate()
+        row = migrated.connection.execute("SELECT * FROM tranche_completion_rechecks").fetchone()
+        payload = {
+            "tranche_id": "T", "generation": 1, "previous_generation": 0,
+            "previous_evidence_hash": "h1", "correction_plan_ids": ["P1"],
+            "accepted_ticket_ids": ["T-F1"], "accepted_commit_shas": ["c1"],
+            "current_integration_sha": "head1", "repository_identity": "/repo",
+            "repo_base_sha": "base", "repo_snapshot_hash": "snapshot",
+            "unresolved_correction_count": 0, "status": "recheck_passed",
+        }
+        expected = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        self.assertEqual(row["evidence_hash"], expected)
+        with self.assertRaises(sqlite3.IntegrityError):
+            migrated.connection.execute("INSERT INTO tranche_completion_rechecks(tranche_id,generation,previous_generation,previous_evidence_hash,correction_plan_ids_json,accepted_ticket_ids_json,accepted_commit_shas_json,current_integration_sha,repository_identity,repo_base_sha,repo_snapshot_hash,unresolved_correction_count,status,evidence_hash,idempotency_key,recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("T", 2, 1, "h", "[]", "[]", "[]", "head", "/repo", "base", "snapshot", 0, "recheck_passed", None, "bad", 124))
+        migrated.migrate()
+        self.assertEqual(migrated.connection.execute("SELECT COUNT(*) FROM tranche_completion_rechecks").fetchone()[0], 1)
+        migrated.close()
+        reopened = Ledger(database); reopened.migrate()
+        self.assertEqual(reopened.connection.execute("SELECT evidence_hash FROM tranche_completion_rechecks").fetchone()[0], expected)
+        reopened.close()
 
 
 if __name__ == "__main__":

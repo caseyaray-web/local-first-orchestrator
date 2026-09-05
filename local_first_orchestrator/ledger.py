@@ -287,6 +287,10 @@ CREATE TABLE IF NOT EXISTS tranche_completion_rechecks (
     idempotency_key TEXT NOT NULL UNIQUE, recorded_at INTEGER NOT NULL,
     UNIQUE(tranche_id, generation)
 );
+CREATE TRIGGER IF NOT EXISTS tranche_completion_evidence_immutable_update
+BEFORE UPDATE ON tranche_completion_evidence BEGIN SELECT RAISE(ABORT, 'tranche completion evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS tranche_completion_evidence_immutable_delete
+BEFORE DELETE ON tranche_completion_evidence BEGIN SELECT RAISE(ABORT, 'tranche completion evidence is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS tranche_completion_rechecks_immutable_update
 BEFORE UPDATE ON tranche_completion_rechecks BEGIN SELECT RAISE(ABORT, 'tranche completion rechecks are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS tranche_completion_rechecks_immutable_delete
@@ -296,6 +300,34 @@ BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'events are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS events_immutable_delete
 BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'events are immutable'); END;
 """
+
+
+def _recheck_evidence_payload(row: Any) -> dict[str, Any]:
+    """Return the canonical persisted payload used by new re-check rows."""
+    return {
+        "tranche_id": str(row["tranche_id"]),
+        "generation": int(row["generation"]),
+        "previous_generation": int(row["previous_generation"]),
+        "previous_evidence_hash": str(row["previous_evidence_hash"]),
+        "correction_plan_ids": json.loads(row["correction_plan_ids_json"]),
+        "accepted_ticket_ids": json.loads(row["accepted_ticket_ids_json"]),
+        "accepted_commit_shas": json.loads(row["accepted_commit_shas_json"]),
+        "current_integration_sha": str(row["current_integration_sha"]),
+        "repository_identity": str(row["repository_identity"]),
+        "repo_base_sha": str(row["repo_base_sha"]),
+        "repo_snapshot_hash": str(row["repo_snapshot_hash"]),
+        "unresolved_correction_count": int(row["unresolved_correction_count"]),
+        "status": str(row["status"]),
+    }
+
+
+def _recheck_evidence_hash(row: Any) -> str:
+    return _hash_recheck_payload(_recheck_evidence_payload(row))
+
+
+def _hash_recheck_payload(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 class Ledger:
@@ -329,6 +361,28 @@ class Ledger:
         recheck_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(tranche_completion_rechecks)")}
         if "evidence_hash" not in recheck_columns:
             self.connection.execute("ALTER TABLE tranche_completion_rechecks ADD COLUMN evidence_hash TEXT")
+        # Older ledgers allowed NULL hashes.  DDL cannot add a NOT NULL
+        # constraint in-place on SQLite, so reconcile rows transactionally and
+        # enforce the same invariant with an insert trigger thereafter.
+        with self._transaction() as conn:
+            legacy_rows = conn.execute("SELECT * FROM tranche_completion_rechecks WHERE evidence_hash IS NULL").fetchall()
+            if legacy_rows:
+                conn.execute("DROP TRIGGER IF EXISTS tranche_completion_rechecks_immutable_update")
+                for row in legacy_rows:
+                    conn.execute(
+                        "UPDATE tranche_completion_rechecks SET evidence_hash=? WHERE id=?",
+                        (_recheck_evidence_hash(row), row["id"]),
+                    )
+                conn.execute("""CREATE TRIGGER tranche_completion_rechecks_immutable_update
+                    BEFORE UPDATE ON tranche_completion_rechecks
+                    BEGIN SELECT RAISE(ABORT, 'tranche completion rechecks are append-only'); END""")
+            conn.execute("""CREATE TRIGGER IF NOT EXISTS tranche_completion_rechecks_hash_required
+                BEFORE INSERT ON tranche_completion_rechecks
+                WHEN NEW.evidence_hash IS NULL OR typeof(NEW.evidence_hash) != 'text'
+                  OR length(NEW.evidence_hash) != 64
+                  OR NEW.evidence_hash GLOB '*[^0123456789abcdef]*'
+                  OR lower(NEW.evidence_hash) != NEW.evidence_hash
+                BEGIN SELECT RAISE(ABORT, 'tranche completion recheck evidence hash is invalid'); END""")
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS feature_contracts (feature_id TEXT PRIMARY KEY, contract_hash TEXT NOT NULL, contract_json TEXT NOT NULL, created_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS decomposition_plans (id TEXT PRIMARY KEY, feature_id TEXT NOT NULL, fingerprint TEXT NOT NULL UNIQUE, plan_json TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, activated_at INTEGER, repository_identity TEXT, repo_base_sha TEXT, repo_snapshot_hash TEXT, repo_snapshot_manifest_json TEXT, UNIQUE(feature_id, fingerprint));
@@ -1745,7 +1799,7 @@ class Ledger:
             previous_generation, previous_hash = int(previous["generation"]), str(previous["evidence_hash"])
         generation = previous_generation + 1
         payload = {"tranche_id": tranche_id, "generation": generation, "previous_generation": previous_generation, "previous_evidence_hash": previous_hash, "correction_plan_ids": plan_ids, "accepted_ticket_ids": ticket_ids, "accepted_commit_shas": commits, "current_integration_sha": head, "repository_identity": provenance[0], "repo_base_sha": provenance[1], "repo_snapshot_hash": provenance[2], "unresolved_correction_count": 0, "status": "recheck_passed"}
-        evidence_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        evidence_hash = _hash_recheck_payload(payload)
         expected_key = "tranche-recheck:v1:" + evidence_hash
         with self._transaction() as conn:
             previous = conn.execute("SELECT * FROM tranche_completion_rechecks WHERE idempotency_key=?", (expected_key,)).fetchone()
