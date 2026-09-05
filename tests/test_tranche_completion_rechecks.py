@@ -7,6 +7,7 @@ import subprocess
 import unittest
 
 from local_first_orchestrator.tranche_completion import completion_evidence
+from local_first_orchestrator.states import CanonicalState
 from tests.test_supplemental_corrections import SupplementalCorrectionTests
 
 
@@ -32,6 +33,32 @@ class TrancheCompletionRecheckTests(SupplementalCorrectionTests):
         self.ledger.connection.execute("UPDATE tickets SET state='done' WHERE id=?", (ticket_id,))
         self.ledger.record_accepted_evidence(ticket_id, head, "accepted", "validated")
         return head
+
+    def finalize_with_state(self, ticket_id, state):
+        self.git("commit", "--allow-empty", "-m", f"integrated evidence {ticket_id}")
+        head = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/local-first/tranches/T/integration-head", head)
+        self.ledger.connection.execute("UPDATE tickets SET state=? WHERE id=?", (state, ticket_id))
+        self.ledger.record_accepted_evidence(ticket_id, head, "accepted", "validated")
+        return head
+
+    def test_accepted_with_valid_integrated_evidence_requires_done(self):
+        self.record_h1(); plan = self.service().create_plan(self.spec("accepted-state")); correction = self.service().materialize(plan.correction_plan_id)
+        self.finalize_with_state(correction.ticket_id, CanonicalState.ACCEPTED.value)
+        with self.assertRaisesRegex(ValueError, "unresolved"):
+            self.ledger.record_tranche_completion_recheck("T", self.repo)
+        self.ledger.connection.execute("UPDATE tickets SET state='done' WHERE id=?", (correction.ticket_id,))
+        row = self.ledger.record_tranche_completion_recheck("T", self.repo)
+        self.assertEqual(row["status"], "recheck_passed")
+
+    def test_non_done_correction_states_never_pass(self):
+        self.record_h1()
+        for index, state in enumerate(("needs_human_test", "needs_checkpoint", "reverted")):
+            with self.subTest(state=state):
+                plan = self.service().create_plan(self.spec(f"non-done-{index}")); correction = self.service().materialize(plan.correction_plan_id)
+                self.finalize_with_state(correction.ticket_id, state)
+                with self.assertRaisesRegex(ValueError, "unresolved"):
+                    self.ledger.record_tranche_completion_recheck("T", self.repo)
 
     def test_open_correction_preserves_immutable_h1_and_blocks_successful_recheck(self):
         h1 = self.record_h1()

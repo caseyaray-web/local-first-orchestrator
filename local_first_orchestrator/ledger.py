@@ -1815,7 +1815,7 @@ class Ledger:
                 provenance = (str(current_provenance[0]), str(current_provenance[1]), str(current_provenance[2]))
             elif provenance != tuple(str(value) for value in current_provenance):
                 raise ValueError("completion re-check correction provenance conflicts")
-            if row["state"] not in {CanonicalState.DONE.value, CanonicalState.ACCEPTED.value} or not isinstance(row["accepted_commit_sha"], str) or not row["accepted_commit_sha"]:
+            if row["state"] != CanonicalState.DONE.value or not isinstance(row["accepted_commit_sha"], str) or not row["accepted_commit_sha"]:
                 raise ValueError("completion re-check has unresolved correction work")
             ticket_ids.append(str(row["ticket_id"])); commits.append(str(row["accepted_commit_sha"]))
         assert provenance is not None
