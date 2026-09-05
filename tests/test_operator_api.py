@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -57,6 +58,7 @@ class OperatorApiTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
+        self.api_module = module
         app = FastAPI()
         app.include_router(module.router, prefix="/api/plugins/local-first-orchestrator")
         self.client = TestClient(app)
@@ -112,6 +114,18 @@ class OperatorApiTests(unittest.TestCase):
         self.assertEqual(forged.json(), baseline)
         self.assertEqual(self.client.post("/api/plugins/local-first-orchestrator/pause?database=/etc/passwd", json={}).status_code, 200)
         self.assertTrue(self.client.get("/api/plugins/local-first-orchestrator/status").json()["paused"])
+
+    def test_implementation_route_uses_named_operator_seam_while_paused(self) -> None:
+        ledger = Ledger(self.database); ledger.pause("operator", reason="maintenance"); ledger.close()
+        calls = []
+        class FakeController:
+            def __init__(self, *args, **kwargs): pass
+            def execute_implementation(self, ticket_id, *, repository, owner):
+                calls.append((ticket_id, owner)); return {"ticket_id": ticket_id, "state": "local_review"}
+        with mock.patch.object(self.api_module, "LocalFirstController", FakeController), mock.patch.object(self.api_module, "LocalQwenAdapter", lambda **kwargs: object()):
+            response = self.client.post("/api/plugins/local-first-orchestrator/implementation", json={"ticket_id": self.ready_ticket})
+        self.assertEqual(response.status_code, 200); self.assertEqual(calls, [(self.ready_ticket, "dashboard-operator")])
+        ledger = Ledger(self.database); self.assertEqual(ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()[0], 1); ledger.close()
 
 
 if __name__ == "__main__":

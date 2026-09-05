@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
 from local_first_orchestrator.hermes_board import ExternalTicket
 from local_first_orchestrator.ledger import Ledger
+from local_first_orchestrator.states import CanonicalState
 
 
 def contract(*, new_test_files: list[str] | None = None) -> dict[str, object]:
@@ -103,11 +104,17 @@ class InvocationLifecycleTests(unittest.TestCase):
 
     def test_implementation_only_freezes_candidate_without_review_and_replays(self) -> None:
         model = LifecycleModel(); ctl, ticket = self.controller(model)
+        self.ledger.pause("operator", reason="maintenance")
+        other = self.ledger.create_ticket(title="other", state=CanonicalState.READY_LOCAL)
+        self.assertFalse(self.ledger.claim_specific(other, "background", 60))
+        self.assertEqual(self.ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()[0], 1)
         first = ctl.execute_implementation(ticket, repository=self.repo)
         assert first is not None
         self.assertFalse(first["replayed"])
         self.assertEqual(self.ledger.get_ticket(ticket)["state"], "local_review")
         self.assertEqual(model.calls, 1)
+        self.assertEqual(self.ledger.get_ticket(other)["state"], "ready_local")
+        self.assertEqual(self.ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()[0], 1)
         self.assertEqual(self.ledger.review_invocations(ticket, 1), [])
         self.assertIsNotNone(self.ledger.model_stage(ticket, 1, "implementation"))
         self.assertIsNotNone(self.ledger.review_candidate(ticket))

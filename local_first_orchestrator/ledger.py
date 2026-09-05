@@ -1273,6 +1273,15 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="lease_claimed", actor_id=owner, from_state=CanonicalState.READY_LOCAL.value, to_state=CanonicalState.IMPLEMENTING.value, payload={"lease_expires_at":now+lease_seconds})
             return True
 
+    def claim_specific_operator(self, ticket_id: str, owner: str, lease_seconds: int, now: int | None = None) -> bool:
+        """Claim exactly one named ticket for an explicit operator operation."""
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            changed = conn.execute("UPDATE tickets SET state=?, lease_owner=?, lease_expires_at=?, updated_at=? WHERE id=? AND state=? AND (lease_expires_at IS NULL OR lease_expires_at<=?)", (CanonicalState.IMPLEMENTING.value, owner, now+lease_seconds, now, ticket_id, CanonicalState.READY_LOCAL.value, now))
+            if changed.rowcount != 1: return False
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="lease_claimed", actor_id=owner, from_state=CanonicalState.READY_LOCAL.value, to_state=CanonicalState.IMPLEMENTING.value, payload={"lease_expires_at":now+lease_seconds,"operator_authorized":True})
+            return True
+
     def record_review(self, ticket_id: str, attempt_number: int, review: Any) -> None:
         with self._transaction() as conn:
             conn.execute(

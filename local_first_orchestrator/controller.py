@@ -198,7 +198,7 @@ class LocalFirstController:
         adapter=GitWorktreeAdapter(repository,worktree_root); fingerprint=adapter.diff_hash(path)
         return self.ledger.authorize_review_resume(ticket_id,operator_id=operator_id,candidate_fingerprint=fingerprint,runtime_identity=self.effective_runtime_identity())
 
-    def _implementation_stage(self, ticket_id: str, *, repository: Path, owner: str, allow_validation_repair: bool, failure_evidence: str = "") -> dict[str, object] | None:
+    def _implementation_stage(self, ticket_id: str, *, repository: Path, owner: str, allow_validation_repair: bool, failure_evidence: str = "", explicit_operator: bool = False) -> dict[str, object] | None:
         """Run implementation through validation and candidate freezing only.
 
         This is the single implementation path used by both the deliberate
@@ -219,7 +219,7 @@ class LocalFirstController:
         if reconciliation is not None and bool(reconciliation["cleanup_required"]) and not self.ledger.cleanup_confirmed(ticket_id, int(reconciliation["retired_attempt_number"])):
             raise RuntimeError("retired attempt cleanup confirmation required before retry execution")
         state=CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
-        if state == CanonicalState.READY_LOCAL and not self.ledger.claim_specific(ticket_id,owner,self.config.lease_seconds): return None
+        if state == CanonicalState.READY_LOCAL and not (self.ledger.claim_specific_operator if explicit_operator else self.ledger.claim_specific)(ticket_id,owner,self.config.lease_seconds): return None
         if state in {CanonicalState.NEEDS_TRIAGE,CanonicalState.BLOCKED,CanonicalState.DONE}: return None
         planning_base=str(binding["starting_sha"]); worktrees=GitWorktreeAdapter(repo,worktree_root)
         base=worktrees.resolve_execution_base(self.ledger.get_ticket(ticket_id)["tranche_id"] or None, planning_base)
@@ -319,7 +319,7 @@ class LocalFirstController:
             fingerprint=hashlib.sha256(diff.encode()).hexdigest()
             if fingerprint != candidate["candidate_fingerprint"]: raise RuntimeError("persisted candidate fingerprint mismatch")
             return {"ticket_id":ticket_id,"attempt_number":int(candidate["attempt_number"]),"candidate_fingerprint":fingerprint,"implementation_artifact":str(artifact),"state":self.ledger.get_ticket(ticket_id)["state"],"replayed":True}
-        result=self._implementation_stage(ticket_id,repository=repository,owner=owner,allow_validation_repair=False)
+        result=self._implementation_stage(ticket_id,repository=repository,owner=owner,allow_validation_repair=False,explicit_operator=True)
         if result is None: return None
         return {"ticket_id":ticket_id,"attempt_number":int(result["attempt_number"]),"candidate_fingerprint":str(result["candidate_fingerprint"]),"implementation_artifact":str(self.ledger.model_stage(ticket_id,int(result["attempt_number"]),"implementation")["response_artifact"]),"state":self.ledger.get_ticket(ticket_id)["state"],"replayed":False}
 
