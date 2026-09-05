@@ -364,7 +364,11 @@ class CorrectionService:
 
         views = [plan_view(row) for row in plans]
         open_count = sum(1 for view in views if view["status"] != "accepted")
-        return {"tranche_id": tranche_id, "correction_plans": len(plans),
+        latest = self.ledger.latest_tranche_completion(tranche_id)
+        return {"tranche_id": tranche_id,
+                "correction_plans": len(plans),
                 "unresolved_corrections": open_count,
                 "review_status": "open_corrections" if open_count else ("no_corrections" if not plans else "recheck_passed"),
+                "latest_completion": latest,
+                "completion_rechecks": self.ledger.tranche_completion_rechecks(tranche_id),
                 "plans": views}

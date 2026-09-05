@@ -275,6 +275,21 @@ CREATE TABLE IF NOT EXISTS tranche_completion_evidence (
     final_integration_sha TEXT NOT NULL, accepted_ticket_ids_json TEXT NOT NULL,
     accepted_commit_shas_json TEXT NOT NULL, evidence_hash TEXT NOT NULL, completed_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tranche_completion_rechecks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tranche_id TEXT NOT NULL REFERENCES tranches(id), generation INTEGER NOT NULL,
+    previous_generation INTEGER NOT NULL, previous_evidence_hash TEXT NOT NULL,
+    correction_plan_ids_json TEXT NOT NULL, accepted_ticket_ids_json TEXT NOT NULL,
+    accepted_commit_shas_json TEXT NOT NULL, current_integration_sha TEXT NOT NULL,
+    repository_identity TEXT NOT NULL, repo_base_sha TEXT NOT NULL, repo_snapshot_hash TEXT NOT NULL,
+    unresolved_correction_count INTEGER NOT NULL, status TEXT NOT NULL, evidence_hash TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE, recorded_at INTEGER NOT NULL,
+    UNIQUE(tranche_id, generation)
+);
+CREATE TRIGGER IF NOT EXISTS tranche_completion_rechecks_immutable_update
+BEFORE UPDATE ON tranche_completion_rechecks BEGIN SELECT RAISE(ABORT, 'tranche completion rechecks are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS tranche_completion_rechecks_immutable_delete
+BEFORE DELETE ON tranche_completion_rechecks BEGIN SELECT RAISE(ABORT, 'tranche completion rechecks are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS events_immutable_update
 BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'events are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS events_immutable_delete
@@ -310,6 +325,9 @@ class Ledger:
 
     def migrate(self) -> None:
         self.connection.executescript(_SCHEMA)
+        recheck_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(tranche_completion_rechecks)")}
+        if "evidence_hash" not in recheck_columns:
+            self.connection.execute("ALTER TABLE tranche_completion_rechecks ADD COLUMN evidence_hash TEXT")
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS feature_contracts (feature_id TEXT PRIMARY KEY, contract_hash TEXT NOT NULL, contract_json TEXT NOT NULL, created_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS decomposition_plans (id TEXT PRIMARY KEY, feature_id TEXT NOT NULL, fingerprint TEXT NOT NULL UNIQUE, plan_json TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, activated_at INTEGER, repository_identity TEXT, repo_base_sha TEXT, repo_snapshot_hash TEXT, repo_snapshot_manifest_json TEXT, UNIQUE(feature_id, fingerprint));
@@ -1661,6 +1679,69 @@ class Ledger:
                 if tuple(existing[k] for k in keys) != values: raise ValueError("conflicting tranche completion evidence")
                 return
             conn.execute("INSERT INTO tranche_completion_evidence(tranche_id,root_planning_sha,final_integration_sha,accepted_ticket_ids_json,accepted_commit_shas_json,evidence_hash,completed_at) VALUES (?,?,?,?,?,?,?)", (*values, now))
+
+    def record_tranche_completion_recheck(self, recheck: dict[str, Any]) -> dict[str, Any]:
+        """Append one successful correction re-check generation.
+
+        The original completion row is never updated.  A re-check is eligible
+        only when all supplemental correction work is resolved, and replaying
+        the same canonical evidence returns the existing row.
+        """
+        required = ("tranche_id", "generation", "previous_generation", "previous_evidence_hash",
+                    "correction_plan_ids", "accepted_ticket_ids", "accepted_commit_shas",
+                    "current_integration_sha", "repository_identity", "repo_base_sha",
+                    "repo_snapshot_hash", "unresolved_correction_count", "status")
+        if any(key not in recheck or recheck[key] is None for key in required):
+            raise ValueError("completion re-check evidence is incomplete")
+        tranche_id = recheck["tranche_id"]
+        generation = recheck["generation"]
+        previous_generation = recheck["previous_generation"]
+        if type(tranche_id) is not str or not tranche_id or type(generation) is not int or isinstance(generation, bool) or generation < 1 or type(previous_generation) is not int or isinstance(previous_generation, bool) or previous_generation != generation - 1:
+            raise ValueError("completion re-check generation is invalid")
+        if recheck["status"] != "recheck_passed" or type(recheck["unresolved_correction_count"]) is not int or recheck["unresolved_correction_count"] != 0:
+            raise ValueError("completion re-check requires resolved corrections")
+        for key in ("previous_evidence_hash", "current_integration_sha", "repository_identity", "repo_base_sha", "repo_snapshot_hash"):
+            if type(recheck[key]) is not str or not recheck[key]:
+                raise ValueError("completion re-check provenance is incomplete")
+        for key in ("correction_plan_ids", "accepted_ticket_ids", "accepted_commit_shas"):
+            if type(recheck[key]) is not list or not all(type(item) is str and item for item in recheck[key]):
+                raise ValueError("completion re-check evidence lists are invalid")
+        if len(recheck["accepted_ticket_ids"]) != len(recheck["accepted_commit_shas"]):
+            raise ValueError("completion re-check ticket/commit evidence mismatch")
+        payload = {key: recheck[key] for key in required}
+        evidence_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        expected_key = "tranche-recheck:v1:" + evidence_hash
+        supplied_key = recheck.get("idempotency_key", expected_key)
+        if supplied_key != expected_key:
+            raise ValueError("completion re-check idempotency key mismatch")
+        with self._transaction() as conn:
+            previous = conn.execute("SELECT * FROM tranche_completion_rechecks WHERE idempotency_key=?", (expected_key,)).fetchone()
+            if previous is not None:
+                return dict(previous)
+            prior = conn.execute("SELECT * FROM tranche_completion_rechecks WHERE tranche_id=? AND generation=?", (tranche_id, previous_generation)).fetchone()
+            if previous_generation == 0:
+                original = conn.execute("SELECT evidence_hash FROM tranche_completion_evidence WHERE tranche_id=?", (tranche_id,)).fetchone()
+                if original is None or original["evidence_hash"] != recheck["previous_evidence_hash"]:
+                    raise ValueError("completion re-check previous completion mismatch")
+            elif prior is None or prior["evidence_hash"] != recheck["previous_evidence_hash"]:
+                raise ValueError("completion re-check previous generation mismatch")
+            values = (tranche_id, generation, previous_generation, recheck["previous_evidence_hash"],
+                      json.dumps(recheck["correction_plan_ids"], separators=(",", ":")),
+                      json.dumps(recheck["accepted_ticket_ids"], separators=(",", ":")),
+                      json.dumps(recheck["accepted_commit_shas"], separators=(",", ":")),
+                      recheck["current_integration_sha"], recheck["repository_identity"], recheck["repo_base_sha"], recheck["repo_snapshot_hash"], 0, "recheck_passed", evidence_hash, expected_key, self._now())
+            conn.execute("INSERT INTO tranche_completion_rechecks(tranche_id,generation,previous_generation,previous_evidence_hash,correction_plan_ids_json,accepted_ticket_ids_json,accepted_commit_shas_json,current_integration_sha,repository_identity,repo_base_sha,repo_snapshot_hash,unresolved_correction_count,status,evidence_hash,idempotency_key,recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
+            return dict(conn.execute("SELECT * FROM tranche_completion_rechecks WHERE idempotency_key=?", (expected_key,)).fetchone())
+
+    def tranche_completion_rechecks(self, tranche_id: str) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute("SELECT * FROM tranche_completion_rechecks WHERE tranche_id=? ORDER BY generation", (tranche_id,)).fetchall()]
+
+    def latest_tranche_completion(self, tranche_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM tranche_completion_rechecks WHERE tranche_id=? ORDER BY generation DESC LIMIT 1", (tranche_id,)).fetchone()
+        if row is not None:
+            return {"kind": "recheck", **dict(row)}
+        row = self.connection.execute("SELECT * FROM tranche_completion_evidence WHERE tranche_id=?", (tranche_id,)).fetchone()
+        return {"kind": "completion", **dict(row)} if row is not None else None
 
     def materialize_next_tranche(self, *, feature: Any, tranche: Any, plan: Any, completion: dict[str, Any]) -> tuple[str, ...]:
         """Atomically freeze completion and create next-tranche draft tickets."""
