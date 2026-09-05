@@ -291,10 +291,18 @@ CREATE TRIGGER IF NOT EXISTS tranche_completion_evidence_immutable_update
 BEFORE UPDATE ON tranche_completion_evidence BEGIN SELECT RAISE(ABORT, 'tranche completion evidence is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS tranche_completion_evidence_immutable_delete
 BEFORE DELETE ON tranche_completion_evidence BEGIN SELECT RAISE(ABORT, 'tranche completion evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS tranche_completion_evidence_hash_integrity
+BEFORE INSERT ON tranche_completion_evidence
+WHEN NEW.evidence_hash != canonical_completion_hash(NEW.tranche_id,NEW.root_planning_sha,NEW.final_integration_sha,NEW.accepted_ticket_ids_json,NEW.accepted_commit_shas_json)
+BEGIN SELECT RAISE(ABORT, 'tranche completion evidence hash mismatch'); END;
 CREATE TRIGGER IF NOT EXISTS tranche_completion_rechecks_immutable_update
 BEFORE UPDATE ON tranche_completion_rechecks BEGIN SELECT RAISE(ABORT, 'tranche completion rechecks are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS tranche_completion_rechecks_immutable_delete
 BEFORE DELETE ON tranche_completion_rechecks BEGIN SELECT RAISE(ABORT, 'tranche completion rechecks are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS tranche_completion_rechecks_hash_integrity
+BEFORE INSERT ON tranche_completion_rechecks
+WHEN NEW.evidence_hash != canonical_recheck_hash(NEW.tranche_id,NEW.generation,NEW.previous_generation,NEW.previous_evidence_hash,NEW.correction_plan_ids_json,NEW.accepted_ticket_ids_json,NEW.accepted_commit_shas_json,NEW.current_integration_sha,NEW.repository_identity,NEW.repo_base_sha,NEW.repo_snapshot_hash,NEW.unresolved_correction_count,NEW.status)
+BEGIN SELECT RAISE(ABORT, 'tranche completion recheck hash mismatch'); END;
 CREATE TRIGGER IF NOT EXISTS events_immutable_update
 BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'events are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS events_immutable_delete
@@ -330,6 +338,33 @@ def _hash_recheck_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
+def _completion_evidence_payload(row: Any) -> dict[str, Any]:
+    return {"tranche_id": str(row["tranche_id"]), "root_planning_sha": str(row["root_planning_sha"]),
+            "final_integration_sha": str(row["final_integration_sha"]),
+            "accepted_ticket_ids": json.loads(row["accepted_ticket_ids_json"]),
+            "accepted_commit_shas": json.loads(row["accepted_commit_shas_json"])}
+
+
+def _completion_evidence_hash(row: Any) -> str:
+    return _hash_recheck_payload(_completion_evidence_payload(row))
+
+
+def _sqlite_completion_hash(tranche_id: str, root: str, final: str, tickets: str, commits: str) -> str:
+    return _completion_evidence_hash({"tranche_id": tranche_id, "root_planning_sha": root, "final_integration_sha": final,
+                                      "accepted_ticket_ids_json": tickets, "accepted_commit_shas_json": commits})
+
+
+def _sqlite_recheck_hash(tranche_id: str, generation: int, previous_generation: int, previous_hash: str,
+                         plan_ids: str, ticket_ids: str, commits: str, head: str, repository: str,
+                         base: str, snapshot: str, unresolved: int, status: str) -> str:
+    return _hash_recheck_payload({"tranche_id": str(tranche_id), "generation": int(generation),
+        "previous_generation": int(previous_generation), "previous_evidence_hash": str(previous_hash),
+        "correction_plan_ids": json.loads(plan_ids), "accepted_ticket_ids": json.loads(ticket_ids),
+        "accepted_commit_shas": json.loads(commits), "current_integration_sha": str(head),
+        "repository_identity": str(repository), "repo_base_sha": str(base), "repo_snapshot_hash": str(snapshot),
+        "unresolved_correction_count": int(unresolved), "status": str(status)})
+
+
 class Ledger:
     """Standalone SQLite ledger. It deliberately has no Hermes imports."""
 
@@ -347,6 +382,8 @@ class Ledger:
         if self.database.name == "kanban.db" or self.database.resolve(strict=False).name == "kanban.db":
             raise ValueError("ledger database must be distinct from Hermes kanban.db")
         self.connection = sqlite3.connect(self.database, isolation_level=None, check_same_thread=False)
+        self.connection.create_function("canonical_completion_hash", 5, _sqlite_completion_hash)
+        self.connection.create_function("canonical_recheck_hash", 13, _sqlite_recheck_hash)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 5000")
@@ -1726,6 +1763,8 @@ class Ledger:
 
     def record_tranche_completion(self, completion: dict[str, Any]) -> None:
         now = self._now()
+        completion = dict(completion)
+        completion["evidence_hash"] = _completion_evidence_hash(completion)
         with self._transaction() as conn:
             existing = conn.execute("SELECT * FROM tranche_completion_evidence WHERE tranche_id=?", (completion["tranche_id"],)).fetchone()
             keys = ("tranche_id", "root_planning_sha", "final_integration_sha", "accepted_ticket_ids_json", "accepted_commit_shas_json", "evidence_hash")
