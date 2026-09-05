@@ -69,7 +69,7 @@ class CorrectionPlanParserTests(SupplementalCorrectionTests):
                 raw = self.plan_json(); self.set_path(raw, path, value); self.assert_rejected_without_persistence(raw)
 
     def test_boolean_and_integer_fields_reject_all_coercible_values(self):
-        for path, values in [(("review_required",), ("false", "0", "1", 0, 1)), (("tickets", 0, "review_required"), ("false", "0", "1", 0, 1)), (("tickets", 0, "max_attempts"), (True, "true", "20", 20.0))]:
+        for path, values in [(("review_required",), ("false", "0", "1", 0, 1)), (("tickets", 0, "review_required"), ("false", "0", "1", 0, 1)), (("tickets", 0, "max_attempts"), (True, "true", "20", 20.0)), (("tickets", 0, "patch_budget", "max_files"), (True, False)), (("tickets", 0, "patch_budget", "max_changed_lines"), (True, False)), (("tickets", 0, "verification", "timeout_seconds"), (True, False)), (("tickets", 0, "verification", "output_limit"), (True, False))]:
             for value in values:
                 with self.subTest(path=path, value=value):
                     raw = self.plan_json(); self.set_path(raw, path, value); self.assert_rejected_without_persistence(raw)
