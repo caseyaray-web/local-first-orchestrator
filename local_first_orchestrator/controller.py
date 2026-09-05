@@ -127,7 +127,7 @@ class LocalFirstController:
         self.ledger.connection.execute("UPDATE attempts SET base_sha=?, branch=?, worktree_path=?, pre_diff_hash=? WHERE ticket_id=? AND attempt_number=?",(base,attempt.branch,str(attempt.path),attempt.pre_diff_hash,ticket_id,number))
         return attempt
 
-    def _assert_pre_inference_isolation(self, *, repository: Path, attempt: AttemptWorktree, base_sha: str, ticket: MicroTicket, admission_sha: str) -> None:
+    def _assert_pre_inference_isolation(self, *, repository: Path, attempt: AttemptWorktree, base_sha: str, ticket: MicroTicket, canonical_sha: str) -> None:
         """Fail closed before artifacts or inference can observe an unsafe attempt."""
         attempt_path = attempt.path.resolve()
         try:
@@ -142,7 +142,7 @@ class LocalFirstController:
             raise RuntimeError("attempt_worktree_identity_mismatch")
         if git(attempt_path, "rev-parse", "HEAD") != base_sha:
             raise RuntimeError("attempt_base_mismatch")
-        if git(repository, "rev-parse", "HEAD") != admission_sha:
+        if git(repository, "rev-parse", "HEAD") != canonical_sha:
             raise RuntimeError("canonical_head_moved_since_admission")
         if git(attempt_path, "status", "--porcelain=v1"):
             raise RuntimeError("attempt_not_clean_before_inference")
@@ -152,6 +152,16 @@ class LocalFirstController:
         for relative in ticket.allowed_files:
             if not (attempt_path / relative).is_file():
                 raise RuntimeError("allowed_file_missing_before_inference")
+
+    def _canonical_provenance_sha(self, ticket_id: str) -> str:
+        row = self.ledger.connection.execute("SELECT canonical_sha FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
+        if row is None or not row[0]:
+            row = self.ledger.connection.execute("""SELECT p.base_sha FROM supplemental_correction_tickets sct JOIN supplemental_correction_plans p ON p.correction_plan_id=sct.correction_plan_id WHERE sct.ticket_id=?""", (ticket_id,)).fetchone()
+        if row is None or not row[0]:
+            row = self.ledger.connection.execute("SELECT repo_base_sha FROM decomposition_plans WHERE feature_id=(SELECT feature_id FROM tickets WHERE id=?) AND status='active' ORDER BY created_at DESC LIMIT 1", (ticket_id,)).fetchone()
+        if row is None or not row[0]:
+            raise RuntimeError("canonical_repository_provenance_missing")
+        return str(row[0])
 
     def effective_runtime_identity(self) -> dict[str, object]:
         repository, worktree_root, artifact_root = self.config.validate_execution_roots()
@@ -221,7 +231,7 @@ class LocalFirstController:
         state=CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
         if state == CanonicalState.READY_LOCAL and not (self.ledger.claim_specific_operator if explicit_operator else self.ledger.claim_specific)(ticket_id,owner,self.config.lease_seconds): return None
         if state in {CanonicalState.NEEDS_TRIAGE,CanonicalState.BLOCKED,CanonicalState.DONE}: return None
-        planning_base=str(binding["starting_sha"]); worktrees=GitWorktreeAdapter(repo,worktree_root)
+        planning_base=str(binding["starting_sha"]); canonical_sha=self._canonical_provenance_sha(ticket_id); worktrees=GitWorktreeAdapter(repo,worktree_root)
         base=worktrees.resolve_execution_base(self.ledger.get_ticket(ticket_id)["tranche_id"] or None, planning_base)
         self.ledger.record_runtime_stage(ticket_id, "execution_base", base)
         reconciliation = self.ledger.failed_attempt_reconciliation(ticket_id)
@@ -249,7 +259,7 @@ class LocalFirstController:
                 impl=self.ledger.model_stage(ticket_id,attempt_number,"implementation")
                 if not impl:
                     if fresh_attempt:
-                        self._assert_pre_inference_isolation(repository=repo,attempt=attempt,base_sha=base,ticket=ticket,admission_sha=planning_base)
+                        self._assert_pre_inference_isolation(repository=repo,attempt=attempt,base_sha=base,ticket=ticket,canonical_sha=canonical_sha)
                     artifacts_root=artifact_root/ticket_id/str(attempt_number); artifacts_root.mkdir(parents=True,exist_ok=True)
                     packet=ContextPacketBuilder().build_from_repository(ticket,attempt.path,repository_rules="Edit only allowed files. Return JSON only.",failure_evidence=repair_evidence)
                     artifacts=ContextPacketBuilder().write_artifacts(packet,artifact_root=artifacts_root); request_hash=hashlib.sha256(packet.text.encode()).hexdigest()

@@ -134,6 +134,26 @@ class InvocationLifecycleTests(unittest.TestCase):
         self.assertEqual(self.ledger.review_invocations(ticket, 1), [])
         self.assertIsNone(self.ledger.accepted_commit(ticket))
 
+    def test_isolation_uses_canonical_provenance_separately_from_execution_base(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        canonical = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("checkout", "-qb", "integration")
+        (self.repo / "app.py").write_text("def value():\n    return 'integrated'\n", encoding="utf-8")
+        self.git("add", "."); self.git("commit", "-qm", "integrated base")
+        execution = self.git("rev-parse", "HEAD").stdout.strip(); self.git("checkout", "main")
+        self.ledger.connection.execute("UPDATE runtime_bindings SET starting_sha=?,canonical_sha=? WHERE ticket_id=?", (execution, canonical, ticket))
+        result = ctl.execute_implementation(ticket, repository=self.repo)
+        assert result is not None
+        self.assertEqual(self.ledger.connection.execute("SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage='execution_base'", (ticket,)).fetchone()[0], execution)
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "local_review")
+
+    def test_isolation_rejects_genuine_canonical_checkout_movement(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        self.git("commit", "--allow-empty", "-qm", "unexpected canonical movement")
+        with self.assertRaisesRegex(RuntimeError, "canonical_head_moved_since_admission"):
+            ctl.execute_implementation(ticket, repository=self.repo)
+        self.assertEqual(model.calls, 0)
+
     def test_implementation_only_restart_recovers_same_candidate(self) -> None:
         model = LifecycleModel(); ctl, ticket = self.controller(model)
         first = ctl.execute_implementation(ticket, repository=self.repo)

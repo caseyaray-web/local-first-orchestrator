@@ -395,6 +395,9 @@ class Ledger:
 
     def migrate(self) -> None:
         self.connection.executescript(_SCHEMA)
+        binding_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(runtime_bindings)")}
+        if "canonical_sha" not in binding_columns:
+            self.connection.execute("ALTER TABLE runtime_bindings ADD COLUMN canonical_sha TEXT")
         recheck_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(tranche_completion_rechecks)")}
         if "evidence_hash" not in recheck_columns:
             self.connection.execute("ALTER TABLE tranche_completion_rechecks ADD COLUMN evidence_hash TEXT")
@@ -878,9 +881,9 @@ class Ledger:
             event_id = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="retired_attempt_cleanup_confirmed", actor_id=operator_id, payload={"retired_attempt":retired_attempt_number,"checked_paths":json.loads(encoded_paths)})
             return {"ticket_id":ticket_id,"retired_attempt_number":retired_attempt_number,"status":"confirmed","event_id":event_id}
 
-    def bind_runtime(self, ticket_id: str, repository_path: str, starting_sha: str) -> None:
+    def bind_runtime(self, ticket_id: str, repository_path: str, starting_sha: str, canonical_sha: str | None = None) -> None:
         with self._transaction() as conn:
-            conn.execute("INSERT OR IGNORE INTO runtime_bindings(ticket_id, repository_path, starting_sha, ownership_verified, created_at) VALUES (?, ?, ?, 1, ?)", (ticket_id, repository_path, starting_sha, self._now()))
+            conn.execute("INSERT OR IGNORE INTO runtime_bindings(ticket_id, repository_path, starting_sha, canonical_sha, ownership_verified, created_at) VALUES (?, ?, ?, ?, 1, ?)", (ticket_id, repository_path, starting_sha, canonical_sha or starting_sha, self._now()))
 
     def runtime_binding(self, ticket_id: str) -> dict[str, Any]:
         row = self.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()

@@ -308,7 +308,7 @@ class CorrectionService:
         with self.ledger._transaction() as conn:
             existing = conn.execute("SELECT repository_path,starting_sha FROM runtime_bindings WHERE ticket_id=?", (correction_ticket_id,)).fetchone()
             if existing is None:
-                conn.execute("INSERT INTO runtime_bindings(ticket_id,repository_path,starting_sha,ownership_verified,created_at) VALUES (?,?,?,1,?)", (correction_ticket_id, *expected, self.ledger._now()))
+                conn.execute("INSERT INTO runtime_bindings(ticket_id,repository_path,starting_sha,canonical_sha,ownership_verified,created_at) VALUES (?,?,?,?,1,?)", (correction_ticket_id, str(self.repository), head, self._git("rev-parse", "HEAD").stdout.strip(), self.ledger._now()))
             elif (existing["repository_path"], existing["starting_sha"]) != expected:
                 raise ValueError("correction runtime binding conflicts with current authoritative lineage")
         result = self.ledger.admit_ticket_if_ready(correction_ticket_id)
