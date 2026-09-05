@@ -198,23 +198,29 @@ class LocalFirstController:
         adapter=GitWorktreeAdapter(repository,worktree_root); fingerprint=adapter.diff_hash(path)
         return self.ledger.authorize_review_resume(ticket_id,operator_id=operator_id,candidate_fingerprint=fingerprint,runtime_identity=self.effective_runtime_identity())
 
-    def execute(self, ticket_id: str, *, repository: Path, allow_board_writes: bool, owner: str="local-first-controller") -> bool:
-        if not allow_board_writes: return False
+    def _implementation_stage(self, ticket_id: str, *, repository: Path, owner: str, allow_validation_repair: bool, failure_evidence: str = "") -> dict[str, object] | None:
+        """Run implementation through validation and candidate freezing only.
+
+        This is the single implementation path used by both the deliberate
+        implementation-only operator operation and autonomous ``execute``.
+        The boolean is an internal composition policy: the operator operation
+        stops on validation failure, while autonomous execution retains its
+        historical bounded validation-repair loop.  Neither path enters review.
+        """
         binding=self.ledger.runtime_binding(ticket_id); raw_repository=Path(repository).resolve(strict=True)
         if str(raw_repository) != binding["repository_path"]: raise ValueError("repository mismatch with imported binding")
         repo, worktree_root, artifact_root = self.config.validate_execution_roots()
         if repo != raw_repository: raise ValueError("repository mismatch with configured canonical repository")
         ticket=ticket_from_ledger(self.ledger.get_ticket(ticket_id))
         if ticket.risk != "low": raise PermissionError("only low-risk tickets may execute locally")
-        if self.ledger.accepted_commit(ticket_id): self.ledger.project_ticket(ticket_id,self.board); return True
         if self.ledger.incomplete_model_invocations(ticket_id):
             raise RuntimeError("execution_reconciliation_required: incomplete model invocation")
         reconciliation = self.ledger.failed_attempt_reconciliation(ticket_id)
         if reconciliation is not None and bool(reconciliation["cleanup_required"]) and not self.ledger.cleanup_confirmed(ticket_id, int(reconciliation["retired_attempt_number"])):
             raise RuntimeError("retired attempt cleanup confirmation required before retry execution")
         state=CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
-        if state == CanonicalState.READY_LOCAL and not self.ledger.claim_specific(ticket_id,owner,self.config.lease_seconds): return False
-        if state in {CanonicalState.NEEDS_TRIAGE,CanonicalState.BLOCKED,CanonicalState.DONE}: return False
+        if state == CanonicalState.READY_LOCAL and not self.ledger.claim_specific(ticket_id,owner,self.config.lease_seconds): return None
+        if state in {CanonicalState.NEEDS_TRIAGE,CanonicalState.BLOCKED,CanonicalState.DONE}: return None
         planning_base=str(binding["starting_sha"]); worktrees=GitWorktreeAdapter(repo,worktree_root)
         base=worktrees.resolve_execution_base(self.ledger.get_ticket(ticket_id)["tranche_id"] or None, planning_base)
         self.ledger.record_runtime_stage(ticket_id, "execution_base", base)
@@ -234,7 +240,7 @@ class LocalFirstController:
             else:
                 attempt_number = self.ledger.next_attempt_number(ticket_id)
             attempt_limit = ticket.max_attempts
-        repair_evidence=""
+        repair_evidence=failure_evidence
         try:
             while attempt_number <= attempt_limit:
                 existing_attempt=self.ledger.connection.execute("SELECT worktree_path FROM attempts WHERE ticket_id=? AND attempt_number=?",(ticket_id,attempt_number)).fetchone()
@@ -275,13 +281,60 @@ class LocalFirstController:
                 validation=DeterministicValidator(artifact_root=artifacts_root).validate(attempt.path,ticket,base_sha=base)
                 self.ledger.record_runtime_stage(ticket_id,f"validation-{attempt_number}",validation.compact_evidence); self.ledger.record_runtime_stage(ticket_id,"validation_completed",validation.compact_evidence); self._crash("validation_completed")
                 if not validation.passed:
-                    if attempt_number >= ticket.max_attempts: self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"validation":validation.compact_evidence}); break
+                    if not allow_validation_repair or attempt_number >= ticket.max_attempts:
+                        self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"validation":validation.compact_evidence}); return None
                     repair_evidence=validation.compact_evidence; self.ledger.transition(ticket_id,CanonicalState.REPAIRING,payload={"validation":repair_evidence}); self.ledger.transition(ticket_id,CanonicalState.IMPLEMENTING); attempt_number+=1; continue
                 diff=subprocess.run(("git","diff",base),cwd=attempt.path,text=True,capture_output=True,check=True).stdout
                 candidate_fingerprint=hashlib.sha256(diff.encode()).hexdigest()
                 self.ledger.transition(ticket_id,CanonicalState.LOCAL_REVIEW) if CanonicalState(self.ledger.get_ticket(ticket_id)["state"]) == CanonicalState.VERIFYING else None
                 implementation_invocation=self.ledger.invocation_for_stage(ticket_id,attempt_number,"implementation")
                 self.ledger.freeze_review_candidate(ticket_id,attempt_number,candidate_fingerprint=candidate_fingerprint,validation_evidence=validation.compact_evidence,implementation_invocation_id=str(implementation_invocation["invocation_id"]) if implementation_invocation else None,runtime_identity=self.effective_runtime_identity())
+                return {"ticket": ticket, "base": base, "worktrees": worktrees, "attempt": attempt, "artifacts_root": artifacts_root, "validation": validation, "diff": diff, "candidate_fingerprint": candidate_fingerprint, "attempt_number": attempt_number}
+        except Exception as exc:
+            current=CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
+            if not isinstance(exc, InjectedCrash):
+                if current in {CanonicalState.IMPLEMENTING,CanonicalState.VERIFYING,CanonicalState.REPAIRING}:
+                    self.ledger.transition(ticket_id,CanonicalState.BLOCKED,payload={"runtime_error":"execution failed; reconciliation required"})
+            raise
+
+    def execute_implementation(self, ticket_id: str, *, repository: Path, owner: str="local-first-operator") -> dict[str, object] | None:
+        """Public resumable implementation-only operation.
+
+        A frozen validated candidate is recovered and verified from the ledger
+        and worktree on replay.  No model, review, repair, commit, or
+        integration operation is reachable from this method.
+        """
+        candidate=self.ledger.review_candidate(ticket_id)
+        if candidate is not None:
+            stage=self.ledger.model_stage(ticket_id,int(candidate["attempt_number"]),"implementation")
+            artifact=Path(str(stage["response_artifact"])) if stage else None
+            if stage is None or artifact is None or not artifact.is_file(): raise RuntimeError("persisted implementation candidate is incomplete")
+            binding=self.ledger.runtime_binding(ticket_id); repo,_,_=self.config.validate_execution_roots()
+            if str(repo) != binding["repository_path"]: raise ValueError("repository mismatch with imported binding")
+            attempt_row=self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?",(ticket_id,int(candidate["attempt_number"]))).fetchone()
+            if attempt_row is None or not attempt_row["worktree_path"]: raise RuntimeError("persisted implementation attempt is missing")
+            path=Path(str(attempt_row["worktree_path"]))
+            if not path.is_dir(): raise RuntimeError("persisted implementation worktree is missing")
+            diff=subprocess.run(("git","diff",str(stage["base_sha"])),cwd=path,text=True,capture_output=True,check=True).stdout
+            fingerprint=hashlib.sha256(diff.encode()).hexdigest()
+            if fingerprint != candidate["candidate_fingerprint"]: raise RuntimeError("persisted candidate fingerprint mismatch")
+            return {"ticket_id":ticket_id,"attempt_number":int(candidate["attempt_number"]),"candidate_fingerprint":fingerprint,"implementation_artifact":str(artifact),"state":self.ledger.get_ticket(ticket_id)["state"],"replayed":True}
+        result=self._implementation_stage(ticket_id,repository=repository,owner=owner,allow_validation_repair=False)
+        if result is None: return None
+        return {"ticket_id":ticket_id,"attempt_number":int(result["attempt_number"]),"candidate_fingerprint":str(result["candidate_fingerprint"]),"implementation_artifact":str(self.ledger.model_stage(ticket_id,int(result["attempt_number"]),"implementation")["response_artifact"]),"state":self.ledger.get_ticket(ticket_id)["state"],"replayed":False}
+
+    def execute(self, ticket_id: str, *, repository: Path, allow_board_writes: bool, owner: str="local-first-controller") -> bool:
+        if not allow_board_writes: return False
+        if self.ledger.accepted_commit(ticket_id): self.ledger.project_ticket(ticket_id,self.board); return True
+        while True:
+            before_state=CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
+            result=self._implementation_stage(ticket_id,repository=repository,owner=owner,allow_validation_repair=True)
+            if result is None:
+                self.ledger.project_ticket(ticket_id,self.board)
+                after_state=CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
+                return after_state != before_state
+            ticket=result["ticket"]; base=str(result["base"]); worktrees=result["worktrees"]; attempt=result["attempt"]; artifacts_root=result["artifacts_root"]; validation=result["validation"]; diff=str(result["diff"]); attempt_number=int(result["attempt_number"])
+            try:
                 review_packet=ReviewPacketBuilder().build(ticket,diff=diff,selected_files={p:(attempt.path/p).read_text() for p in (*ticket.allowed_files, *ticket.new_test_files) if (attempt.path/p).exists()},validation_evidence=validation.compact_evidence)
                 review_stage=self.ledger.model_stage(ticket_id,attempt_number,"review")
                 if review_stage and Path(review_stage["response_artifact"]).exists(): review=normalize_review(json.loads(Path(review_stage["response_artifact"]).read_text()).get("payload",{}),ticket)
@@ -290,51 +343,30 @@ class LocalFirstController:
                     invocation_id=uuid.uuid4().hex; provider=str(getattr(self.local_model,"review_provider",getattr(self.local_model,"provider",type(self.local_model).__name__))); model=str(getattr(self.local_model,"review_model",getattr(self.local_model,"model",type(self.local_model).__name__)))
                     self.ledger.start_model_invocation(invocation_id=invocation_id,ticket_id=ticket_id,attempt_number=attempt_number,stage="review",provider=provider,model=model,packet_hash=hashlib.sha256(review_packet.encode()).hexdigest(),worktree_path=str(attempt.path),timeout_seconds=self.config.review_timeout_seconds)
                     started=time.monotonic()
-                    try:
-                        result=LocalReviewAdapter(self.local_model).review(ticket,review_packet,artifact_dir=artifacts_root,workdir=attempt.path)
+                    try: result=LocalReviewAdapter(self.local_model).review(ticket,review_packet,artifact_dir=artifacts_root,workdir=attempt.path)
                     except subprocess.TimeoutExpired as exc:
                         self.ledger.finish_model_invocation(invocation_id,status="timeout",duration_seconds=time.monotonic()-started,error={"type":"TimeoutExpired","timeout_seconds":self.config.review_timeout_seconds,"process":str(exc)[:1000]}); self.ledger.record_review_infrastructure_failure(ticket_id,attempt_number,outcome="review_timeout"); self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"review_infrastructure":"review_timeout; reconciliation required","attempt_number":attempt_number}); raise
                     except ValueError as exc:
-                        malformed_artifact = str(getattr(exc, "artifact_path", "")) or None
-                        self.ledger.finish_model_invocation(invocation_id,status="malformed_output",duration_seconds=time.monotonic()-started,error={"type":type(exc).__name__,"message":str(exc)[:1000]},model_artifact=malformed_artifact)
-                        self.ledger.record_review_infrastructure_failure(ticket_id,attempt_number,outcome="review_malformed_output")
-                        raise
+                        malformed_artifact=str(getattr(exc,"artifact_path","")) or None; self.ledger.finish_model_invocation(invocation_id,status="malformed_output",duration_seconds=time.monotonic()-started,error={"type":type(exc).__name__,"message":str(exc)[:1000]},model_artifact=malformed_artifact); self.ledger.record_review_infrastructure_failure(ticket_id,attempt_number,outcome="review_malformed_output"); raise
                     except Exception as exc:
                         self.ledger.finish_model_invocation(invocation_id,status="process_error",duration_seconds=time.monotonic()-started,error={"type":type(exc).__name__,"message":str(exc)[:1000]}); self.ledger.record_review_infrastructure_failure(ticket_id,attempt_number,outcome="review_process_error"); self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"review_infrastructure":"review_process_error; reconciliation required","attempt_number":attempt_number}); raise
-                    response_path=getattr(result,"artifact_path",artifacts_root/"review-result.json"); self.ledger.finish_model_invocation(invocation_id,status="completed",duration_seconds=time.monotonic()-started,model_artifact=str(response_path))
-                    path=artifacts_root/"review-result.json"; path.write_text(json.dumps({"payload":result.raw},sort_keys=True),encoding="utf-8")
-                    self.ledger.record_model_stage(ticket_id,attempt_number,"review",purpose="review",adapter=type(self.local_model).__name__,request_hash=hashlib.sha256(review_packet.encode()).hexdigest(),response_artifact=str(path),worktree_path=str(attempt.path),base_sha=base,diff_hash=worktrees.diff_hash(attempt.path)); self.ledger.record_runtime_stage(ticket_id,"review_completed",str(path)); self._crash("review_completed"); review=result
+                    path=artifacts_root/"review-result.json"; path.write_text(json.dumps({"payload":result.raw},sort_keys=True),encoding="utf-8"); self.ledger.finish_model_invocation(invocation_id,status="completed",duration_seconds=time.monotonic()-started,model_artifact=str(path)); self.ledger.record_model_stage(ticket_id,attempt_number,"review",purpose="review",adapter=type(self.local_model).__name__,request_hash=hashlib.sha256(review_packet.encode()).hexdigest(),response_artifact=str(path),worktree_path=str(attempt.path),base_sha=base,diff_hash=worktrees.diff_hash(attempt.path)); self.ledger.record_runtime_stage(ticket_id,"review_completed",str(path)); self._crash("review_completed"); review=result
                 outcome=SameTicketRepairCoordinator(self.ledger).apply(ticket_id,attempt_number,review)
                 if outcome=="repair":
                     repair_evidence="; ".join(f"{f.criterion_id}: {f.evidence}; repair: {f.minimal_repair}" for f in review.findings)
-                    self.ledger.transition(ticket_id,CanonicalState.IMPLEMENTING)
-                    next_attempt=attempt_number+1
-                    # A review repair is a new model attempt on the same isolated diff,
-                    # not a fresh worktree that loses the implementation under review.
-                    self.ledger.ensure_attempt(ticket_id,next_attempt)
-                    self.ledger.connection.execute(
-                        "UPDATE attempts SET base_sha=?, branch=?, worktree_path=?, pre_diff_hash=? WHERE ticket_id=? AND attempt_number=?",
-                        (base,attempt.branch,str(attempt.path),worktrees.diff_hash(attempt.path),ticket_id,next_attempt),
-                    )
-                    attempt_number=next_attempt
-                    continue
+                    self.ledger.transition(ticket_id,CanonicalState.IMPLEMENTING); next_attempt=attempt_number+1; self.ledger.ensure_attempt(ticket_id,next_attempt); self.ledger.connection.execute("UPDATE attempts SET base_sha=?, branch=?, worktree_path=?, pre_diff_hash=? WHERE ticket_id=? AND attempt_number=?",(base,attempt.branch,str(attempt.path),worktrees.diff_hash(attempt.path),ticket_id,next_attempt)); result_failure_evidence=repair_evidence
+                    result=self._implementation_stage(ticket_id,repository=repository,owner=owner,allow_validation_repair=True,failure_evidence=result_failure_evidence)
+                    if result is None: self.ledger.project_ticket(ticket_id,self.board); return True
+                    ticket=result["ticket"]; base=str(result["base"]); worktrees=result["worktrees"]; attempt=result["attempt"]; artifacts_root=result["artifacts_root"]; validation=result["validation"]; diff=str(result["diff"]); attempt_number=int(result["attempt_number"]); continue
                 if outcome=="triage": break
                 if self.ledger.accepted_commit(ticket_id):
-                    if CanonicalState(self.ledger.get_ticket(ticket_id)["state"]) == CanonicalState.ACCEPTED:
-                        self.ledger.transition(ticket_id,CanonicalState.DONE)
+                    if CanonicalState(self.ledger.get_ticket(ticket_id)["state"]) == CanonicalState.ACCEPTED: self.ledger.transition(ticket_id,CanonicalState.DONE)
                     break
-                self.ledger.record_runtime_stage(ticket_id,"accepted_commit_created", "pending")
-                commit=worktrees.accept(attempt,f"local-first: {self.ledger.get_ticket(ticket_id)['title']}")
-                worktrees.advance_integration_head(self.ledger.get_ticket(ticket_id)["tranche_id"] or None, base, commit)
-                self.ledger.record_accepted_evidence(ticket_id,commit,"accepted ticket diff",validation.compact_evidence); self.ledger.record_runtime_stage(ticket_id,"accepted_commit_created",commit); self._crash("accepted_commit_created"); self.ledger.transition(ticket_id,CanonicalState.DONE); break
-            self.ledger.project_ticket(ticket_id,self.board); return True
-        except Exception as exc:
-            current=CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
-            if not isinstance(exc, InjectedCrash):
-                if current == CanonicalState.LOCAL_REVIEW:
-                    review_status = self.ledger.review_reconciliation_status(ticket_id)
-                    if review_status["classification"] not in {"review_invocation_failed_no_verdict", "review_in_flight", "review_retry_exhausted"}:
-                        self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"runtime_error":"malformed local review; reconciliation required"})
-                elif current in {CanonicalState.IMPLEMENTING,CanonicalState.VERIFYING,CanonicalState.REPAIRING}:
-                    self.ledger.transition(ticket_id,CanonicalState.BLOCKED,payload={"runtime_error":"execution failed; reconciliation required"})
-            raise
+                self.ledger.record_runtime_stage(ticket_id,"accepted_commit_created","pending"); commit=worktrees.accept(attempt,f"local-first: {self.ledger.get_ticket(ticket_id)['title']}"); worktrees.advance_integration_head(self.ledger.get_ticket(ticket_id)["tranche_id"] or None,base,commit); self.ledger.record_accepted_evidence(ticket_id,commit,"accepted ticket diff",validation.compact_evidence); self.ledger.record_runtime_stage(ticket_id,"accepted_commit_created",commit); self._crash("accepted_commit_created"); self.ledger.transition(ticket_id,CanonicalState.DONE); break
+            except Exception as exc:
+                current=CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
+                if not isinstance(exc,InjectedCrash) and current == CanonicalState.LOCAL_REVIEW:
+                    review_status=self.ledger.review_reconciliation_status(ticket_id)
+                    if review_status["classification"] not in {"review_invocation_failed_no_verdict","review_in_flight","review_retry_exhausted"}: self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"runtime_error":"malformed local review; reconciliation required"})
+                raise
+        self.ledger.project_ticket(ticket_id,self.board); return True

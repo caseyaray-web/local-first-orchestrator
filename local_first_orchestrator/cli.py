@@ -206,6 +206,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     status=commands.add_parser("status"); status.add_argument("--active",action="store_true")
     imported=commands.add_parser("import"); imported.add_argument("--task-id",required=True)
     run=commands.add_parser("run-once"); run.add_argument("--task-id",required=True); run.add_argument("--dry-run",action="store_true",default=True); run.add_argument("--execute",action="store_true"); run.add_argument("--allow-board-writes",action="store_true")
+    implementation=commands.add_parser("implementation-only", aliases=("implement-only",), help="run exactly implementation and deterministic validation; never review or accept")
+    implementation.add_argument("--task-id",required=True)
     inspect=commands.add_parser("inspect"); inspect.add_argument("--task-id",required=True)
     generated=commands.add_parser("project-generated"); generated.add_argument("--allow-board-writes",action="store_true")
     activate=commands.add_parser("activate-generated"); activate.add_argument("ticket_id")
@@ -257,6 +259,11 @@ def run_command(args: argparse.Namespace) -> int:
             if not args.execute: print(json.dumps(ctl.dry_run(args.task_id),sort_keys=True))
             elif not args.allow_board_writes: raise PermissionError("--execute requires --allow-board-writes; no write-enabled execution without both")
             else: print(json.dumps({"executed":ctl.execute(args.task_id,repository=repository,allow_board_writes=True)}))
+        elif args.command in {"implementation-only", "implement-only"}:
+            if args.ad_hoc_runtime: raise ValueError("implementation-only execution requires registered operator runtime")
+            ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
+            result=ctl.execute_implementation(args.task_id,repository=registered.canonical_repository)
+            print(json.dumps(result or {"ticket_id":args.task_id,"status":"not_run"},sort_keys=True))
         elif args.command=="inspect": print(json.dumps(ledger.get_ticket(args.task_id),sort_keys=True))
         elif args.command=="register-dashboard":
             root=Path(args.repository).resolve(strict=True)

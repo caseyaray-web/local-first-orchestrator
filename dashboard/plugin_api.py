@@ -17,6 +17,8 @@ if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
 from local_first_orchestrator.ledger import Ledger
+from local_first_orchestrator.controller import LocalFirstController
+from local_first_orchestrator.local_qwen import LocalQwenAdapter
 from local_first_orchestrator.operator_config import OperatorConfig, load_operator_config
 
 router = APIRouter()
@@ -24,6 +26,15 @@ router = APIRouter()
 
 class OperatorAction(BaseModel):
     reason: str = Field(default="operator action", max_length=240)
+
+
+class ImplementationAction(BaseModel):
+    ticket_id: str = Field(min_length=1, max_length=240)
+    reason: str = Field(default="operator implementation-only action", max_length=240)
+
+
+class _OperatorBoard:
+    is_fake = False
 
 
 def _config() -> OperatorConfig:
@@ -61,7 +72,6 @@ def _status() -> dict[str, Any]:
     finally:
         ledger.close()
 
-
 @router.get("/status")
 def status() -> dict[str, Any]:
     """Read bounded operator status from the single registered ledger."""
@@ -86,3 +96,22 @@ def resume(action: OperatorAction) -> dict[str, Any]:
     finally:
         ledger.close()
     return _status()
+
+
+@router.post("/implementation")
+def implementation(action: ImplementationAction) -> dict[str, Any]:
+    """Run one registered ticket through implementation and validation only."""
+    ledger, config = _ledger()
+    try:
+        runtime = config.runtime_config()
+        model = LocalQwenAdapter(provider=config.implementation.provider, model=config.implementation.model,
+                                 hermes_home=Path.home()/".hermes"/"profiles"/config.implementation.profile,
+                                 implementation_timeout_seconds=runtime.implementation_timeout_seconds,
+                                 review_timeout_seconds=runtime.review_timeout_seconds)
+        result = LocalFirstController(ledger, _OperatorBoard(), runtime, local_model=model).execute_implementation(
+            action.ticket_id, repository=config.canonical_repository, owner="dashboard-operator")
+        return result or {"ticket_id": action.ticket_id, "status": "not_run"}
+    except (OSError, ValueError, RuntimeError, PermissionError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        ledger.close()

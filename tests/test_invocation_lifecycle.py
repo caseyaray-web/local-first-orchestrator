@@ -49,6 +49,17 @@ class LifecycleModel:
         return type("Result", (), {"payload": payload, "artifact_path": artifact})()
 
 
+class InvalidLifecycleModel(LifecycleModel):
+    def invoke(self, purpose: str, packet: str, *, artifact_dir: Path, workdir: Path | None = None) -> object:
+        self.calls += 1
+        if purpose == "implementation":
+            assert workdir is not None
+            (workdir / "app.py").write_text("def value():\n    return 'still-bad'\n", encoding="utf-8")
+        artifact = artifact_dir / f"{purpose}-result.json"
+        artifact.write_text("{}", encoding="utf-8")
+        return type("Result", (), {"payload": {}, "artifact_path": artifact})()
+
+
 class InvocationLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = TemporaryDirectory(); self.root = Path(self.temp.name); self.repo = self.root / "repo"; self.repo.mkdir()
@@ -89,6 +100,42 @@ class InvocationLifecycleTests(unittest.TestCase):
         resumed = LocalFirstController(self.ledger, Board(), self.config, local_model=model)
         with self.assertRaisesRegex(RuntimeError, "execution_reconciliation_required"): resumed.execute(ticket, repository=self.repo, allow_board_writes=True)
         self.assertEqual(model.calls, 0)
+
+    def test_implementation_only_freezes_candidate_without_review_and_replays(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        first = ctl.execute_implementation(ticket, repository=self.repo)
+        assert first is not None
+        self.assertFalse(first["replayed"])
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "local_review")
+        self.assertEqual(model.calls, 1)
+        self.assertEqual(self.ledger.review_invocations(ticket, 1), [])
+        self.assertIsNotNone(self.ledger.model_stage(ticket, 1, "implementation"))
+        self.assertIsNotNone(self.ledger.review_candidate(ticket))
+        replay = ctl.execute_implementation(ticket, repository=self.repo)
+        self.assertEqual(replay["candidate_fingerprint"], first["candidate_fingerprint"])
+        self.assertEqual(replay["implementation_artifact"], first["implementation_artifact"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(model.calls, 1)
+        self.assertIsNone(self.ledger.accepted_commit(ticket))
+
+    def test_implementation_only_validation_failure_stops_before_review(self) -> None:
+        model = InvalidLifecycleModel(); ctl, ticket = self.controller(model)
+        result = ctl.execute_implementation(ticket, repository=self.repo)
+        self.assertIsNone(result)
+        self.assertEqual(model.calls, 1)
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "needs_triage")
+        self.assertEqual(self.ledger.review_invocations(ticket, 1), [])
+        self.assertIsNone(self.ledger.accepted_commit(ticket))
+
+    def test_implementation_only_restart_recovers_same_candidate(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        first = ctl.execute_implementation(ticket, repository=self.repo)
+        assert first is not None
+        self.ledger.close(); self.ledger = Ledger(self.root / "ledger.db"); self.ledger.migrate()
+        resumed = LocalFirstController(self.ledger, Board(), self.config, local_model=model)
+        replay = resumed.execute_implementation(ticket, repository=self.repo)
+        self.assertEqual(replay["candidate_fingerprint"], first["candidate_fingerprint"])
+        self.assertEqual(model.calls, 1)
 
 
 if __name__ == "__main__":
