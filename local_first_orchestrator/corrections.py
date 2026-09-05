@@ -290,17 +290,27 @@ class CorrectionService:
         return MaterializedCorrection(correction_plan_id, ticket_ids[0])
 
     def activate(self, correction_ticket_id: str) -> str:
-        """Bind a delivered correction to the current lineage and admit it normally."""
-        row = self.ledger.connection.execute("""
-            SELECT b.acknowledged_at FROM supplemental_correction_tickets t
+        """Bind a delivered correction to its current authoritative lineage."""
+        rows = self.ledger.connection.execute("""
+            SELECT e.id,b.acknowledged_at,b.external_task_id,b.terminal_error
+            FROM supplemental_correction_tickets t
             JOIN events e ON e.entity_type='ticket' AND e.entity_id=t.ticket_id AND e.event_type='generated_microticket_created'
-            JOIN board_projection_outbox b ON b.ticket_id=t.ticket_id AND b.event_id=e.id AND b.operation='create_microticket'
+            LEFT JOIN board_projection_outbox b ON b.ticket_id=t.ticket_id AND b.event_id=e.id AND b.operation='create_microticket'
             WHERE t.ticket_id=?
-        """, (correction_ticket_id,)).fetchone()
-        if row is None or row["acknowledged_at"] is None:
+        """, (correction_ticket_id,)).fetchall()
+        if len(rows) != 1:
+            raise ValueError("correction generated provenance is missing or ambiguous")
+        row = rows[0]
+        if row["acknowledged_at"] is None or not isinstance(row["external_task_id"], str) or not row["external_task_id"] or row["terminal_error"] is not None:
             raise ValueError("correction board materialization is incomplete")
         head = self.admission_base(correction_ticket_id)
-        self.ledger.bind_runtime(correction_ticket_id, str(self.repository), head)
+        expected = (str(self.repository), head)
+        with self.ledger._transaction() as conn:
+            existing = conn.execute("SELECT repository_path,starting_sha FROM runtime_bindings WHERE ticket_id=?", (correction_ticket_id,)).fetchone()
+            if existing is None:
+                conn.execute("INSERT INTO runtime_bindings(ticket_id,repository_path,starting_sha,ownership_verified,created_at) VALUES (?,?,?,1,?)", (correction_ticket_id, *expected, self.ledger._now()))
+            elif (existing["repository_path"], existing["starting_sha"]) != expected:
+                raise ValueError("correction runtime binding conflicts with current authoritative lineage")
         result = self.ledger.admit_ticket_if_ready(correction_ticket_id)
         if result.status != "ready":
             raise ValueError("correction admission prerequisites are not satisfied")

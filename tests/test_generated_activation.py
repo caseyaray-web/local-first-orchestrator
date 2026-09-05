@@ -12,3 +12,6 @@ class ActivationTests(unittest.TestCase):
   self.l.bind_runtime(self.ticket,'/other','b'*40)
   with patch('local_first_orchestrator.generated_activation.resolve_generated_activation_context',return_value=self.ctx):r=activate_generated_ticket(self.ticket,self.cfg,self.l)
   self.assertEqual(r.status,'binding_conflict');self.assertEqual(self.l.runtime_binding(self.ticket)['repository_path'],'/other')
+ def test_normal_generated_activation_remains_on_normal_path(self):
+  with patch('local_first_orchestrator.generated_activation.resolve_generated_activation_context',return_value=self.ctx): r=activate_generated_ticket(self.ticket,self.cfg,self.l)
+  self.assertEqual(r.status,'readiness_failed');self.assertEqual(self.l.runtime_binding(self.ticket)['starting_sha'],'a'*40)

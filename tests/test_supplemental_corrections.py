@@ -5,7 +5,11 @@ import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
+from local_first_orchestrator.controller import RuntimeConfig
+from local_first_orchestrator.generated_activation import activate_generated_ticket
+from local_first_orchestrator.generated_projection import GeneratedProjectionWorker
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.states import CanonicalState
 from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
@@ -300,6 +304,66 @@ class SupplementalCorrectionTests(unittest.TestCase):
         self.ledger.record_accepted_evidence(first, self.base, "accepted", "validated")
         ready = self.ledger.evaluate_ticket_readiness(second)
         self.assertEqual(ready.status, "ready", ready.unresolved_dependency_ids)
+
+    def _runtime_config(self):
+        return RuntimeConfig(self.repo, self.root / "worktrees", self.root / "artifacts", repository_allowlist=(self.repo,))
+
+    def delivered_correction(self):
+        plan = self.service().create_plan(self.spec())
+        correction = self.service().materialize(plan.correction_plan_id)
+
+        class Board:
+            timeout_seconds = 1
+            allow_writes = True
+            def __init__(self): self.body = ""
+            def create_microticket(self, title, body, *, idempotency_key): self.body = body; return "external-correction"
+            def get_task(self, task_id): return SimpleNamespace(id=task_id, body=self.body)
+
+        delivered = GeneratedProjectionWorker(self.ledger, Board(), worker_id="test").deliver_one()
+        self.assertEqual(delivered.ticket_id, correction.ticket_id)
+        return correction.ticket_id
+
+    def test_public_generated_activation_uses_correction_current_head_and_replays(self):
+        ticket_id = self.delivered_correction()
+        self.git("commit", "--allow-empty", "-m", "later integrated sibling")
+        head2 = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/local-first/tranches/T/integration-head", head2)
+        first = activate_generated_ticket(ticket_id, self._runtime_config(), self.ledger)
+        replay = activate_generated_ticket(ticket_id, self._runtime_config(), self.ledger)
+        self.assertEqual((first.status, first.starting_sha), ("activated_ready", head2))
+        self.assertEqual((replay.status, replay.starting_sha), ("already_activated", head2))
+        self.assertEqual(self.ledger.runtime_binding(ticket_id)["starting_sha"], head2)
+
+    def test_public_generated_activation_rejects_missing_predecessor_ancestry(self):
+        ticket_id = self.delivered_correction()
+        self.git("update-ref", "refs/local-first/tranches/T/integration-head", self.base)
+        with self.assertRaises(ValueError):
+            activate_generated_ticket(ticket_id, self._runtime_config(), self.ledger)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()[0], 0)
+
+    def test_public_generated_activation_rejects_accepted_evidence_mismatch(self):
+        ticket_id = self.delivered_correction()
+        self.ledger.record_accepted_evidence("A", self.base, "accepted", "tampered")
+        with self.assertRaises(ValueError):
+            activate_generated_ticket(ticket_id, self._runtime_config(), self.ledger)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()[0], 0)
+
+    def test_public_generated_activation_rejects_wrong_existing_correction_binding(self):
+        ticket_id = self.delivered_correction()
+        self.ledger.bind_runtime(ticket_id, str(self.repo), self.base)
+        with self.assertRaises(ValueError):
+            activate_generated_ticket(ticket_id, self._runtime_config(), self.ledger)
+        self.assertEqual(self.ledger.runtime_binding(ticket_id)["starting_sha"], self.base)
+
+    def test_public_generated_activation_rejects_missing_or_ambiguous_correction_projection(self):
+        plan = self.service().create_plan(self.spec())
+        ticket_id = self.service().materialize(plan.correction_plan_id).ticket_id
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            activate_generated_ticket(ticket_id, self._runtime_config(), self.ledger)
+        with self.ledger._transaction() as conn:
+            conn.execute("INSERT INTO events(entity_type,entity_id,event_type,actor_type,actor_id,payload_json,created_at) VALUES ('ticket',?,'generated_microticket_created','controller','test','{}',?)", (ticket_id, self.ledger._now()))
+        with self.assertRaises(ValueError):
+            activate_generated_ticket(ticket_id, self._runtime_config(), self.ledger)
 
     def test_ordinary_plan_dependencies_remain_local_only(self):
         from local_first_orchestrator.decomposition import Criterion, DecompositionPlan, FeatureContract, PlanValidator, Tranche

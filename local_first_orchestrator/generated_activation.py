@@ -32,7 +32,7 @@ class GeneratedActivationContext:
 
 
 def resolve_generated_activation_context(ticket_id: str, runtime_config: RuntimeConfig, ledger: Ledger) -> GeneratedActivationContext:
-    row = ledger.connection.execute("""
+    rows = ledger.connection.execute("""
         SELECT t.id ticket_id,t.feature_id,t.tranche_id,tr.feature_id tranche_feature_id,tr.status tranche_status,
                p.id plan_id,p.status plan_status,p.repository_identity,p.repo_base_sha,p.repo_snapshot_hash,p.repo_snapshot_manifest_json,
                b.acknowledged_at,b.external_task_id,b.terminal_error,b.operation,e.entity_type,e.entity_id,e.event_type
@@ -41,8 +41,12 @@ def resolve_generated_activation_context(ticket_id: str, runtime_config: Runtime
         LEFT JOIN events e ON e.entity_id=t.id AND e.entity_type='ticket' AND e.event_type='generated_microticket_created'
         LEFT JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.event_id=e.id AND b.operation='create_microticket'
         WHERE t.id=?
-    """, (ticket_id,)).fetchone()
-    if row is None: raise GeneratedActivationError('ticket_not_found')
+    """, (ticket_id,)).fetchall()
+    if not rows:
+        raise GeneratedActivationError('ticket_not_found')
+    if len(rows) != 1:
+        raise GeneratedActivationError('ambiguous_generated_provenance')
+    row = rows[0]
     if (row['entity_type'],row['entity_id'],row['event_type']) != ('ticket',ticket_id,'generated_microticket_created') or row['feature_id'] != row['tranche_feature_id']:
         raise GeneratedActivationError('invalid_generated_provenance')
     if row['tranche_status'] != 'active' or not row['plan_id']:
@@ -77,12 +81,34 @@ class GeneratedActivationResult:
     readiness_status: str | None = None
 
 
+def _correction_plan_id(ticket_id: str, ledger: Ledger) -> str | None:
+    rows = ledger.connection.execute("""
+        SELECT sct.correction_plan_id
+        FROM supplemental_correction_tickets sct
+        JOIN supplemental_correction_plans sc ON sc.correction_plan_id=sct.correction_plan_id
+        WHERE sct.ticket_id=?
+    """, (ticket_id,)).fetchall()
+    if len(rows) > 1:
+        raise GeneratedActivationError("ambiguous_correction_provenance")
+    return str(rows[0]["correction_plan_id"]) if rows else None
+
+
 def activate_generated_ticket(ticket_id: str, runtime_config: RuntimeConfig, ledger: Ledger) -> GeneratedActivationResult:
-    """Bind one validated generated ticket, then reuse shared readiness admission."""
-    try:
-        context = resolve_generated_activation_context(ticket_id, runtime_config, ledger)
-    except GeneratedActivationError:
-        raise
+    """Activate ordinary generated tickets or correction tickets by persisted provenance."""
+    correction_plan_id = _correction_plan_id(ticket_id, ledger)
+    if correction_plan_id is not None:
+        from .corrections import CorrectionService
+        try:
+            repository = runtime_config.canonical_repository(runtime_config.repository)
+        except Exception as exc:
+            raise GeneratedActivationError("repository_identity_mismatch") from exc
+        was_ready = ledger.get_ticket(ticket_id)["state"] == "ready_local"
+        try:
+            head = CorrectionService(ledger, repository).activate(ticket_id)
+        except (KeyError, ValueError) as exc:
+            raise GeneratedActivationError(str(exc)) from exc
+        return GeneratedActivationResult("already_activated" if was_ready else "activated_ready", ticket_id, repository, head, "ready")
+    context = resolve_generated_activation_context(ticket_id, runtime_config, ledger)
     existing = ledger.connection.execute("SELECT repository_path,starting_sha FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
     expected = (str(context.repository_path), context.starting_sha)
     if existing is None:
