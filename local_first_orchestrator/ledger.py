@@ -322,7 +322,33 @@ class Ledger:
         );
         CREATE TABLE IF NOT EXISTS tranche_criteria (tranche_id TEXT NOT NULL, criterion_id TEXT NOT NULL, PRIMARY KEY(tranche_id, criterion_id));
         CREATE TABLE IF NOT EXISTS ticket_criteria (ticket_id TEXT NOT NULL, criterion_id TEXT NOT NULL, PRIMARY KEY(ticket_id, criterion_id));
+        CREATE TABLE IF NOT EXISTS supplemental_correction_plans (
+            correction_plan_id TEXT PRIMARY KEY, finding_key TEXT NOT NULL UNIQUE,
+            feature_id TEXT NOT NULL REFERENCES features(id), tranche_id TEXT NOT NULL REFERENCES tranches(id),
+            source_kind TEXT NOT NULL, source_reference TEXT NOT NULL, finding_fingerprint TEXT NOT NULL,
+            finding_summary TEXT NOT NULL, observed_integration_head TEXT NOT NULL,
+            repository_identity TEXT NOT NULL, base_sha TEXT NOT NULL, snapshot_hash TEXT NOT NULL,
+            plan_json TEXT NOT NULL, status TEXT NOT NULL, ordinal INTEGER NOT NULL, created_at INTEGER NOT NULL, materialized_at INTEGER,
+            UNIQUE(tranche_id, ordinal)
+        );
+        CREATE TABLE IF NOT EXISTS supplemental_correction_predecessors (
+            correction_plan_id TEXT NOT NULL REFERENCES supplemental_correction_plans(correction_plan_id),
+            ticket_id TEXT NOT NULL REFERENCES tickets(id), accepted_commit_sha TEXT NOT NULL,
+            PRIMARY KEY(correction_plan_id, ticket_id)
+        );
+        CREATE TABLE IF NOT EXISTS supplemental_correction_tickets (
+            correction_plan_id TEXT NOT NULL REFERENCES supplemental_correction_plans(correction_plan_id),
+            ticket_id TEXT PRIMARY KEY REFERENCES tickets(id), ordinal INTEGER NOT NULL, admission_head TEXT,
+            UNIQUE(correction_plan_id, ordinal)
+        );
+        CREATE TABLE IF NOT EXISTS correction_ticket_predecessors (
+            correction_ticket_id TEXT NOT NULL REFERENCES tickets(id), ticket_id TEXT NOT NULL REFERENCES tickets(id),
+            accepted_commit_sha TEXT NOT NULL, PRIMARY KEY(correction_ticket_id, ticket_id)
+        );
         """)
+        # Unique indexes are re-runnable so ledgers migrated before the
+        # supplemental-correction schema still gain durable collision guards.
+        self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_supplemental_correction_plans_ordinal ON supplemental_correction_plans(tranche_id, ordinal)")
         plan_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(decomposition_plans)")}
         for name in ("repository_identity", "repo_base_sha", "repo_snapshot_hash", "repo_snapshot_manifest_json"):
             if name not in plan_columns:
@@ -1269,12 +1295,16 @@ class Ledger:
         row = self.connection.execute("""
             SELECT t.id AS ticket_id, t.feature_id AS feature_id, t.tranche_id AS tranche_id,
                    tr.feature_id AS tranche_feature_id, f.id AS resolved_feature_id,
-                   p.repository_identity, p.repo_base_sha, p.repo_snapshot_hash,
+                   COALESCE(sc.repository_identity, p.repository_identity) AS repository_identity,
+                   COALESCE(sc.base_sha, p.repo_base_sha) AS repo_base_sha,
+                   COALESCE(sc.snapshot_hash, p.repo_snapshot_hash) AS repo_snapshot_hash,
                    e.entity_type, e.entity_id, e.event_type
             FROM tickets t
             JOIN tranches tr ON tr.id=t.tranche_id
             JOIN features f ON f.id=t.feature_id
-            JOIN decomposition_plans p ON p.feature_id=t.feature_id AND p.status='active'
+            LEFT JOIN decomposition_plans p ON p.feature_id=t.feature_id AND p.status='active'
+            LEFT JOIN supplemental_correction_tickets sct ON sct.ticket_id=t.id
+            LEFT JOIN supplemental_correction_plans sc ON sc.correction_plan_id=sct.correction_plan_id
             JOIN events e ON e.id=?
             WHERE t.id=?
         """, (event_id, ticket_id)).fetchone()

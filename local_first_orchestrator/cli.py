@@ -5,12 +5,97 @@ import json
 from pathlib import Path
 
 from .controller import LocalFirstController, RuntimeConfig
+from .corrections import AcceptedPredecessor, CorrectionService, CorrectionTicketSpec, SupplementalCorrectionPlan
 from .generated_activation import GeneratedActivationError, activate_generated_ticket
 from .generated_projection import GeneratedProjectionWorker
 from .hermes_board import HermesBoardAdapter
 from .ledger import Ledger
 from .local_qwen import LOCAL_QWEN_MODEL, LOCAL_QWEN_PROVIDER, LocalQwenAdapter
 from .operator_config import ModelRegistration, OperatorConfig, default_execution_roots, load_operator_config, save_operator_config
+from .ticket import MicroTicket, PatchBudget, VerificationProfile
+
+
+def _correction_service(ledger: Ledger, args: argparse.Namespace) -> CorrectionService:
+    root=Path(args.repository).resolve(strict=True)
+    allowlist=tuple(Path(item).resolve(strict=True) for item in args.allow_repository) or (root,)
+    if root not in allowlist: raise PermissionError("repository is not on the explicit --allow-repository list")
+    return CorrectionService(ledger, root)
+
+
+def _correction_plan_from_file(path: str, repository_identity: str) -> SupplementalCorrectionPlan:
+    """Parse a controller-owned correction plan file (fail-closed).
+
+    The operator supplies structured provenance (source kind/reference,
+    finding fingerprint/summary, predecessor ticket+accepted commit pairs,
+    and MicroTicket-shaped contracts). IDs are derived by the controller;
+    no board contents or model output are consulted here. Unknown keys or
+    missing required fields reject the whole plan.
+    """
+    raw=json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    if not isinstance(raw, dict): raise ValueError("correction plan file must contain a JSON object")
+    top_required={"feature_id","tranche_id","source_kind","source_reference","finding_fingerprint","finding_summary","predecessors","tickets","base_sha","snapshot_hash"}
+    unknown=set(raw) - top_required
+    if unknown: raise ValueError(f"unknown correction plan fields: {sorted(unknown)}")
+    missing=top_required - set(raw)
+    if missing: raise ValueError(f"missing correction plan fields: {sorted(missing)}")
+
+    pred_raw=raw["predecessors"]
+    if not isinstance(pred_raw, list) or not pred_raw: raise ValueError("correction predecessors must be a non-empty list of {ticket_id, accepted_commit}")
+    predecessors=[]
+    for entry in pred_raw:
+        keys=set(entry) - {"ticket_id","accepted_commit"}
+        if keys: raise ValueError(f"unknown predecessor fields: {sorted(keys)}")
+        ticket=entry.get("ticket_id"); commit=entry.get("accepted_commit")
+        if not isinstance(ticket,str) or not ticket or not isinstance(commit,str): raise ValueError("predecessor requires string ticket_id and accepted_commit")
+        predecessors.append(AcceptedPredecessor(ticket,commit))
+
+    spec_raws=raw["tickets"]
+    if not isinstance(spec_raws, list) or not spec_raws: raise ValueError("correction tickets must be a non-empty list")
+    specs=[]
+    for entry in spec_raws:
+        keys=set(entry) - {"objective","criterion_ids","primary_symbol","allowed_existing_files","new_test_files","forbidden_changes","patch_budget","verification","risk","review_required","max_attempts","dependencies","relevant_symbols","acceptance_criteria","non_goals","red_evidence"}
+        if keys: raise ValueError(f"unknown ticket fields: {sorted(keys)}")
+        patch_raw=entry.get("patch_budget",{})
+        verification_raw=entry.get("verification",{})
+        if not isinstance(patch_raw, dict) or set(patch_raw) - {"max_files", "max_changed_lines", "exception_reason"}:
+            raise ValueError("patch_budget must be a closed object")
+        if not isinstance(verification_raw, dict) or set(verification_raw) - {"commands", "working_directory", "timeout_seconds", "output_limit"}:
+            raise ValueError("verification must be a closed object")
+        raw_commands=verification_raw.get("commands", [])
+        if not isinstance(raw_commands, list) or not all(isinstance(command, list) and command and all(isinstance(arg, str) and arg for arg in command) for command in raw_commands):
+            raise ValueError("verification.commands must be a list of non-empty string argv lists")
+        commands=[tuple(command) for command in raw_commands]
+        specs.append(CorrectionTicketSpec(
+            objective=str(entry.get("objective","")),
+            criterion_ids=tuple(str(x) for x in entry.get("criterion_ids",())),
+            primary_symbol=str(entry.get("primary_symbol","")),
+            allowed_existing_files=tuple(str(x) for x in entry.get("allowed_existing_files",())),
+            new_test_files=tuple(str(x) for x in entry.get("new_test_files",())),
+            forbidden_changes=tuple(str(x) for x in entry.get("forbidden_changes",())),
+            patch_budget=PatchBudget(
+                max_files=int(patch_raw.get("max_files",2)),
+                max_changed_lines=int(patch_raw.get("max_changed_lines",180)),
+                exception_reason=patch_raw.get("exception_reason")),
+            verification=VerificationProfile(
+                tuple(commands) if commands else (("true",),),
+                working_directory=str(verification_raw.get("working_directory",".")),
+                timeout_seconds=int(verification_raw.get("timeout_seconds",60)),
+                output_limit=int(verification_raw.get("output_limit",20_000))),
+            risk=str(entry.get("risk","low")),
+            review_required=bool(entry.get("review_required",True)),
+            max_attempts=max(1,int(entry.get("max_attempts",1))),
+            dependencies=tuple(str(x) for x in entry.get("dependencies",())),
+            relevant_symbols=tuple(str(x) for x in entry.get("relevant_symbols",())),
+            acceptance_criteria=tuple(str(x) for x in entry.get("acceptance_criteria",())),
+            non_goals=tuple(str(x) for x in entry.get("non_goals",())),
+            red_evidence=str(entry.get("red_evidence",""))))
+
+    return SupplementalCorrectionPlan(
+        feature_id=str(raw["feature_id"]), tranche_id=str(raw["tranche_id"]),
+        source_kind=str(raw["source_kind"]), source_reference=str(raw["source_reference"]),
+        finding_fingerprint=str(raw["finding_fingerprint"]), finding_summary=str(raw["finding_summary"]),
+        predecessors=tuple(predecessors), tickets=tuple(specs),
+        repository_identity=repository_identity, base_sha=str(raw["base_sha"]), snapshot_hash=str(raw["snapshot_hash"]))
 
 
 def _ledger(path: str) -> Ledger:
@@ -96,6 +181,10 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     reconcile.add_argument("--classification", required=True, choices=("runtime_infrastructure_failure", "model_timeout", "process_error", "validation_failure", "review_exhaustion"))
     reconcile.add_argument("--operator-id", default="local-first-cli")
     reconcile.add_argument("--forensic-artifact-path", action="append", default=[], help="existing artifact root retained with the retired attempt; repeatable")
+    correction_plan=commands.add_parser("correction-plan", aliases=("create-correction-plan",), help="validate and persist a supplemental post-acceptance correction plan from --plan-file JSON; never materializes, unpause, or executes")
+    correction_plan.add_argument("--plan-file", required=True)
+    correction_materialize=commands.add_parser("correction-materialize", aliases=("materialize-correction",), help="materialize one persisted correction plan into draft microtickets with the normal durable board-projection intent; never unpause or execute")
+    correction_materialize.add_argument("--correction-plan-id", required=True)
     review_resume=commands.add_parser("resume-failed-review", help="authorize a review-only retry for an unchanged validated candidate")
     review_resume.add_argument("--task-id", required=True)
     review_resume.add_argument("--operator-id", default="local-first-cli")
@@ -181,6 +270,16 @@ def run_command(args: argparse.Namespace) -> int:
             board=HermesBoardAdapter(executable=args.hermes_executable,board=args.board,allow_writes=True)
             result=GeneratedProjectionWorker(ledger,board,worker_id="local-first-cli").deliver_one()
             print(json.dumps(result.__dict__,sort_keys=True))
+        elif args.command in {"correction-plan", "create-correction-plan"}:
+            service=_correction_service(ledger,args)
+            plan=_correction_plan_from_file(args.plan_file,str(service.repository))
+            persisted=service.create_plan(plan)  # validates + persists; never materializes
+            print(json.dumps(persisted.__dict__,sort_keys=True))
+        elif args.command in {"correction-materialize", "materialize-correction"}:
+            service=_correction_service(ledger,args)
+            materialized=service.materialize(args.correction_plan_id)  # draft tickets only; no unpause/execute
+            ticket_ids=[r[0] for r in ledger.connection.execute("SELECT sct.ticket_id FROM supplemental_correction_tickets sct WHERE sct.correction_plan_id=? ORDER BY sct.ordinal",(materialized.correction_plan_id,)).fetchall()]
+            print(json.dumps({"correction_plan_id": materialized.correction_plan_id, "ticket_ids": ticket_ids}, sort_keys=True))
     finally: ledger.close()
     return 0
 
