@@ -234,7 +234,7 @@ CREATE TABLE IF NOT EXISTS review_candidates (
 CREATE TABLE IF NOT EXISTS review_retry_authorizations (
     authorization_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), attempt_number INTEGER NOT NULL,
     candidate_fingerprint TEXT NOT NULL, failed_invocation_id TEXT NOT NULL REFERENCES model_invocations(invocation_id),
-    operator_id TEXT NOT NULL, authorized_at INTEGER NOT NULL,
+    operator_id TEXT NOT NULL, authorized_at INTEGER NOT NULL, consumed_invocation_id TEXT REFERENCES model_invocations(invocation_id), consumed_at INTEGER,
     UNIQUE(ticket_id, attempt_number, failed_invocation_id)
 );
 CREATE TABLE IF NOT EXISTS failed_attempt_reconciliations (
@@ -393,7 +393,10 @@ class Ledger:
         for name,definition in {"lease_expires_at":"INTEGER","next_attempt_at":"INTEGER","terminal_owner":"TEXT"}.items():
             if name not in comment_columns: self.connection.execute(f"ALTER TABLE evidence_comment_outbox ADD COLUMN {name} {definition}")
         self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_model_calls_reservation ON model_calls(reservation_id)")
-        self.connection.execute("CREATE TABLE IF NOT EXISTS review_retry_authorizations (authorization_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), attempt_number INTEGER NOT NULL, candidate_fingerprint TEXT NOT NULL, failed_invocation_id TEXT NOT NULL REFERENCES model_invocations(invocation_id), operator_id TEXT NOT NULL, authorized_at INTEGER NOT NULL, UNIQUE(ticket_id, attempt_number, failed_invocation_id))")
+        self.connection.execute("CREATE TABLE IF NOT EXISTS review_retry_authorizations (authorization_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), attempt_number INTEGER NOT NULL, candidate_fingerprint TEXT NOT NULL, failed_invocation_id TEXT NOT NULL REFERENCES model_invocations(invocation_id), operator_id TEXT NOT NULL, authorized_at INTEGER NOT NULL, consumed_invocation_id TEXT REFERENCES model_invocations(invocation_id), consumed_at INTEGER, UNIQUE(ticket_id, attempt_number, failed_invocation_id))")
+        retry_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(review_retry_authorizations)")}
+        for name, definition in {"consumed_invocation_id": "TEXT", "consumed_at": "INTEGER"}.items():
+            if name not in retry_columns: self.connection.execute(f"ALTER TABLE review_retry_authorizations ADD COLUMN {name} {definition}")
         projection_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(board_projection_outbox)")}
         for name, definition in {"payload_json": "TEXT NOT NULL DEFAULT '{}'", "operation": "TEXT NOT NULL DEFAULT 'set_state'", "external_task_id": "TEXT", "lease_owner": "TEXT", "lease_expires_at": "INTEGER", "next_attempt_at": "INTEGER", "attempt_count": "INTEGER NOT NULL DEFAULT 0", "last_error": "TEXT", "terminal_error": "TEXT", "superseded_at": "INTEGER", "superseded_by_event_id": "INTEGER", "supersession_reason": "TEXT"}.items():
             if name not in projection_columns:
@@ -909,6 +912,32 @@ class Ledger:
             conn.execute("INSERT INTO review_retry_authorizations(authorization_id,ticket_id,attempt_number,candidate_fingerprint,failed_invocation_id,operator_id,authorized_at) VALUES (?,?,?,?,?,?,?)", (authorization_id, ticket_id, candidate["attempt_number"], candidate_fingerprint, failed, operator_id, self._now()))
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="review_retry_authorized", actor_id=operator_id, payload={"attempt_number":candidate["attempt_number"], "failed_invocation_id":failed})
             return dict(conn.execute("SELECT * FROM review_retry_authorizations WHERE authorization_id=?", (authorization_id,)).fetchone())
+
+    def launch_authorized_review(self, authorization_id: str, *, invocation_id: str, provider: str, model: str, packet_hash: str, worktree_path: str, timeout_seconds: int) -> dict[str, Any]:
+        """Atomically consume one authorization and create its sole invocation."""
+        with self._transaction() as conn:
+            auth = conn.execute("SELECT * FROM review_retry_authorizations WHERE authorization_id=?", (authorization_id,)).fetchone()
+            if auth is None: raise KeyError("review retry authorization")
+            if auth["consumed_invocation_id"] is not None:
+                return dict(conn.execute("SELECT * FROM model_invocations WHERE invocation_id=?", (auth["consumed_invocation_id"],)).fetchone())
+            status = self.review_reconciliation_status(str(auth["ticket_id"]), int(auth["attempt_number"]))
+            if status["classification"] != "review_invocation_failed_no_verdict": raise PermissionError("review retry is no longer eligible")
+            if int(status["review_invocation_count"]) >= self._MAX_REVIEW_INVOCATIONS: raise PermissionError("review retry budget exhausted")
+            now = self._now()
+            conn.execute("INSERT INTO model_invocations(invocation_id,ticket_id,attempt_number,stage,provider,model,packet_hash,worktree_path,timeout_seconds,started_at,status) VALUES (?,?,?,?,?,?,?,?,?,?, 'started')", (invocation_id,auth["ticket_id"],auth["attempt_number"],"review",provider,model,packet_hash,worktree_path,timeout_seconds,now))
+            changed = conn.execute("UPDATE review_retry_authorizations SET consumed_invocation_id=?,consumed_at=? WHERE authorization_id=? AND consumed_invocation_id IS NULL", (invocation_id,now,authorization_id))
+            if changed.rowcount != 1: raise RuntimeError("review authorization consumption lost")
+            self._append_event(conn, entity_type="ticket", entity_id=str(auth["ticket_id"]), event_type="model_invocation_started", actor_id="controller", payload={"invocation_id":invocation_id,"attempt_number":auth["attempt_number"],"stage":"review","retry_authorization_id":authorization_id})
+            return self.model_invocation(invocation_id)
+
+    def recover_stale_review_invocation(self, invocation_id: str, *, now: int, stale_after_seconds: int) -> bool:
+        if stale_after_seconds < 1: raise ValueError("invalid stale threshold")
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM model_invocations WHERE invocation_id=?", (invocation_id,)).fetchone()
+            if row is None or row["stage"] != "review" or row["status"] != "started" or int(row["started_at"]) + stale_after_seconds > now: return False
+            conn.execute("UPDATE model_invocations SET status='process_error',completed_at=?,duration_seconds=?,error_json=? WHERE invocation_id=? AND status='started'", (now,float(now-int(row["started_at"])),json.dumps({"type":"ReviewInvocationAbandoned","message":"review invocation exceeded stale threshold"},sort_keys=True),invocation_id))
+            self._append_event(conn,entity_type="ticket",entity_id=str(row["ticket_id"]),event_type="model_invocation_finished",actor_id="recovery",payload={"invocation_id":invocation_id,"attempt_number":row["attempt_number"],"stage":"review","status":"process_error","reason":"abandoned"})
+            return True
 
     def freeze_review_candidate(self, ticket_id: str, attempt_number: int, *, candidate_fingerprint: str, validation_evidence: str, implementation_invocation_id: str | None, runtime_identity: dict[str, Any], historical_review_attempted: bool = False) -> dict[str, Any]:
         if not candidate_fingerprint or not validation_evidence:
