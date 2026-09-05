@@ -394,8 +394,17 @@ class CorrectionService:
 
     def completion_authority(self, tranche_id: str) -> dict[str, Any]:
         """Return the durable completion authority used by successor gating."""
-        status = self.lifecycle_status(tranche_id)
         h1 = self.ledger.tranche_completion(tranche_id)
+        if h1 is None:
+            return {"authorized": False, "kind": None, "completion": None,
+                    "final_integration_sha": None, "status": "missing_h1"}
+        schema = self.ledger.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tranche_completion_rechecks'"
+        ).fetchone()
+        if schema is None:
+            return {"authorized": False, "kind": None, "completion": h1,
+                    "final_integration_sha": None, "status": "completion_schema_missing"}
+        status = self.lifecycle_status(tranche_id)
         latest = status["latest_completion"]
         if status["review_status"] == "no_corrections" and h1 is not None:
             return {"authorized": True, "kind": "h1", "completion": h1,

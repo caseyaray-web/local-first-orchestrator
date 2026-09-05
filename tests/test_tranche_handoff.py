@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import subprocess
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from local_first_orchestrator.controller import RuntimeConfig
 from local_first_orchestrator.decomposition import Criterion, DecompositionPlan, FeatureContract, PlanValidator, Tranche, activate_validated_plan
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.tranche_completion import completion_evidence
+from local_first_orchestrator.corrections import CorrectionService
 from local_first_orchestrator.planning_coordinator import PlanningCoordinator
 from local_first_orchestrator.repository_snapshot import RepositoryPlanValidator, snapshot
 from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
@@ -88,6 +90,31 @@ class TrancheHandoffTests(unittest.TestCase):
         outcome = coordinator.materialize_next_tranche("F")
         self.assertEqual(outcome.status, "waiting_not_complete")
         self.assertIn("completion authority", outcome.reasons[0])
+
+    def test_legacy_missing_h1_and_recheck_schema_returns_controlled_unauthorized(self):
+        self.ledger.connection.execute("DROP TRIGGER tranche_completion_rechecks_hash_integrity")
+        self.ledger.connection.execute("DROP TRIGGER tranche_completion_rechecks_immutable_delete")
+        self.ledger.connection.execute("DROP TRIGGER tranche_completion_rechecks_immutable_update")
+        self.ledger.connection.execute("DROP TABLE tranche_completion_rechecks")
+        authority = CorrectionService(self.ledger, self.repo).completion_authority("T1")
+        self.assertEqual(authority["authorized"], False)
+        self.assertEqual(authority["status"], "missing_h1")
+
+    def test_legacy_h1_without_recheck_schema_returns_controlled_unauthorized(self):
+        self.ledger.record_tranche_completion(completion_evidence(self.ledger, self.repo, "T1"))
+        self.ledger.connection.execute("DROP TRIGGER tranche_completion_rechecks_hash_integrity")
+        self.ledger.connection.execute("DROP TRIGGER tranche_completion_rechecks_immutable_delete")
+        self.ledger.connection.execute("DROP TRIGGER tranche_completion_rechecks_immutable_update")
+        self.ledger.connection.execute("DROP TABLE tranche_completion_rechecks")
+        authority = CorrectionService(self.ledger, self.repo).completion_authority("T1")
+        self.assertEqual(authority["authorized"], False)
+        self.assertEqual(authority["status"], "completion_schema_missing")
+
+    def test_unrelated_database_errors_are_not_converted_to_not_complete(self):
+        self.ledger.record_tranche_completion(completion_evidence(self.ledger, self.repo, "T1"))
+        self.ledger.connection.execute("DROP TABLE supplemental_correction_plans")
+        with self.assertRaises(sqlite3.OperationalError):
+            CorrectionService(self.ledger, self.repo).completion_authority("T1")
 
 
 if __name__ == "__main__": unittest.main()
