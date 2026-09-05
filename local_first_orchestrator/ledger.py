@@ -14,6 +14,7 @@ from typing import Any, Iterator
 from .adapters import BoardAdapter
 from .readiness import ReadinessError, validate_ticket
 from .states import CanonicalState, validate_transition
+from .evidence_hash import canonical_sha256
 from .ticket import MicroTicket
 
 
@@ -334,8 +335,7 @@ def _recheck_evidence_hash(row: Any) -> str:
 
 
 def _hash_recheck_payload(payload: dict[str, Any]) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode()).hexdigest()
+    return canonical_sha256(payload)
 
 
 def _completion_evidence_payload(row: Any) -> dict[str, Any]:

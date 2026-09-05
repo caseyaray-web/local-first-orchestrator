@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import subprocess
 from typing import Any
 
 from .states import CanonicalState
+from .evidence_hash import canonical_sha256
 
 
 class TrancheNotComplete(ValueError):
@@ -40,5 +40,4 @@ def completion_evidence(ledger: Any, repository: Any, tranche_id: str) -> dict[s
     if final != commits[-1]:
         raise TrancheNotComplete("integration head does not match final accepted commit")
     payload = {"tranche_id": tranche_id, "root_planning_sha": root, "final_integration_sha": final, "accepted_ticket_ids": ticket_ids, "accepted_commit_shas": commits}
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return {**payload, "accepted_ticket_ids_json": json.dumps(ticket_ids, separators=(",", ":")), "accepted_commit_shas_json": json.dumps(commits, separators=(",", ":")), "evidence_hash": hashlib.sha256(encoded.encode()).hexdigest()}
+    return {**payload, "accepted_ticket_ids_json": json.dumps(ticket_ids, separators=(",", ":")), "accepted_commit_shas_json": json.dumps(commits, separators=(",", ":")), "evidence_hash": canonical_sha256(payload)}

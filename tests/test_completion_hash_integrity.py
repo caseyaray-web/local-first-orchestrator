@@ -8,10 +8,21 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.ledger import Ledger, _completion_evidence_hash, _hash_recheck_payload
+from local_first_orchestrator.tranche_completion import completion_evidence
 from tests.test_tranche_completion_rechecks import TrancheCompletionRecheckTests
 
 
 class CompletionHashIntegrityTests(TrancheCompletionRecheckTests):
+    def test_h1_producer_and_persistence_validator_share_canonical_hash(self):
+        produced = completion_evidence(self.ledger, self.repo, "T")
+        self.ledger.record_tranche_completion(produced)
+        stored = self.ledger.tranche_completion("T")
+        self.assertEqual(produced["evidence_hash"], stored["evidence_hash"])
+        self.assertEqual(stored["evidence_hash"], _completion_evidence_hash(stored))
+        source = Path(__file__).parents[1] / "local_first_orchestrator" / "tranche_completion.py"
+        self.assertNotIn("import hashlib", source.read_text())
+        self.assertIn("canonical_sha256", source.read_text())
+
     def test_h1_api_derives_hash_instead_of_trusting_caller(self):
         supplied = self.record_h1()
         self.assertNotEqual(supplied["evidence_hash"], "h1-evidence")
