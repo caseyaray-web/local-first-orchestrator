@@ -295,7 +295,10 @@ class LocalFirstController:
                     except subprocess.TimeoutExpired as exc:
                         self.ledger.finish_model_invocation(invocation_id,status="timeout",duration_seconds=time.monotonic()-started,error={"type":"TimeoutExpired","timeout_seconds":self.config.review_timeout_seconds,"process":str(exc)[:1000]}); self.ledger.record_review_infrastructure_failure(ticket_id,attempt_number,outcome="review_timeout"); self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"review_infrastructure":"review_timeout; reconciliation required","attempt_number":attempt_number}); raise
                     except ValueError as exc:
-                        self.ledger.finish_model_invocation(invocation_id,status="malformed_output",duration_seconds=time.monotonic()-started,error={"type":type(exc).__name__,"message":str(exc)[:1000]}); self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"review_content":"malformed local review"}); raise
+                        malformed_artifact = str(getattr(exc, "artifact_path", "")) or None
+                        self.ledger.finish_model_invocation(invocation_id,status="malformed_output",duration_seconds=time.monotonic()-started,error={"type":type(exc).__name__,"message":str(exc)[:1000]},model_artifact=malformed_artifact)
+                        self.ledger.record_review_infrastructure_failure(ticket_id,attempt_number,outcome="review_malformed_output")
+                        raise
                     except Exception as exc:
                         self.ledger.finish_model_invocation(invocation_id,status="process_error",duration_seconds=time.monotonic()-started,error={"type":type(exc).__name__,"message":str(exc)[:1000]}); self.ledger.record_review_infrastructure_failure(ticket_id,attempt_number,outcome="review_process_error"); self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"review_infrastructure":"review_process_error; reconciliation required","attempt_number":attempt_number}); raise
                     response_path=getattr(result,"artifact_path",artifacts_root/"review-result.json"); self.ledger.finish_model_invocation(invocation_id,status="completed",duration_seconds=time.monotonic()-started,model_artifact=str(response_path))
@@ -329,7 +332,9 @@ class LocalFirstController:
             current=CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
             if not isinstance(exc, InjectedCrash):
                 if current == CanonicalState.LOCAL_REVIEW:
-                    self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"runtime_error":"malformed local review; reconciliation required"})
+                    review_status = self.ledger.review_reconciliation_status(ticket_id)
+                    if review_status["classification"] not in {"review_invocation_failed_no_verdict", "review_in_flight", "review_retry_exhausted"}:
+                        self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"runtime_error":"malformed local review; reconciliation required"})
                 elif current in {CanonicalState.IMPLEMENTING,CanonicalState.VERIFYING,CanonicalState.REPAIRING}:
                     self.ledger.transition(ticket_id,CanonicalState.BLOCKED,payload={"runtime_error":"execution failed; reconciliation required"})
             raise

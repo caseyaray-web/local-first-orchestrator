@@ -16,6 +16,13 @@ class ModelResult:
     argv: tuple[str, ...]
 
 
+class MalformedReviewOutput(ValueError):
+    """Strictly rejected response with retained, non-verdict provenance."""
+    def __init__(self, message: str, artifact_path: Path) -> None:
+        super().__init__(message)
+        self.artifact_path = artifact_path
+
+
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
@@ -142,9 +149,14 @@ class LocalQwenAdapter:
             if not isinstance(result, dict) or set(result) != {"content_type", "parsed"}:
                 raise ValueError("local review did not return structured JSON")
             content_type, parsed = result["content_type"], result["parsed"]
-        if content_type != "json":
-            raise ValueError("local review did not return structured JSON")
-        payload = _require_exact_review_payload(parsed)
+        raw_artifact = artifact_dir / ("review-malformed-" + __import__("hashlib").sha256(json.dumps({"content_type": content_type, "parsed": parsed}, sort_keys=True, default=str).encode()).hexdigest() + ".json")
+        try:
+            if content_type != "json":
+                raise ValueError("local review did not return structured JSON")
+            payload = _require_exact_review_payload(parsed)
+        except ValueError as exc:
+            raw_artifact.write_text(json.dumps({"content_type": content_type, "parsed": parsed}, sort_keys=True, default=str), encoding="utf-8")
+            raise MalformedReviewOutput("local review did not return structured JSON", raw_artifact) from exc
         artifact = artifact_dir / "review-result.json"
         artifact.write_text(json.dumps({"provider": self.review_provider, "model": self.review_model, "payload": payload}, sort_keys=True), encoding="utf-8")
         return ModelResult(payload, artifact, tuple(argv))

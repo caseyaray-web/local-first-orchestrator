@@ -231,6 +231,12 @@ CREATE TABLE IF NOT EXISTS review_candidates (
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
     PRIMARY KEY(ticket_id, attempt_number)
 );
+CREATE TABLE IF NOT EXISTS review_retry_authorizations (
+    authorization_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), attempt_number INTEGER NOT NULL,
+    candidate_fingerprint TEXT NOT NULL, failed_invocation_id TEXT NOT NULL REFERENCES model_invocations(invocation_id),
+    operator_id TEXT NOT NULL, authorized_at INTEGER NOT NULL,
+    UNIQUE(ticket_id, attempt_number, failed_invocation_id)
+);
 CREATE TABLE IF NOT EXISTS failed_attempt_reconciliations (
     ticket_id TEXT NOT NULL REFERENCES tickets(id), retired_attempt_number INTEGER NOT NULL,
     classification TEXT NOT NULL, previous_ticket_state TEXT NOT NULL, resulting_ticket_state TEXT NOT NULL,
@@ -387,6 +393,7 @@ class Ledger:
         for name,definition in {"lease_expires_at":"INTEGER","next_attempt_at":"INTEGER","terminal_owner":"TEXT"}.items():
             if name not in comment_columns: self.connection.execute(f"ALTER TABLE evidence_comment_outbox ADD COLUMN {name} {definition}")
         self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_model_calls_reservation ON model_calls(reservation_id)")
+        self.connection.execute("CREATE TABLE IF NOT EXISTS review_retry_authorizations (authorization_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), attempt_number INTEGER NOT NULL, candidate_fingerprint TEXT NOT NULL, failed_invocation_id TEXT NOT NULL REFERENCES model_invocations(invocation_id), operator_id TEXT NOT NULL, authorized_at INTEGER NOT NULL, UNIQUE(ticket_id, attempt_number, failed_invocation_id))")
         projection_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(board_projection_outbox)")}
         for name, definition in {"payload_json": "TEXT NOT NULL DEFAULT '{}'", "operation": "TEXT NOT NULL DEFAULT 'set_state'", "external_task_id": "TEXT", "lease_owner": "TEXT", "lease_expires_at": "INTEGER", "next_attempt_at": "INTEGER", "attempt_count": "INTEGER NOT NULL DEFAULT 0", "last_error": "TEXT", "terminal_error": "TEXT", "superseded_at": "INTEGER", "superseded_by_event_id": "INTEGER", "supersession_reason": "TEXT"}.items():
             if name not in projection_columns:
@@ -847,6 +854,62 @@ class Ledger:
     def review_invocations(self, ticket_id: str, attempt_number: int) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM model_invocations WHERE ticket_id=? AND attempt_number=? AND stage='review' ORDER BY started_at, invocation_id", (ticket_id, attempt_number))]
 
+    _MAX_REVIEW_INVOCATIONS = 3
+
+    def has_valid_review_verdict(self, ticket_id: str, attempt_number: int) -> bool:
+        # review_results is the substantive coordinator record; a completed
+        # review stage is also durable schema-accepted evidence after a crash
+        # before coordinator application.
+        if self.connection.execute("SELECT 1 FROM review_results WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone():
+            return True
+        return self.connection.execute("SELECT 1 FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='review'", (ticket_id, attempt_number)).fetchone() is not None
+
+    def review_reconciliation_status(self, ticket_id: str, attempt_number: int | None = None) -> dict[str, Any]:
+        candidate = self.review_candidate(ticket_id, attempt_number)
+        if candidate is None:
+            return {"classification": "no_review_attempt", "retry_eligible": False, "candidate": None, "latest_invocation_status": None, "review_invocation_count": 0, "latest_response_artifact": None}
+        attempt = int(candidate["attempt_number"])
+        invocations = self.review_invocations(ticket_id, attempt)
+        latest = invocations[-1] if invocations else None
+        valid = self.has_valid_review_verdict(ticket_id, attempt)
+        newest = self.review_candidate(ticket_id)
+        if newest is not None and int(newest["attempt_number"]) != attempt:
+            classification, eligible = "ambiguous_review_history", False
+        elif valid:
+            classification, eligible = "valid_review_completed", False
+        elif latest is None:
+            classification, eligible = "no_review_attempt", True
+        elif latest["status"] == "started":
+            classification, eligible = "review_in_flight", False
+        elif latest["status"] == "completed":
+            classification, eligible = "ambiguous_review_history", False
+        elif len(invocations) >= self._MAX_REVIEW_INVOCATIONS:
+            classification, eligible = "review_retry_exhausted", False
+        else:
+            classification, eligible = "review_invocation_failed_no_verdict", True
+        return {"classification": classification, "retry_eligible": eligible, "candidate": candidate, "latest_invocation_status": latest["status"] if latest else None, "latest_invocation_id": latest["invocation_id"] if latest else None, "latest_response_artifact": latest["model_artifact"] if latest else None, "review_invocation_count": len(invocations), "valid_review_verdict": valid, "retry_budget": self._MAX_REVIEW_INVOCATIONS}
+
+    def authorize_review_retry(self, ticket_id: str, *, operator_id: str, candidate_fingerprint: str) -> dict[str, Any]:
+        with self._transaction() as conn:
+            status = self.review_reconciliation_status(ticket_id)
+            candidate = status["candidate"]
+            if candidate is None or candidate["candidate_fingerprint"] != candidate_fingerprint:
+                raise ValueError("validated candidate fingerprint mismatch")
+            if self.get_ticket(ticket_id)["state"] != CanonicalState.LOCAL_REVIEW.value:
+                raise PermissionError("review retry requires local_review")
+            if status["classification"] == "review_in_flight":
+                raise PermissionError("review invocation already in flight")
+            if status["classification"] != "review_invocation_failed_no_verdict":
+                raise PermissionError("review retry is not eligible")
+            failed = str(status["latest_invocation_id"])
+            existing = conn.execute("SELECT * FROM review_retry_authorizations WHERE ticket_id=? AND attempt_number=? AND failed_invocation_id=?", (ticket_id, candidate["attempt_number"], failed)).fetchone()
+            if existing is not None:
+                return dict(existing)
+            authorization_id = uuid.uuid4().hex
+            conn.execute("INSERT INTO review_retry_authorizations(authorization_id,ticket_id,attempt_number,candidate_fingerprint,failed_invocation_id,operator_id,authorized_at) VALUES (?,?,?,?,?,?,?)", (authorization_id, ticket_id, candidate["attempt_number"], candidate_fingerprint, failed, operator_id, self._now()))
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="review_retry_authorized", actor_id=operator_id, payload={"attempt_number":candidate["attempt_number"], "failed_invocation_id":failed})
+            return dict(conn.execute("SELECT * FROM review_retry_authorizations WHERE authorization_id=?", (authorization_id,)).fetchone())
+
     def freeze_review_candidate(self, ticket_id: str, attempt_number: int, *, candidate_fingerprint: str, validation_evidence: str, implementation_invocation_id: str | None, runtime_identity: dict[str, Any], historical_review_attempted: bool = False) -> dict[str, Any]:
         if not candidate_fingerprint or not validation_evidence:
             raise ValueError("invalid_review_candidate")
@@ -868,7 +931,7 @@ class Ledger:
         return dict(row) if row else None
 
     def record_review_infrastructure_failure(self, ticket_id: str, attempt_number: int, *, outcome: str) -> None:
-        if outcome not in {"review_timeout","review_process_error"}: raise ValueError("invalid_review_infrastructure_outcome")
+        if outcome not in {"review_timeout","review_process_error","review_malformed_output"}: raise ValueError("invalid_review_infrastructure_outcome")
         with self._transaction() as conn:
             changed=conn.execute("UPDATE review_candidates SET status='review_infrastructure_failed',last_outcome=?,updated_at=? WHERE ticket_id=? AND attempt_number=?",(outcome,self._now(),ticket_id,attempt_number))
             if not changed.rowcount: raise ValueError("review candidate missing")
