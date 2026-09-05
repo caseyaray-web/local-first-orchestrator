@@ -164,6 +164,9 @@ CREATE TABLE IF NOT EXISTS board_projection_outbox (
     idempotency_key TEXT NOT NULL UNIQUE,
     queued_at INTEGER NOT NULL,
     acknowledged_at INTEGER,
+    superseded_at INTEGER,
+    superseded_by_event_id INTEGER REFERENCES events(id),
+    supersession_reason TEXT,
     PRIMARY KEY(ticket_id, event_id)
 );
 CREATE TABLE IF NOT EXISTS acceptance_criteria (
@@ -282,6 +285,7 @@ class Ledger:
         CanonicalState.NEEDS_CHECKPOINT.value, CanonicalState.NEEDS_TRIAGE.value,
         CanonicalState.BLOCKED.value, CanonicalState.DONE.value,
         CanonicalState.REJECTED.value, CanonicalState.REVERTED.value,
+        CanonicalState.LOCAL_REVIEW.value,
     })
 
     def __init__(self, database: Path, *, failure_injector: Any | None = None) -> None:
@@ -384,9 +388,10 @@ class Ledger:
             if name not in comment_columns: self.connection.execute(f"ALTER TABLE evidence_comment_outbox ADD COLUMN {name} {definition}")
         self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_model_calls_reservation ON model_calls(reservation_id)")
         projection_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(board_projection_outbox)")}
-        for name, definition in {"payload_json": "TEXT NOT NULL DEFAULT '{}'", "operation": "TEXT NOT NULL DEFAULT 'set_state'", "external_task_id": "TEXT", "lease_owner": "TEXT", "lease_expires_at": "INTEGER", "next_attempt_at": "INTEGER", "attempt_count": "INTEGER NOT NULL DEFAULT 0", "last_error": "TEXT", "terminal_error": "TEXT"}.items():
+        for name, definition in {"payload_json": "TEXT NOT NULL DEFAULT '{}'", "operation": "TEXT NOT NULL DEFAULT 'set_state'", "external_task_id": "TEXT", "lease_owner": "TEXT", "lease_expires_at": "INTEGER", "next_attempt_at": "INTEGER", "attempt_count": "INTEGER NOT NULL DEFAULT 0", "last_error": "TEXT", "terminal_error": "TEXT", "superseded_at": "INTEGER", "superseded_by_event_id": "INTEGER", "supersession_reason": "TEXT"}.items():
             if name not in projection_columns:
                 self.connection.execute(f"ALTER TABLE board_projection_outbox ADD COLUMN {name} {definition}")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_state_projection_claimable ON board_projection_outbox(operation, acknowledged_at, superseded_at, next_attempt_at, lease_expires_at, queued_at)")
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)",
             (self._now(),),
@@ -488,12 +493,26 @@ class Ledger:
         safe = re.sub(r"(?i)(password|token|secret|api[_-]?key)\s*[:=]\s*\S+", r"\1=[REDACTED]", evidence)[:800]
         return (f"Local-first ticket {ticket_id} | state={state} | {safe}\n<!-- local-first-comment:{operation_id} -->")[:1000]
 
+    @classmethod
+    def _is_projectable_state_event(cls, event: sqlite3.Row) -> bool:
+        return (event["entity_type"] == "ticket" and event["event_type"] in {"state_transition", "review_reconciliation_authorized"}
+                and event["to_state"] is not None and str(event["to_state"]) in cls._PROJECTABLE_STATES)
+
+    def _supersede_older_state_projections_in_transaction(self, conn: sqlite3.Connection, ticket_id: str, current_event_id: int) -> int:
+        """Retain obsolete state intents as audit history, but make them ineligible."""
+        return conn.execute(
+            "UPDATE board_projection_outbox SET superseded_at=?, superseded_by_event_id=?, supersession_reason=?, "
+            "lease_owner=NULL, lease_expires_at=NULL WHERE ticket_id=? AND operation='set_state' "
+            "AND acknowledged_at IS NULL AND superseded_at IS NULL AND event_id < ?",
+            (self._now(), current_event_id, "newer_authoritative_state_event", ticket_id, current_event_id),
+        ).rowcount
+
     def _enqueue_projection_bundle_in_transaction(self, conn: sqlite3.Connection, *, ticket_id: str, event_id: int, evidence: str, state_payload: dict[str, Any] | None = None, external_task_id: str | None = None) -> dict[str, Any]:
         ticket = conn.execute("SELECT id, external_id, state FROM tickets WHERE id=?", (ticket_id,)).fetchone()
         if ticket is None: raise KeyError(ticket_id)
         event = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
         if event is None: raise KeyError(f"event {event_id}")
-        if event["entity_type"] != "ticket" or event["entity_id"] != ticket_id or event["event_type"] != "state_transition" or event["to_state"] is None or str(event["to_state"]) not in self._PROJECTABLE_STATES:
+        if event["entity_id"] != ticket_id or not self._is_projectable_state_event(event):
             raise ValueError("event is not a projectable ticket state transition")
         state = str(event["to_state"]); state_key = f"ticket-event:{event_id}"
         state_payload_json = json.dumps(state_payload or {}, sort_keys=True, separators=(",", ":"))
@@ -508,6 +527,9 @@ class Ledger:
                 raise ValueError("external_projection_identity_conflict")
         else:
             conn.execute("INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,external_task_id) VALUES (?,?,?,?,?,?,?)", (ticket_id, event_id, state, state_payload_json, state_key, self._now(), resolved_task_id))
+        # This is intentionally inside the transition/enqueue transaction.  It
+        # never touches evidence comments, create projections, or acknowledgements.
+        self._supersede_older_state_projections_in_transaction(conn, ticket_id, event_id)
         self._inject_failure("after_state_intent")
         comment_key = f"evidence-comment:{ticket_id}:{event_id}"; comment_id = hashlib.sha256(comment_key.encode()).hexdigest()[:32]
         payload = self._comment_payload(ticket_id, state, comment_id, evidence)
@@ -541,7 +563,7 @@ class Ledger:
             SELECT 'projectable_event_without_bundle', e.entity_id, e.id
             FROM events e LEFT JOIN board_projection_outbox b ON b.ticket_id=e.entity_id AND b.event_id=e.id
             LEFT JOIN evidence_comment_outbox c ON c.ticket_id=e.entity_id AND c.event_id=e.id
-            WHERE e.entity_type='ticket' AND e.event_type='state_transition' AND e.to_state IS NOT NULL AND e.to_state IN ('needs_architecture','ready_local','accepted','needs_human_test','needs_checkpoint','needs_triage','blocked','done','rejected','reverted') AND (b.ticket_id IS NULL OR c.operation_id IS NULL)
+            WHERE e.entity_type='ticket' AND e.event_type IN ('state_transition','review_reconciliation_authorized') AND e.to_state IS NOT NULL AND e.to_state IN ('needs_architecture','ready_local','accepted','needs_human_test','needs_checkpoint','needs_triage','blocked','done','rejected','reverted','local_review') AND (b.ticket_id IS NULL OR c.operation_id IS NULL)
         """).fetchall()
         return [dict(row) for row in rows]
 
@@ -861,7 +883,11 @@ class Ledger:
             if conn.execute("SELECT 1 FROM accepted_evidence WHERE ticket_id=?",(ticket_id,)).fetchone(): raise ValueError("accepted evidence already exists")
             if conn.execute("SELECT 1 FROM review_results WHERE ticket_id=? AND attempt_number=?",(ticket_id,row["attempt_number"])).fetchone(): raise ValueError("valid review verdict already exists")
             if conn.execute("SELECT 1 FROM model_invocations WHERE ticket_id=? AND status='started'",(ticket_id,)).fetchone(): raise ValueError("incomplete model invocation requires explicit resolution")
-            now=self._now(); conn.execute("UPDATE review_candidates SET status='review_pending',updated_at=? WHERE ticket_id=? AND attempt_number=?",(now,ticket_id,row["attempt_number"])); conn.execute("UPDATE tickets SET state=?,updated_at=? WHERE id=?",(CanonicalState.LOCAL_REVIEW.value,now,ticket_id)); self._append_event(conn,entity_type="ticket",entity_id=ticket_id,event_type="review_reconciliation_authorized",actor_id=operator_id,from_state=CanonicalState.NEEDS_TRIAGE.value,to_state=CanonicalState.LOCAL_REVIEW.value,payload={"attempt_number":row["attempt_number"],"candidate_fingerprint":candidate_fingerprint})
+            now=self._now()
+            conn.execute("UPDATE review_candidates SET status='review_pending',updated_at=? WHERE ticket_id=? AND attempt_number=?", (now, ticket_id, row["attempt_number"]))
+            conn.execute("UPDATE tickets SET state=?,updated_at=? WHERE id=?", (CanonicalState.LOCAL_REVIEW.value, now, ticket_id))
+            event_id = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="review_reconciliation_authorized", actor_id=operator_id, from_state=CanonicalState.NEEDS_TRIAGE.value, to_state=CanonicalState.LOCAL_REVIEW.value, payload={"attempt_number":row["attempt_number"], "candidate_fingerprint":candidate_fingerprint})
+            self._enqueue_projection_bundle_in_transaction(conn, ticket_id=ticket_id, event_id=event_id, evidence="review reconciliation authorized")
         return self.review_candidate(ticket_id, int(row["attempt_number"])) or {}
 
     def stage_rows(self, ticket_id: str) -> list[dict[str, Any]]:
@@ -1297,9 +1323,11 @@ class Ledger:
         )]
         outbox_pending = self.connection.execute(
             "SELECT "
-            "(SELECT COUNT(*) FROM board_projection_outbox WHERE acknowledged_at IS NULL) + "
+            "(SELECT COUNT(*) FROM board_projection_outbox WHERE acknowledged_at IS NULL AND superseded_at IS NULL) + "
             "(SELECT COUNT(*) FROM evidence_comment_outbox WHERE status IN ('pending', 'retryable', 'delivering'))"
         ).fetchone()[0]
+        pending_state_projections = self.connection.execute("SELECT COUNT(*) FROM board_projection_outbox WHERE operation='set_state' AND acknowledged_at IS NULL AND superseded_at IS NULL").fetchone()[0]
+        superseded_state_projections = self.connection.execute("SELECT COUNT(*) FROM board_projection_outbox WHERE operation='set_state' AND superseded_at IS NOT NULL").fetchone()[0]
         reconciliations = [{**dict(row), "cleanup_confirmed": row["cleanup_confirmed_at"] is not None} for row in self.connection.execute(
             "SELECT r.ticket_id, r.retired_attempt_number AS retired_attempt, r.prospective_next_attempt_number AS next_attempt, "
             "r.cleanup_required, r.classification, r.retry_base_sha, c.confirmed_at AS cleanup_confirmed_at "
@@ -1316,6 +1344,8 @@ class Ledger:
             "active": active,
             "active_truncated": len(active) == active_limit and sum(state_counts.get(state, 0) for state in active_states) > active_limit,
             "outbox_pending": int(outbox_pending),
+            "pending_state_projections": int(pending_state_projections),
+            "superseded_state_projections": int(superseded_state_projections),
             "failed_attempt_reconciliations": reconciliations,
         }
 
@@ -1334,34 +1364,121 @@ class Ledger:
         self.record_runtime_stage(ticket_id, "projection_enqueued", result["state"]["idempotency_key"])
         return result
 
+    def reconcile_state_projections(self, ticket_id: str) -> dict[str, Any]:
+        """Durably retire stale state intents and restore a missing current intent.
+
+        This is ledger-only: it never changes the ticket, domain events, comments,
+        leases, or any external board state.
+        """
+        with self._transaction() as conn:
+            ticket = conn.execute("SELECT state FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None:
+                raise KeyError(ticket_id)
+            current = conn.execute(
+                "SELECT * FROM events WHERE entity_type='ticket' AND entity_id=? AND "
+                "event_type IN ('state_transition','review_reconciliation_authorized') "
+                "AND to_state=? ORDER BY id DESC LIMIT 1",
+                (ticket_id, ticket["state"]),
+            ).fetchone()
+            if current is None or not self._is_projectable_state_event(current):
+                return {"ticket_id": ticket_id, "current_projection_event_id": None, "superseded_count": 0, "current_intent": None}
+            event_id = int(current["id"])
+            existing = conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()
+            if existing is None:
+                target = self._resolve_external_task_id_in_transaction(conn, ticket_id)
+                conn.execute(
+                    "INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,operation,external_task_id) VALUES (?,?,?,?,?,?, 'set_state',?)",
+                    (ticket_id, event_id, str(current["to_state"]), "{}", f"ticket-event:{event_id}", self._now(), target),
+                )
+            elif (existing["operation"], existing["state"], existing["idempotency_key"]) != ("set_state", str(current["to_state"]), f"ticket-event:{event_id}"):
+                raise ValueError("current state projection conflicts with authoritative event")
+            count = self._supersede_older_state_projections_in_transaction(conn, ticket_id, event_id)
+            current_intent = conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()
+            return {"ticket_id": ticket_id, "current_projection_event_id": event_id, "superseded_count": count, "current_intent": dict(current_intent)}
+
+    def claim_state_projection(self, ticket_id: str, event_id: int, owner: str, *, lease_seconds: int = 60, now: int | None = None) -> bool:
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            changed = conn.execute(
+                "UPDATE board_projection_outbox SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1 "
+                "WHERE ticket_id=? AND event_id=? AND operation='set_state' AND acknowledged_at IS NULL "
+                "AND superseded_at IS NULL AND terminal_error IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) "
+                "AND (lease_expires_at IS NULL OR lease_expires_at<=?)",
+                (owner, now + lease_seconds, ticket_id, event_id, now, now),
+            )
+            return changed.rowcount == 1
+
+    def claim_next_state_projection(self, owner: str, *, lease_seconds: int = 60, now: int | None = None) -> dict[str, Any] | None:
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT ticket_id,event_id FROM board_projection_outbox WHERE operation='set_state' AND acknowledged_at IS NULL "
+                "AND superseded_at IS NULL AND terminal_error IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) "
+                "AND (lease_expires_at IS NULL OR lease_expires_at<=?) ORDER BY queued_at,event_id LIMIT 1",
+                (now, now),
+            ).fetchone()
+            if row is None:
+                return None
+            changed = conn.execute(
+                "UPDATE board_projection_outbox SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1 "
+                "WHERE ticket_id=? AND event_id=? AND operation='set_state' AND acknowledged_at IS NULL AND superseded_at IS NULL "
+                "AND terminal_error IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) AND (lease_expires_at IS NULL OR lease_expires_at<=?)",
+                (owner, now + lease_seconds, row["ticket_id"], row["event_id"], now, now),
+            )
+            if changed.rowcount != 1:
+                return None
+            claimed = conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (row["ticket_id"], row["event_id"])).fetchone()
+            return dict(claimed) if claimed else None
+
+    def prepare_claimed_state_projection(self, ticket_id: str, event_id: int, owner: str, *, now: int | None = None) -> dict[str, Any] | None:
+        """Final causal freshness gate immediately before a state adapter call."""
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()
+            if row is None or row["operation"] != "set_state" or row["acknowledged_at"] is not None:
+                return None
+            if row["superseded_at"] is not None:
+                return None
+            if row["lease_owner"] != owner or row["lease_expires_at"] is None or row["lease_expires_at"] <= now:
+                raise PermissionError("state projection lease is not owned")
+            current = conn.execute(
+                "SELECT id FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type IN ('state_transition','review_reconciliation_authorized') "
+                "ORDER BY id DESC LIMIT 1", (ticket_id,)
+            ).fetchone()
+            if row["superseded_at"] is not None or (current is not None and int(current["id"]) > event_id):
+                newer = int(current["id"]) if current is not None else event_id
+                conn.execute("UPDATE board_projection_outbox SET superseded_at=COALESCE(superseded_at,?),superseded_by_event_id=COALESCE(superseded_by_event_id,?),supersession_reason=COALESCE(supersession_reason,?),lease_owner=NULL,lease_expires_at=NULL WHERE ticket_id=? AND event_id=?", (now, newer, "newer_authoritative_state_event", ticket_id, event_id))
+                return None
+            target = self._resolve_external_task_id_in_transaction(conn, ticket_id)
+            if row["external_task_id"] not in {None, target}:
+                raise ValueError("external_projection_identity_conflict")
+            if row["external_task_id"] is None:
+                conn.execute("UPDATE board_projection_outbox SET external_task_id=? WHERE ticket_id=? AND event_id=?", (target, ticket_id, event_id))
+            return dict(conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone())
+
+    def acknowledge_state_projection(self, ticket_id: str, event_id: int, owner: str, *, now: int | None = None) -> bool:
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            return conn.execute("UPDATE board_projection_outbox SET acknowledged_at=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,last_error=NULL WHERE ticket_id=? AND event_id=? AND operation='set_state' AND acknowledged_at IS NULL AND lease_owner=? AND lease_expires_at>?", (now, ticket_id, event_id, owner, now)).rowcount == 1
+
+    def release_state_projection(self, ticket_id: str, event_id: int, owner: str, error: str, *, now: int | None = None) -> bool:
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            return conn.execute("UPDATE board_projection_outbox SET lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=?,last_error=? WHERE ticket_id=? AND event_id=? AND operation='set_state' AND acknowledged_at IS NULL AND superseded_at IS NULL AND lease_owner=? AND lease_expires_at>?", (now, error[:2000], ticket_id, event_id, owner, now)).rowcount == 1
+
     def project_ticket(self, ticket_id: str, adapter: BoardAdapter) -> bool:
-        row = self.connection.execute("SELECT id, state FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
-        if row is None:
-            raise KeyError(ticket_id)
-        event = self.connection.execute("SELECT id FROM events WHERE entity_type = 'ticket' AND entity_id = ? AND to_state = ? ORDER BY id DESC LIMIT 1", (ticket_id, row["state"])).fetchone()
-        if event is None:
+        """Compatibility one-ticket delivery path using the causal state worker."""
+        report = self.reconcile_state_projections(ticket_id)
+        event_id = report["current_projection_event_id"]
+        if event_id is None:
             return False
-        event_id = int(event["id"])
-        bundle = self.plan_projection(ticket_id, evidence=f"attempts={self.attempt_count(ticket_id)}; state={row['state']}")
-        if bundle is None:
+        from .state_projection import StateProjectionWorker
+        result = StateProjectionWorker(self, adapter, worker_id="project-ticket").deliver_ticket_event(ticket_id, int(event_id))
+        if result.status != "delivered":
             return False
-        existing = self.connection.execute("SELECT 1 FROM board_projections WHERE ticket_id=? AND event_id=?", (ticket_id,event_id)).fetchone()
-        did_work = existing is None
-        outbox = bundle["state"]
-        target = self.resolve_external_task_id(ticket_id)
-        if outbox["external_task_id"] not in {None, target}:
-            raise ValueError("external_projection_identity_conflict")
-        if existing is None and outbox["acknowledged_at"] is None:
-            if outbox["external_task_id"] is None:
-                with self._transaction() as conn:
-                    changed = conn.execute("UPDATE board_projection_outbox SET external_task_id=? WHERE ticket_id=? AND event_id=? AND external_task_id IS NULL AND acknowledged_at IS NULL", (target, ticket_id, event_id))
-                    if changed.rowcount != 1: raise RuntimeError("external_projection_identity_changed")
-                outbox = self.connection.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()
-            adapter.set_state(target, CanonicalState(outbox["state"]), idempotency_key=outbox["idempotency_key"])
-            with self._transaction() as conn:
-                conn.execute("INSERT OR IGNORE INTO board_projections(ticket_id,event_id,state,projected_at) VALUES (?,?,?,?)",(ticket_id,event_id,outbox["state"],self._now()))
-                conn.execute("UPDATE board_projection_outbox SET acknowledged_at=? WHERE ticket_id=? AND event_id=?",(self._now(),ticket_id,event_id))
-        return did_work
+        with self._transaction() as conn:
+            conn.execute("INSERT OR IGNORE INTO board_projections(ticket_id,event_id,state,projected_at) SELECT ticket_id,event_id,state,? FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (self._now(), ticket_id, event_id))
+        return True
 
     def record_accepted_evidence(self, ticket_id: str, accepted_commit_sha: str, diff_summary: str, validation_summary: str, *, local_reasoning: str | None = None) -> None:
         """Persist only checkpoint-safe accepted evidence; local reasoning is discarded."""

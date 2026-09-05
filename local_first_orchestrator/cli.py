@@ -99,6 +99,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     review_resume=commands.add_parser("resume-failed-review", help="authorize a review-only retry for an unchanged validated candidate")
     review_resume.add_argument("--task-id", required=True)
     review_resume.add_argument("--operator-id", default="local-first-cli")
+    state_reconcile=commands.add_parser("reconcile-state-projections", help="ledger-only: supersede stale state intents and ensure the current state intent")
+    state_reconcile.add_argument("--task-id", required=True)
     confirm_cleanup=commands.add_parser("confirm-retired-attempt-cleanup", help="verify separately-authorized cleanup; never removes files")
     confirm_cleanup.add_argument("--task-id", required=True)
     confirm_cleanup.add_argument("--operator-id", default="local-first-cli")
@@ -161,6 +163,8 @@ def run_command(args: argparse.Namespace) -> int:
             if args.ad_hoc_runtime: raise ValueError("review reconciliation requires registered operator runtime")
             ctl, _ = _registered_controller(ledger,args,allow_board_writes=False)
             print(json.dumps(ctl.resume_failed_review(args.task_id,operator_id=args.operator_id),sort_keys=True))
+        elif args.command=="reconcile-state-projections":
+            print(json.dumps(ledger.reconcile_state_projections(args.task_id), sort_keys=True))
         elif args.command=="confirm-retired-attempt-cleanup":
             if args.ad_hoc_runtime: raise ValueError("cleanup confirmation requires registered operator runtime")
             ctl, _ = _registered_controller(ledger,args,allow_board_writes=False)
