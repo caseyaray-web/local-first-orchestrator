@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import subprocess
 import time
 import uuid
 from threading import RLock
@@ -1680,56 +1681,79 @@ class Ledger:
                 return
             conn.execute("INSERT INTO tranche_completion_evidence(tranche_id,root_planning_sha,final_integration_sha,accepted_ticket_ids_json,accepted_commit_shas_json,evidence_hash,completed_at) VALUES (?,?,?,?,?,?,?)", (*values, now))
 
-    def record_tranche_completion_recheck(self, recheck: dict[str, Any]) -> dict[str, Any]:
+    def record_tranche_completion_recheck(self, tranche_id: str, repository: Path) -> dict[str, Any]:
         """Append one successful correction re-check generation.
 
         The original completion row is never updated.  A re-check is eligible
         only when all supplemental correction work is resolved, and replaying
         the same canonical evidence returns the existing row.
         """
-        required = ("tranche_id", "generation", "previous_generation", "previous_evidence_hash",
-                    "correction_plan_ids", "accepted_ticket_ids", "accepted_commit_shas",
-                    "current_integration_sha", "repository_identity", "repo_base_sha",
-                    "repo_snapshot_hash", "unresolved_correction_count", "status")
-        if any(key not in recheck or recheck[key] is None for key in required):
-            raise ValueError("completion re-check evidence is incomplete")
-        tranche_id = recheck["tranche_id"]
-        generation = recheck["generation"]
-        previous_generation = recheck["previous_generation"]
-        if type(tranche_id) is not str or not tranche_id or type(generation) is not int or isinstance(generation, bool) or generation < 1 or type(previous_generation) is not int or isinstance(previous_generation, bool) or previous_generation != generation - 1:
-            raise ValueError("completion re-check generation is invalid")
-        if recheck["status"] != "recheck_passed" or type(recheck["unresolved_correction_count"]) is not int or recheck["unresolved_correction_count"] != 0:
-            raise ValueError("completion re-check requires resolved corrections")
-        for key in ("previous_evidence_hash", "current_integration_sha", "repository_identity", "repo_base_sha", "repo_snapshot_hash"):
-            if type(recheck[key]) is not str or not recheck[key]:
-                raise ValueError("completion re-check provenance is incomplete")
-        for key in ("correction_plan_ids", "accepted_ticket_ids", "accepted_commit_shas"):
-            if type(recheck[key]) is not list or not all(type(item) is str and item for item in recheck[key]):
-                raise ValueError("completion re-check evidence lists are invalid")
-        if len(recheck["accepted_ticket_ids"]) != len(recheck["accepted_commit_shas"]):
-            raise ValueError("completion re-check ticket/commit evidence mismatch")
-        payload = {key: recheck[key] for key in required}
+        if type(tranche_id) is not str or not tranche_id:
+            raise ValueError("completion re-check tranche is invalid")
+        repository = Path(repository).resolve(strict=True)
+        tranche = self.connection.execute("SELECT feature_id FROM tranches WHERE id=?", (tranche_id,)).fetchone()
+        if tranche is None:
+            raise ValueError("completion re-check tranche is missing")
+        plans = self.connection.execute("SELECT * FROM supplemental_correction_plans WHERE tranche_id=? ORDER BY ordinal", (tranche_id,)).fetchall()
+        if not plans:
+            raise ValueError("completion re-check requires correction plans")
+        plan_ids = [str(row["correction_plan_id"]) for row in plans]
+        ticket_rows = self.connection.execute("""
+            SELECT sct.correction_plan_id,sct.ticket_id,t.state,ae.accepted_commit_sha,
+                   sc.feature_id,sc.tranche_id,sc.repository_identity,sc.base_sha,sc.snapshot_hash
+            FROM supplemental_correction_tickets sct
+            JOIN supplemental_correction_plans sc ON sc.correction_plan_id=sct.correction_plan_id
+            JOIN tickets t ON t.id=sct.ticket_id
+            LEFT JOIN accepted_evidence ae ON ae.ticket_id=t.id
+            WHERE sct.correction_plan_id IN (%s) ORDER BY sc.ordinal,sct.ordinal
+        """ % ",".join("?" for _ in plan_ids), plan_ids).fetchall()
+        if len(ticket_rows) != sum(self.connection.execute("SELECT COUNT(*) FROM supplemental_correction_tickets WHERE correction_plan_id=?", (plan_id,)).fetchone()[0] for plan_id in plan_ids):
+            raise ValueError("completion re-check correction membership is incomplete")
+        if not ticket_rows:
+            raise ValueError("completion re-check requires correction tickets")
+        commits: list[str] = []
+        ticket_ids: list[str] = []
+        provenance: tuple[str, str, str] | None = None
+        for row in ticket_rows:
+            current_provenance = (row["repository_identity"], row["base_sha"], row["snapshot_hash"])
+            if row["feature_id"] != tranche["feature_id"] or row["tranche_id"] != tranche_id or current_provenance[0] != str(repository) or not all(isinstance(value, str) and value for value in current_provenance):
+                raise ValueError("completion re-check correction provenance mismatch")
+            if provenance is None:
+                provenance = (str(current_provenance[0]), str(current_provenance[1]), str(current_provenance[2]))
+            elif provenance != tuple(str(value) for value in current_provenance):
+                raise ValueError("completion re-check correction provenance conflicts")
+            if row["state"] not in {CanonicalState.DONE.value, CanonicalState.ACCEPTED.value} or not isinstance(row["accepted_commit_sha"], str) or not row["accepted_commit_sha"]:
+                raise ValueError("completion re-check has unresolved correction work")
+            ticket_ids.append(str(row["ticket_id"])); commits.append(str(row["accepted_commit_sha"]))
+        assert provenance is not None
+        head_result = subprocess.run(("git", "show-ref", "--verify", "--hash", f"refs/local-first/tranches/{tranche_id}/integration-head"), cwd=repository, text=True, capture_output=True)
+        if head_result.returncode:
+            raise ValueError("completion re-check integration head is unavailable")
+        head = subprocess.run(("git", "rev-parse", "--verify", head_result.stdout.strip() + "^{commit}"), cwd=repository, text=True, capture_output=True, check=True).stdout.strip()
+        for commit in commits:
+            if subprocess.run(("git", "merge-base", "--is-ancestor", commit, head), cwd=repository, text=True, capture_output=True).returncode != 0:
+                raise ValueError("completion re-check accepted commit is outside integration lineage")
+        previous = self.connection.execute("SELECT * FROM tranche_completion_rechecks WHERE tranche_id=? ORDER BY generation DESC LIMIT 1", (tranche_id,)).fetchone()
+        if previous is not None and previous["current_integration_sha"] == head and json.loads(previous["correction_plan_ids_json"]) == plan_ids and json.loads(previous["accepted_ticket_ids_json"]) == ticket_ids and json.loads(previous["accepted_commit_shas_json"]) == commits:
+            return dict(previous)
+        original = self.connection.execute("SELECT evidence_hash FROM tranche_completion_evidence WHERE tranche_id=?", (tranche_id,)).fetchone()
+        if previous is None:
+            if original is None:
+                raise ValueError("completion re-check previous completion is missing")
+            previous_generation, previous_hash = 0, str(original["evidence_hash"])
+        else:
+            previous_generation, previous_hash = int(previous["generation"]), str(previous["evidence_hash"])
+        generation = previous_generation + 1
+        payload = {"tranche_id": tranche_id, "generation": generation, "previous_generation": previous_generation, "previous_evidence_hash": previous_hash, "correction_plan_ids": plan_ids, "accepted_ticket_ids": ticket_ids, "accepted_commit_shas": commits, "current_integration_sha": head, "repository_identity": provenance[0], "repo_base_sha": provenance[1], "repo_snapshot_hash": provenance[2], "unresolved_correction_count": 0, "status": "recheck_passed"}
         evidence_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         expected_key = "tranche-recheck:v1:" + evidence_hash
-        supplied_key = recheck.get("idempotency_key", expected_key)
-        if supplied_key != expected_key:
-            raise ValueError("completion re-check idempotency key mismatch")
         with self._transaction() as conn:
             previous = conn.execute("SELECT * FROM tranche_completion_rechecks WHERE idempotency_key=?", (expected_key,)).fetchone()
             if previous is not None:
                 return dict(previous)
-            prior = conn.execute("SELECT * FROM tranche_completion_rechecks WHERE tranche_id=? AND generation=?", (tranche_id, previous_generation)).fetchone()
-            if previous_generation == 0:
-                original = conn.execute("SELECT evidence_hash FROM tranche_completion_evidence WHERE tranche_id=?", (tranche_id,)).fetchone()
-                if original is None or original["evidence_hash"] != recheck["previous_evidence_hash"]:
-                    raise ValueError("completion re-check previous completion mismatch")
-            elif prior is None or prior["evidence_hash"] != recheck["previous_evidence_hash"]:
-                raise ValueError("completion re-check previous generation mismatch")
-            values = (tranche_id, generation, previous_generation, recheck["previous_evidence_hash"],
-                      json.dumps(recheck["correction_plan_ids"], separators=(",", ":")),
-                      json.dumps(recheck["accepted_ticket_ids"], separators=(",", ":")),
-                      json.dumps(recheck["accepted_commit_shas"], separators=(",", ":")),
-                      recheck["current_integration_sha"], recheck["repository_identity"], recheck["repo_base_sha"], recheck["repo_snapshot_hash"], 0, "recheck_passed", evidence_hash, expected_key, self._now())
+            values = (tranche_id, generation, previous_generation, previous_hash,
+                      json.dumps(plan_ids, separators=(",", ":")), json.dumps(ticket_ids, separators=(",", ":")),
+                      json.dumps(commits, separators=(",", ":")), head, provenance[0], provenance[1], provenance[2], 0, "recheck_passed", evidence_hash, expected_key, self._now())
             conn.execute("INSERT INTO tranche_completion_rechecks(tranche_id,generation,previous_generation,previous_evidence_hash,correction_plan_ids_json,accepted_ticket_ids_json,accepted_commit_shas_json,current_integration_sha,repository_identity,repo_base_sha,repo_snapshot_hash,unresolved_correction_count,status,evidence_hash,idempotency_key,recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
             return dict(conn.execute("SELECT * FROM tranche_completion_rechecks WHERE idempotency_key=?", (expected_key,)).fetchone())
 

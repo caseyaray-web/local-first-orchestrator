@@ -20,16 +20,8 @@ class TrancheCompletionRecheckTests(SupplementalCorrectionTests):
         self.ledger.record_tranche_completion(evidence)
         return self.ledger.tranche_completion("T")
 
-    def recheck(self, generation, previous_generation, previous_hash, plan_ids, ticket_ids, commits, head, unresolved=0):
-        return self.ledger.record_tranche_completion_recheck({
-            "tranche_id": "T", "generation": generation, "previous_generation": previous_generation,
-            "previous_evidence_hash": previous_hash, "correction_plan_ids": plan_ids,
-            "accepted_ticket_ids": ticket_ids, "accepted_commit_shas": commits,
-            "current_integration_sha": head, "repository_identity": str(self.repo),
-            "repo_base_sha": self.base, "repo_snapshot_hash": "snapshot",
-            "unresolved_correction_count": unresolved,
-            "status": "recheck_passed" if unresolved == 0 else "open_corrections",
-        })
+    def recheck(self, generation=None, previous_generation=None, previous_hash=None, plan_ids=None, ticket_ids=None, commits=None, head=None, unresolved=0):
+        return self.ledger.record_tranche_completion_recheck("T", self.repo)
 
     def accept_correction(self, ticket_id):
         self.git("commit", "--allow-empty", "-m", f"accepted correction {ticket_id}")
@@ -64,6 +56,33 @@ class TrancheCompletionRecheckTests(SupplementalCorrectionTests):
         self.assertEqual(self.ledger.tranche_completion("T"), h1)
         self.assertEqual(self.service().lifecycle_status("T")["latest_completion"]["generation"], 1)
 
+    def test_recheck_api_rejects_caller_supplied_evidence_claims(self):
+        self.record_h1()
+        with self.assertRaises(TypeError):
+            self.ledger.record_tranche_completion_recheck("T", self.repo, **{"correction_plan_ids": []})  # type: ignore[call-arg]
+
+    def test_missing_evidence_and_nonterminal_ticket_fail_closed(self):
+        self.record_h1(); plan = self.service().create_plan(self.spec("missing-evidence")); correction = self.service().materialize(plan.correction_plan_id)
+        with self.assertRaisesRegex(ValueError, "unresolved"):
+            self.ledger.record_tranche_completion_recheck("T", self.repo)
+        self.accept_correction(correction.ticket_id)
+        self.ledger.connection.execute("DELETE FROM accepted_evidence WHERE ticket_id=?", (correction.ticket_id,))
+        with self.assertRaisesRegex(ValueError, "unresolved"):
+            self.ledger.record_tranche_completion_recheck("T", self.repo)
+
+    def test_stale_head_and_out_of_lineage_commit_fail_closed(self):
+        self.record_h1(); plan = self.service().create_plan(self.spec("lineage")); correction = self.service().materialize(plan.correction_plan_id)
+        head2 = self.accept_correction(correction.ticket_id)
+        self.git("update-ref", "refs/local-first/tranches/T/integration-head", self.base)
+        with self.assertRaisesRegex(ValueError, "outside integration lineage"):
+            self.ledger.record_tranche_completion_recheck("T", self.repo)
+        self.git("update-ref", "refs/local-first/tranches/T/integration-head", head2)
+        self.git("checkout", "-b", "unintegrated-side", self.base); self.git("commit", "--allow-empty", "-m", "unintegrated correction evidence")
+        side = self.git("rev-parse", "HEAD"); self.git("checkout", "main")
+        self.ledger.record_accepted_evidence(correction.ticket_id, side, "accepted", "tampered")
+        with self.assertRaisesRegex(ValueError, "outside integration lineage"):
+            self.ledger.record_tranche_completion_recheck("T", self.repo)
+
     def test_second_correction_cycle_appends_h3_without_rewriting_h1_or_h2(self):
         h1 = self.record_h1()
         first_plan = self.service().create_plan(self.spec("cycle-one"))
@@ -79,6 +98,9 @@ class TrancheCompletionRecheckTests(SupplementalCorrectionTests):
         self.assertEqual([row["generation"] for row in generations], [1, 2])
         self.assertEqual(generations[0]["evidence_hash"], h2["evidence_hash"])
         self.assertEqual(generations[1]["evidence_hash"], h3["evidence_hash"])
+        self.assertEqual(json.loads(generations[1]["correction_plan_ids_json"]), [first_plan.correction_plan_id, second_plan.correction_plan_id])
+        self.assertEqual(json.loads(generations[1]["accepted_ticket_ids_json"]), [first.ticket_id, second.ticket_id])
+        self.assertEqual(json.loads(generations[1]["accepted_commit_shas_json"]), [h2["current_integration_sha"], h3["current_integration_sha"]])
         self.assertEqual(self.ledger.tranche_completion("T"), h1)
         self.assertEqual(self.service().lifecycle_status("T")["latest_completion"]["generation"], 2)
 
