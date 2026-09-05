@@ -365,10 +365,29 @@ class CorrectionService:
         views = [plan_view(row) for row in plans]
         open_count = sum(1 for view in views if view["status"] != "accepted")
         latest = self.ledger.latest_tranche_completion(tranche_id)
+        rechecks = self.ledger.tranche_completion_rechecks(tranche_id)
+        current_plan_ids = [view["correction_plan_id"] for view in views]
+        current_ticket_ids = [ticket_id for view in views for ticket_id in view["ticket_ids"]]
+        durable_current_recheck = False
+        if rechecks and not open_count:
+            candidate = rechecks[-1]
+            durable_current_recheck = (
+                json.loads(candidate["correction_plan_ids_json"]) == current_plan_ids
+                and json.loads(candidate["accepted_ticket_ids_json"]) == current_ticket_ids
+                and candidate["status"] == "recheck_passed"
+            )
+        if open_count:
+            review_status = "open_corrections"
+        elif not plans:
+            review_status = "no_corrections"
+        elif durable_current_recheck:
+            review_status = "recheck_passed"
+        else:
+            review_status = "ready_for_recheck"
         return {"tranche_id": tranche_id,
                 "correction_plans": len(plans),
                 "unresolved_corrections": open_count,
-                "review_status": "open_corrections" if open_count else ("no_corrections" if not plans else "recheck_passed"),
+                "review_status": review_status,
                 "latest_completion": latest,
-                "completion_rechecks": self.ledger.tranche_completion_rechecks(tranche_id),
+                "completion_rechecks": rechecks,
                 "plans": views}

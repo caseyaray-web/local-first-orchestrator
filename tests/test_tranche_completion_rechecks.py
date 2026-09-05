@@ -72,6 +72,41 @@ class TrancheCompletionRecheckTests(SupplementalCorrectionTests):
         self.assertEqual(self.ledger.tranche_completion("T"), h1)
         self.assertEqual(self.ledger.tranche_completion_rechecks("T"), [])
 
+    def test_lifecycle_status_is_evidence_backed_across_h1_h2_h3(self):
+        h1 = self.record_h1()
+        self.assertEqual(self.service().lifecycle_status("T")["review_status"], "no_corrections")
+        first_plan = self.service().create_plan(self.spec("status-cycle-one"))
+        first = self.service().materialize(first_plan.correction_plan_id)
+        self.assertEqual(self.service().lifecycle_status("T")["review_status"], "open_corrections")
+        head2 = self.accept_correction(first.ticket_id)
+        self.assertEqual(self.service().lifecycle_status("T")["review_status"], "ready_for_recheck")
+        h2 = self.recheck()
+        self.assertEqual(self.service().lifecycle_status("T")["review_status"], "recheck_passed")
+        second_plan = self.service().create_plan(self.spec("status-cycle-two"))
+        second = self.service().materialize(second_plan.correction_plan_id)
+        self.assertEqual(self.service().lifecycle_status("T")["review_status"], "open_corrections")
+        head3 = self.accept_correction(second.ticket_id)
+        self.assertEqual(self.service().lifecycle_status("T")["review_status"], "ready_for_recheck")
+        h3 = self.recheck()
+        status = self.service().lifecycle_status("T")
+        self.assertEqual(status["review_status"], "recheck_passed")
+        self.assertEqual([row["generation"] for row in status["completion_rechecks"]], [1, 2])
+        self.assertEqual(self.ledger.tranche_completion("T"), h1)
+        self.assertEqual(h2["current_integration_sha"], head2)
+        self.assertEqual(h3["current_integration_sha"], head3)
+
+    def test_lifecycle_status_reopens_identically_after_restart(self):
+        self.record_h1()
+        plan = self.service().create_plan(self.spec("status-reopen")); correction = self.service().materialize(plan.correction_plan_id)
+        self.accept_correction(correction.ticket_id)
+        before = self.service().lifecycle_status("T")
+        self.ledger.close()
+        from local_first_orchestrator.ledger import Ledger
+        self.ledger = Ledger(self.root / "ledger.db")
+        self.ledger.migrate()
+        after = self.service().lifecycle_status("T")
+        self.assertEqual(after, before)
+
     def test_accepted_integrated_correction_creates_idempotent_h2_recheck(self):
         h1 = self.record_h1()
         plan = self.service().create_plan(self.spec("cycle-one"))

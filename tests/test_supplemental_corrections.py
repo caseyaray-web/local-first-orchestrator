@@ -283,7 +283,7 @@ class SupplementalCorrectionTests(unittest.TestCase):
         self.assertEqual(evidence["accepted_ticket_ids"], ["A", correction.ticket_id])
         self.assertEqual(evidence["final_integration_sha"], new_head)
         lifecycle_after = self.service().lifecycle_status("T")
-        self.assertEqual(lifecycle_after["review_status"], "recheck_passed", lifecycle_after)
+        self.assertEqual(lifecycle_after["review_status"], "ready_for_recheck", lifecycle_after)
         self.assertEqual(lifecycle_after["unresolved_corrections"], 0)
         self.assertEqual(lifecycle_after["plans"][0]["status"], "accepted")
 
