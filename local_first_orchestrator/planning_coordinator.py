@@ -132,13 +132,23 @@ class PlanningCoordinator:
         if active_row is None: return PlanningOutcome("planner_failed", feature_id, reasons=("active tranche missing",))
         if int(active_row["ordinal"]) > 0: return PlanningOutcome("already_materialized", feature_id, plan_id=str(stored_plan["id"]))
         active = next(t for t in coarse_plan.tranches if t.id == active_row["id"])
-        try: completion = completion_evidence(self.ledger, self.config.canonical_repository(self.config.repository), active.id)
+        repository = self.config.canonical_repository(self.config.repository)
+        from .corrections import CorrectionService
+        authority = CorrectionService(self.ledger, repository).completion_authority(active.id)
+        if not authority["authorized"]:
+            return PlanningOutcome("waiting_not_complete", feature_id, reasons=(f"predecessor completion authority is {authority['status']}",))
+        try:
+            completion = authority["completion"]
+            if authority["kind"] == "h1":
+                completion = completion_evidence(self.ledger, repository, active.id)
+            if completion is None:
+                raise TrancheNotComplete("durable predecessor completion is missing")
         except (TrancheNotComplete, OSError, subprocess.CalledProcessError) as exc: return PlanningOutcome("waiting_not_complete", feature_id, reasons=(str(exc),))
         next_coarse = next((t for t in coarse_plan.tranches if t.ordinal == active.ordinal + 1), None)
         if next_coarse is None:
             self.ledger.record_tranche_completion(completion)
             return PlanningOutcome("feature_complete_candidate", feature_id, reasons=("no later coarse tranche",))
-        final = completion["final_integration_sha"]
+        final = authority["final_integration_sha"]
         snap = snapshot(self.config.canonical_repository(self.config.repository), final, feature)
         artifact_dir = self._artifact_dir(feature, self._request_key(feature, snap) + "-" + next_coarse.id); artifact_dir.mkdir(parents=True, exist_ok=True)
         try:

@@ -391,3 +391,17 @@ class CorrectionService:
                 "latest_completion": latest,
                 "completion_rechecks": rechecks,
                 "plans": views}
+
+    def completion_authority(self, tranche_id: str) -> dict[str, Any]:
+        """Return the durable completion authority used by successor gating."""
+        status = self.lifecycle_status(tranche_id)
+        h1 = self.ledger.tranche_completion(tranche_id)
+        latest = status["latest_completion"]
+        if status["review_status"] == "no_corrections" and h1 is not None:
+            return {"authorized": True, "kind": "h1", "completion": h1,
+                    "final_integration_sha": h1["final_integration_sha"]}
+        if status["review_status"] == "recheck_passed" and latest is not None:
+            return {"authorized": True, "kind": "recheck", "completion": h1,
+                    "final_integration_sha": latest["current_integration_sha"]}
+        return {"authorized": False, "kind": None, "completion": h1,
+                "final_integration_sha": None, "status": status["review_status"]}

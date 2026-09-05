@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 from local_first_orchestrator.controller import RuntimeConfig
 from local_first_orchestrator.decomposition import Criterion, DecompositionPlan, FeatureContract, PlanValidator, Tranche, activate_validated_plan
 from local_first_orchestrator.ledger import Ledger
+from local_first_orchestrator.tranche_completion import completion_evidence
 from local_first_orchestrator.planning_coordinator import PlanningCoordinator
 from local_first_orchestrator.repository_snapshot import RepositoryPlanValidator, snapshot
 from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
@@ -59,6 +60,7 @@ class TrancheHandoffTests(unittest.TestCase):
     def rev(self, ref): return self.git("rev-parse", ref).stdout.strip()
 
     def test_materializes_only_next_tranche_from_completed_head_and_replays(self):
+        self.ledger.record_tranche_completion(completion_evidence(self.ledger, self.repo, "T1"))
         s2 = snapshot(self.repo, self.a1, self.feature)
         self.assertEqual(hashlib.sha256((self.repo / "alpha.py").read_bytes()).hexdigest(), next(e.content_hash for e in s2.entries if e.path == "alpha.py"))
         proposal = DecompositionPlan(1, "F", self.feature.contract_hash, "wrong", "wrong", (), {"next": ("B",)}, (Tranche("proposal", 0, "beta", (), ("B",), (self.b,)),))
@@ -79,6 +81,13 @@ class TrancheHandoffTests(unittest.TestCase):
         self.assertEqual(self.ledger.connection.execute("select count(*) from tranche_completion_evidence").fetchone()[0], 1)
         self.assertEqual(self.ledger.connection.execute("select count(*) from events where event_type='generated_microticket_created'").fetchone()[0], 2)
         self.assertEqual(self.ledger.connection.execute("select status from tranches where id='T3'").fetchone() if False else "planned", "planned")
+
+    def test_successor_is_blocked_without_durable_h1(self):
+        proposal = DecompositionPlan(1, "F", self.feature.contract_hash, "wrong", "wrong", (), {"next": ("B",)}, (Tranche("proposal", 0, "beta", (), ("B",), (self.b,)),))
+        coordinator = PlanningCoordinator(self.ledger, self.config, NextPlanner(proposal))
+        outcome = coordinator.materialize_next_tranche("F")
+        self.assertEqual(outcome.status, "waiting_not_complete")
+        self.assertIn("completion authority", outcome.reasons[0])
 
 
 if __name__ == "__main__": unittest.main()
