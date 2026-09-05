@@ -372,6 +372,82 @@ class SupplementalCorrectionTests(unittest.TestCase):
         plan = DecompositionPlan(1, "F2", feature.contract_hash, self.base, "s", (), {"C": ("AC",)}, (Tranche("T2", 0, "x", (), ("AC",), (external,)),), repository_identity=str(self.repo), repo_snapshot_manifest_json="{}")
         self.assertIn("invalid_dependency", PlanValidator().validate(feature, plan).reasons)
 
+    def test_correction_projection_reconciles_after_restart_and_original_plan_lifecycle_advance(self):
+        """Correction identity comes from its own durable plan, not an active plan join."""
+        plan = self.service().create_plan(self.spec())
+        correction = self.service().materialize(plan.correction_plan_id)
+        event_id = self.ledger.connection.execute(
+            "SELECT event_id FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket'",
+            (correction.ticket_id,),
+        ).fetchone()[0]
+        row = self.ledger.connection.execute(
+            "SELECT payload_json FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",
+            (correction.ticket_id, event_id),
+        ).fetchone()
+        payload = json.loads(row[0])
+        prefix, encoded = payload["body"].split("```local-first-contract\\n", 1)
+        contract, suffix = encoded.split("\\n```", 1)
+        contract = json.loads(contract)
+        for field in ("repository_identity", "repo_base_sha", "repo_snapshot_hash"):
+            contract.pop(field)
+        payload["body"] = prefix + "```local-first-contract\\n" + json.dumps(contract, sort_keys=True, separators=(",", ":")) + "\\n```" + suffix
+        self.ledger.connection.execute("UPDATE board_projection_outbox SET payload_json=? WHERE ticket_id=? AND event_id=?", (json.dumps(payload, sort_keys=True, separators=(",", ":")), correction.ticket_id, event_id))
+
+        # There is deliberately no active decomposition plan.  A later lifecycle
+        # state must not make correction provenance disappear.
+        self.ledger.close()
+        self.ledger = Ledger(self.root / "ledger.db")
+        self.ledger.migrate()
+        repaired = self.ledger.reconcile_generated_projection(correction.ticket_id, event_id)
+        contract = json.loads(repaired["body"].split("```local-first-contract\\n", 1)[1].split("\\n```", 1)[0])
+        self.assertEqual(contract["repository_identity"], str(self.repo))
+        self.assertEqual(contract["repo_base_sha"], self.base)
+
+    def test_correction_projection_missing_or_conflicting_provenance_fails_closed(self):
+        plan = self.service().create_plan(self.spec())
+        correction = self.service().materialize(plan.correction_plan_id)
+        event_id = self.ledger.connection.execute("SELECT event_id FROM board_projection_outbox WHERE ticket_id=?", (correction.ticket_id,)).fetchone()[0]
+        self.ledger.connection.execute("DELETE FROM supplemental_correction_tickets WHERE correction_plan_id=?", (plan.correction_plan_id,))
+        with self.assertRaises(ValueError):
+            self.ledger.reconcile_generated_projection(correction.ticket_id, event_id)
+
+        # Rebuild this case independently so the conflict cannot be hidden by
+        # the missing correction row.
+        self.tearDown(); self.setUp()
+        plan = self.service().create_plan(self.spec("conflict"))
+        correction = self.service().materialize(plan.correction_plan_id)
+        event_id = self.ledger.connection.execute("SELECT event_id FROM board_projection_outbox WHERE ticket_id=?", (correction.ticket_id,)).fetchone()[0]
+        now = self.ledger._now()
+        self.ledger.connection.execute(
+            "INSERT INTO decomposition_plans(id,feature_id,fingerprint,plan_json,status,created_at,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("normal-conflict", "F", "normal-conflict", "{}", "active", now, "other-repository", self.base, "other-snapshot", "{}"),
+        )
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            self.ledger.reconcile_generated_projection(correction.ticket_id, event_id)
+
+    def test_correction_replay_keeps_acknowledged_external_identity_without_duplicate_card(self):
+        from types import SimpleNamespace
+        from local_first_orchestrator.generated_projection import GeneratedProjectionWorker
+        plan = self.service().create_plan(self.spec("replay"))
+        correction = self.service().materialize(plan.correction_plan_id)
+
+        class Board:
+            timeout_seconds = 1
+            allow_writes = True
+            def __init__(self): self.calls = 0; self.body = ""
+            def create_microticket(self, title, body, *, idempotency_key):
+                self.calls += 1; self.body = body; return "external-correction-replay"
+            def get_task(self, task_id): return SimpleNamespace(id=task_id, body=self.body)
+
+        board = Board()
+        first = GeneratedProjectionWorker(self.ledger, board, worker_id="first").deliver_one()
+        self.assertEqual(first.external_task_id, "external-correction-replay")
+        self.ledger.close(); self.ledger = Ledger(self.root / "ledger.db"); self.ledger.migrate()
+        second = GeneratedProjectionWorker(self.ledger, board, worker_id="restart").deliver_one()
+        self.assertEqual(second.status, "no_work")
+        self.assertEqual(board.calls, 1)
+        self.assertEqual(self.ledger.resolve_external_task_id(correction.ticket_id), "external-correction-replay")
+
 
 if __name__ == "__main__":
     unittest.main()
