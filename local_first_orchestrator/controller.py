@@ -12,7 +12,7 @@ from typing import Any, Callable
 from .context_packet import ContextPacketBuilder
 from .evidence_hash import canonical_sha256
 from .git_adapter import AttemptWorktree, GitWorktreeAdapter
-from .historical_revalidation import attestation_hash_from_row, authorization_hash_from_row, classify_obsolete_validation_failure
+from .historical_revalidation import attestation_hash_from_row, authorization_hash_from_row, classify_obsolete_validation_failure, historical_validation_result_hash
 from .ledger import Ledger
 from .local_qwen import LocalQwenAdapter
 from .readiness import validate_ticket
@@ -551,7 +551,37 @@ class LocalFirstController:
             raise PermissionError("historical implementation live worktree diff mismatch")
         if live_diff_hash != str(impl["diff_hash"]):
             raise PermissionError("historical implementation durable diff mismatch")
-        raise RuntimeError("historical validation/recovery execution gate required")
+        validation_profile_hash = canonical_sha256(ticket.contract())
+        existing_result = self.ledger.historical_revalidation_validation_result(ticket_id, attempt_number)
+        if existing_result is not None:
+            if int(existing_result["passed"]) not in (0, 1) or historical_validation_result_hash(ticket_id=ticket_id, attempt_number=attempt_number, authorization_hash=str(stored_hash), attestation_hash=stored_attestation_hash, base_sha=str(impl["base_sha"]), implementation_diff_hash=str(impl["diff_hash"]), validation_profile_hash=validation_profile_hash, artifact_sha256=str(existing_result["artifact_sha256"]), passed=bool(existing_result["passed"]), compact_evidence=str(existing_result["compact_evidence"])) != str(existing_result["result_hash"]):
+                raise PermissionError("historical validation result integrity mismatch")
+            if str(existing_result["validation_profile_hash"]) != validation_profile_hash or str(existing_result["authorization_hash"]) != str(stored_hash) or str(existing_result["attestation_hash"]) != stored_attestation_hash:
+                raise PermissionError("historical validation result identity mismatch")
+            if not Path(str(existing_result["artifact_path"])).is_file() or hashlib.sha256(Path(str(existing_result["artifact_path"])).read_bytes()).hexdigest() != str(existing_result["artifact_sha256"]):
+                raise PermissionError("historical validation result artifact integrity mismatch")
+            if not bool(existing_result["passed"]):
+                raise RuntimeError("historical current validation failed; explicit handling required")
+            raise RuntimeError("historical candidate freeze gate required")
+        claim = self.ledger.claim_historical_revalidation_validation(ticket_id=ticket_id, attempt_number=attempt_number, authorization_hash_value=str(stored_hash), attestation_hash_value=stored_attestation_hash, base_sha=str(impl["base_sha"]), implementation_diff_hash=str(impl["diff_hash"]), validation_profile_hash=validation_profile_hash)
+        if claim.get("status") == "completed":
+            raise RuntimeError("historical validation result reconciliation required")
+        try:
+            validation = DeterministicValidator(artifact_root=artifact_root / ticket_id / str(attempt_number)).validate(expected_path, ticket, base_sha=str(impl["base_sha"]))
+            artifact_path = Path(validation.full_evidence_path).resolve()
+            artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+            post_top_level = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            post_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            post_branch = subprocess.run(("git", "branch", "--show-current"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            post_diff_hash = GitWorktreeAdapter(repo, worktree_root).diff_hash(expected_path)
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            raise RuntimeError("historical validation live integrity inspection failed") from exc
+        if post_top_level != str(expected_path) or post_head != str(impl["base_sha"]) or post_branch != expected_branch or post_diff_hash != str(impl["diff_hash"]) or post_diff_hash != str(attestation["worktree_diff_hash"]):
+            raise RuntimeError("historical implementation changed during validation")
+        result = self.ledger.record_historical_revalidation_validation_result(claim_id=str(claim["claim_id"]), ticket_id=ticket_id, attempt_number=attempt_number, authorization_hash_value=str(stored_hash), attestation_hash_value=stored_attestation_hash, base_sha=str(impl["base_sha"]), implementation_diff_hash=str(impl["diff_hash"]), validation_profile_hash=validation_profile_hash, artifact_path=str(artifact_path), artifact_sha256=artifact_sha256, passed=validation.passed, compact_evidence=validation.compact_evidence)
+        if not validation.passed:
+            raise RuntimeError("historical current validation failed; explicit handling required")
+        raise RuntimeError("historical candidate freeze gate required")
 
     def execute(self, ticket_id: str, *, repository: Path, allow_board_writes: bool, owner: str="local-first-controller") -> bool:
         if not allow_board_writes: return False

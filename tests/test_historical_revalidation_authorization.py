@@ -6,13 +6,16 @@ import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest import mock
 
-from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
+from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig, ticket_from_ledger
+from local_first_orchestrator.evidence_hash import canonical_sha256
 from local_first_orchestrator.hermes_board import ExternalTicket
 from local_first_orchestrator.historical_revalidation import attestation_hash, attestation_hash_from_row, attestation_identity, authorization_hash, authorization_hash_from_row, authorization_identity
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.states import CanonicalState
+from local_first_orchestrator.validation import DeterministicValidator
 
 
 F1_FILE = "scripts/test-meal-planner-c0910-ui.mjs"
@@ -156,7 +159,7 @@ class HistoricalAuthorizationTests(unittest.TestCase):
 
     def test_consumer_with_valid_attestation_reaches_only_next_explicit_gate(self) -> None:
         self.create_obsolete_failure(); self.authorize(); self.attest()
-        with self.assertRaisesRegex(RuntimeError, "historical validation/recovery execution gate required"):
+        with self.assertRaisesRegex(RuntimeError, "historical candidate freeze gate required"):
             self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
         self.assertIsNone(self.ledger.review_candidate(self.ticket)); self.assertEqual(self.model.calls, ["implementation"])
 
@@ -168,7 +171,7 @@ class HistoricalAuthorizationTests(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "live worktree diff mismatch"):
             self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
         path.write_text(original, encoding="utf-8")
-        with self.assertRaisesRegex(RuntimeError, "historical validation/recovery execution gate required"):
+        with self.assertRaisesRegex(RuntimeError, "historical candidate freeze gate required"):
             self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
 
     def test_consumer_rejects_deleted_worktree(self) -> None:
@@ -197,6 +200,43 @@ class HistoricalAuthorizationTests(unittest.TestCase):
         with mock.patch.object(self.ledger, "historical_revalidation_attestation", return_value=corrupt):
             with self.assertRaisesRegex(PermissionError, "attestation hash mismatch"):
                 self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+
+    def test_current_validation_replay_does_not_rerun_validator(self) -> None:
+        self.create_obsolete_failure(); self.authorize(); self.attest()
+        original_validate = DeterministicValidator.validate
+        calls: list[object] = []
+        def count_then_validate(validator: DeterministicValidator, worktree: Path, ticket: Any, *, base_sha: str) -> Any:
+            calls.append(ticket)
+            return original_validate(validator, worktree, ticket, base_sha=base_sha)
+        with mock.patch.object(DeterministicValidator, "validate", new=count_then_validate):
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, "historical candidate freeze gate required"):
+                    self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+            self.assertEqual(len(calls), 1)
+
+    def test_incomplete_claim_fails_closed_before_validator(self) -> None:
+        self.create_obsolete_failure(); authorization = self.authorize(); attestation = self.attest()
+        impl = self.ledger.model_stage(self.ticket, 1, "implementation"); assert impl is not None
+        self.ledger.claim_historical_revalidation_validation(ticket_id=self.ticket, attempt_number=1, authorization_hash_value=str(authorization["authorization_hash"]), attestation_hash_value=str(attestation["attestation_hash"]), base_sha=str(impl["base_sha"]), implementation_diff_hash=str(impl["diff_hash"]), validation_profile_hash=canonical_sha256(ticket_from_ledger(self.ledger.get_ticket(self.ticket)).contract()))
+        with mock.patch.object(DeterministicValidator, "validate") as validate:
+            with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+            validate.assert_not_called()
+
+    def test_post_validation_implementation_mutation_is_rejected(self) -> None:
+        self.create_obsolete_failure(); self.authorize(); self.attest()
+        original_validate = DeterministicValidator.validate
+        attempt = self.ledger.connection.execute("SELECT worktree_path FROM attempts WHERE ticket_id=? AND attempt_number=1", (self.ticket,)).fetchone(); assert attempt is not None
+        path = Path(attempt["worktree_path"]).joinpath(F1_FILE)
+        original = path.read_text(encoding="utf-8")
+        def mutate_then_validate(validator: DeterministicValidator, worktree: Path, ticket: Any, *, base_sha: str) -> Any:
+            path.write_text(original + "\n// mutated by validation\n", encoding="utf-8")
+            return original_validate(validator, worktree, ticket, base_sha=base_sha)
+        with mock.patch.object(DeterministicValidator, "validate", new=mutate_then_validate):
+            with self.assertRaisesRegex(RuntimeError, "changed during validation"):
+                self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+        path.write_text(original, encoding="utf-8")
+        self.assertIsNone(self.ledger.historical_revalidation_validation_result(self.ticket, 1))
 
     def test_exact_f1_attempt_can_receive_bound_authorization(self) -> None:
         self.create_obsolete_failure()

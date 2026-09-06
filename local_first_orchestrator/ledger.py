@@ -16,7 +16,7 @@ from .adapters import BoardAdapter
 from .readiness import ReadinessError, validate_ticket
 from .states import CanonicalState, validate_transition
 from .evidence_hash import canonical_sha256
-from .historical_revalidation import authorization_hash, authorization_identity, authorization_hash_from_row, attestation_hash, attestation_identity, attestation_hash_from_row
+from .historical_revalidation import authorization_hash, authorization_identity, authorization_hash_from_row, attestation_hash, attestation_identity, attestation_hash_from_row, historical_validation_hash, historical_validation_identity, historical_validation_result_hash
 from .ticket import MicroTicket
 
 
@@ -53,6 +53,14 @@ def _sqlite_historical_authorization_hash(ticket_id: str, attempt_number: int, b
 
 def _sqlite_historical_attestation_hash(ticket_id: str, attempt_number: int, base_sha: str, repository_identity: str, implementation_invocation_id: str, implementation_artifact: str, implementation_diff_hash: str, worktree_path: str, worktree_diff_hash: str, authorization_hash_value: str, operator_id: str) -> str:
     return attestation_hash(attestation_identity(ticket_id=ticket_id, attempt_number=attempt_number, base_sha=base_sha, repository_identity=repository_identity, implementation_invocation_id=implementation_invocation_id, implementation_artifact=implementation_artifact, implementation_diff_hash=implementation_diff_hash, worktree_path=worktree_path, worktree_diff_hash=worktree_diff_hash, authorization_hash=authorization_hash_value, operator_id=operator_id))
+
+
+def _sqlite_historical_validation_hash(ticket_id: str, attempt_number: int, authorization_hash_value: str, attestation_hash_value: str, base_sha: str, implementation_diff_hash: str, validation_profile_hash: str) -> str:
+    return historical_validation_hash(historical_validation_identity(ticket_id=ticket_id, attempt_number=attempt_number, authorization_hash=authorization_hash_value, attestation_hash=attestation_hash_value, base_sha=base_sha, implementation_diff_hash=implementation_diff_hash, validation_profile_hash=validation_profile_hash))
+
+
+def _sqlite_historical_validation_result_hash(ticket_id: str, attempt_number: int, authorization_hash_value: str, attestation_hash_value: str, base_sha: str, implementation_diff_hash: str, validation_profile_hash: str, artifact_sha256: str, passed: int, compact_evidence: str) -> str:
+    return historical_validation_result_hash(ticket_id=ticket_id, attempt_number=attempt_number, authorization_hash=authorization_hash_value, attestation_hash=attestation_hash_value, base_sha=base_sha, implementation_diff_hash=implementation_diff_hash, validation_profile_hash=validation_profile_hash, artifact_sha256=artifact_sha256, passed=bool(passed), compact_evidence=compact_evidence)
 
 
 @dataclass(frozen=True)
@@ -395,6 +403,32 @@ CREATE TRIGGER IF NOT EXISTS historical_revalidation_attestations_hash_integrity
 BEFORE INSERT ON historical_revalidation_attestations
 WHEN NEW.attestation_hash IS NULL OR NEW.attestation_hash != canonical_historical_attestation_hash(NEW.ticket_id,NEW.attempt_number,NEW.base_sha,NEW.repository_identity,NEW.implementation_invocation_id,NEW.implementation_artifact,NEW.implementation_diff_hash,NEW.worktree_path,NEW.worktree_diff_hash,NEW.authorization_hash,NEW.operator_id)
 BEGIN SELECT RAISE(ABORT, 'historical revalidation attestation hash mismatch'); END;
+CREATE TABLE IF NOT EXISTS historical_revalidation_validation_claims (
+    claim_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), attempt_number INTEGER NOT NULL,
+    authorization_hash TEXT NOT NULL, attestation_hash TEXT NOT NULL, base_sha TEXT NOT NULL,
+    implementation_diff_hash TEXT NOT NULL, validation_profile_hash TEXT NOT NULL, created_at INTEGER NOT NULL,
+    UNIQUE(ticket_id, attempt_number)
+);
+CREATE TRIGGER IF NOT EXISTS historical_revalidation_validation_claims_immutable_update
+BEFORE UPDATE ON historical_revalidation_validation_claims BEGIN SELECT RAISE(ABORT, 'historical validation claims are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS historical_revalidation_validation_claims_immutable_delete
+BEFORE DELETE ON historical_revalidation_validation_claims BEGIN SELECT RAISE(ABORT, 'historical validation claims are append-only'); END;
+CREATE TABLE IF NOT EXISTS historical_revalidation_validation_results (
+    result_id TEXT PRIMARY KEY, claim_id TEXT NOT NULL UNIQUE REFERENCES historical_revalidation_validation_claims(claim_id),
+    ticket_id TEXT NOT NULL REFERENCES tickets(id), attempt_number INTEGER NOT NULL, authorization_hash TEXT NOT NULL,
+    attestation_hash TEXT NOT NULL, base_sha TEXT NOT NULL, implementation_diff_hash TEXT NOT NULL,
+    validation_profile_hash TEXT NOT NULL, artifact_path TEXT NOT NULL, artifact_sha256 TEXT NOT NULL,
+    passed INTEGER NOT NULL CHECK (passed IN (0,1)), compact_evidence TEXT NOT NULL, result_hash TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL, UNIQUE(ticket_id, attempt_number)
+);
+CREATE TRIGGER IF NOT EXISTS historical_revalidation_validation_results_immutable_update
+BEFORE UPDATE ON historical_revalidation_validation_results BEGIN SELECT RAISE(ABORT, 'historical validation results are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS historical_revalidation_validation_results_immutable_delete
+BEFORE DELETE ON historical_revalidation_validation_results BEGIN SELECT RAISE(ABORT, 'historical validation results are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS historical_revalidation_validation_results_hash_integrity
+BEFORE INSERT ON historical_revalidation_validation_results
+WHEN NEW.result_hash IS NULL OR NEW.result_hash != canonical_historical_validation_result_hash(NEW.ticket_id,NEW.attempt_number,NEW.authorization_hash,NEW.attestation_hash,NEW.base_sha,NEW.implementation_diff_hash,NEW.validation_profile_hash,NEW.artifact_sha256,NEW.passed,NEW.compact_evidence)
+BEGIN SELECT RAISE(ABORT, 'historical validation result hash mismatch'); END;
 """
 
 
@@ -473,6 +507,8 @@ class Ledger:
         self.connection.create_function("canonical_recheck_hash", 13, _sqlite_recheck_hash)
         self.connection.create_function("canonical_historical_authorization_hash", 10, _sqlite_historical_authorization_hash)
         self.connection.create_function("canonical_historical_attestation_hash", 11, _sqlite_historical_attestation_hash)
+        self.connection.create_function("canonical_historical_validation_hash", 7, _sqlite_historical_validation_hash)
+        self.connection.create_function("canonical_historical_validation_result_hash", 10, _sqlite_historical_validation_result_hash)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 5000")
@@ -1072,6 +1108,39 @@ class Ledger:
     def historical_revalidation_attestation(self, ticket_id: str, attempt_number: int) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT * FROM historical_revalidation_attestations WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
         return dict(row) if row else None
+
+    def historical_revalidation_validation_claim(self, ticket_id: str, attempt_number: int) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM historical_revalidation_validation_claims WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        return dict(row) if row else None
+
+    def historical_revalidation_validation_result(self, ticket_id: str, attempt_number: int) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM historical_revalidation_validation_results WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        return dict(row) if row else None
+
+    def claim_historical_revalidation_validation(self, *, ticket_id: str, attempt_number: int, authorization_hash_value: str, attestation_hash_value: str, base_sha: str, implementation_diff_hash: str, validation_profile_hash: str) -> dict[str, Any]:
+        identity = historical_validation_identity(ticket_id=ticket_id, attempt_number=attempt_number, authorization_hash=authorization_hash_value, attestation_hash=attestation_hash_value, base_sha=base_sha, implementation_diff_hash=implementation_diff_hash, validation_profile_hash=validation_profile_hash)
+        with self._transaction() as conn:
+            existing = conn.execute("SELECT * FROM historical_revalidation_validation_claims WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            if existing is not None:
+                if any(str(existing[field]) != str(identity[field]) for field in identity):
+                    raise RuntimeError("conflicting historical validation execution identity")
+                if conn.execute("SELECT 1 FROM historical_revalidation_validation_results WHERE claim_id=?", (existing["claim_id"],)).fetchone():
+                    return {**dict(existing), "status": "completed"}
+                raise RuntimeError("historical validation execution is incomplete; reconciliation required")
+            claim_id = uuid.uuid4().hex
+            conn.execute("INSERT INTO historical_revalidation_validation_claims(claim_id,ticket_id,attempt_number,authorization_hash,attestation_hash,base_sha,implementation_diff_hash,validation_profile_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?)", (claim_id, ticket_id, attempt_number, authorization_hash_value, attestation_hash_value, base_sha, implementation_diff_hash, validation_profile_hash, self._now()))
+            return dict(conn.execute("SELECT * FROM historical_revalidation_validation_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
+    def record_historical_revalidation_validation_result(self, *, claim_id: str, ticket_id: str, attempt_number: int, authorization_hash_value: str, attestation_hash_value: str, base_sha: str, implementation_diff_hash: str, validation_profile_hash: str, artifact_path: str, artifact_sha256: str, passed: bool, compact_evidence: str) -> dict[str, Any]:
+        result_hash = historical_validation_result_hash(ticket_id=ticket_id, attempt_number=attempt_number, authorization_hash=authorization_hash_value, attestation_hash=attestation_hash_value, base_sha=base_sha, implementation_diff_hash=implementation_diff_hash, validation_profile_hash=validation_profile_hash, artifact_sha256=artifact_sha256, passed=passed, compact_evidence=compact_evidence)
+        with self._transaction() as conn:
+            existing = conn.execute("SELECT * FROM historical_revalidation_validation_results WHERE claim_id=?", (claim_id,)).fetchone()
+            if existing is not None:
+                if str(existing["result_hash"]) != result_hash or int(existing["passed"]) != int(passed):
+                    raise RuntimeError("conflicting historical validation result")
+                return dict(existing)
+            conn.execute("INSERT INTO historical_revalidation_validation_results(result_id,claim_id,ticket_id,attempt_number,authorization_hash,attestation_hash,base_sha,implementation_diff_hash,validation_profile_hash,artifact_path,artifact_sha256,passed,compact_evidence,result_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (uuid.uuid4().hex, claim_id, ticket_id, attempt_number, authorization_hash_value, attestation_hash_value, base_sha, implementation_diff_hash, validation_profile_hash, artifact_path, artifact_sha256, int(passed), compact_evidence, result_hash, self._now()))
+            return dict(conn.execute("SELECT * FROM historical_revalidation_validation_results WHERE claim_id=?", (claim_id,)).fetchone())
 
     def create_historical_revalidation_attestation(self, *, ticket_id: str, attempt_number: int, base_sha: str, repository_identity: str, implementation_invocation_id: str, implementation_artifact: str, implementation_diff_hash: str, worktree_path: str, worktree_diff_hash: str, authorization_hash_value: str, operator_id: str) -> dict[str, Any]:
         fields = attestation_identity(ticket_id=ticket_id, attempt_number=attempt_number, base_sha=base_sha, repository_identity=repository_identity, implementation_invocation_id=implementation_invocation_id, implementation_artifact=implementation_artifact, implementation_diff_hash=implementation_diff_hash, worktree_path=worktree_path, worktree_diff_hash=worktree_diff_hash, authorization_hash=authorization_hash_value, operator_id=operator_id)

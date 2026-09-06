@@ -63,6 +63,29 @@ def attestation_hash_from_row(row: Mapping[str, Any]) -> str:
     return attestation_hash({field: row[field] for field in ATTESTATION_IDENTITY_FIELDS})
 
 
+HISTORICAL_VALIDATION_CLAIM_FIELDS = (
+    "ticket_id", "attempt_number", "authorization_hash", "attestation_hash",
+    "base_sha", "implementation_diff_hash", "validation_profile_hash",
+)
+
+
+def historical_validation_identity(**values: Any) -> dict[str, Any]:
+    if set(values) != set(HISTORICAL_VALIDATION_CLAIM_FIELDS):
+        raise ValueError("historical validation identity fields are incomplete or ambiguous")
+    return {field: values[field] for field in HISTORICAL_VALIDATION_CLAIM_FIELDS}
+
+
+def historical_validation_hash(identity: Mapping[str, Any]) -> str:
+    return canonical_sha256(historical_validation_identity(**dict(identity)))
+
+
+def historical_validation_result_hash(**values: Any) -> str:
+    required = (*HISTORICAL_VALIDATION_CLAIM_FIELDS, "artifact_sha256", "passed", "compact_evidence")
+    if set(values) != set(required):
+        raise ValueError("historical validation result identity fields are incomplete or ambiguous")
+    return canonical_sha256({field: values[field] for field in required})
+
+
 def _obsolete_file_scope_symbol_error(path: str) -> str:
     return f"symbol scope exceeded in test file: {path}"
 
