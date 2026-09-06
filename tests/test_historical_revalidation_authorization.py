@@ -160,6 +160,27 @@ class HistoricalAuthorizationTests(unittest.TestCase):
             self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
         self.assertIsNone(self.ledger.review_candidate(self.ticket)); self.assertEqual(self.model.calls, ["implementation"])
 
+    def test_consumer_rejects_post_attestation_mutation_then_accepts_restored_state(self) -> None:
+        self.create_obsolete_failure(); self.authorize(); self.attest()
+        attempt = self.ledger.connection.execute("SELECT worktree_path FROM attempts WHERE ticket_id=? AND attempt_number=1", (self.ticket,)).fetchone(); assert attempt is not None
+        path = Path(attempt["worktree_path"]).joinpath(F1_FILE); original = path.read_text(encoding="utf-8")
+        path.write_text(original + "\n// changed after attestation\n", encoding="utf-8")
+        with self.assertRaisesRegex(PermissionError, "live worktree diff mismatch"):
+            self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+        path.write_text(original, encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "historical validation/recovery execution gate required"):
+            self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+
+    def test_consumer_rejects_deleted_worktree(self) -> None:
+        self.create_obsolete_failure(); self.authorize(); self.attest()
+        attempt = self.ledger.connection.execute("SELECT worktree_path FROM attempts WHERE ticket_id=? AND attempt_number=1", (self.ticket,)).fetchone(); assert attempt is not None
+        path = Path(attempt["worktree_path"]); replacement = path.with_name(path.name + "-missing"); path.rename(replacement)
+        try:
+            with self.assertRaisesRegex(PermissionError, "worktree is unavailable"):
+                self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+        finally:
+            replacement.rename(path)
+
     def test_consumer_rejects_corrupt_attestation_hash_fixture(self) -> None:
         self.create_obsolete_failure(); self.authorize(); attestation = self.attest(); corrupt = dict(attestation); corrupt["attestation_hash"] = "0" * 64
         with mock.patch.object(self.ledger, "historical_revalidation_attestation", return_value=corrupt):

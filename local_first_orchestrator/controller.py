@@ -524,6 +524,24 @@ class LocalFirstController:
         attestation_identity = {"ticket_id": ticket_id, "attempt_number": attempt_number, "base_sha": str(impl["base_sha"]), "repository_identity": str(repo), "implementation_invocation_id": str(invocation["invocation_id"]), "implementation_artifact": str(impl["response_artifact"]), "implementation_diff_hash": str(impl["diff_hash"]), "worktree_path": str(Path(str(attempt["worktree_path"])).resolve()), "authorization_hash": str(stored_hash),}
         if any(str(attestation[key]) != str(value) for key, value in attestation_identity.items()):
             raise PermissionError("historical implementation attestation identity mismatch")
+        expected_path = Path(str(attempt["worktree_path"])).resolve()
+        attested_path = Path(str(attestation["worktree_path"])).resolve()
+        if expected_path != attested_path or not expected_path.is_dir():
+            raise PermissionError("historical implementation worktree is unavailable or mismatched")
+        if str(attempt["branch"] or "") != f"local-first/{ticket_id}/attempt-{attempt_number}":
+            raise PermissionError("historical implementation attempt branch mismatch")
+        try:
+            live_top_level = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            live_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            live_diff_hash = GitWorktreeAdapter(repo, worktree_root).diff_hash(expected_path)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise PermissionError("historical implementation live worktree inspection failed") from exc
+        if live_top_level != str(expected_path) or live_head != str(impl["base_sha"]):
+            raise PermissionError("historical implementation live worktree identity mismatch")
+        if live_diff_hash != str(attestation["worktree_diff_hash"]):
+            raise PermissionError("historical implementation live worktree diff mismatch")
+        if live_diff_hash != str(impl["diff_hash"]):
+            raise PermissionError("historical implementation durable diff mismatch")
         raise RuntimeError("historical validation/recovery execution gate required")
 
     def execute(self, ticket_id: str, *, repository: Path, allow_board_writes: bool, owner: str="local-first-controller") -> bool:
