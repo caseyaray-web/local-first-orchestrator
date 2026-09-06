@@ -573,10 +573,17 @@ class LocalFirstController:
             post_top_level = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
             post_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
             post_branch = subprocess.run(("git", "branch", "--show-current"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            post_registered_worktrees = subprocess.run(("git", "worktree", "list", "--porcelain"), cwd=repo, text=True, capture_output=True, check=True, timeout=15).stdout
             post_diff_hash = GitWorktreeAdapter(repo, worktree_root).diff_hash(expected_path)
         except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
             raise RuntimeError("historical validation live integrity inspection failed") from exc
-        if post_top_level != str(expected_path) or post_head != str(impl["base_sha"]) or post_branch != expected_branch or post_diff_hash != str(impl["diff_hash"]) or post_diff_hash != str(attestation["worktree_diff_hash"]):
+        post_registered = any(
+            lines and lines[0] == f"worktree {expected_path}"
+            and f"HEAD {post_head}" in lines
+            and f"branch refs/heads/{expected_branch}" in lines
+            for lines in (block.splitlines() for block in post_registered_worktrees.split("\n\n"))
+        )
+        if post_top_level != str(expected_path) or post_head != str(impl["base_sha"]) or post_branch != expected_branch or not post_registered or post_diff_hash != str(impl["diff_hash"]) or post_diff_hash != str(attestation["worktree_diff_hash"]):
             raise RuntimeError("historical implementation changed during validation")
         result = self.ledger.record_historical_revalidation_validation_result(claim_id=str(claim["claim_id"]), ticket_id=ticket_id, attempt_number=attempt_number, authorization_hash_value=str(stored_hash), attestation_hash_value=stored_attestation_hash, base_sha=str(impl["base_sha"]), implementation_diff_hash=str(impl["diff_hash"]), validation_profile_hash=validation_profile_hash, artifact_path=str(artifact_path), artifact_sha256=artifact_sha256, passed=validation.passed, compact_evidence=validation.compact_evidence)
         if not validation.passed:
