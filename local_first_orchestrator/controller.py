@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from .context_packet import ContextPacketBuilder
 from .git_adapter import AttemptWorktree, GitWorktreeAdapter
+from .historical_revalidation import classify_obsolete_validation_failure
 from .ledger import Ledger
 from .local_qwen import LocalQwenAdapter
 from .readiness import validate_ticket
@@ -389,6 +390,9 @@ class LocalFirstController:
             raise ValueError("historical validation provenance is ambiguous") from exc
         if old_payload.get("attempt_number") != attempt_number or old_payload.get("passed") is not False:
             raise ValueError("historical attempt was not rejected by deterministic validation")
+        obsolete_classification = classify_obsolete_validation_failure(ticket, old_payload)
+        if obsolete_classification is None:
+            raise ValueError("historical validation failure is not a recognized obsolete controller defect")
         artifact = Path(str(impl["response_artifact"])).resolve()
         path = Path(str(attempt["worktree_path"])).resolve()
         if not artifact.is_file():
@@ -412,7 +416,7 @@ class LocalFirstController:
         validation = DeterministicValidator(artifact_root=fresh_root).validate(path, ticket, base_sha=str(impl["base_sha"]))
         validation_path = validation.full_evidence_path.resolve()
         validation_sha = hashlib.sha256(validation_path.read_bytes()).hexdigest()
-        detail = json.dumps({"attempt_number": attempt_number, "artifact_path": str(validation_path), "artifact_sha256": validation_sha, "completed": True, "passed": validation.passed, "compact_evidence": validation.compact_evidence, "revalidation": True}, sort_keys=True)
+        detail = json.dumps({"attempt_number": attempt_number, "artifact_path": str(validation_path), "artifact_sha256": validation_sha, "completed": True, "passed": validation.passed, "compact_evidence": validation.compact_evidence, "revalidation": True, "obsolete_classification": obsolete_classification}, sort_keys=True)
         self.ledger.record_runtime_stage(ticket_id, f"validation-revalidation-{attempt_number}", detail, attempt_number=attempt_number, artifact_path=str(validation_path), artifact_sha256=validation_sha, base_sha=str(impl["base_sha"]))
         if not validation.passed:
             return {"ticket_id": ticket_id, "attempt_number": attempt_number, "state": self.ledger.get_ticket(ticket_id)["state"], "validation": validation.compact_evidence, "fresh_validation_artifact": str(validation_path), "replayed": False}
