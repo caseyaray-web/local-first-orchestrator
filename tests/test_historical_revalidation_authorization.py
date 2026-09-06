@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest import mock
 
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
 from local_first_orchestrator.hermes_board import ExternalTicket
+from local_first_orchestrator.historical_revalidation import authorization_hash, authorization_hash_from_row, authorization_identity
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.states import CanonicalState
 
@@ -77,6 +79,35 @@ class HistoricalAuthorizationTests(unittest.TestCase):
 
     def authorize(self, *, operator: str = "operator", reason: str = "recognized F1 obsolete rule") -> dict[str, object]:
         return self.controller.authorize_historical_revalidation(self.ticket, 1, repository=self.repo, operator_id=operator, reason=reason)
+
+    def raw_identity(self, *, attempt: int = 99, invocation: str = "raw-invocation") -> dict[str, object]:
+        return authorization_identity(ticket_id=self.ticket, attempt_number=attempt, base_sha=self.base, repository_identity=str(self.repo.resolve()), target_file=F1_FILE, failure_classification="obsolete_file_scope_symbol_validation", failure_evidence_identity="e" * 64, implementation_invocation_id=invocation, operator_id="raw-operator", reason="raw fixture")
+
+    def raw_insert(self, identity: dict[str, object], digest: str | None) -> None:
+        values = ("raw-authorization", *[identity[field] for field in ("ticket_id", "attempt_number", "base_sha", "repository_identity", "target_file", "failure_classification", "failure_evidence_identity", "implementation_invocation_id", "operator_id", "reason")], digest, 1)
+        self.ledger.connection.execute("INSERT INTO historical_revalidation_authorizations(authorization_id,ticket_id,attempt_number,base_sha,repository_identity,target_file,failure_classification,failure_evidence_identity,implementation_invocation_id,operator_id,reason,authorization_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
+
+    def test_controller_authorization_stores_valid_canonical_hash(self) -> None:
+        self.create_obsolete_failure(); authorization = self.authorize()
+        self.assertEqual(authorization["authorization_hash"], authorization_hash_from_row(authorization))
+
+    def test_direct_sql_correct_hash_succeeds(self) -> None:
+        identity = self.raw_identity(); self.raw_insert(identity, authorization_hash(identity))
+        self.assertIsNotNone(self.ledger.historical_revalidation_authorization(self.ticket, 99))
+
+    def test_direct_sql_arbitrary_changed_field_or_null_hash_is_rejected(self) -> None:
+        identity = self.raw_identity()
+        for digest, changed in (("a" * 64, identity), (authorization_hash(identity), {**identity, "target_file": "other.mjs"}), (None, identity)):
+            with self.subTest(digest=digest, changed=changed):
+                with self.assertRaises((sqlite3.IntegrityError, sqlite3.OperationalError)):
+                    self.raw_insert(changed, digest)
+
+    def test_consumer_rejects_corrupt_persisted_hash_fixture(self) -> None:
+        self.create_obsolete_failure(); authorization = self.authorize()
+        corrupt = dict(authorization); corrupt["authorization_hash"] = "0" * 64
+        with mock.patch.object(self.ledger, "historical_revalidation_authorization", return_value=corrupt):
+            with self.assertRaisesRegex(PermissionError, "authorization hash mismatch"):
+                self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
 
     def test_exact_f1_attempt_can_receive_bound_authorization(self) -> None:
         self.create_obsolete_failure()

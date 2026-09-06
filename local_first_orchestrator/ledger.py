@@ -16,6 +16,7 @@ from .adapters import BoardAdapter
 from .readiness import ReadinessError, validate_ticket
 from .states import CanonicalState, validate_transition
 from .evidence_hash import canonical_sha256
+from .historical_revalidation import authorization_hash, authorization_identity, authorization_hash_from_row
 from .ticket import MicroTicket
 
 
@@ -44,6 +45,10 @@ def _is_command_list(value: object) -> bool:
         if type(command.get("stdout_summary")) is not str or type(command.get("stderr_summary")) is not str or type(command.get("truncated")) is not bool:
             return False
     return True
+
+
+def _sqlite_historical_authorization_hash(ticket_id: str, attempt_number: int, base_sha: str, repository_identity: str, target_file: str, failure_classification: str, failure_evidence_identity: str, implementation_invocation_id: str, operator_id: str, reason: str) -> str:
+    return authorization_hash(authorization_identity(ticket_id=ticket_id, attempt_number=attempt_number, base_sha=base_sha, repository_identity=repository_identity, target_file=target_file, failure_classification=failure_classification, failure_evidence_identity=failure_evidence_identity, implementation_invocation_id=implementation_invocation_id, operator_id=operator_id, reason=reason))
 
 
 @dataclass(frozen=True)
@@ -357,6 +362,10 @@ CREATE TRIGGER IF NOT EXISTS historical_revalidation_authorizations_immutable_up
 BEFORE UPDATE ON historical_revalidation_authorizations BEGIN SELECT RAISE(ABORT, 'historical revalidation authorizations are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS historical_revalidation_authorizations_immutable_delete
 BEFORE DELETE ON historical_revalidation_authorizations BEGIN SELECT RAISE(ABORT, 'historical revalidation authorizations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS historical_revalidation_authorizations_hash_integrity
+BEFORE INSERT ON historical_revalidation_authorizations
+WHEN NEW.authorization_hash IS NULL OR NEW.authorization_hash != canonical_historical_authorization_hash(NEW.ticket_id,NEW.attempt_number,NEW.base_sha,NEW.repository_identity,NEW.target_file,NEW.failure_classification,NEW.failure_evidence_identity,NEW.implementation_invocation_id,NEW.operator_id,NEW.reason)
+BEGIN SELECT RAISE(ABORT, 'historical revalidation authorization hash mismatch'); END;
 """
 
 
@@ -433,6 +442,7 @@ class Ledger:
         self.connection = sqlite3.connect(self.database, isolation_level=None, check_same_thread=False)
         self.connection.create_function("canonical_completion_hash", 5, _sqlite_completion_hash)
         self.connection.create_function("canonical_recheck_hash", 13, _sqlite_recheck_hash)
+        self.connection.create_function("canonical_historical_authorization_hash", 10, _sqlite_historical_authorization_hash)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 5000")
@@ -1016,17 +1026,17 @@ class Ledger:
         return dict(row) if row else None
 
     def create_historical_revalidation_authorization(self, *, ticket_id: str, attempt_number: int, base_sha: str, repository_identity: str, target_file: str, failure_classification: str, failure_evidence_identity: str, implementation_invocation_id: str, operator_id: str, reason: str) -> dict[str, Any]:
-        fields = {"ticket_id": ticket_id, "attempt_number": attempt_number, "base_sha": base_sha, "repository_identity": repository_identity, "target_file": target_file, "failure_classification": failure_classification, "failure_evidence_identity": failure_evidence_identity, "implementation_invocation_id": implementation_invocation_id, "operator_id": operator_id, "reason": reason}
-        authorization_hash = canonical_sha256(fields)
+        fields = authorization_identity(ticket_id=ticket_id, attempt_number=attempt_number, base_sha=base_sha, repository_identity=repository_identity, target_file=target_file, failure_classification=failure_classification, failure_evidence_identity=failure_evidence_identity, implementation_invocation_id=implementation_invocation_id, operator_id=operator_id, reason=reason)
+        authorization_digest = authorization_hash(fields)
         with self._transaction() as conn:
             existing = conn.execute("SELECT * FROM historical_revalidation_authorizations WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
             if existing is not None:
-                if str(existing["authorization_hash"]) != authorization_hash:
+                if str(existing["authorization_hash"]) != authorization_digest:
                     raise ValueError("conflicting historical revalidation authorization")
                 return dict(existing)
             authorization_id = uuid.uuid4().hex
-            conn.execute("INSERT INTO historical_revalidation_authorizations(authorization_id,ticket_id,attempt_number,base_sha,repository_identity,target_file,failure_classification,failure_evidence_identity,implementation_invocation_id,operator_id,reason,authorization_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (authorization_id, ticket_id, attempt_number, base_sha, repository_identity, target_file, failure_classification, failure_evidence_identity, implementation_invocation_id, operator_id, reason, authorization_hash, self._now()))
-            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="historical_revalidation_authorized", actor_id=operator_id, payload={"authorization_id": authorization_id, "attempt_number": attempt_number, "base_sha": base_sha, "target_file": target_file, "failure_classification": failure_classification, "implementation_invocation_id": implementation_invocation_id, "authorization_hash": authorization_hash})
+            conn.execute("INSERT INTO historical_revalidation_authorizations(authorization_id,ticket_id,attempt_number,base_sha,repository_identity,target_file,failure_classification,failure_evidence_identity,implementation_invocation_id,operator_id,reason,authorization_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (authorization_id, ticket_id, attempt_number, base_sha, repository_identity, target_file, failure_classification, failure_evidence_identity, implementation_invocation_id, operator_id, reason, authorization_digest, self._now()))
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="historical_revalidation_authorized", actor_id=operator_id, payload={"authorization_id": authorization_id, "attempt_number": attempt_number, "base_sha": base_sha, "target_file": target_file, "failure_classification": failure_classification, "implementation_invocation_id": implementation_invocation_id, "authorization_hash": authorization_digest})
             return dict(conn.execute("SELECT * FROM historical_revalidation_authorizations WHERE authorization_id=?", (authorization_id,)).fetchone())
 
     def evaluate_ticket_readiness(self, ticket_id: str) -> TicketReadinessResult:

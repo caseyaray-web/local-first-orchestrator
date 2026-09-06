@@ -12,7 +12,7 @@ from typing import Any, Callable
 from .context_packet import ContextPacketBuilder
 from .evidence_hash import canonical_sha256
 from .git_adapter import AttemptWorktree, GitWorktreeAdapter
-from .historical_revalidation import classify_obsolete_validation_failure
+from .historical_revalidation import authorization_hash_from_row, classify_obsolete_validation_failure
 from .ledger import Ledger
 from .local_qwen import LocalQwenAdapter
 from .readiness import validate_ticket
@@ -437,6 +437,15 @@ class LocalFirstController:
         authorization = self.ledger.historical_revalidation_authorization(ticket_id, attempt_number)
         if authorization is None:
             raise PermissionError("historical revalidation authorization is required")
+        stored_hash = authorization.get("authorization_hash")
+        if type(stored_hash) is not str or len(stored_hash) != 64 or any(character not in "0123456789abcdef" for character in stored_hash):
+            raise PermissionError("historical revalidation authorization hash is malformed")
+        try:
+            recomputed_hash = authorization_hash_from_row(authorization)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise PermissionError("historical revalidation authorization hash cannot be recomputed") from exc
+        if stored_hash != recomputed_hash:
+            raise PermissionError("historical revalidation authorization hash mismatch")
         target_file = ticket.allowed_files[0]
         evidence_identity = canonical_sha256({"attempt_number": attempt_number, "passed": False, "compact_evidence": old_payload["compact_evidence"]})
         expected_identity = {"ticket_id": ticket_id, "attempt_number": attempt_number, "base_sha": str(impl["base_sha"]), "repository_identity": str(repo), "target_file": target_file, "failure_classification": obsolete_classification, "failure_evidence_identity": evidence_identity, "implementation_invocation_id": str(invocation["invocation_id"])}
