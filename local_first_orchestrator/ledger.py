@@ -849,17 +849,49 @@ class Ledger:
                 if ticket["state"] != CanonicalState.READY_LOCAL.value:
                     raise ValueError("reconciled ticket state drift requires investigation")
                 return {**dict(existing), "status": "already_reconciled"}
-            if ticket["state"] != CanonicalState.BLOCKED.value: raise ValueError("failed-attempt reconciliation requires blocked ticket")
+            previous_state = str(ticket["state"])
+            if previous_state == CanonicalState.BLOCKED.value:
+                pass
+            elif previous_state == CanonicalState.NEEDS_TRIAGE.value and classification == "validation_failure":
+                # Validation exhaustion is admitted only from a complete, same-attempt
+                # implementation/validation pair.  These checks deliberately use the
+                # durable ledger, not the caller's claimed reason or artifact path.
+                implementation_stage = conn.execute(
+                    "SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='implementation'",
+                    (ticket_id, retired),
+                ).fetchone()
+                implementation_invocation = conn.execute(
+                    "SELECT * FROM model_invocations WHERE ticket_id=? AND attempt_number=? AND stage='implementation' ORDER BY started_at DESC LIMIT 1",
+                    (ticket_id, retired),
+                ).fetchone()
+                validation_stage = conn.execute(
+                    "SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage=?",
+                    (ticket_id, f"validation-{retired}"),
+                ).fetchone()
+                if implementation_stage is None or implementation_stage["status"] != "completed" or implementation_invocation is None or implementation_invocation["status"] != "completed":
+                    raise ValueError("validation-failure reconciliation requires completed implementation")
+                if validation_stage is None or str(validation_stage["detail"]).strip().startswith("validation passed"):
+                    raise ValueError("validation-failure reconciliation requires failed validation")
+                if conn.execute("SELECT 1 FROM review_candidates WHERE ticket_id=?", (ticket_id,)).fetchone():
+                    raise ValueError("validation-failure reconciliation cannot retire a ticket with review candidate")
+                if conn.execute("SELECT 1 FROM review_results WHERE ticket_id=?", (ticket_id,)).fetchone() or conn.execute("SELECT 1 FROM model_invocations WHERE ticket_id=? AND stage='review'", (ticket_id,)).fetchone():
+                    raise ValueError("validation-failure reconciliation cannot retire after review activity")
+                if conn.execute("SELECT 1 FROM accepted_evidence WHERE ticket_id=?", (ticket_id,)).fetchone() or conn.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND accepted_commit_sha IS NOT NULL", (ticket_id,)).fetchone():
+                    raise ValueError("accepted ticket cannot retire an attempt")
+                if conn.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number>?", (ticket_id, retired)).fetchone():
+                    raise ValueError("validation-failure reconciliation cannot retire an attempt with repair history")
+            else:
+                raise ValueError("failed-attempt reconciliation requires blocked ticket")
             if conn.execute("SELECT 1 FROM accepted_evidence WHERE ticket_id=?", (ticket_id,)).fetchone(): raise ValueError("accepted ticket cannot retire an attempt")
             if conn.execute("SELECT 1 FROM model_invocations WHERE ticket_id=? AND status='started'", (ticket_id,)).fetchone(): raise ValueError("incomplete model invocation requires explicit resolution")
             if attempt["outcome"] not in {None, "failed"}: raise ValueError("attempt is not eligible for failed-attempt reconciliation")
             next_attempt = self.next_attempt_number(ticket_id)
             now = self._now()
             conn.execute("UPDATE attempts SET outcome='failed_retired' WHERE ticket_id=? AND attempt_number=?", (ticket_id, retired))
-            conn.execute("INSERT INTO failed_attempt_reconciliations(ticket_id,retired_attempt_number,classification,previous_ticket_state,resulting_ticket_state,operator_id,runtime_identity_json,retry_base_sha,prospective_next_attempt_number,cleanup_required,forensic_artifact_paths_json,reconciled_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (ticket_id,retired,classification,CanonicalState.BLOCKED.value,CanonicalState.READY_LOCAL.value,operator_id,encoded_identity,retry_base_sha,next_attempt,1,encoded_artifacts,now))
-            conn.execute("UPDATE tickets SET state=?, lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE id=? AND state=?", (CanonicalState.READY_LOCAL.value,now,ticket_id,CanonicalState.BLOCKED.value))
+            conn.execute("INSERT INTO failed_attempt_reconciliations(ticket_id,retired_attempt_number,classification,previous_ticket_state,resulting_ticket_state,operator_id,runtime_identity_json,retry_base_sha,prospective_next_attempt_number,cleanup_required,forensic_artifact_paths_json,reconciled_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (ticket_id,retired,classification,previous_state,CanonicalState.READY_LOCAL.value,operator_id,encoded_identity,retry_base_sha,next_attempt,1,encoded_artifacts,now))
+            conn.execute("UPDATE tickets SET state=?, lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE id=? AND state=?", (CanonicalState.READY_LOCAL.value,now,ticket_id,previous_state))
             reconciliation_event = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="failed_attempt_reconciled", actor_id=operator_id, payload={"retired_attempt":retired,"classification":classification,"next_attempt":next_attempt,"retry_base_sha":retry_base_sha,"cleanup_required":True,"forensic_artifact_paths":json.loads(encoded_artifacts),"runtime_identity":runtime_identity})
-            transition_event = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="state_transition", actor_id=operator_id, from_state=CanonicalState.BLOCKED.value, to_state=CanonicalState.READY_LOCAL.value, payload={"reason":"failed_attempt_reconciled","retired_attempt":retired,"next_attempt":next_attempt,"cleanup_required":True})
+            transition_event = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="state_transition", actor_id=operator_id, from_state=previous_state, to_state=CanonicalState.READY_LOCAL.value, payload={"reason":"failed_attempt_reconciled","retired_attempt":retired,"next_attempt":next_attempt,"cleanup_required":True})
             self._enqueue_projection_bundle_in_transaction(conn, ticket_id=ticket_id, event_id=transition_event, evidence=f"failed attempt {retired} retired; cleanup required before attempt {next_attempt}")
             return {"ticket_id":ticket_id,"retired_attempt_number":retired,"prospective_next_attempt_number":next_attempt,"retry_base_sha":retry_base_sha,"cleanup_required":True,"status":"reconciled","event_id":reconciliation_event}
 

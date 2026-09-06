@@ -30,7 +30,8 @@ class Model:
         if purpose == "implementation":
             assert workdir is not None
             if self.assertion: self.assertion(workdir)
-            (workdir / "app.py").write_text("def value():\n    return 'ok'\n", encoding="utf-8")
+            value = "wrong" if self.mode == "validation_failure" else "ok"
+            (workdir / "app.py").write_text(f"def value():\n    return '{value}'\n", encoding="utf-8")
             if self.mode == "timeout": raise subprocess.TimeoutExpired(("fixture",), 1)
         artifact = artifact_dir / f"{purpose}.json"; artifact.write_text("{}", encoding="utf-8")
         payload = {} if purpose == "implementation" else {"verdict":"pass","criterion_results":[{"criterion_id":"AC-1","status":"pass","evidence":"ok"}],"findings":[],"suggestions":[]}
@@ -64,6 +65,52 @@ class FailedAttemptReconciliationTests(unittest.TestCase):
         return self.git("show-ref","--verify","--hash","refs/local-first/tranches/T/integration-head").stdout.strip()
     def clean_retired_attempt(self, worktree: Path, artifact: Path) -> None:
         self.git("worktree","remove","--force",str(worktree)); self.git("branch","-D","local-first/"+self.ticket+"/attempt-1"); shutil.rmtree(artifact)
+    def fail_validation_attempt(self) -> tuple[Path, Path]:
+        self.assertIsNone(self.controller(Model("validation_failure")).execute_implementation(self.ticket, repository=self.repo))
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (self.ticket,)).fetchone(); assert attempt is not None
+        stage = self.ledger.model_stage(self.ticket, 1, "implementation"); assert stage is not None
+        self.assertEqual(self.ledger.get_ticket(self.ticket)["state"], "needs_triage")
+        self.ledger.pause("operator", reason="validation reconciliation fixture")
+        return Path(attempt["worktree_path"]), Path(stage["response_artifact"])
+    def reconcile_validation(self, artifact: Path, classification: str = "validation_failure") -> dict[str, object]:
+        return self.controller(Model("good")).reconcile_failed_attempt(self.ticket, operator_id="operator", classification=classification, forensic_artifact_paths=(artifact,))
+
+    def test_completed_failed_validation_needs_triage_is_admitted_and_preserves_rejected_history(self) -> None:
+        worktree, artifact = self.fail_validation_attempt()
+        self.assertTrue(worktree.exists()); self.assertTrue(artifact.exists()); self.assertIn("wrong", (worktree / "app.py").read_text(encoding="utf-8"))
+        result = self.reconcile_validation(artifact)
+        self.assertEqual(result["status"], "reconciled")
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (self.ticket,)).fetchone(); assert attempt is not None
+        self.assertEqual(attempt["outcome"], "failed_retired")
+        self.assertEqual(result["prospective_next_attempt_number"], 2)
+        self.assertEqual(self.ledger.attempt_count(self.ticket), 1)
+        self.assertIsNone(self.ledger.review_candidate(self.ticket))
+        self.assertEqual(self.ledger.cleanup_prerequisites()[0]["cleanup_confirmed"], False)
+        self.assertTrue(worktree.exists()); self.assertTrue(artifact.exists())
+
+    def test_needs_triage_without_failed_validation_is_rejected(self) -> None:
+        _, artifact = self.fail_validation_attempt()
+        self.ledger.connection.execute("UPDATE runtime_stages SET detail='validation passed' WHERE ticket_id=? AND stage='validation-1'", (self.ticket,))
+        with self.assertRaisesRegex(ValueError, "failed validation"):
+            self.reconcile_validation(artifact)
+
+    def test_needs_triage_with_frozen_candidate_is_rejected(self) -> None:
+        _, artifact = self.fail_validation_attempt()
+        self.ledger.freeze_review_candidate(self.ticket, 1, candidate_fingerprint="f" * 64, validation_evidence="failed", implementation_invocation_id=None, runtime_identity={})
+        with self.assertRaisesRegex(ValueError, "review candidate"):
+            self.reconcile_validation(artifact)
+
+    def test_needs_triage_after_review_activity_is_rejected(self) -> None:
+        _, artifact = self.fail_validation_attempt()
+        self.ledger.start_model_invocation(invocation_id="review-started", ticket_id=self.ticket, attempt_number=1, stage="review", provider="fixture", model="fixture", packet_hash="a" * 64, worktree_path="/tmp/forensic", timeout_seconds=31)
+        self.ledger.finish_model_invocation("review-started", status="completed", duration_seconds=0.1)
+        with self.assertRaisesRegex(ValueError, "review activity"):
+            self.reconcile_validation(artifact)
+
+    def test_needs_triage_mismatched_classification_is_rejected(self) -> None:
+        _, artifact = self.fail_validation_attempt()
+        with self.assertRaisesRegex(ValueError, "requires blocked ticket"):
+            self.reconcile_validation(artifact, "runtime_infrastructure_failure")
     def test_reconciliation_retires_history_idempotently_without_creating_attempt_two(self) -> None:
         path, artifact=self.fail_attempt_one(); self.assertTrue(path.exists()); self.assertTrue(artifact.exists())
         before=self.integration_head(); result=self.reconcile(artifact); self.assertEqual(result["status"],"reconciled")
