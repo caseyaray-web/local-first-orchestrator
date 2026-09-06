@@ -45,11 +45,13 @@ class F1Model:
 
     def invoke(self, purpose: str, packet: str, *, artifact_dir: Path, workdir: Path | None = None) -> object:
         self.calls.append(purpose)
-        assert workdir is not None
         if purpose == "implementation":
+            assert workdir is not None
             (workdir / F1_FILE).write_text("function run() { return true; }\nfunction incidental() { return true; }\n", encoding="utf-8")
         artifact = artifact_dir / f"{purpose}.json"
         artifact.write_text("{}", encoding="utf-8")
+        if purpose == "review":
+            return type("Result", (), {"payload": {"verdict": "pass", "criterion_results": [{"criterion_id": "AC-1", "status": "pass", "evidence": "fixture review"}], "findings": [], "suggestions": []}, "artifact_path": artifact})()
         return type("Result", (), {"payload": {}, "artifact_path": artifact})()
 
 
@@ -226,6 +228,18 @@ class HistoricalAuthorizationTests(unittest.TestCase):
         self.assertEqual(candidate["historical_provenance_json"], replay["historical_provenance_json"])
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM review_candidates WHERE ticket_id=?", (self.ticket,)).fetchone()[0], 1)
         self.assertEqual(self.model.calls, ["implementation"])
+
+    def test_historical_candidate_uses_ordinary_fresh_review_and_replays_stage(self) -> None:
+        self.create_obsolete_failure(); self.authorize(); self.attest()
+        with self.assertRaisesRegex(RuntimeError, "candidate freeze gate"):
+            self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+        self.controller.freeze_historical_candidate(self.ticket, 1, repository=self.repo)
+        first = self.controller.review_historical_candidate(self.ticket, 1, repository=self.repo)
+        replay = self.controller.review_historical_candidate(self.ticket, 1, repository=self.repo)
+        self.assertEqual(first["classification"], "valid_review_stage_pending_application")
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(self.model.calls, ["implementation", "review"])
+        self.assertIsNone(self.ledger.connection.execute("SELECT * FROM review_results WHERE ticket_id=?", (self.ticket,)).fetchone())
 
     def test_incomplete_claim_fails_closed_before_validator(self) -> None:
         self.create_obsolete_failure(); authorization = self.authorize(); attestation = self.attest()

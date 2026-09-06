@@ -340,6 +340,7 @@ class LocalFirstController:
 
     def authorize_historical_revalidation(self, ticket_id: str, attempt_number: int, *, repository: Path, operator_id: str="local-first-operator", reason: str="operator authorization for historical revalidation") -> dict[str, object]:
         """Authorize one exact historical attempt for a future integrity gate."""
+        allow_existing_review = False
         if type(attempt_number) is not int or attempt_number < 1:
             raise ValueError("attempt number must be a positive integer")
         paused = self.ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
@@ -359,7 +360,7 @@ class LocalFirstController:
             raise ValueError("accepted evidence already exists")
         if self.ledger.incomplete_model_invocations(ticket_id):
             raise ValueError("incomplete model invocation requires explicit resolution")
-        if self.ledger.connection.execute("SELECT 1 FROM review_results WHERE ticket_id=? UNION SELECT 1 FROM model_invocations WHERE ticket_id=? AND stage='review' UNION SELECT 1 FROM model_stage_artifacts WHERE ticket_id=? AND stage='review'", (ticket_id, ticket_id, ticket_id)).fetchone():
+        if self.ledger.connection.execute("SELECT 1 FROM review_results WHERE ticket_id=? UNION SELECT 1 FROM model_invocations WHERE ticket_id=? AND stage='review' UNION SELECT 1 FROM model_stage_artifacts WHERE ticket_id=? AND stage='review'", (ticket_id, ticket_id, ticket_id)).fetchone() and not allow_existing_review:
             raise ValueError("review activity already exists")
         if self.ledger.connection.execute("SELECT 1 FROM events WHERE entity_type='ticket' AND entity_id=? AND to_state=?", (ticket_id, CanonicalState.REPAIRING.value)).fetchone():
             raise ValueError("repair activity already exists")
@@ -391,6 +392,7 @@ class LocalFirstController:
 
     def attest_historical_revalidation_implementation(self, ticket_id: str, attempt_number: int, *, repository: Path, operator_id: str="local-first-operator") -> dict[str, object]:
         """Attest preserved implementation identity only; never validate semantics."""
+        allow_existing_review = False
         if type(attempt_number) is not int or attempt_number < 1:
             raise ValueError("attempt number must be a positive integer")
         paused = self.ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
@@ -408,7 +410,7 @@ class LocalFirstController:
             raise ValueError("candidate or accepted evidence already exists")
         if self.ledger.incomplete_model_invocations(ticket_id):
             raise ValueError("incomplete model invocation requires explicit resolution")
-        if self.ledger.connection.execute("SELECT 1 FROM review_results WHERE ticket_id=? UNION SELECT 1 FROM model_invocations WHERE ticket_id=? AND stage='review' UNION SELECT 1 FROM model_stage_artifacts WHERE ticket_id=? AND stage='review'", (ticket_id, ticket_id, ticket_id)).fetchone():
+        if self.ledger.connection.execute("SELECT 1 FROM review_results WHERE ticket_id=? UNION SELECT 1 FROM model_invocations WHERE ticket_id=? AND stage='review' UNION SELECT 1 FROM model_stage_artifacts WHERE ticket_id=? AND stage='review'", (ticket_id, ticket_id, ticket_id)).fetchone() and not allow_existing_review:
             raise ValueError("review activity already exists")
         if self.ledger.connection.execute("SELECT 1 FROM events WHERE entity_type='ticket' AND entity_id=? AND to_state=?", (ticket_id, CanonicalState.REPAIRING.value)).fetchone():
             raise ValueError("repair activity already exists")
@@ -447,7 +449,7 @@ class LocalFirstController:
         result = self.ledger.create_historical_revalidation_attestation(ticket_id=ticket_id, attempt_number=attempt_number, base_sha=str(impl["base_sha"]), repository_identity=str(repo), implementation_invocation_id=str(invocation["invocation_id"]), implementation_artifact=str(impl["response_artifact"]), implementation_diff_hash=str(impl["diff_hash"]), worktree_path=str(path), worktree_diff_hash=worktree_diff_hash, authorization_hash_value=str(stored_auth_hash), operator_id=operator_id)
         return result
 
-    def revalidate_historical_implementation(self, ticket_id: str, attempt_number: int, *, repository: Path, operator_id: str="local-first-operator", freeze_candidate: bool = False) -> dict[str, object]:
+    def revalidate_historical_implementation(self, ticket_id: str, attempt_number: int, *, repository: Path, operator_id: str="local-first-operator", freeze_candidate: bool = False, allow_existing_review: bool = False) -> dict[str, object]:
         """Revalidate one preserved, rejected implementation without inference."""
         if type(attempt_number) is not int or attempt_number < 1:
             raise ValueError("attempt number must be a positive integer")
@@ -469,7 +471,7 @@ class LocalFirstController:
             raise ValueError("accepted evidence already exists")
         if self.ledger.incomplete_model_invocations(ticket_id):
             raise ValueError("incomplete model invocation requires explicit resolution")
-        if self.ledger.connection.execute("SELECT 1 FROM review_results WHERE ticket_id=? UNION SELECT 1 FROM model_invocations WHERE ticket_id=? AND stage='review' UNION SELECT 1 FROM model_stage_artifacts WHERE ticket_id=? AND stage='review'", (ticket_id, ticket_id, ticket_id)).fetchone():
+        if self.ledger.connection.execute("SELECT 1 FROM review_results WHERE ticket_id=? UNION SELECT 1 FROM model_invocations WHERE ticket_id=? AND stage='review' UNION SELECT 1 FROM model_stage_artifacts WHERE ticket_id=? AND stage='review'", (ticket_id, ticket_id, ticket_id)).fetchone() and not allow_existing_review:
             raise ValueError("review activity already exists")
         if self.ledger.connection.execute("SELECT 1 FROM events WHERE entity_type='ticket' AND entity_id=? AND to_state=?", (ticket_id, CanonicalState.REPAIRING.value)).fetchone():
             raise ValueError("repair activity already exists")
@@ -598,9 +600,65 @@ class LocalFirstController:
             raise RuntimeError("historical current validation failed; explicit handling required")
         raise RuntimeError("historical candidate freeze gate required")
 
-    def freeze_historical_candidate(self, ticket_id: str, attempt_number: int, *, repository: Path, operator_id: str="local-first-operator") -> dict[str, object]:
+    def freeze_historical_candidate(self, ticket_id: str, attempt_number: int, *, repository: Path, operator_id: str="local-first-operator", allow_existing_review: bool = False) -> dict[str, object]:
         """Freeze an exact, already-completed passing historical validation result."""
-        return self.revalidate_historical_implementation(ticket_id, attempt_number, repository=repository, operator_id=operator_id, freeze_candidate=True)
+        return self.revalidate_historical_implementation(ticket_id, attempt_number, repository=repository, operator_id=operator_id, freeze_candidate=True, allow_existing_review=allow_existing_review)
+
+    def review_historical_candidate(self, ticket_id: str, attempt_number: int, *, repository: Path, owner: str="local-first-reviewer") -> dict[str, object]:
+        """Hand an R2d candidate to the ordinary fresh review machinery only."""
+        candidate = self.ledger.review_candidate(ticket_id, attempt_number)
+        if candidate is None:
+            raise RuntimeError("canonical historical candidate is required before fresh review")
+        candidate = self.freeze_historical_candidate(ticket_id, attempt_number, repository=repository, allow_existing_review=True)
+        status = self.ledger.review_reconciliation_status(ticket_id, attempt_number)
+        if status["classification"] == "valid_review_stage_pending_application":
+            return {"ticket_id": ticket_id, "attempt_number": attempt_number, "candidate_fingerprint": str(candidate["candidate_fingerprint"]), "classification": status["classification"], "replayed": True}
+        if status["classification"] in {"review_in_flight", "ambiguous_review_history", "review_retry_exhausted"}:
+            raise RuntimeError("historical candidate review requires explicit reconciliation")
+        if status["classification"] != "no_review_attempt":
+            raise RuntimeError("historical candidate has non-fresh review activity")
+        ticket_row = self.ledger.get_ticket(ticket_id); ticket = ticket_from_ledger(ticket_row)
+        binding = self.ledger.runtime_binding(ticket_id); repo, _, artifact_root = self.config.validate_execution_roots()
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        if attempt is None:
+            raise RuntimeError("historical candidate attempt is missing")
+        path = Path(str(attempt["worktree_path"])).resolve(); base = str(candidate["historical_provenance_json"] and json.loads(str(candidate["historical_provenance_json"])).get("base_sha", ""))
+        if not base or str(repo) != binding["repository_path"]:
+            raise PermissionError("historical candidate repository provenance is invalid")
+        diff = subprocess.run(("git", "diff", base), cwd=path, text=True, capture_output=True, check=True).stdout
+        if hashlib.sha256(diff.encode()).hexdigest() != str(candidate["candidate_fingerprint"]):
+            raise PermissionError("historical candidate fingerprint mismatch")
+        selected_files = {relative: (path / relative).read_text(encoding="utf-8") for relative in (*ticket.allowed_files, *ticket.new_test_files) if (path / relative).is_file()}
+        packet = ReviewPacketBuilder().build(ticket, diff=diff, selected_files=selected_files, validation_evidence=str(candidate["validation_evidence"]))
+        artifacts_root = artifact_root / ticket_id / str(attempt_number); artifacts_root.mkdir(parents=True, exist_ok=True)
+        invocation_id = uuid.uuid4().hex
+        provider = str(getattr(self.local_model, "review_provider", getattr(self.local_model, "provider", type(self.local_model).__name__)))
+        model = str(getattr(self.local_model, "review_model", getattr(self.local_model, "model", type(self.local_model).__name__)))
+        packet_hash = hashlib.sha256(packet.encode()).hexdigest()
+        self.ledger.start_model_invocation(invocation_id=invocation_id, ticket_id=ticket_id, attempt_number=attempt_number, stage="review", provider=provider, model=model, packet_hash=packet_hash, worktree_path=str(path), timeout_seconds=self.config.review_timeout_seconds)
+        started = time.monotonic()
+        try:
+            if hasattr(self.local_model, "review_timeout_seconds"): self.local_model.review_timeout_seconds = self.config.review_timeout_seconds
+            review = LocalReviewAdapter(self.local_model).review(ticket, packet, artifact_dir=artifacts_root)
+        except subprocess.TimeoutExpired as exc:
+            self.ledger.finish_model_invocation(invocation_id, status="timeout", duration_seconds=time.monotonic() - started, error={"type": "TimeoutExpired", "timeout_seconds": self.config.review_timeout_seconds, "process": str(exc)[:1000]})
+            self.ledger.record_review_infrastructure_failure(ticket_id, attempt_number, outcome="review_timeout")
+            raise
+        except ValueError as exc:
+            artifact = str(getattr(exc, "artifact_path", "")) or None
+            self.ledger.finish_model_invocation(invocation_id, status="malformed_output", duration_seconds=time.monotonic() - started, error={"type": type(exc).__name__, "message": str(exc)[:1000]}, model_artifact=artifact)
+            self.ledger.record_review_infrastructure_failure(ticket_id, attempt_number, outcome="review_malformed_output")
+            raise
+        except Exception as exc:
+            self.ledger.finish_model_invocation(invocation_id, status="process_error", duration_seconds=time.monotonic() - started, error={"type": type(exc).__name__, "message": str(exc)[:1000]})
+            self.ledger.record_review_infrastructure_failure(ticket_id, attempt_number, outcome="review_process_error")
+            raise
+        review_path = artifacts_root / "review-result.json"
+        review_path.write_text(json.dumps({"payload": review.raw}, sort_keys=True), encoding="utf-8")
+        self.ledger.finish_model_invocation(invocation_id, status="completed", duration_seconds=time.monotonic() - started, model_artifact=str(review_path))
+        self.ledger.record_model_stage(ticket_id, attempt_number, "review", purpose="review", adapter=type(self.local_model).__name__, request_hash=packet_hash, response_artifact=str(review_path), worktree_path=str(path), base_sha=base, diff_hash=str(candidate["candidate_fingerprint"]))
+        status = self.ledger.review_reconciliation_status(ticket_id, attempt_number)
+        return {"ticket_id": ticket_id, "attempt_number": attempt_number, "candidate_fingerprint": str(candidate["candidate_fingerprint"]), "classification": status["classification"], "replayed": False}
 
     def execute(self, ticket_id: str, *, repository: Path, allow_board_writes: bool, owner: str="local-first-controller") -> bool:
         if not allow_board_writes: return False
