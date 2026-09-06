@@ -32,6 +32,22 @@ class SymbolSelection:
     scope: str = "symbol"
 
 
+def contract_target_scope(ticket: MicroTicket) -> str:
+    """Return the implementation scope authorized by contract fields."""
+    try:
+        relative, _ = ticket.primary_symbol.split("::", 1)
+    except ValueError:
+        return "symbol"
+    language = language_for(relative)
+    if (len(ticket.allowed_files) == 1 and not ticket.new_test_files
+            and relative == ticket.allowed_files[0]
+            and is_test_path(relative)
+            and language is not None
+            and language.name in {"javascript", "typescript"}):
+        return "file"
+    return "symbol"
+
+
 def _python_symbols(path: str, source: str) -> tuple[str, ...]:
     tree = ast.parse(source)
     return tuple(node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
@@ -102,6 +118,12 @@ class SymbolIndex:
                 for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
 
     def select_for_ticket(self, ticket: MicroTicket) -> SymbolSelection:
+        if contract_target_scope(ticket) == "file":
+            relative = ticket.allowed_files[0]
+            try:
+                return SymbolSelection(Symbol(relative, "", self._source(relative)), (), (), (), False, "file")
+            except (OSError, UnicodeError):
+                return SymbolSelection(Symbol("", "", ""), (), (), (), True)
         try:
             relative, name = ticket.primary_symbol.split("::", 1)
         except ValueError:

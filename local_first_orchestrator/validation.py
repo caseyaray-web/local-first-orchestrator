@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .ticket import MicroTicket
 from .source_languages import is_supported_source, is_test_path, normalized_repository_path
-from .symbols import enforce_symbol_scope
+from .symbols import contract_target_scope, enforce_symbol_scope
 
 
 class ValidationError(RuntimeError):
@@ -162,7 +162,10 @@ class DeterministicValidator:
                 errors.append(f"declared new test file existed at base: {path}")
         errors += [f"forbidden file type: {p}" for p in names if p.endswith(self.denied_suffixes)]
         errors += [error for path in names if (error := self._secret_scan_error(worktree, path))]
-        symbol_errors, scope_unverified = enforce_symbol_scope(worktree, names, ticket, base_sha)
+        if contract_target_scope(ticket) == "file":
+            symbol_errors, scope_unverified = (), False
+        else:
+            symbol_errors, scope_unverified = enforce_symbol_scope(worktree, names, ticket, base_sha)
         errors.extend(symbol_errors)
         diff = self._git(worktree, "diff", "--numstat", base_sha, "--")
         changed_lines = sum(int(a) + int(d) for a, d, *_ in (line.split("\t") for line in diff.splitlines() if line))
