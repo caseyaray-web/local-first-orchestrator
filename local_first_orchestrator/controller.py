@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .context_packet import ContextPacketBuilder
+from .evidence_hash import canonical_sha256
 from .git_adapter import AttemptWorktree, GitWorktreeAdapter
 from .historical_revalidation import classify_obsolete_validation_failure
 from .ledger import Ledger
@@ -337,6 +338,57 @@ class LocalFirstController:
         if result is None: return None
         return {"ticket_id":ticket_id,"attempt_number":int(result["attempt_number"]),"candidate_fingerprint":str(result["candidate_fingerprint"]),"implementation_artifact":str(self.ledger.model_stage(ticket_id,int(result["attempt_number"]),"implementation")["response_artifact"]),"state":self.ledger.get_ticket(ticket_id)["state"],"replayed":False}
 
+    def authorize_historical_revalidation(self, ticket_id: str, attempt_number: int, *, repository: Path, operator_id: str="local-first-operator", reason: str="operator authorization for historical revalidation") -> dict[str, object]:
+        """Authorize one exact historical attempt for a future integrity gate."""
+        if type(attempt_number) is not int or attempt_number < 1:
+            raise ValueError("attempt number must be a positive integer")
+        paused = self.ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+        if paused is None or not paused["paused"]:
+            raise PermissionError("historical revalidation authorization requires Local First paused")
+        ticket_row = self.ledger.get_ticket(ticket_id)
+        if ticket_row["state"] != CanonicalState.NEEDS_TRIAGE.value:
+            raise ValueError("historical revalidation authorization requires needs_triage")
+        binding = self.ledger.runtime_binding(ticket_id)
+        repo, _, _ = self.config.validate_execution_roots()
+        if repo != Path(repository).resolve(strict=True) or str(repo) != binding["repository_path"]:
+            raise ValueError("repository mismatch with imported binding")
+        ticket = ticket_from_ledger(ticket_row)
+        if self.ledger.review_candidate(ticket_id) is not None:
+            raise ValueError("review candidate already exists")
+        if self.ledger.accepted_commit(ticket_id):
+            raise ValueError("accepted evidence already exists")
+        if self.ledger.incomplete_model_invocations(ticket_id):
+            raise ValueError("incomplete model invocation requires explicit resolution")
+        if self.ledger.connection.execute("SELECT 1 FROM review_results WHERE ticket_id=? UNION SELECT 1 FROM model_invocations WHERE ticket_id=? AND stage='review' UNION SELECT 1 FROM model_stage_artifacts WHERE ticket_id=? AND stage='review'", (ticket_id, ticket_id, ticket_id)).fetchone():
+            raise ValueError("review activity already exists")
+        if self.ledger.connection.execute("SELECT 1 FROM events WHERE entity_type='ticket' AND entity_id=? AND to_state=?", (ticket_id, CanonicalState.REPAIRING.value)).fetchone():
+            raise ValueError("repair activity already exists")
+        latest = self.ledger.connection.execute("SELECT MAX(attempt_number) AS latest FROM attempts WHERE ticket_id=?", (ticket_id,)).fetchone()["latest"]
+        if latest is None or int(latest) != attempt_number:
+            raise ValueError("selected attempt is not the latest attempt")
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        impl = self.ledger.model_stage(ticket_id, attempt_number, "implementation")
+        invocation = self.ledger.invocation_for_stage(ticket_id, attempt_number, "implementation")
+        if attempt is None or impl is None or invocation is None or invocation["status"] != "completed":
+            raise ValueError("historical attempt lacks completed implementation provenance")
+        old_validation = self.ledger.runtime_stage(ticket_id, f"validation-{attempt_number}")
+        if old_validation is None:
+            raise ValueError("historical attempt lacks deterministic validation failure")
+        try:
+            old_payload = json.loads(str(old_validation["detail"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("historical validation provenance is ambiguous") from exc
+        if old_payload.get("attempt_number") != attempt_number or old_payload.get("passed") is not False:
+            raise ValueError("historical attempt was not rejected by deterministic validation")
+        classification = classify_obsolete_validation_failure(ticket, old_payload)
+        if classification is None:
+            raise ValueError("historical validation failure is not a recognized obsolete controller defect")
+        if str(attempt["base_sha"]) != str(impl["base_sha"]):
+            raise ValueError("implementation base provenance mismatch")
+        target_file = ticket.allowed_files[0]
+        evidence_identity = canonical_sha256({"attempt_number": attempt_number, "passed": False, "compact_evidence": old_payload["compact_evidence"]})
+        return self.ledger.create_historical_revalidation_authorization(ticket_id=ticket_id, attempt_number=attempt_number, base_sha=str(impl["base_sha"]), repository_identity=str(repo), target_file=target_file, failure_classification=classification, failure_evidence_identity=evidence_identity, implementation_invocation_id=str(invocation["invocation_id"]), operator_id=operator_id, reason=reason)
+
     def revalidate_historical_implementation(self, ticket_id: str, attempt_number: int, *, repository: Path, operator_id: str="local-first-operator") -> dict[str, object]:
         """Revalidate one preserved, rejected implementation without inference."""
         if type(attempt_number) is not int or attempt_number < 1:
@@ -352,18 +404,7 @@ class LocalFirstController:
         ticket = ticket_from_ledger(ticket_row)
         candidate = self.ledger.review_candidate(ticket_id)
         if candidate is not None:
-            if int(candidate["attempt_number"]) != attempt_number:
-                raise ValueError("review candidate already exists")
-            stage = self.ledger.model_stage(ticket_id, attempt_number, "implementation")
-            if stage is None or not Path(str(stage["response_artifact"])).is_file():
-                raise RuntimeError("persisted implementation candidate is incomplete")
-            path = Path(str(stage["worktree_path"]))
-            if not path.is_dir():
-                raise RuntimeError("preserved implementation worktree is missing")
-            current = GitWorktreeAdapter(repo, worktree_root).diff_hash(path)
-            if current != stage["diff_hash"] or current != candidate["candidate_fingerprint"]:
-                raise RuntimeError("preserved implementation changed during recovery")
-            return {"ticket_id": ticket_id, "attempt_number": attempt_number, "candidate_fingerprint": current, "state": ticket_row["state"], "replayed": True}
+            raise ValueError("review candidate already exists")
         if ticket_row["state"] != CanonicalState.NEEDS_TRIAGE.value:
             raise ValueError("historical implementation revalidation requires needs_triage")
         if self.ledger.accepted_commit(ticket_id):
@@ -393,38 +434,15 @@ class LocalFirstController:
         obsolete_classification = classify_obsolete_validation_failure(ticket, old_payload)
         if obsolete_classification is None:
             raise ValueError("historical validation failure is not a recognized obsolete controller defect")
-        artifact = Path(str(impl["response_artifact"])).resolve()
-        path = Path(str(attempt["worktree_path"])).resolve()
-        if not artifact.is_file():
-            raise ValueError("implementation artifact is missing")
-        if not path.is_dir():
-            raise ValueError("preserved implementation worktree is missing or ambiguous")
-        if str(impl["worktree_path"]) != str(attempt["worktree_path"]):
-            raise ValueError("implementation artifact/worktree provenance mismatch")
-        if str(attempt["base_sha"]) != str(impl["base_sha"]):
-            raise ValueError("implementation base provenance mismatch")
-        execution_base = self.ledger.runtime_stage(ticket_id, "execution_base")
-        if execution_base is not None and str(execution_base["detail"]) != str(impl["base_sha"]):
-            raise ValueError("attempt base does not match runtime binding")
-        adapter = GitWorktreeAdapter(repo, worktree_root)
-        current_diff_hash = adapter.diff_hash(path)
-        if current_diff_hash != str(impl["diff_hash"]):
-            raise RuntimeError("preserved implementation changed during recovery")
-        if str(attempt["outcome"] or "") not in {"", "validation_failure", "failed"}:
-            raise ValueError("historical attempt outcome is not validation failure")
-        fresh_root = artifact_root / ticket_id / str(attempt_number) / "revalidation"
-        validation = DeterministicValidator(artifact_root=fresh_root).validate(path, ticket, base_sha=str(impl["base_sha"]))
-        validation_path = validation.full_evidence_path.resolve()
-        validation_sha = hashlib.sha256(validation_path.read_bytes()).hexdigest()
-        detail = json.dumps({"attempt_number": attempt_number, "artifact_path": str(validation_path), "artifact_sha256": validation_sha, "completed": True, "passed": validation.passed, "compact_evidence": validation.compact_evidence, "revalidation": True, "obsolete_classification": obsolete_classification}, sort_keys=True)
-        self.ledger.record_runtime_stage(ticket_id, f"validation-revalidation-{attempt_number}", detail, attempt_number=attempt_number, artifact_path=str(validation_path), artifact_sha256=validation_sha, base_sha=str(impl["base_sha"]))
-        if not validation.passed:
-            return {"ticket_id": ticket_id, "attempt_number": attempt_number, "state": self.ledger.get_ticket(ticket_id)["state"], "validation": validation.compact_evidence, "fresh_validation_artifact": str(validation_path), "replayed": False}
-        diff = subprocess.run(("git", "diff", str(impl["base_sha"]), "--"), cwd=path, text=True, capture_output=True, check=True).stdout
-        fingerprint = hashlib.sha256(diff.encode()).hexdigest()
-        self.ledger.freeze_review_candidate(ticket_id, attempt_number, candidate_fingerprint=fingerprint, validation_evidence=validation.compact_evidence, implementation_invocation_id=str(invocation["invocation_id"]), runtime_identity={**self.effective_runtime_identity(), "revalidation": True})
-        self.ledger.transition(ticket_id, CanonicalState.LOCAL_REVIEW, actor_id=operator_id, payload={"attempt_number": attempt_number, "revalidated": True, "validation_artifact": str(validation_path)})
-        return {"ticket_id": ticket_id, "attempt_number": attempt_number, "candidate_fingerprint": fingerprint, "state": self.ledger.get_ticket(ticket_id)["state"], "fresh_validation_artifact": str(validation_path), "replayed": False}
+        authorization = self.ledger.historical_revalidation_authorization(ticket_id, attempt_number)
+        if authorization is None:
+            raise PermissionError("historical revalidation authorization is required")
+        target_file = ticket.allowed_files[0]
+        evidence_identity = canonical_sha256({"attempt_number": attempt_number, "passed": False, "compact_evidence": old_payload["compact_evidence"]})
+        expected_identity = {"ticket_id": ticket_id, "attempt_number": attempt_number, "base_sha": str(impl["base_sha"]), "repository_identity": str(repo), "target_file": target_file, "failure_classification": obsolete_classification, "failure_evidence_identity": evidence_identity, "implementation_invocation_id": str(invocation["invocation_id"])}
+        if any(str(authorization[key]) != str(value) for key, value in expected_identity.items()):
+            raise PermissionError("historical revalidation authorization identity mismatch")
+        raise RuntimeError("implementation-integrity attestation required before historical revalidation")
 
     def execute(self, ticket_id: str, *, repository: Path, allow_board_writes: bool, owner: str="local-first-controller") -> bool:
         if not allow_board_writes: return False

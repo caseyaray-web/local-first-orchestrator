@@ -337,6 +337,26 @@ CREATE TRIGGER IF NOT EXISTS events_immutable_update
 BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'events are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS events_immutable_delete
 BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'events are immutable'); END;
+CREATE TABLE IF NOT EXISTS historical_revalidation_authorizations (
+    authorization_id TEXT PRIMARY KEY,
+    ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    attempt_number INTEGER NOT NULL,
+    base_sha TEXT NOT NULL,
+    repository_identity TEXT NOT NULL,
+    target_file TEXT NOT NULL,
+    failure_classification TEXT NOT NULL,
+    failure_evidence_identity TEXT NOT NULL,
+    implementation_invocation_id TEXT NOT NULL,
+    operator_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    authorization_hash TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL,
+    UNIQUE(ticket_id, attempt_number)
+);
+CREATE TRIGGER IF NOT EXISTS historical_revalidation_authorizations_immutable_update
+BEFORE UPDATE ON historical_revalidation_authorizations BEGIN SELECT RAISE(ABORT, 'historical revalidation authorizations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS historical_revalidation_authorizations_immutable_delete
+BEFORE DELETE ON historical_revalidation_authorizations BEGIN SELECT RAISE(ABORT, 'historical revalidation authorizations are append-only'); END;
 """
 
 
@@ -990,6 +1010,24 @@ class Ledger:
         row = self.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
         if row is None: raise KeyError(f"no runtime binding for {ticket_id}")
         return dict(row)
+
+    def historical_revalidation_authorization(self, ticket_id: str, attempt_number: int) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM historical_revalidation_authorizations WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        return dict(row) if row else None
+
+    def create_historical_revalidation_authorization(self, *, ticket_id: str, attempt_number: int, base_sha: str, repository_identity: str, target_file: str, failure_classification: str, failure_evidence_identity: str, implementation_invocation_id: str, operator_id: str, reason: str) -> dict[str, Any]:
+        fields = {"ticket_id": ticket_id, "attempt_number": attempt_number, "base_sha": base_sha, "repository_identity": repository_identity, "target_file": target_file, "failure_classification": failure_classification, "failure_evidence_identity": failure_evidence_identity, "implementation_invocation_id": implementation_invocation_id, "operator_id": operator_id, "reason": reason}
+        authorization_hash = canonical_sha256(fields)
+        with self._transaction() as conn:
+            existing = conn.execute("SELECT * FROM historical_revalidation_authorizations WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            if existing is not None:
+                if str(existing["authorization_hash"]) != authorization_hash:
+                    raise ValueError("conflicting historical revalidation authorization")
+                return dict(existing)
+            authorization_id = uuid.uuid4().hex
+            conn.execute("INSERT INTO historical_revalidation_authorizations(authorization_id,ticket_id,attempt_number,base_sha,repository_identity,target_file,failure_classification,failure_evidence_identity,implementation_invocation_id,operator_id,reason,authorization_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (authorization_id, ticket_id, attempt_number, base_sha, repository_identity, target_file, failure_classification, failure_evidence_identity, implementation_invocation_id, operator_id, reason, authorization_hash, self._now()))
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="historical_revalidation_authorized", actor_id=operator_id, payload={"authorization_id": authorization_id, "attempt_number": attempt_number, "base_sha": base_sha, "target_file": target_file, "failure_classification": failure_classification, "implementation_invocation_id": implementation_invocation_id, "authorization_hash": authorization_hash})
+            return dict(conn.execute("SELECT * FROM historical_revalidation_authorizations WHERE authorization_id=?", (authorization_id,)).fetchone())
 
     def evaluate_ticket_readiness(self, ticket_id: str) -> TicketReadinessResult:
         row = self.connection.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()

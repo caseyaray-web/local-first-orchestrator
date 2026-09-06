@@ -39,6 +39,12 @@ class RevalidateImplementationAction(BaseModel):
     reason: str = Field(default="operator revalidate existing implementation", max_length=240)
 
 
+class AuthorizeHistoricalRevalidationAction(BaseModel):
+    ticket_id: str = Field(min_length=1, max_length=240)
+    attempt_number: int = Field(ge=1)
+    reason: str = Field(default="operator authorization for historical revalidation", max_length=240)
+
+
 class _OperatorBoard:
     is_fake = False
 
@@ -131,6 +137,21 @@ def implementation_revalidate(action: RevalidateImplementationAction) -> dict[st
         runtime = config.runtime_config()
         return LocalFirstController(ledger, _OperatorBoard(), runtime).revalidate_historical_implementation(
             action.ticket_id, action.attempt_number, repository=config.canonical_repository, operator_id="dashboard-operator")
+    except (OSError, ValueError, RuntimeError, PermissionError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        ledger.close()
+
+
+@router.post("/implementation-revalidation-authorize")
+def implementation_revalidation_authorize(action: AuthorizeHistoricalRevalidationAction) -> dict[str, Any]:
+    """Authorize one exact historical implementation for a future integrity gate."""
+    ledger, config = _ledger()
+    try:
+        runtime = config.runtime_config()
+        return LocalFirstController(ledger, _OperatorBoard(), runtime).authorize_historical_revalidation(
+            action.ticket_id, action.attempt_number, repository=config.canonical_repository,
+            operator_id="dashboard-operator", reason=action.reason)
     except (OSError, ValueError, RuntimeError, PermissionError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     finally:

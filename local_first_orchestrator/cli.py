@@ -210,6 +210,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     implementation.add_argument("--task-id",required=True)
     revalidate=commands.add_parser("revalidate-implementation", help="revalidate an existing implementation; never retry implementation or review")
     revalidate.add_argument("--task-id", required=True); revalidate.add_argument("--attempt-number", required=True, type=int); revalidate.add_argument("--operator-id", default="local-first-cli")
+    authorize_revalidate=commands.add_parser("authorize-historical-revalidation", help="authorize one exact historical implementation for a future integrity gate; does not revalidate")
+    authorize_revalidate.add_argument("--task-id", required=True); authorize_revalidate.add_argument("--attempt-number", required=True, type=int); authorize_revalidate.add_argument("--operator-id", default="local-first-cli"); authorize_revalidate.add_argument("--reason", default="operator authorization for historical revalidation")
     inspect=commands.add_parser("inspect"); inspect.add_argument("--task-id",required=True)
     generated=commands.add_parser("project-generated"); generated.add_argument("--allow-board-writes",action="store_true")
     activate=commands.add_parser("activate-generated"); activate.add_argument("ticket_id")
@@ -270,6 +272,10 @@ def run_command(args: argparse.Namespace) -> int:
             if args.ad_hoc_runtime: raise ValueError("implementation revalidation requires registered operator runtime")
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
             print(json.dumps(ctl.revalidate_historical_implementation(args.task_id,args.attempt_number,repository=registered.canonical_repository,operator_id=args.operator_id),sort_keys=True))
+        elif args.command=="authorize-historical-revalidation":
+            if args.ad_hoc_runtime: raise ValueError("historical revalidation authorization requires registered operator runtime")
+            ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
+            print(json.dumps(ctl.authorize_historical_revalidation(args.task_id,args.attempt_number,repository=registered.canonical_repository,operator_id=args.operator_id,reason=args.reason),sort_keys=True))
         elif args.command=="inspect": print(json.dumps(ledger.get_ticket(args.task_id),sort_keys=True))
         elif args.command=="register-dashboard":
             root=Path(args.repository).resolve(strict=True)
