@@ -533,10 +533,19 @@ class LocalFirstController:
         try:
             live_top_level = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
             live_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            live_branch = subprocess.run(("git", "branch", "--show-current"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            registered_worktrees = subprocess.run(("git", "worktree", "list", "--porcelain"), cwd=repo, text=True, capture_output=True, check=True, timeout=15).stdout
             live_diff_hash = GitWorktreeAdapter(repo, worktree_root).diff_hash(expected_path)
         except (OSError, subprocess.SubprocessError) as exc:
             raise PermissionError("historical implementation live worktree inspection failed") from exc
-        if live_top_level != str(expected_path) or live_head != str(impl["base_sha"]):
+        expected_branch = f"local-first/{ticket_id}/attempt-{attempt_number}"
+        registered = False
+        for block in registered_worktrees.split("\n\n"):
+            lines = block.splitlines()
+            if lines and lines[0] == f"worktree {expected_path}":
+                registered = (f"HEAD {live_head}" in lines and f"branch refs/heads/{expected_branch}" in lines)
+                break
+        if live_top_level != str(expected_path) or live_head != str(impl["base_sha"]) or live_branch != expected_branch or not registered:
             raise PermissionError("historical implementation live worktree identity mismatch")
         if live_diff_hash != str(attestation["worktree_diff_hash"]):
             raise PermissionError("historical implementation live worktree diff mismatch")

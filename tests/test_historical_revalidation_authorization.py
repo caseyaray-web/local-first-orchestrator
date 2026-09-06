@@ -181,6 +181,17 @@ class HistoricalAuthorizationTests(unittest.TestCase):
         finally:
             replacement.rename(path)
 
+    def test_consumer_rejects_detached_live_attempt_branch(self) -> None:
+        self.create_obsolete_failure(); self.authorize(); self.attest()
+        attempt = self.ledger.connection.execute("SELECT worktree_path FROM attempts WHERE ticket_id=? AND attempt_number=1", (self.ticket,)).fetchone(); assert attempt is not None
+        path = Path(attempt["worktree_path"])
+        subprocess.run(("git", "checkout", "--detach"), cwd=path, check=True, capture_output=True, text=True)
+        try:
+            with self.assertRaisesRegex(PermissionError, "live worktree identity"):
+                self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+        finally:
+            subprocess.run(("git", "symbolic-ref", "HEAD", f"refs/heads/local-first/{self.ticket}/attempt-1"), cwd=path, check=True, capture_output=True, text=True)
+
     def test_consumer_rejects_corrupt_attestation_hash_fixture(self) -> None:
         self.create_obsolete_failure(); self.authorize(); attestation = self.attest(); corrupt = dict(attestation); corrupt["attestation_hash"] = "0" * 64
         with mock.patch.object(self.ledger, "historical_revalidation_attestation", return_value=corrupt):
