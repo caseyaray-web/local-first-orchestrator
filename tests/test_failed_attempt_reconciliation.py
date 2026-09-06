@@ -119,6 +119,33 @@ class FailedAttemptReconciliationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "structured validation"):
             self.reconcile_validation(artifact)
 
+    def test_structured_numeric_boolean_fields_fail_closed(self) -> None:
+        _, artifact = self.fail_validation_attempt(); _, validation_artifact = self.validation_record()
+        payload = json.loads(validation_artifact.read_text(encoding="utf-8")); command = payload["commands"][0] if payload["commands"] else None
+        cases = [("changed_lines", True), ("changed_lines", False)]
+        if command is not None:
+            cases.extend([("returncode", True), ("returncode", False), ("duration_seconds", True), ("duration_seconds", False)])
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                target = payload if field == "changed_lines" else command
+                assert target is not None
+                original = target[field]
+                target[field] = value
+                validation_artifact.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "structured validation"):
+                    self.reconcile_validation(artifact)
+                target[field] = original
+        validation_artifact.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    def test_structured_numeric_values_remain_admissible(self) -> None:
+        _, artifact = self.fail_validation_attempt(); _, validation_artifact = self.validation_record()
+        payload = json.loads(validation_artifact.read_text(encoding="utf-8")); payload["changed_lines"] = int(payload["changed_lines"])
+        if payload["commands"]:
+            payload["commands"][0]["returncode"] = int(payload["commands"][0]["returncode"])
+            payload["commands"][0]["duration_seconds"] = float(payload["commands"][0]["duration_seconds"])
+        validation_artifact.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        self.assertEqual(self.reconcile_validation(artifact)["status"], "reconciled")
+
     def test_validation_evidence_from_another_attempt_is_rejected(self) -> None:
         _, artifact = self.fail_validation_attempt(); record, _ = self.validation_record(); record["attempt_number"] = 2
         self.ledger.connection.execute("UPDATE runtime_stages SET detail=? WHERE ticket_id=? AND stage='validation-1'", (json.dumps(record, sort_keys=True), self.ticket))

@@ -18,6 +18,33 @@ from .evidence_hash import canonical_sha256
 from .ticket import MicroTicket
 
 
+def _is_json_int(value: object) -> bool:
+    return type(value) is int
+
+
+def _is_json_number(value: object) -> bool:
+    return type(value) in (int, float)
+
+
+def _is_string_list(value: object) -> bool:
+    return isinstance(value, list) and all(type(item) is str for item in value)
+
+
+def _is_command_list(value: object) -> bool:
+    if not isinstance(value, list):
+        return False
+    for command in value:
+        if type(command) is not dict:
+            return False
+        if not isinstance(command.get("argv"), list) or not all(type(argument) is str for argument in command["argv"]):
+            return False
+        if not _is_json_int(command.get("returncode")) or not _is_json_number(command.get("duration_seconds")):
+            return False
+        if type(command.get("stdout_summary")) is not str or type(command.get("stderr_summary")) is not str or type(command.get("truncated")) is not bool:
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class TicketReadinessResult:
     status: str
@@ -881,33 +908,25 @@ class Ledger:
                     errors = artifact["errors"]
                     if (
                         not isinstance(record, dict)
+                        or not _is_json_int(record.get("attempt_number"))
                         or record.get("attempt_number") != retired
                         or record.get("completed") is not True
                         or record.get("passed") is not False
+                        or type(record.get("completed")) is not bool
+                        or type(record.get("passed")) is not bool
                         or not isinstance(record.get("compact_evidence"), str)
                         or record["compact_evidence"].strip().startswith("validation passed")
                         or artifact_path != expected_path
                         or not artifact_path.is_file()
                         or not isinstance(artifact, dict)
                         or artifact.get("base_sha") != implementation_stage["base_sha"]
-                        or not isinstance(artifact.get("changed_files"), list)
-                        or not isinstance(artifact.get("changed_lines"), int)
-                        or not isinstance(artifact.get("scope_unverified"), bool)
+                        or not _is_string_list(artifact.get("changed_files"))
+                        or not _is_json_int(artifact.get("changed_lines"))
+                        or type(artifact.get("scope_unverified")) is not bool
                         or not isinstance(errors, list)
                         or not errors
                         or not all(isinstance(error, str) and error.strip() for error in errors)
-                        or not isinstance(artifact.get("commands"), list)
-                        or not all(
-                            isinstance(command, dict)
-                            and isinstance(command.get("argv"), list)
-                            and all(isinstance(argument, str) for argument in command["argv"])
-                            and isinstance(command.get("returncode"), int)
-                            and isinstance(command.get("duration_seconds"), (int, float))
-                            and isinstance(command.get("stdout_summary"), str)
-                            and isinstance(command.get("stderr_summary"), str)
-                            and isinstance(command.get("truncated"), bool)
-                            for command in artifact["commands"]
-                        )
+                        or not _is_command_list(artifact.get("commands"))
                     ):
                         raise ValueError("invalid structured validation failure evidence")
                 except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
