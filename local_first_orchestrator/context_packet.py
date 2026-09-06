@@ -80,9 +80,12 @@ class ContextPacketBuilder:
             failure_evidence=failure_evidence,
         )
         packet.manifest["scope_verification"] = "verified"
+        packet.manifest["target_scope"] = selection.scope
+        if selection.scope == "file":
+            packet.manifest["primary_file"] = selection.primary.path
         for section in packet.manifest["sections"]:
             if section["kind"] == "source_file":
-                section["kind"] = "source_symbol"
+                section["kind"] = "source_file" if selection.scope == "file" else "source_symbol"
         return packet
 
     def write_artifacts(self, packet: ContextPacket, *, artifact_root: Path) -> ContextPacketArtifacts:

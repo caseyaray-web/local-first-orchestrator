@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import cast
 
-from local_first_orchestrator.context_packet import ContextPacketBuilder
+from local_first_orchestrator.context_packet import ContextBudgetError, ContextPacketBuilder
 from local_first_orchestrator.metrics import AdaptiveSizingPolicy, MetricsCollector, TicketOutcome
 from local_first_orchestrator.symbols import SymbolIndex
 from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
@@ -80,6 +82,35 @@ class Phase6Tests(unittest.TestCase):
         )
         self.assertTrue(unknown.scope_unverified)
         self.assertIn("scope_unverified", unknown.compact_evidence)
+
+    def test_file_scoped_f1_shape_builds_deterministic_packet_without_inventing_symbol(self) -> None:
+        path = self.repo / "scripts" / "test-meal-planner-c0910-ui.mjs"; path.parent.mkdir()
+        content = "// AUTHED expectation\nfunction makeFetchCapture() { return {}; }\n"
+        path.write_text(content, encoding="utf-8")
+        ticket = MicroTicket(**{**self.ticket.__dict__, "primary_symbol": "scripts/test-meal-planner-c0910-ui.mjs::fakeFetch", "allowed_files": ("scripts/test-meal-planner-c0910-ui.mjs",)})
+        builder = ContextPacketBuilder(target_tokens=500, max_tokens=600)
+        first = builder.build_from_repository(ticket, self.repo, repository_rules="Edit only this test file.")
+        second = builder.build_from_repository(ticket, self.repo, repository_rules="Edit only this test file.")
+        self.assertEqual(first.manifest, second.manifest); self.assertEqual(first.text, second.text)
+        self.assertEqual(first.manifest["target_scope"], "file")
+        self.assertEqual(first.manifest["primary_file"], "scripts/test-meal-planner-c0910-ui.mjs")
+        self.assertIn(content, first.text)
+        sections = cast(list[dict[str, object]], first.manifest["sections"])
+        self.assertNotIn("source_symbol", {section["kind"] for section in sections})
+        self.assertEqual(hashlib.sha256(first.text.encode()).hexdigest(), hashlib.sha256(second.text.encode()).hexdigest())
+
+    def test_file_scope_fails_closed_for_ambiguous_missing_unsupported_and_oversized_targets(self) -> None:
+        path = self.repo / "scripts" / "test-meal-planner-c0910-ui.mjs"; path.parent.mkdir(); path.write_text("function makeFetchCapture() {}\n", encoding="utf-8")
+        file_ticket = MicroTicket(**{**self.ticket.__dict__, "primary_symbol": "scripts/test-meal-planner-c0910-ui.mjs::fakeFetch", "allowed_files": ("scripts/test-meal-planner-c0910-ui.mjs",)})
+        with self.assertRaises(ContextBudgetError):
+            ContextPacketBuilder().build_from_repository(MicroTicket(**{**file_ticket.__dict__, "allowed_files": ("scripts/test-meal-planner-c0910-ui.mjs", "test_app.py")}), self.repo, repository_rules="rules")
+        with self.assertRaises(ContextBudgetError):
+            ContextPacketBuilder().build_from_repository(file_ticket, self.repo / "missing", repository_rules="rules")
+        unsupported = MicroTicket(**{**file_ticket.__dict__, "primary_symbol": "notes.txt::unknown", "allowed_files": ("notes.txt",)})
+        (self.repo / "notes.txt").write_text("notes", encoding="utf-8")
+        with self.assertRaises(ContextBudgetError): ContextPacketBuilder().build_from_repository(unsupported, self.repo, repository_rules="rules")
+        path.write_text("x" * 20000, encoding="utf-8")
+        with self.assertRaises(ContextBudgetError): ContextPacketBuilder(target_tokens=1, max_tokens=10).build_from_repository(file_ticket, self.repo, repository_rules="rules")
 
     def test_metrics_report_and_conservative_sizing_policy(self) -> None:
         outcomes = [TicketOutcome("T1", attempts=1, accepted=True, reverted=False, context_tokens=1000, changed_symbols=1)] * 18

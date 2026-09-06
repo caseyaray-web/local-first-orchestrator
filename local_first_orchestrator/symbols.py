@@ -29,6 +29,7 @@ class SymbolSelection:
     callers: tuple[Symbol, ...]
     tests: tuple[Symbol, ...]
     scope_unverified: bool = False
+    scope: str = "symbol"
 
 
 def _python_symbols(path: str, source: str) -> tuple[str, ...]:
@@ -103,6 +104,9 @@ class SymbolIndex:
     def select_for_ticket(self, ticket: MicroTicket) -> SymbolSelection:
         try:
             relative, name = ticket.primary_symbol.split("::", 1)
+        except ValueError:
+            relative, name = "", ""
+        try:
             definitions = self._definitions(relative, self._source(relative))
             primary = definitions[name]
             language = language_for(relative)
@@ -128,6 +132,16 @@ class SymbolIndex:
                     (tests if is_test_path(path) else callers).append(candidate)
             return SymbolSelection(primary, dependencies, tuple(callers), tuple(tests))
         except (OSError, SyntaxError, KeyError, ValueError):
+            language = language_for(relative)
+            if (len(ticket.allowed_files) == 1 and not ticket.new_test_files
+                    and relative == ticket.allowed_files[0]
+                    and is_test_path(relative)
+                    and language is not None
+                    and language.name == "javascript"):
+                try:
+                    return SymbolSelection(Symbol(relative, "", self._source(relative)), (), (), (), False, "file")
+                except (OSError, UnicodeError):
+                    pass
             return SymbolSelection(Symbol("", "", ""), (), (), (), True)
 
 
