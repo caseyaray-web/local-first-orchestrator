@@ -289,8 +289,10 @@ class LocalFirstController:
                     artifacts_root=artifact_root/ticket_id/str(attempt_number)
                 self.ledger.transition(ticket_id,CanonicalState.VERIFYING) if CanonicalState(self.ledger.get_ticket(ticket_id)["state"]) == CanonicalState.IMPLEMENTING else None
                 validation=DeterministicValidator(artifact_root=artifacts_root).validate(attempt.path,ticket,base_sha=base)
-                validation_record=(json.dumps({"attempt_number":attempt_number,"artifact_path":str(validation.full_evidence_path),"completed":True,"passed":validation.passed,"compact_evidence":validation.compact_evidence},sort_keys=True) if not validation.passed else validation.compact_evidence)
-                self.ledger.record_runtime_stage(ticket_id,f"validation-{attempt_number}",validation_record); self.ledger.record_runtime_stage(ticket_id,"validation_completed",validation_record); self._crash("validation_completed")
+                validation_artifact_path=validation.full_evidence_path.resolve(); validation_artifact_sha256=hashlib.sha256(validation_artifact_path.read_bytes()).hexdigest()
+                validation_record=(json.dumps({"attempt_number":attempt_number,"artifact_path":str(validation_artifact_path),"artifact_sha256":validation_artifact_sha256,"completed":True,"passed":validation.passed,"compact_evidence":validation.compact_evidence},sort_keys=True) if not validation.passed else validation.compact_evidence)
+                validation_metadata={"attempt_number":attempt_number,"artifact_path":str(validation_artifact_path),"artifact_sha256":validation_artifact_sha256,"base_sha":base}
+                self.ledger.record_runtime_stage(ticket_id,f"validation-{attempt_number}",validation_record,**validation_metadata); self.ledger.record_runtime_stage(ticket_id,"validation_completed",validation_record,**validation_metadata); self._crash("validation_completed")
                 if not validation.passed:
                     if not allow_validation_repair or attempt_number >= ticket.max_attempts:
                         self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"validation":validation.compact_evidence}); return None

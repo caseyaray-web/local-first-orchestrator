@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import subprocess
 import time
@@ -233,6 +234,7 @@ CREATE TABLE IF NOT EXISTS runtime_bindings (
 );
 CREATE TABLE IF NOT EXISTS runtime_stages (
     ticket_id TEXT NOT NULL REFERENCES tickets(id), stage TEXT NOT NULL, detail TEXT NOT NULL,
+    attempt_number INTEGER, artifact_path TEXT, artifact_sha256 TEXT, base_sha TEXT,
     created_at INTEGER NOT NULL, PRIMARY KEY(ticket_id, stage)
 );
 CREATE TABLE IF NOT EXISTS model_stage_artifacts (
@@ -425,6 +427,10 @@ class Ledger:
         binding_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(runtime_bindings)")}
         if "canonical_sha" not in binding_columns:
             self.connection.execute("ALTER TABLE runtime_bindings ADD COLUMN canonical_sha TEXT")
+        runtime_stage_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(runtime_stages)")}
+        for column, definition in (("attempt_number", "INTEGER"), ("artifact_path", "TEXT"), ("artifact_sha256", "TEXT"), ("base_sha", "TEXT")):
+            if column not in runtime_stage_columns:
+                self.connection.execute(f"ALTER TABLE runtime_stages ADD COLUMN {column} {definition}")
         recheck_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(tranche_completion_rechecks)")}
         if "evidence_hash" not in recheck_columns:
             self.connection.execute("ALTER TABLE tranche_completion_rechecks ADD COLUMN evidence_hash TEXT")
@@ -892,32 +898,36 @@ class Ledger:
                     (ticket_id, retired),
                 ).fetchone()
                 validation_stage = conn.execute(
-                    "SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage=?",
+                    "SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?",
                     (ticket_id, f"validation-{retired}"),
                 ).fetchone()
                 if implementation_stage is None or implementation_stage["status"] != "completed" or implementation_invocation is None or implementation_invocation["status"] != "completed":
                     raise ValueError("validation-failure reconciliation requires completed implementation")
                 try:
-                    record = json.loads(str(validation_stage["detail"])) if validation_stage is not None else None
-                    if not isinstance(record, dict):
-                        raise ValueError("validation record is not an object")
-                    artifact_path = Path(str(record["artifact_path"]))
+                    if validation_stage is None or validation_stage["attempt_number"] != retired or validation_stage["base_sha"] != implementation_stage["base_sha"] or not isinstance(validation_stage["artifact_path"], str) or not isinstance(validation_stage["artifact_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", validation_stage["artifact_sha256"]):
+                        raise ValueError("missing or mismatched durable validation artifact binding")
+                    artifact_path = Path(validation_stage["artifact_path"])
                     expected_name = f"validation-{hashlib.sha256((str(implementation_stage['worktree_path']) + str(implementation_stage['base_sha'])).encode()).hexdigest()[:12]}.json"
                     expected_path = Path(str(implementation_stage["response_artifact"])).parent / expected_name
-                    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+                    artifact_bytes = artifact_path.read_bytes()
+                    if artifact_path != expected_path or hashlib.sha256(artifact_bytes).hexdigest() != validation_stage["artifact_sha256"]:
+                        raise ValueError("validation artifact integrity binding mismatch")
+                    record = json.loads(str(validation_stage["detail"]))
+                    if not isinstance(record, dict):
+                        raise ValueError("validation record is not an object")
+                    artifact = json.loads(artifact_bytes.decode("utf-8"))
                     errors = artifact["errors"]
                     if (
-                        not isinstance(record, dict)
+                        record.get("attempt_number") != retired
+                        or record.get("artifact_path") != str(artifact_path)
+                        or record.get("artifact_sha256") != validation_stage["artifact_sha256"]
                         or not _is_json_int(record.get("attempt_number"))
-                        or record.get("attempt_number") != retired
                         or record.get("completed") is not True
                         or record.get("passed") is not False
                         or type(record.get("completed")) is not bool
                         or type(record.get("passed")) is not bool
                         or not isinstance(record.get("compact_evidence"), str)
                         or record["compact_evidence"].strip().startswith("validation passed")
-                        or artifact_path != expected_path
-                        or not artifact_path.is_file()
                         or not isinstance(artifact, dict)
                         or artifact.get("base_sha") != implementation_stage["base_sha"]
                         or not _is_string_list(artifact.get("changed_files"))
@@ -1015,9 +1025,9 @@ class Ledger:
         self.transition(ticket_id, CanonicalState.READY_LOCAL, actor_id="readiness", payload={"reason":"dependencies_satisfied"})
         return TicketReadinessResult("ready")
 
-    def record_runtime_stage(self, ticket_id: str, stage: str, detail: str) -> bool:
+    def record_runtime_stage(self, ticket_id: str, stage: str, detail: str, *, attempt_number: int | None = None, artifact_path: str | None = None, artifact_sha256: str | None = None, base_sha: str | None = None) -> bool:
         with self._transaction() as conn:
-            try: conn.execute("INSERT INTO runtime_stages(ticket_id, stage, detail, created_at) VALUES (?, ?, ?, ?)", (ticket_id, stage, detail, self._now()))
+            try: conn.execute("INSERT INTO runtime_stages(ticket_id, stage, detail, attempt_number, artifact_path, artifact_sha256, base_sha, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (ticket_id, stage, detail, attempt_number, artifact_path, artifact_sha256, base_sha, self._now()))
             except sqlite3.IntegrityError: return False
             return True
 
