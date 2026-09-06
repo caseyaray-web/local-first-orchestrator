@@ -270,6 +270,7 @@ CREATE TABLE IF NOT EXISTS model_invocations (
 );
 CREATE INDEX IF NOT EXISTS idx_model_invocations_incomplete ON model_invocations(status, ticket_id);
 CREATE INDEX IF NOT EXISTS idx_model_invocations_attempt_stage ON model_invocations(ticket_id, attempt_number, stage, started_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_model_invocations_one_started_review ON model_invocations(ticket_id, attempt_number, stage) WHERE stage='review' AND status='started';
 CREATE TABLE IF NOT EXISTS review_candidates (
     ticket_id TEXT NOT NULL REFERENCES tickets(id), attempt_number INTEGER NOT NULL,
     candidate_fingerprint TEXT NOT NULL, validation_evidence TEXT NOT NULL,
@@ -611,7 +612,7 @@ class Ledger:
         # implementation attempt.
         invocation_indexes = self.connection.execute("PRAGMA index_list(model_invocations)").fetchall()
         legacy_stage_key = any(
-            row["unique"] and [part["name"] for part in self.connection.execute(f"PRAGMA index_info({row['name']})")] == ["ticket_id", "attempt_number", "stage"]
+            row["unique"] and row["name"] != "idx_model_invocations_one_started_review" and [part["name"] for part in self.connection.execute(f"PRAGMA index_info({row['name']})")] == ["ticket_id", "attempt_number", "stage"]
             for row in invocation_indexes
         )
         if legacy_stage_key:
@@ -629,6 +630,7 @@ class Ledger:
             CREATE INDEX IF NOT EXISTS idx_model_invocations_incomplete ON model_invocations(status, ticket_id);
             CREATE INDEX IF NOT EXISTS idx_model_invocations_attempt_stage ON model_invocations(ticket_id, attempt_number, stage, started_at);
             """)
+        self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_model_invocations_one_started_review ON model_invocations(ticket_id, attempt_number, stage) WHERE stage='review' AND status='started'")
         # Phase 2 is additive: preserve Phase 1 ledgers already created.
         ticket_columns = {
             "criterion_ids_json": "TEXT NOT NULL DEFAULT '[]'",

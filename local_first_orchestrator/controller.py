@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
@@ -635,7 +636,10 @@ class LocalFirstController:
         provider = str(getattr(self.local_model, "review_provider", getattr(self.local_model, "provider", type(self.local_model).__name__)))
         model = str(getattr(self.local_model, "review_model", getattr(self.local_model, "model", type(self.local_model).__name__)))
         packet_hash = hashlib.sha256(packet.encode()).hexdigest()
-        self.ledger.start_model_invocation(invocation_id=invocation_id, ticket_id=ticket_id, attempt_number=attempt_number, stage="review", provider=provider, model=model, packet_hash=packet_hash, worktree_path=str(path), timeout_seconds=self.config.review_timeout_seconds)
+        try:
+            self.ledger.start_model_invocation(invocation_id=invocation_id, ticket_id=ticket_id, attempt_number=attempt_number, stage="review", provider=provider, model=model, packet_hash=packet_hash, worktree_path=str(path), timeout_seconds=self.config.review_timeout_seconds)
+        except sqlite3.IntegrityError as exc:
+            raise RuntimeError("historical candidate review is already in flight or ambiguous") from exc
         started = time.monotonic()
         try:
             if hasattr(self.local_model, "review_timeout_seconds"): self.local_model.review_timeout_seconds = self.config.review_timeout_seconds
