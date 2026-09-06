@@ -425,6 +425,10 @@ CREATE TRIGGER IF NOT EXISTS historical_revalidation_validation_results_immutabl
 BEFORE UPDATE ON historical_revalidation_validation_results BEGIN SELECT RAISE(ABORT, 'historical validation results are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS historical_revalidation_validation_results_immutable_delete
 BEFORE DELETE ON historical_revalidation_validation_results BEGIN SELECT RAISE(ABORT, 'historical validation results are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS historical_revalidation_validation_results_claim_integrity
+BEFORE INSERT ON historical_revalidation_validation_results
+WHEN NOT EXISTS (SELECT 1 FROM historical_revalidation_validation_claims c WHERE c.claim_id=NEW.claim_id AND c.ticket_id=NEW.ticket_id AND c.attempt_number=NEW.attempt_number AND c.authorization_hash=NEW.authorization_hash AND c.attestation_hash=NEW.attestation_hash AND c.base_sha=NEW.base_sha AND c.implementation_diff_hash=NEW.implementation_diff_hash AND c.validation_profile_hash=NEW.validation_profile_hash)
+BEGIN SELECT RAISE(ABORT, 'historical validation result claim mismatch'); END;
 CREATE TRIGGER IF NOT EXISTS historical_revalidation_validation_results_hash_integrity
 BEFORE INSERT ON historical_revalidation_validation_results
 WHEN NEW.result_hash IS NULL OR NEW.result_hash != canonical_historical_validation_result_hash(NEW.ticket_id,NEW.attempt_number,NEW.authorization_hash,NEW.attestation_hash,NEW.base_sha,NEW.implementation_diff_hash,NEW.validation_profile_hash,NEW.artifact_sha256,NEW.passed,NEW.compact_evidence)
@@ -1134,6 +1138,10 @@ class Ledger:
     def record_historical_revalidation_validation_result(self, *, claim_id: str, ticket_id: str, attempt_number: int, authorization_hash_value: str, attestation_hash_value: str, base_sha: str, implementation_diff_hash: str, validation_profile_hash: str, artifact_path: str, artifact_sha256: str, passed: bool, compact_evidence: str) -> dict[str, Any]:
         result_hash = historical_validation_result_hash(ticket_id=ticket_id, attempt_number=attempt_number, authorization_hash=authorization_hash_value, attestation_hash=attestation_hash_value, base_sha=base_sha, implementation_diff_hash=implementation_diff_hash, validation_profile_hash=validation_profile_hash, artifact_sha256=artifact_sha256, passed=passed, compact_evidence=compact_evidence)
         with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM historical_revalidation_validation_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            expected_claim = historical_validation_identity(ticket_id=ticket_id, attempt_number=attempt_number, authorization_hash=authorization_hash_value, attestation_hash=attestation_hash_value, base_sha=base_sha, implementation_diff_hash=implementation_diff_hash, validation_profile_hash=validation_profile_hash)
+            if claim is None or any(str(claim[field]) != str(expected_claim[field]) for field in expected_claim):
+                raise RuntimeError("historical validation result claim mismatch")
             existing = conn.execute("SELECT * FROM historical_revalidation_validation_results WHERE claim_id=?", (claim_id,)).fetchone()
             if existing is not None:
                 if str(existing["result_hash"]) != result_hash or int(existing["passed"]) != int(passed):

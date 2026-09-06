@@ -554,6 +554,9 @@ class LocalFirstController:
         validation_profile_hash = canonical_sha256(ticket.contract())
         existing_result = self.ledger.historical_revalidation_validation_result(ticket_id, attempt_number)
         if existing_result is not None:
+            existing_claim = self.ledger.historical_revalidation_validation_claim(ticket_id, attempt_number)
+            if existing_claim is None or str(existing_result["claim_id"]) != str(existing_claim["claim_id"]) or any(str(existing_claim[field]) != str(value) for field, value in {"authorization_hash": str(stored_hash), "attestation_hash": stored_attestation_hash, "base_sha": str(impl["base_sha"]), "implementation_diff_hash": str(impl["diff_hash"]), "validation_profile_hash": canonical_sha256(ticket.contract())}.items()):
+                raise PermissionError("historical validation result claim identity mismatch")
             if int(existing_result["passed"]) not in (0, 1) or historical_validation_result_hash(ticket_id=ticket_id, attempt_number=attempt_number, authorization_hash=str(stored_hash), attestation_hash=stored_attestation_hash, base_sha=str(impl["base_sha"]), implementation_diff_hash=str(impl["diff_hash"]), validation_profile_hash=validation_profile_hash, artifact_sha256=str(existing_result["artifact_sha256"]), passed=bool(existing_result["passed"]), compact_evidence=str(existing_result["compact_evidence"])) != str(existing_result["result_hash"]):
                 raise PermissionError("historical validation result integrity mismatch")
             if str(existing_result["validation_profile_hash"]) != validation_profile_hash or str(existing_result["authorization_hash"]) != str(stored_hash) or str(existing_result["attestation_hash"]) != stored_attestation_hash:
