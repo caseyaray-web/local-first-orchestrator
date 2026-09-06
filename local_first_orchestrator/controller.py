@@ -12,7 +12,7 @@ from typing import Any, Callable
 from .context_packet import ContextPacketBuilder
 from .evidence_hash import canonical_sha256
 from .git_adapter import AttemptWorktree, GitWorktreeAdapter
-from .historical_revalidation import authorization_hash_from_row, classify_obsolete_validation_failure
+from .historical_revalidation import attestation_hash_from_row, authorization_hash_from_row, classify_obsolete_validation_failure
 from .ledger import Ledger
 from .local_qwen import LocalQwenAdapter
 from .readiness import validate_ticket
@@ -389,6 +389,64 @@ class LocalFirstController:
         evidence_identity = canonical_sha256({"attempt_number": attempt_number, "passed": False, "compact_evidence": old_payload["compact_evidence"]})
         return self.ledger.create_historical_revalidation_authorization(ticket_id=ticket_id, attempt_number=attempt_number, base_sha=str(impl["base_sha"]), repository_identity=str(repo), target_file=target_file, failure_classification=classification, failure_evidence_identity=evidence_identity, implementation_invocation_id=str(invocation["invocation_id"]), operator_id=operator_id, reason=reason)
 
+    def attest_historical_revalidation_implementation(self, ticket_id: str, attempt_number: int, *, repository: Path, operator_id: str="local-first-operator") -> dict[str, object]:
+        """Attest preserved implementation identity only; never validate semantics."""
+        if type(attempt_number) is not int or attempt_number < 1:
+            raise ValueError("attempt number must be a positive integer")
+        paused = self.ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+        if paused is None or not paused["paused"]:
+            raise PermissionError("historical implementation attestation requires Local First paused")
+        ticket_row = self.ledger.get_ticket(ticket_id)
+        if ticket_row["state"] != CanonicalState.NEEDS_TRIAGE.value:
+            raise ValueError("historical implementation attestation requires needs_triage")
+        binding = self.ledger.runtime_binding(ticket_id)
+        repo, worktree_root, _ = self.config.validate_execution_roots()
+        if repo != Path(repository).resolve(strict=True) or str(repo) != binding["repository_path"]:
+            raise ValueError("repository mismatch with imported binding")
+        ticket = ticket_from_ledger(ticket_row)
+        if self.ledger.review_candidate(ticket_id) is not None or self.ledger.accepted_commit(ticket_id):
+            raise ValueError("candidate or accepted evidence already exists")
+        if self.ledger.incomplete_model_invocations(ticket_id):
+            raise ValueError("incomplete model invocation requires explicit resolution")
+        if self.ledger.connection.execute("SELECT 1 FROM review_results WHERE ticket_id=? UNION SELECT 1 FROM model_invocations WHERE ticket_id=? AND stage='review' UNION SELECT 1 FROM model_stage_artifacts WHERE ticket_id=? AND stage='review'", (ticket_id, ticket_id, ticket_id)).fetchone():
+            raise ValueError("review activity already exists")
+        if self.ledger.connection.execute("SELECT 1 FROM events WHERE entity_type='ticket' AND entity_id=? AND to_state=?", (ticket_id, CanonicalState.REPAIRING.value)).fetchone():
+            raise ValueError("repair activity already exists")
+        if self.ledger.connection.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number>?", (ticket_id, attempt_number)).fetchone():
+            raise ValueError("a later attempt already exists")
+        authorization = self.ledger.historical_revalidation_authorization(ticket_id, attempt_number)
+        if authorization is None:
+            raise PermissionError("historical revalidation authorization is required")
+        stored_auth_hash = authorization.get("authorization_hash")
+        if type(stored_auth_hash) is not str or len(stored_auth_hash) != 64 or any(character not in "0123456789abcdef" for character in stored_auth_hash) or stored_auth_hash != authorization_hash_from_row(authorization):
+            raise PermissionError("historical revalidation authorization hash is invalid")
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        impl = self.ledger.model_stage(ticket_id, attempt_number, "implementation")
+        invocation = self.ledger.invocation_for_stage(ticket_id, attempt_number, "implementation")
+        implementation_invocations = self.ledger.connection.execute("SELECT COUNT(*) AS count FROM model_invocations WHERE ticket_id=? AND attempt_number=? AND stage='implementation'", (ticket_id, attempt_number)).fetchone()["count"]
+        if attempt is None or impl is None or invocation is None or invocation["status"] != "completed" or int(implementation_invocations) != 1:
+            raise ValueError("historical implementation provenance is incomplete or ambiguous")
+        if str(invocation["invocation_id"]) != str(authorization["implementation_invocation_id"]):
+            raise PermissionError("authorization implementation invocation mismatch")
+        if str(invocation["model_artifact"] or "") != str(impl["response_artifact"]):
+            raise ValueError("implementation artifact provenance mismatch")
+        if str(attempt["base_sha"]) != str(impl["base_sha"]) or str(impl["base_sha"]) != str(authorization["base_sha"]):
+            raise ValueError("implementation base provenance mismatch")
+        path = Path(str(attempt["worktree_path"])).resolve()
+        if not path.is_dir() or str(path) != str(Path(str(impl["worktree_path"])).resolve()):
+            raise ValueError("preserved implementation worktree is missing or ambiguous")
+        if str(attempt["branch"] or "") == "" or str(attempt["branch"]) != f"local-first/{ticket_id}/attempt-{attempt_number}":
+            raise ValueError("implementation worktree branch provenance mismatch")
+        def git(*args: str) -> str:
+            return subprocess.run(("git", *args), cwd=path, text=True, capture_output=True, check=True).stdout.strip()
+        if git("rev-parse", "--show-toplevel") != str(path) or git("rev-parse", "HEAD") != str(impl["base_sha"]):
+            raise ValueError("implementation worktree repository/base mismatch")
+        worktree_diff_hash = GitWorktreeAdapter(repo, worktree_root).diff_hash(path)
+        if worktree_diff_hash != str(impl["diff_hash"]):
+            raise RuntimeError("preserved implementation does not match durable historical diff")
+        result = self.ledger.create_historical_revalidation_attestation(ticket_id=ticket_id, attempt_number=attempt_number, base_sha=str(impl["base_sha"]), repository_identity=str(repo), implementation_invocation_id=str(invocation["invocation_id"]), implementation_artifact=str(impl["response_artifact"]), implementation_diff_hash=str(impl["diff_hash"]), worktree_path=str(path), worktree_diff_hash=worktree_diff_hash, authorization_hash_value=str(stored_auth_hash), operator_id=operator_id)
+        return result
+
     def revalidate_historical_implementation(self, ticket_id: str, attempt_number: int, *, repository: Path, operator_id: str="local-first-operator") -> dict[str, object]:
         """Revalidate one preserved, rejected implementation without inference."""
         if type(attempt_number) is not int or attempt_number < 1:
@@ -451,7 +509,22 @@ class LocalFirstController:
         expected_identity = {"ticket_id": ticket_id, "attempt_number": attempt_number, "base_sha": str(impl["base_sha"]), "repository_identity": str(repo), "target_file": target_file, "failure_classification": obsolete_classification, "failure_evidence_identity": evidence_identity, "implementation_invocation_id": str(invocation["invocation_id"])}
         if any(str(authorization[key]) != str(value) for key, value in expected_identity.items()):
             raise PermissionError("historical revalidation authorization identity mismatch")
-        raise RuntimeError("implementation-integrity attestation required before historical revalidation")
+        attestation = self.ledger.historical_revalidation_attestation(ticket_id, attempt_number)
+        if attestation is None:
+            raise RuntimeError("implementation-integrity attestation required before historical revalidation")
+        stored_attestation_hash = attestation.get("attestation_hash")
+        if type(stored_attestation_hash) is not str or len(stored_attestation_hash) != 64 or any(character not in "0123456789abcdef" for character in stored_attestation_hash):
+            raise PermissionError("historical implementation attestation hash is malformed")
+        try:
+            recomputed_attestation_hash = attestation_hash_from_row(attestation)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PermissionError("historical implementation attestation hash cannot be recomputed") from exc
+        if stored_attestation_hash != recomputed_attestation_hash:
+            raise PermissionError("historical implementation attestation hash mismatch")
+        attestation_identity = {"ticket_id": ticket_id, "attempt_number": attempt_number, "base_sha": str(impl["base_sha"]), "repository_identity": str(repo), "implementation_invocation_id": str(invocation["invocation_id"]), "implementation_artifact": str(impl["response_artifact"]), "implementation_diff_hash": str(impl["diff_hash"]), "worktree_path": str(Path(str(attempt["worktree_path"])).resolve()), "authorization_hash": str(stored_hash),}
+        if any(str(attestation[key]) != str(value) for key, value in attestation_identity.items()):
+            raise PermissionError("historical implementation attestation identity mismatch")
+        raise RuntimeError("historical validation/recovery execution gate required")
 
     def execute(self, ticket_id: str, *, repository: Path, allow_board_writes: bool, owner: str="local-first-controller") -> bool:
         if not allow_board_writes: return False

@@ -45,6 +45,11 @@ class AuthorizeHistoricalRevalidationAction(BaseModel):
     reason: str = Field(default="operator authorization for historical revalidation", max_length=240)
 
 
+class AttestHistoricalRevalidationAction(BaseModel):
+    ticket_id: str = Field(min_length=1, max_length=240)
+    attempt_number: int = Field(ge=1)
+
+
 class _OperatorBoard:
     is_fake = False
 
@@ -152,6 +157,20 @@ def implementation_revalidation_authorize(action: AuthorizeHistoricalRevalidatio
         return LocalFirstController(ledger, _OperatorBoard(), runtime).authorize_historical_revalidation(
             action.ticket_id, action.attempt_number, repository=config.canonical_repository,
             operator_id="dashboard-operator", reason=action.reason)
+    except (OSError, ValueError, RuntimeError, PermissionError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        ledger.close()
+
+
+@router.post("/implementation-revalidation-attest")
+def implementation_revalidation_attest(action: AttestHistoricalRevalidationAction) -> dict[str, Any]:
+    """Attest preserved implementation identity; never validates semantics."""
+    ledger, config = _ledger()
+    try:
+        runtime = config.runtime_config()
+        return LocalFirstController(ledger, _OperatorBoard(), runtime).attest_historical_revalidation_implementation(
+            action.ticket_id, action.attempt_number, repository=config.canonical_repository, operator_id="dashboard-operator")
     except (OSError, ValueError, RuntimeError, PermissionError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     finally:

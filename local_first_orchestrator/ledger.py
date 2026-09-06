@@ -16,7 +16,7 @@ from .adapters import BoardAdapter
 from .readiness import ReadinessError, validate_ticket
 from .states import CanonicalState, validate_transition
 from .evidence_hash import canonical_sha256
-from .historical_revalidation import authorization_hash, authorization_identity, authorization_hash_from_row
+from .historical_revalidation import authorization_hash, authorization_identity, authorization_hash_from_row, attestation_hash, attestation_identity, attestation_hash_from_row
 from .ticket import MicroTicket
 
 
@@ -49,6 +49,10 @@ def _is_command_list(value: object) -> bool:
 
 def _sqlite_historical_authorization_hash(ticket_id: str, attempt_number: int, base_sha: str, repository_identity: str, target_file: str, failure_classification: str, failure_evidence_identity: str, implementation_invocation_id: str, operator_id: str, reason: str) -> str:
     return authorization_hash(authorization_identity(ticket_id=ticket_id, attempt_number=attempt_number, base_sha=base_sha, repository_identity=repository_identity, target_file=target_file, failure_classification=failure_classification, failure_evidence_identity=failure_evidence_identity, implementation_invocation_id=implementation_invocation_id, operator_id=operator_id, reason=reason))
+
+
+def _sqlite_historical_attestation_hash(ticket_id: str, attempt_number: int, base_sha: str, repository_identity: str, implementation_invocation_id: str, implementation_artifact: str, implementation_diff_hash: str, worktree_path: str, worktree_diff_hash: str, authorization_hash_value: str, operator_id: str) -> str:
+    return attestation_hash(attestation_identity(ticket_id=ticket_id, attempt_number=attempt_number, base_sha=base_sha, repository_identity=repository_identity, implementation_invocation_id=implementation_invocation_id, implementation_artifact=implementation_artifact, implementation_diff_hash=implementation_diff_hash, worktree_path=worktree_path, worktree_diff_hash=worktree_diff_hash, authorization_hash=authorization_hash_value, operator_id=operator_id))
 
 
 @dataclass(frozen=True)
@@ -366,6 +370,31 @@ CREATE TRIGGER IF NOT EXISTS historical_revalidation_authorizations_hash_integri
 BEFORE INSERT ON historical_revalidation_authorizations
 WHEN NEW.authorization_hash IS NULL OR NEW.authorization_hash != canonical_historical_authorization_hash(NEW.ticket_id,NEW.attempt_number,NEW.base_sha,NEW.repository_identity,NEW.target_file,NEW.failure_classification,NEW.failure_evidence_identity,NEW.implementation_invocation_id,NEW.operator_id,NEW.reason)
 BEGIN SELECT RAISE(ABORT, 'historical revalidation authorization hash mismatch'); END;
+CREATE TABLE IF NOT EXISTS historical_revalidation_attestations (
+    attestation_id TEXT PRIMARY KEY,
+    ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    attempt_number INTEGER NOT NULL,
+    base_sha TEXT NOT NULL,
+    repository_identity TEXT NOT NULL,
+    implementation_invocation_id TEXT NOT NULL,
+    implementation_artifact TEXT NOT NULL,
+    implementation_diff_hash TEXT NOT NULL,
+    worktree_path TEXT NOT NULL,
+    worktree_diff_hash TEXT NOT NULL,
+    authorization_hash TEXT NOT NULL,
+    operator_id TEXT NOT NULL,
+    attestation_hash TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL,
+    UNIQUE(ticket_id, attempt_number)
+);
+CREATE TRIGGER IF NOT EXISTS historical_revalidation_attestations_immutable_update
+BEFORE UPDATE ON historical_revalidation_attestations BEGIN SELECT RAISE(ABORT, 'historical revalidation attestations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS historical_revalidation_attestations_immutable_delete
+BEFORE DELETE ON historical_revalidation_attestations BEGIN SELECT RAISE(ABORT, 'historical revalidation attestations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS historical_revalidation_attestations_hash_integrity
+BEFORE INSERT ON historical_revalidation_attestations
+WHEN NEW.attestation_hash IS NULL OR NEW.attestation_hash != canonical_historical_attestation_hash(NEW.ticket_id,NEW.attempt_number,NEW.base_sha,NEW.repository_identity,NEW.implementation_invocation_id,NEW.implementation_artifact,NEW.implementation_diff_hash,NEW.worktree_path,NEW.worktree_diff_hash,NEW.authorization_hash,NEW.operator_id)
+BEGIN SELECT RAISE(ABORT, 'historical revalidation attestation hash mismatch'); END;
 """
 
 
@@ -443,6 +472,7 @@ class Ledger:
         self.connection.create_function("canonical_completion_hash", 5, _sqlite_completion_hash)
         self.connection.create_function("canonical_recheck_hash", 13, _sqlite_recheck_hash)
         self.connection.create_function("canonical_historical_authorization_hash", 10, _sqlite_historical_authorization_hash)
+        self.connection.create_function("canonical_historical_attestation_hash", 11, _sqlite_historical_attestation_hash)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 5000")
@@ -1038,6 +1068,24 @@ class Ledger:
             conn.execute("INSERT INTO historical_revalidation_authorizations(authorization_id,ticket_id,attempt_number,base_sha,repository_identity,target_file,failure_classification,failure_evidence_identity,implementation_invocation_id,operator_id,reason,authorization_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (authorization_id, ticket_id, attempt_number, base_sha, repository_identity, target_file, failure_classification, failure_evidence_identity, implementation_invocation_id, operator_id, reason, authorization_digest, self._now()))
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="historical_revalidation_authorized", actor_id=operator_id, payload={"authorization_id": authorization_id, "attempt_number": attempt_number, "base_sha": base_sha, "target_file": target_file, "failure_classification": failure_classification, "implementation_invocation_id": implementation_invocation_id, "authorization_hash": authorization_digest})
             return dict(conn.execute("SELECT * FROM historical_revalidation_authorizations WHERE authorization_id=?", (authorization_id,)).fetchone())
+
+    def historical_revalidation_attestation(self, ticket_id: str, attempt_number: int) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM historical_revalidation_attestations WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        return dict(row) if row else None
+
+    def create_historical_revalidation_attestation(self, *, ticket_id: str, attempt_number: int, base_sha: str, repository_identity: str, implementation_invocation_id: str, implementation_artifact: str, implementation_diff_hash: str, worktree_path: str, worktree_diff_hash: str, authorization_hash_value: str, operator_id: str) -> dict[str, Any]:
+        fields = attestation_identity(ticket_id=ticket_id, attempt_number=attempt_number, base_sha=base_sha, repository_identity=repository_identity, implementation_invocation_id=implementation_invocation_id, implementation_artifact=implementation_artifact, implementation_diff_hash=implementation_diff_hash, worktree_path=worktree_path, worktree_diff_hash=worktree_diff_hash, authorization_hash=authorization_hash_value, operator_id=operator_id)
+        digest = attestation_hash(fields)
+        with self._transaction() as conn:
+            existing = conn.execute("SELECT * FROM historical_revalidation_attestations WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            if existing is not None:
+                if str(existing["attestation_hash"]) != digest:
+                    raise ValueError("conflicting historical revalidation attestation")
+                return dict(existing)
+            attestation_id = uuid.uuid4().hex
+            conn.execute("INSERT INTO historical_revalidation_attestations(attestation_id,ticket_id,attempt_number,base_sha,repository_identity,implementation_invocation_id,implementation_artifact,implementation_diff_hash,worktree_path,worktree_diff_hash,authorization_hash,operator_id,attestation_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (attestation_id, ticket_id, attempt_number, base_sha, repository_identity, implementation_invocation_id, implementation_artifact, implementation_diff_hash, worktree_path, worktree_diff_hash, authorization_hash_value, operator_id, digest, self._now()))
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="historical_revalidation_attested", actor_id=operator_id, payload={"attestation_id": attestation_id, "attempt_number": attempt_number, "implementation_invocation_id": implementation_invocation_id, "implementation_diff_hash": implementation_diff_hash, "worktree_diff_hash": worktree_diff_hash, "authorization_hash": authorization_hash_value, "attestation_hash": digest})
+            return dict(conn.execute("SELECT * FROM historical_revalidation_attestations WHERE attestation_id=?", (attestation_id,)).fetchone())
 
     def evaluate_ticket_readiness(self, ticket_id: str) -> TicketReadinessResult:
         row = self.connection.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()

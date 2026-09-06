@@ -36,6 +36,33 @@ def authorization_hash_from_row(row: Mapping[str, Any]) -> str:
     return authorization_hash({field: row[field] for field in AUTHORIZATION_IDENTITY_FIELDS})
 
 
+ATTESTATION_IDENTITY_FIELDS = (
+    "ticket_id", "attempt_number", "base_sha", "repository_identity",
+    "implementation_invocation_id", "implementation_artifact", "implementation_diff_hash",
+    "worktree_path", "worktree_diff_hash", "authorization_hash", "operator_id",
+)
+
+
+def attestation_identity(*, ticket_id: str, attempt_number: int, base_sha: str, repository_identity: str, implementation_invocation_id: str, implementation_artifact: str, implementation_diff_hash: str, worktree_path: str, worktree_diff_hash: str, authorization_hash: str, operator_id: str) -> dict[str, Any]:
+    return {
+        "ticket_id": ticket_id, "attempt_number": attempt_number, "base_sha": base_sha,
+        "repository_identity": repository_identity, "implementation_invocation_id": implementation_invocation_id,
+        "implementation_artifact": implementation_artifact, "implementation_diff_hash": implementation_diff_hash,
+        "worktree_path": worktree_path, "worktree_diff_hash": worktree_diff_hash,
+        "authorization_hash": authorization_hash, "operator_id": operator_id,
+    }
+
+
+def attestation_hash(identity: Mapping[str, Any]) -> str:
+    if set(identity) != set(ATTESTATION_IDENTITY_FIELDS):
+        raise ValueError("historical implementation attestation identity fields are incomplete or ambiguous")
+    return canonical_sha256({field: identity[field] for field in ATTESTATION_IDENTITY_FIELDS})
+
+
+def attestation_hash_from_row(row: Mapping[str, Any]) -> str:
+    return attestation_hash({field: row[field] for field in ATTESTATION_IDENTITY_FIELDS})
+
+
 def _obsolete_file_scope_symbol_error(path: str) -> str:
     return f"symbol scope exceeded in test file: {path}"
 

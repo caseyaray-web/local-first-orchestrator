@@ -10,7 +10,7 @@ from unittest import mock
 
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
 from local_first_orchestrator.hermes_board import ExternalTicket
-from local_first_orchestrator.historical_revalidation import authorization_hash, authorization_hash_from_row, authorization_identity
+from local_first_orchestrator.historical_revalidation import attestation_hash, attestation_hash_from_row, attestation_identity, authorization_hash, authorization_hash_from_row, authorization_identity
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.states import CanonicalState
 
@@ -80,6 +80,9 @@ class HistoricalAuthorizationTests(unittest.TestCase):
     def authorize(self, *, operator: str = "operator", reason: str = "recognized F1 obsolete rule") -> dict[str, object]:
         return self.controller.authorize_historical_revalidation(self.ticket, 1, repository=self.repo, operator_id=operator, reason=reason)
 
+    def attest(self) -> dict[str, object]:
+        return self.controller.attest_historical_revalidation_implementation(self.ticket, 1, repository=self.repo, operator_id="attestor")
+
     def raw_identity(self, *, attempt: int = 99, invocation: str = "raw-invocation") -> dict[str, object]:
         return authorization_identity(ticket_id=self.ticket, attempt_number=attempt, base_sha=self.base, repository_identity=str(self.repo.resolve()), target_file=F1_FILE, failure_classification="obsolete_file_scope_symbol_validation", failure_evidence_identity="e" * 64, implementation_invocation_id=invocation, operator_id="raw-operator", reason="raw fixture")
 
@@ -107,6 +110,60 @@ class HistoricalAuthorizationTests(unittest.TestCase):
         corrupt = dict(authorization); corrupt["authorization_hash"] = "0" * 64
         with mock.patch.object(self.ledger, "historical_revalidation_authorization", return_value=corrupt):
             with self.assertRaisesRegex(PermissionError, "authorization hash mismatch"):
+                self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+
+    def test_valid_authorized_attempt_receives_integrity_attestation_and_replay_is_idempotent(self) -> None:
+        self.create_obsolete_failure(); self.authorize(); first = self.attest(); replay = self.attest()
+        self.assertEqual(first["attestation_hash"], attestation_hash_from_row(first))
+        self.assertEqual(first["attestation_id"], replay["attestation_id"])
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM historical_revalidation_attestations").fetchone()[0], 1)
+
+    def test_attestation_requires_authorization_and_preserved_worktree_identity(self) -> None:
+        self.create_obsolete_failure()
+        with self.assertRaisesRegex(PermissionError, "authorization"):
+            self.attest()
+        self.authorize()
+        attempt = self.ledger.connection.execute("SELECT worktree_path FROM attempts WHERE ticket_id=? AND attempt_number=1", (self.ticket,)).fetchone(); assert attempt is not None
+        Path(attempt["worktree_path"]).joinpath(F1_FILE).write_text("function run() { return false; }\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "does not match durable historical diff"):
+            self.attest()
+
+    def test_attestation_provenance_mismatch_and_conflict_fail_closed(self) -> None:
+        self.create_obsolete_failure(); self.authorize()
+        self.ledger.connection.execute("UPDATE model_stage_artifacts SET diff_hash=? WHERE ticket_id=? AND attempt_number=1 AND stage='implementation'", ("0" * 64, self.ticket))
+        with self.assertRaisesRegex(RuntimeError, "does not match durable historical diff"):
+            self.attest()
+
+    def test_attestation_base_or_invocation_provenance_mismatch_fails_closed(self) -> None:
+        self.create_obsolete_failure(); self.authorize()
+        self.ledger.connection.execute("UPDATE model_stage_artifacts SET base_sha=? WHERE ticket_id=? AND attempt_number=1 AND stage='implementation'", ("f" * 40, self.ticket))
+        with self.assertRaisesRegex(ValueError, "base provenance"):
+            self.attest()
+        self.ledger.connection.execute("UPDATE model_stage_artifacts SET base_sha=? WHERE ticket_id=? AND attempt_number=1 AND stage='implementation'", (self.base, self.ticket))
+        self.ledger.connection.execute("UPDATE model_invocations SET invocation_id=invocation_id || '-changed' WHERE ticket_id=? AND attempt_number=1 AND stage='implementation'", (self.ticket,))
+        with self.assertRaisesRegex(PermissionError, "invocation mismatch"):
+            self.attest()
+
+    def test_direct_sql_attestation_hash_forgery_is_rejected(self) -> None:
+        self.create_obsolete_failure(); authorization = self.authorize()
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (self.ticket,)).fetchone(); assert attempt is not None
+        impl = self.ledger.model_stage(self.ticket, 1, "implementation"); assert impl is not None
+        invocation = self.ledger.invocation_for_stage(self.ticket, 1, "implementation"); assert invocation is not None
+        identity = attestation_identity(ticket_id=self.ticket, attempt_number=1, base_sha=str(impl["base_sha"]), repository_identity=str(self.repo.resolve()), implementation_invocation_id=str(invocation["invocation_id"]), implementation_artifact=str(impl["response_artifact"]), implementation_diff_hash=str(impl["diff_hash"]), worktree_path=str(Path(str(attempt["worktree_path"])).resolve()), worktree_diff_hash=str(impl["diff_hash"]), authorization_hash=str(authorization["authorization_hash"]), operator_id="attestor")
+        values = ("raw-attestation", *[identity[field] for field in ("ticket_id", "attempt_number", "base_sha", "repository_identity", "implementation_invocation_id", "implementation_artifact", "implementation_diff_hash", "worktree_path", "worktree_diff_hash", "authorization_hash", "operator_id")], "f" * 64, 1)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.ledger.connection.execute("INSERT INTO historical_revalidation_attestations(attestation_id,ticket_id,attempt_number,base_sha,repository_identity,implementation_invocation_id,implementation_artifact,implementation_diff_hash,worktree_path,worktree_diff_hash,authorization_hash,operator_id,attestation_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
+
+    def test_consumer_with_valid_attestation_reaches_only_next_explicit_gate(self) -> None:
+        self.create_obsolete_failure(); self.authorize(); self.attest()
+        with self.assertRaisesRegex(RuntimeError, "historical validation/recovery execution gate required"):
+            self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+        self.assertIsNone(self.ledger.review_candidate(self.ticket)); self.assertEqual(self.model.calls, ["implementation"])
+
+    def test_consumer_rejects_corrupt_attestation_hash_fixture(self) -> None:
+        self.create_obsolete_failure(); self.authorize(); attestation = self.attest(); corrupt = dict(attestation); corrupt["attestation_hash"] = "0" * 64
+        with mock.patch.object(self.ledger, "historical_revalidation_attestation", return_value=corrupt):
+            with self.assertRaisesRegex(PermissionError, "attestation hash mismatch"):
                 self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
 
     def test_exact_f1_attempt_can_receive_bound_authorization(self) -> None:
