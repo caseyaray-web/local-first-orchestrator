@@ -447,7 +447,7 @@ class LocalFirstController:
         result = self.ledger.create_historical_revalidation_attestation(ticket_id=ticket_id, attempt_number=attempt_number, base_sha=str(impl["base_sha"]), repository_identity=str(repo), implementation_invocation_id=str(invocation["invocation_id"]), implementation_artifact=str(impl["response_artifact"]), implementation_diff_hash=str(impl["diff_hash"]), worktree_path=str(path), worktree_diff_hash=worktree_diff_hash, authorization_hash_value=str(stored_auth_hash), operator_id=operator_id)
         return result
 
-    def revalidate_historical_implementation(self, ticket_id: str, attempt_number: int, *, repository: Path, operator_id: str="local-first-operator") -> dict[str, object]:
+    def revalidate_historical_implementation(self, ticket_id: str, attempt_number: int, *, repository: Path, operator_id: str="local-first-operator", freeze_candidate: bool = False) -> dict[str, object]:
         """Revalidate one preserved, rejected implementation without inference."""
         if type(attempt_number) is not int or attempt_number < 1:
             raise ValueError("attempt number must be a positive integer")
@@ -461,7 +461,7 @@ class LocalFirstController:
             raise ValueError("repository mismatch with imported binding")
         ticket = ticket_from_ledger(ticket_row)
         candidate = self.ledger.review_candidate(ticket_id)
-        if candidate is not None:
+        if candidate is not None and not freeze_candidate:
             raise ValueError("review candidate already exists")
         if ticket_row["state"] != CanonicalState.NEEDS_TRIAGE.value:
             raise ValueError("historical implementation revalidation requires needs_triage")
@@ -565,7 +565,12 @@ class LocalFirstController:
                 raise PermissionError("historical validation result artifact integrity mismatch")
             if not bool(existing_result["passed"]):
                 raise RuntimeError("historical current validation failed; explicit handling required")
+            if freeze_candidate:
+                provenance = {"ticket_id": ticket_id, "attempt_number": attempt_number, "base_sha": str(impl["base_sha"]), "implementation_diff_hash": str(impl["diff_hash"]), "authorization_hash": str(stored_hash), "attestation_hash": stored_attestation_hash, "validation_claim_id": str(existing_claim["claim_id"]), "validation_result_id": str(existing_result["result_id"]), "validation_result_hash": str(existing_result["result_hash"]), "validation_profile_hash": validation_profile_hash}
+                return self.ledger.freeze_review_candidate(ticket_id, attempt_number, candidate_fingerprint=live_diff_hash, validation_evidence=str(existing_result["compact_evidence"]), implementation_invocation_id=str(invocation["invocation_id"]), runtime_identity=self.effective_runtime_identity(), historical_provenance=provenance)
             raise RuntimeError("historical candidate freeze gate required")
+        if freeze_candidate:
+            raise RuntimeError("historical validation result required before candidate freeze")
         claim = self.ledger.claim_historical_revalidation_validation(ticket_id=ticket_id, attempt_number=attempt_number, authorization_hash_value=str(stored_hash), attestation_hash_value=stored_attestation_hash, base_sha=str(impl["base_sha"]), implementation_diff_hash=str(impl["diff_hash"]), validation_profile_hash=validation_profile_hash)
         if claim.get("status") == "completed":
             raise RuntimeError("historical validation result reconciliation required")
@@ -592,6 +597,10 @@ class LocalFirstController:
         if not validation.passed:
             raise RuntimeError("historical current validation failed; explicit handling required")
         raise RuntimeError("historical candidate freeze gate required")
+
+    def freeze_historical_candidate(self, ticket_id: str, attempt_number: int, *, repository: Path, operator_id: str="local-first-operator") -> dict[str, object]:
+        """Freeze an exact, already-completed passing historical validation result."""
+        return self.revalidate_historical_implementation(ticket_id, attempt_number, repository=repository, operator_id=operator_id, freeze_candidate=True)
 
     def execute(self, ticket_id: str, *, repository: Path, allow_board_writes: bool, owner: str="local-first-controller") -> bool:
         if not allow_board_writes: return False

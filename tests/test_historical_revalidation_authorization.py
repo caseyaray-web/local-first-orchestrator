@@ -214,6 +214,19 @@ class HistoricalAuthorizationTests(unittest.TestCase):
                     self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
             self.assertEqual(len(calls), 1)
 
+    def test_passing_historical_validation_freezes_one_canonical_candidate(self) -> None:
+        self.create_obsolete_failure(); self.authorize(); self.attest()
+        with self.assertRaisesRegex(RuntimeError, "candidate freeze gate"):
+            self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+        result = self.ledger.historical_revalidation_validation_result(self.ticket, 1); assert result is not None
+        candidate = self.controller.freeze_historical_candidate(self.ticket, 1, repository=self.repo)
+        replay = self.controller.freeze_historical_candidate(self.ticket, 1, repository=self.repo)
+        self.assertEqual(candidate["candidate_fingerprint"], result["implementation_diff_hash"])
+        self.assertEqual(candidate["candidate_fingerprint"], replay["candidate_fingerprint"])
+        self.assertEqual(candidate["historical_provenance_json"], replay["historical_provenance_json"])
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM review_candidates WHERE ticket_id=?", (self.ticket,)).fetchone()[0], 1)
+        self.assertEqual(self.model.calls, ["implementation"])
+
     def test_incomplete_claim_fails_closed_before_validator(self) -> None:
         self.create_obsolete_failure(); authorization = self.authorize(); attestation = self.attest()
         impl = self.ledger.model_stage(self.ticket, 1, "implementation"); assert impl is not None

@@ -275,7 +275,7 @@ CREATE TABLE IF NOT EXISTS review_candidates (
     candidate_fingerprint TEXT NOT NULL, validation_evidence TEXT NOT NULL,
     implementation_invocation_id TEXT, runtime_identity_json TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('review_pending','review_infrastructure_failed','review_completed')),
-    last_outcome TEXT, historical_review_attempted INTEGER NOT NULL DEFAULT 0 CHECK(historical_review_attempted IN (0,1)),
+    last_outcome TEXT, historical_review_attempted INTEGER NOT NULL DEFAULT 0 CHECK(historical_review_attempted IN (0,1)), historical_provenance_json TEXT NOT NULL DEFAULT '{}',
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
     PRIMARY KEY(ticket_id, attempt_number)
 );
@@ -666,6 +666,8 @@ class Ledger:
             if name not in comment_columns: self.connection.execute(f"ALTER TABLE evidence_comment_outbox ADD COLUMN {name} {definition}")
         self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_model_calls_reservation ON model_calls(reservation_id)")
         self.connection.execute("CREATE TABLE IF NOT EXISTS review_retry_authorizations (authorization_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), attempt_number INTEGER NOT NULL, candidate_fingerprint TEXT NOT NULL, failed_invocation_id TEXT NOT NULL REFERENCES model_invocations(invocation_id), operator_id TEXT NOT NULL, authorized_at INTEGER NOT NULL, consumed_invocation_id TEXT REFERENCES model_invocations(invocation_id), consumed_at INTEGER, UNIQUE(ticket_id, attempt_number, failed_invocation_id))")
+        candidate_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(review_candidates)")}
+        if "historical_provenance_json" not in candidate_columns: self.connection.execute("ALTER TABLE review_candidates ADD COLUMN historical_provenance_json TEXT NOT NULL DEFAULT '{}'")
         retry_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(review_retry_authorizations)")}
         for name, definition in {"consumed_invocation_id": "TEXT", "consumed_at": "INTEGER"}.items():
             if name not in retry_columns: self.connection.execute(f"ALTER TABLE review_retry_authorizations ADD COLUMN {name} {definition}")
@@ -1373,17 +1375,17 @@ class Ledger:
         outcome = SameTicketRepairCoordinator(self).apply(ticket_id, attempt_number, review)
         return {"verdict": review.verdict, "status": outcome}
 
-    def freeze_review_candidate(self, ticket_id: str, attempt_number: int, *, candidate_fingerprint: str, validation_evidence: str, implementation_invocation_id: str | None, runtime_identity: dict[str, Any], historical_review_attempted: bool = False) -> dict[str, Any]:
+    def freeze_review_candidate(self, ticket_id: str, attempt_number: int, *, candidate_fingerprint: str, validation_evidence: str, implementation_invocation_id: str | None, runtime_identity: dict[str, Any], historical_review_attempted: bool = False, historical_provenance: dict[str, Any] | None = None) -> dict[str, Any]:
         if not candidate_fingerprint or not validation_evidence:
             raise ValueError("invalid_review_candidate")
-        now = self._now(); identity = json.dumps(runtime_identity, sort_keys=True, separators=(",", ":"))
+        now = self._now(); identity = json.dumps(runtime_identity, sort_keys=True, separators=(",", ":")); provenance = json.dumps(historical_provenance or {}, sort_keys=True, separators=(",", ":"))
         with self._transaction() as conn:
             row = conn.execute("SELECT * FROM review_candidates WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
             if row is not None:
-                if row["candidate_fingerprint"] != candidate_fingerprint or row["validation_evidence"] != validation_evidence:
+                if row["candidate_fingerprint"] != candidate_fingerprint or row["validation_evidence"] != validation_evidence or row["historical_provenance_json"] != provenance:
                     raise RuntimeError("review_candidate_conflicts_with_validated_evidence")
                 return dict(row)
-            conn.execute("INSERT INTO review_candidates(ticket_id,attempt_number,candidate_fingerprint,validation_evidence,implementation_invocation_id,runtime_identity_json,status,historical_review_attempted,created_at,updated_at) VALUES (?,?,?,?,?,?, 'review_pending',?,?,?)", (ticket_id,attempt_number,candidate_fingerprint,validation_evidence,implementation_invocation_id,identity,int(historical_review_attempted),now,now))
+            conn.execute("INSERT INTO review_candidates(ticket_id,attempt_number,candidate_fingerprint,validation_evidence,implementation_invocation_id,runtime_identity_json,status,historical_review_attempted,historical_provenance_json,created_at,updated_at) VALUES (?,?,?,?,?,?, 'review_pending',?,?,?,?)", (ticket_id,attempt_number,candidate_fingerprint,validation_evidence,implementation_invocation_id,identity,int(historical_review_attempted),provenance,now,now))
             self._append_event(conn,entity_type="ticket",entity_id=ticket_id,event_type="validated_review_candidate_frozen",actor_id="controller",payload={"attempt_number":attempt_number,"candidate_fingerprint":candidate_fingerprint,"historical_review_attempted":historical_review_attempted})
         return self.review_candidate(ticket_id, attempt_number) or {}
 
