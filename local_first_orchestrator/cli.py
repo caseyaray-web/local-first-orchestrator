@@ -208,6 +208,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     run=commands.add_parser("run-once"); run.add_argument("--task-id",required=True); run.add_argument("--dry-run",action="store_true",default=True); run.add_argument("--execute",action="store_true"); run.add_argument("--allow-board-writes",action="store_true")
     implementation=commands.add_parser("implementation-only", aliases=("implement-only",), help="run exactly implementation and deterministic validation; never review or accept")
     implementation.add_argument("--task-id",required=True)
+    revalidate=commands.add_parser("revalidate-implementation", help="revalidate an existing implementation; never retry implementation or review")
+    revalidate.add_argument("--task-id", required=True); revalidate.add_argument("--attempt-number", required=True, type=int); revalidate.add_argument("--operator-id", default="local-first-cli")
     inspect=commands.add_parser("inspect"); inspect.add_argument("--task-id",required=True)
     generated=commands.add_parser("project-generated"); generated.add_argument("--allow-board-writes",action="store_true")
     activate=commands.add_parser("activate-generated"); activate.add_argument("ticket_id")
@@ -264,6 +266,10 @@ def run_command(args: argparse.Namespace) -> int:
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
             result=ctl.execute_implementation(args.task_id,repository=registered.canonical_repository)
             print(json.dumps(result or {"ticket_id":args.task_id,"status":"not_run"},sort_keys=True))
+        elif args.command=="revalidate-implementation":
+            if args.ad_hoc_runtime: raise ValueError("implementation revalidation requires registered operator runtime")
+            ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
+            print(json.dumps(ctl.revalidate_historical_implementation(args.task_id,args.attempt_number,repository=registered.canonical_repository,operator_id=args.operator_id),sort_keys=True))
         elif args.command=="inspect": print(json.dumps(ledger.get_ticket(args.task_id),sort_keys=True))
         elif args.command=="register-dashboard":
             root=Path(args.repository).resolve(strict=True)

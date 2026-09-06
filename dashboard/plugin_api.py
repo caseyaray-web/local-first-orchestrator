@@ -33,6 +33,12 @@ class ImplementationAction(BaseModel):
     reason: str = Field(default="operator implementation-only action", max_length=240)
 
 
+class RevalidateImplementationAction(BaseModel):
+    ticket_id: str = Field(min_length=1, max_length=240)
+    attempt_number: int = Field(ge=1)
+    reason: str = Field(default="operator revalidate existing implementation", max_length=240)
+
+
 class _OperatorBoard:
     is_fake = False
 
@@ -111,6 +117,20 @@ def implementation(action: ImplementationAction) -> dict[str, Any]:
         result = LocalFirstController(ledger, _OperatorBoard(), runtime, local_model=model).execute_implementation(
             action.ticket_id, repository=config.canonical_repository, owner="dashboard-operator")
         return result or {"ticket_id": action.ticket_id, "status": "not_run"}
+    except (OSError, ValueError, RuntimeError, PermissionError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        ledger.close()
+
+
+@router.post("/implementation-revalidate")
+def implementation_revalidate(action: RevalidateImplementationAction) -> dict[str, Any]:
+    """Revalidate one preserved implementation; never invokes a model."""
+    ledger, config = _ledger()
+    try:
+        runtime = config.runtime_config()
+        return LocalFirstController(ledger, _OperatorBoard(), runtime).revalidate_historical_implementation(
+            action.ticket_id, action.attempt_number, repository=config.canonical_repository, operator_id="dashboard-operator")
     except (OSError, ValueError, RuntimeError, PermissionError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     finally:

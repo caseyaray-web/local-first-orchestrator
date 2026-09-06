@@ -5,6 +5,7 @@ import hashlib
 import shutil
 import subprocess
 import unittest
+from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -248,5 +249,56 @@ class FailedAttemptReconciliationTests(unittest.TestCase):
     def test_incomplete_invocation_must_be_resolved_before_reconciliation(self) -> None:
         _, artifact=self.fail_attempt_one(); self.ledger.start_model_invocation(invocation_id="incomplete",ticket_id=self.ticket,attempt_number=1,stage="review",provider="fixture",model="fixture",packet_hash="a"*64,worktree_path="/tmp/forensic",timeout_seconds=31); self.ledger.pause("operator",reason="test")
         with self.assertRaisesRegex(ValueError,"incomplete model invocation"): self.controller(Model("good")).reconcile_failed_attempt(self.ticket,operator_id="operator",classification="runtime_infrastructure_failure",forensic_artifact_paths=(artifact,))
+
+    def test_governed_revalidation_promotes_unchanged_f1_attempt_without_model(self) -> None:
+        import local_first_orchestrator.validation as validation_module
+        old = lambda *args: (("symbol scope exceeded in test file: tests/test_app.py",), False)
+        with mock.patch.object(validation_module, "enforce_symbol_scope", old):
+            self.assertIsNone(self.controller(Model("good")).execute_implementation(self.ticket, repository=self.repo))
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (self.ticket,)).fetchone(); assert attempt is not None
+        worktree = Path(attempt["worktree_path"]); before = (worktree / "app.py").read_bytes()
+        self.ledger.pause("operator", reason="governed revalidation")
+        model = Model("good")
+        result = self.controller(model).revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+        self.assertEqual(result["state"], "local_review"); self.assertEqual(model.calls, [])
+        self.assertTrue(Path(result["fresh_validation_artifact"]).is_file())
+        self.assertEqual((worktree / "app.py").read_bytes(), before)
+        candidate = self.ledger.review_candidate(self.ticket); assert candidate is not None
+        self.assertEqual(candidate["candidate_fingerprint"], result["candidate_fingerprint"])
+        fresh = self.ledger.runtime_stage(self.ticket, "validation-revalidation-1"); assert fresh is not None
+        self.assertEqual(fresh["artifact_sha256"], hashlib.sha256(Path(fresh["artifact_path"]).read_bytes()).hexdigest())
+        replay = self.controller(model).revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+        self.assertTrue(replay["replayed"]); self.assertEqual(replay["candidate_fingerprint"], result["candidate_fingerprint"]); self.assertEqual(model.calls, [])
+
+    def test_revalidation_fails_closed_on_mutated_worktree_or_artifact_provenance(self) -> None:
+        import local_first_orchestrator.validation as validation_module
+        old = lambda *args: (("symbol scope exceeded in test file: tests/test_app.py",), False)
+        with mock.patch.object(validation_module, "enforce_symbol_scope", old):
+            self.assertIsNone(self.controller(Model("good")).execute_implementation(self.ticket, repository=self.repo))
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (self.ticket,)).fetchone(); assert attempt is not None
+        self.ledger.pause("operator", reason="revalidation checks")
+        path = Path(attempt["worktree_path"]); (path / "app.py").write_text("def value():\n    return 'mutated'\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "preserved implementation changed"):
+            self.controller(Model("good")).revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+        (path / "app.py").write_text("def value():\n    return 'ok'\n", encoding="utf-8")
+        self.ledger.connection.execute("UPDATE model_stage_artifacts SET diff_hash=? WHERE ticket_id=? AND attempt_number=1 AND stage='implementation'", ("0" * 64, self.ticket))
+        with self.assertRaisesRegex(RuntimeError, "preserved implementation changed"):
+            self.controller(Model("good")).revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+
+    def test_revalidation_current_failure_stays_triage_and_rejects_review_or_accepted_history(self) -> None:
+        import local_first_orchestrator.validation as validation_module
+        old = lambda *args: (("symbol scope exceeded in test file: tests/test_app.py",), False)
+        with mock.patch.object(validation_module, "enforce_symbol_scope", old):
+            self.assertIsNone(self.controller(Model("good")).execute_implementation(self.ticket, repository=self.repo))
+        self.ledger.pause("operator", reason="revalidation failure")
+        stage = self.ledger.model_stage(self.ticket, 1, "implementation"); assert stage is not None
+        current_hash = GitWorktreeAdapter(self.repo, self.config.worktree_root).diff_hash(Path(stage["worktree_path"]))
+        self.ledger.connection.execute("UPDATE model_stage_artifacts SET diff_hash=? WHERE ticket_id=? AND attempt_number=1 AND stage='implementation'", (current_hash, self.ticket))
+        with mock.patch.object(validation_module, "enforce_symbol_scope", lambda *args: (("current failure",), False)):
+            result = self.controller(Model("good")).revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+        self.assertEqual(result["state"], "needs_triage"); self.assertIsNone(self.ledger.review_candidate(self.ticket))
+        self.ledger.freeze_review_candidate(self.ticket, 1, candidate_fingerprint="f" * 64, validation_evidence="old", implementation_invocation_id=None, runtime_identity={})
+        with self.assertRaisesRegex(RuntimeError, "preserved implementation changed"):
+            self.controller(Model("good")).revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
 
 if __name__ == "__main__": unittest.main()
