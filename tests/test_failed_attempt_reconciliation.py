@@ -74,6 +74,9 @@ class FailedAttemptReconciliationTests(unittest.TestCase):
         return Path(attempt["worktree_path"]), Path(stage["response_artifact"])
     def reconcile_validation(self, artifact: Path, classification: str = "validation_failure") -> dict[str, object]:
         return self.controller(Model("good")).reconcile_failed_attempt(self.ticket, operator_id="operator", classification=classification, forensic_artifact_paths=(artifact,))
+    def validation_record(self) -> tuple[dict[str, object], Path]:
+        row = self.ledger.connection.execute("SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage='validation-1'", (self.ticket,)).fetchone(); assert row is not None
+        record = json.loads(row["detail"]); return record, Path(str(record["artifact_path"]))
 
     def test_completed_failed_validation_needs_triage_is_admitted_and_preserves_rejected_history(self) -> None:
         worktree, artifact = self.fail_validation_attempt()
@@ -90,8 +93,42 @@ class FailedAttemptReconciliationTests(unittest.TestCase):
 
     def test_needs_triage_without_failed_validation_is_rejected(self) -> None:
         _, artifact = self.fail_validation_attempt()
-        self.ledger.connection.execute("UPDATE runtime_stages SET detail='validation passed' WHERE ticket_id=? AND stage='validation-1'", (self.ticket,))
-        with self.assertRaisesRegex(ValueError, "failed validation"):
+        self.ledger.connection.execute("UPDATE runtime_stages SET detail='arbitrary runtime text' WHERE ticket_id=? AND stage='validation-1'", (self.ticket,))
+        with self.assertRaisesRegex(ValueError, "structured validation"):
+            self.reconcile_validation(artifact)
+
+    def test_missing_structured_validation_artifact_is_rejected(self) -> None:
+        _, artifact = self.fail_validation_attempt(); _, validation_artifact = self.validation_record(); validation_artifact.unlink()
+        with self.assertRaisesRegex(ValueError, "structured validation"):
+            self.reconcile_validation(artifact)
+
+    def test_malformed_structured_validation_artifact_is_rejected(self) -> None:
+        _, artifact = self.fail_validation_attempt(); _, validation_artifact = self.validation_record(); validation_artifact.write_text("not json", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "structured validation"):
+            self.reconcile_validation(artifact)
+
+    def test_structured_passed_true_is_rejected_even_when_stage_text_fails(self) -> None:
+        _, artifact = self.fail_validation_attempt(); record, _ = self.validation_record(); record["passed"] = True
+        self.ledger.connection.execute("UPDATE runtime_stages SET detail=? WHERE ticket_id=? AND stage='validation-1'", (json.dumps(record, sort_keys=True), self.ticket))
+        with self.assertRaisesRegex(ValueError, "structured validation"):
+            self.reconcile_validation(artifact)
+
+    def test_structured_failure_without_concrete_errors_is_rejected(self) -> None:
+        _, artifact = self.fail_validation_attempt(); record, validation_artifact = self.validation_record(); payload = json.loads(validation_artifact.read_text(encoding="utf-8")); payload["errors"] = []
+        validation_artifact.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "structured validation"):
+            self.reconcile_validation(artifact)
+
+    def test_validation_evidence_from_another_attempt_is_rejected(self) -> None:
+        _, artifact = self.fail_validation_attempt(); record, _ = self.validation_record(); record["attempt_number"] = 2
+        self.ledger.connection.execute("UPDATE runtime_stages SET detail=? WHERE ticket_id=? AND stage='validation-1'", (json.dumps(record, sort_keys=True), self.ticket))
+        with self.assertRaisesRegex(ValueError, "structured validation"):
+            self.reconcile_validation(artifact)
+
+    def test_conflicting_runtime_stage_text_cannot_override_structured_failure(self) -> None:
+        _, artifact = self.fail_validation_attempt(); record, _ = self.validation_record(); record["compact_evidence"] = "validation passed"
+        self.ledger.connection.execute("UPDATE runtime_stages SET detail=? WHERE ticket_id=? AND stage='validation-1'", (json.dumps(record, sort_keys=True), self.ticket))
+        with self.assertRaisesRegex(ValueError, "structured validation"):
             self.reconcile_validation(artifact)
 
     def test_needs_triage_with_frozen_candidate_is_rejected(self) -> None:

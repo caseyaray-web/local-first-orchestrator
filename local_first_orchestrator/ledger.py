@@ -870,8 +870,48 @@ class Ledger:
                 ).fetchone()
                 if implementation_stage is None or implementation_stage["status"] != "completed" or implementation_invocation is None or implementation_invocation["status"] != "completed":
                     raise ValueError("validation-failure reconciliation requires completed implementation")
-                if validation_stage is None or str(validation_stage["detail"]).strip().startswith("validation passed"):
-                    raise ValueError("validation-failure reconciliation requires failed validation")
+                try:
+                    record = json.loads(str(validation_stage["detail"])) if validation_stage is not None else None
+                    if not isinstance(record, dict):
+                        raise ValueError("validation record is not an object")
+                    artifact_path = Path(str(record["artifact_path"]))
+                    expected_name = f"validation-{hashlib.sha256((str(implementation_stage['worktree_path']) + str(implementation_stage['base_sha'])).encode()).hexdigest()[:12]}.json"
+                    expected_path = Path(str(implementation_stage["response_artifact"])).parent / expected_name
+                    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+                    errors = artifact["errors"]
+                    if (
+                        not isinstance(record, dict)
+                        or record.get("attempt_number") != retired
+                        or record.get("completed") is not True
+                        or record.get("passed") is not False
+                        or not isinstance(record.get("compact_evidence"), str)
+                        or record["compact_evidence"].strip().startswith("validation passed")
+                        or artifact_path != expected_path
+                        or not artifact_path.is_file()
+                        or not isinstance(artifact, dict)
+                        or artifact.get("base_sha") != implementation_stage["base_sha"]
+                        or not isinstance(artifact.get("changed_files"), list)
+                        or not isinstance(artifact.get("changed_lines"), int)
+                        or not isinstance(artifact.get("scope_unverified"), bool)
+                        or not isinstance(errors, list)
+                        or not errors
+                        or not all(isinstance(error, str) and error.strip() for error in errors)
+                        or not isinstance(artifact.get("commands"), list)
+                        or not all(
+                            isinstance(command, dict)
+                            and isinstance(command.get("argv"), list)
+                            and all(isinstance(argument, str) for argument in command["argv"])
+                            and isinstance(command.get("returncode"), int)
+                            and isinstance(command.get("duration_seconds"), (int, float))
+                            and isinstance(command.get("stdout_summary"), str)
+                            and isinstance(command.get("stderr_summary"), str)
+                            and isinstance(command.get("truncated"), bool)
+                            for command in artifact["commands"]
+                        )
+                    ):
+                        raise ValueError("invalid structured validation failure evidence")
+                except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                    raise ValueError("validation-failure reconciliation requires valid structured validation failure evidence") from exc
                 if conn.execute("SELECT 1 FROM review_candidates WHERE ticket_id=?", (ticket_id,)).fetchone():
                     raise ValueError("validation-failure reconciliation cannot retire a ticket with review candidate")
                 if conn.execute("SELECT 1 FROM review_results WHERE ticket_id=?", (ticket_id,)).fetchone() or conn.execute("SELECT 1 FROM model_invocations WHERE ticket_id=? AND stage='review'", (ticket_id,)).fetchone():
