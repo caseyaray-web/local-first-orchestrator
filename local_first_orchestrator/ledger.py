@@ -1360,22 +1360,79 @@ class Ledger:
             self._append_event(conn,entity_type="ticket",entity_id=str(row["ticket_id"]),event_type="model_invocation_finished",actor_id="recovery",payload={"invocation_id":invocation_id,"attempt_number":row["attempt_number"],"stage":"review","status":"process_error","reason":"abandoned"})
             return True
 
+    def _historical_review_bridge_valid(self, conn: sqlite3.Connection, ticket_id: str, attempt_number: int, candidate: sqlite3.Row) -> bool:
+        """Require the complete immutable R2 chain before bridging needs_triage."""
+        auth = conn.execute("SELECT * FROM historical_revalidation_authorizations WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        attestation = conn.execute("SELECT * FROM historical_revalidation_attestations WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        claim = conn.execute("SELECT * FROM historical_revalidation_validation_claims WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        result = conn.execute("SELECT * FROM historical_revalidation_validation_results WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        if any(row is None for row in (auth, attestation, claim, result)):
+            return False
+        try:
+            if authorization_hash_from_row(auth) != auth["authorization_hash"] or attestation_hash_from_row(attestation) != attestation["attestation_hash"]:
+                return False
+            claim_identity = historical_validation_identity(ticket_id=claim["ticket_id"], attempt_number=claim["attempt_number"], authorization_hash=claim["authorization_hash"], attestation_hash=claim["attestation_hash"], base_sha=claim["base_sha"], implementation_diff_hash=claim["implementation_diff_hash"], validation_profile_hash=claim["validation_profile_hash"])
+            if claim["authorization_hash"] != auth["authorization_hash"] or claim["attestation_hash"] != attestation["attestation_hash"] or claim["attempt_number"] != attempt_number:
+                return False
+            if claim["base_sha"] != attestation["base_sha"] or claim["implementation_diff_hash"] != attestation["implementation_diff_hash"]:
+                return False
+            if historical_validation_result_hash(ticket_id=result["ticket_id"], attempt_number=result["attempt_number"], authorization_hash=result["authorization_hash"], attestation_hash=result["attestation_hash"], base_sha=result["base_sha"], implementation_diff_hash=result["implementation_diff_hash"], validation_profile_hash=result["validation_profile_hash"], artifact_sha256=result["artifact_sha256"], passed=bool(result["passed"]), compact_evidence=result["compact_evidence"]) != result["result_hash"]:
+                return False
+        except (KeyError, TypeError, ValueError):
+            return False
+        provenance = json.loads(str(candidate["historical_provenance_json"]))
+        return (
+            candidate["status"] == "review_pending" and int(result["passed"]) == 1 and
+            auth["authorization_hash"] == provenance.get("authorization_hash") and
+            attestation["attestation_hash"] == provenance.get("attestation_hash") and
+            claim["claim_id"] == provenance.get("validation_claim_id") and
+            result["result_id"] == provenance.get("validation_result_id") and
+            result["result_hash"] == provenance.get("validation_result_hash") and
+            str(candidate["candidate_fingerprint"]) == str(result["implementation_diff_hash"]) and
+            str(auth["implementation_invocation_id"]) == str(candidate["implementation_invocation_id"])
+        )
+
     def apply_persisted_review(self, ticket_id: str, attempt_number: int) -> dict[str, Any]:
+        """Persist a normalized review result without applying its verdict."""
         status = self.review_reconciliation_status(ticket_id, attempt_number)
         if status["classification"] == "valid_review_applied":
             row = self.connection.execute("SELECT * FROM review_results WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
             return {"verdict": row["verdict"], "status": "already_applied"}
-        if status["classification"] != "valid_review_stage_pending_application": raise PermissionError("persisted review application is not eligible")
+        if status["classification"] != "valid_review_stage_pending_application":
+            raise PermissionError("persisted review application is not eligible")
         stage = self.model_stage(ticket_id, attempt_number, "review")
-        if stage is None or stage["diff_hash"] != status["candidate"]["candidate_fingerprint"]: raise ValueError("persisted review stage conflicts with frozen candidate")
-        from pathlib import Path
+        candidate = self.review_candidate(ticket_id, attempt_number)
+        if stage is None or candidate is None or stage["diff_hash"] != candidate["candidate_fingerprint"]:
+            raise ValueError("persisted review stage conflicts with frozen candidate")
         from .controller import ticket_from_ledger
-        from .review import SameTicketRepairCoordinator, normalize_review
+        from .review import normalize_review
         artifact = Path(stage["response_artifact"])
-        if not artifact.is_file(): raise ValueError("persisted review artifact missing")
+        if not artifact.is_file():
+            raise ValueError("persisted review artifact missing")
         review = normalize_review(json.loads(artifact.read_text(encoding="utf-8")).get("payload", {}), ticket_from_ledger(self.get_ticket(ticket_id)))
-        outcome = SameTicketRepairCoordinator(self).apply(ticket_id, attempt_number, review)
-        return {"verdict": review.verdict, "status": outcome}
+        with self._transaction() as conn:
+            current = conn.execute("SELECT state FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if current is None:
+                raise KeyError(ticket_id)
+            if current["state"] == CanonicalState.NEEDS_TRIAGE.value:
+                if not self._historical_review_bridge_valid(conn, ticket_id, attempt_number, conn.execute("SELECT * FROM review_candidates WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()):
+                    raise PermissionError("needs_triage review application requires complete historical revalidation authority")
+                now = self._now()
+                changed = conn.execute("UPDATE tickets SET state=?, updated_at=? WHERE id=? AND state=?", (CanonicalState.LOCAL_REVIEW.value, now, ticket_id, CanonicalState.NEEDS_TRIAGE.value))
+                if changed.rowcount != 1:
+                    raise RuntimeError("ticket changed concurrently")
+                event_id = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="state_transition", actor_id="local-reviewer", from_state=CanonicalState.NEEDS_TRIAGE.value, to_state=CanonicalState.LOCAL_REVIEW.value, payload={"attempt_number": attempt_number, "application_only": True})
+                self._enqueue_projection_bundle_in_transaction(conn, ticket_id=ticket_id, event_id=event_id, evidence="historical review application ready", state_payload={"attempt_number": attempt_number})
+            elif current["state"] != CanonicalState.LOCAL_REVIEW.value:
+                raise PermissionError("persisted review application requires local_review or governed historical needs_triage")
+            existing = conn.execute("SELECT * FROM review_results WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            if existing is not None:
+                if existing["verdict"] != review.verdict or existing["payload_json"] != json.dumps(review.raw, sort_keys=True):
+                    raise RuntimeError("conflicting persisted review result")
+                return {"verdict": existing["verdict"], "status": "already_applied"}
+            conn.execute("INSERT INTO review_results(ticket_id, attempt_number, verdict, payload_json, created_at) VALUES (?, ?, ?, ?, ?)", (ticket_id, attempt_number, review.verdict, json.dumps(review.raw, sort_keys=True), self._now()))
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="review_recorded", actor_id="local_reviewer", payload={"attempt_number": attempt_number, "verdict": review.verdict, "application_only": True})
+        return {"verdict": review.verdict, "status": "applied_only"}
 
     def freeze_review_candidate(self, ticket_id: str, attempt_number: int, *, candidate_fingerprint: str, validation_evidence: str, implementation_invocation_id: str | None, runtime_identity: dict[str, Any], historical_review_attempted: bool = False, historical_provenance: dict[str, Any] | None = None) -> dict[str, Any]:
         if not candidate_fingerprint or not validation_evidence:

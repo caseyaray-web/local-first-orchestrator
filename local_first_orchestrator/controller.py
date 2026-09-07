@@ -666,6 +666,41 @@ class LocalFirstController:
         status = self.ledger.review_reconciliation_status(ticket_id, attempt_number)
         return {"ticket_id": ticket_id, "attempt_number": attempt_number, "candidate_fingerprint": str(candidate["candidate_fingerprint"]), "classification": status["classification"], "replayed": False}
 
+    def apply_persisted_review_only(self, ticket_id: str, attempt_number: int, *, repository: Path) -> dict[str, object]:
+        """Apply only the persisted semantic review; never dispose its verdict."""
+        if self.ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"] != 1:
+            raise PermissionError("persisted review application requires Local First paused")
+        candidate = self.ledger.review_candidate(ticket_id, attempt_number)
+        if candidate is None or candidate["status"] not in {"review_pending", "review_applied"}:
+            raise PermissionError("review_pending historical candidate is required")
+        current_ticket = self.ledger.get_ticket(ticket_id)
+        current_state = str(current_ticket["state"])
+        current_status = self.ledger.review_reconciliation_status(ticket_id, attempt_number)
+        if current_status["classification"] == "valid_review_applied":
+            return self.ledger.apply_persisted_review(ticket_id, attempt_number)
+        if candidate["status"] != "review_pending":
+            raise PermissionError("review_pending historical candidate is required")
+        if current_state == CanonicalState.LOCAL_REVIEW.value:
+            stage = self.ledger.model_stage(ticket_id, attempt_number, "review")
+            attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            binding = self.ledger.runtime_binding(ticket_id)
+            repo, _, _ = self.config.validate_execution_roots()
+            if stage is None or attempt is None or str(repo) != str(binding["repository_path"]):
+                raise PermissionError("ordinary review application provenance is invalid")
+            path = Path(str(attempt["worktree_path"])).resolve()
+            diff = subprocess.run(("git", "diff", str(stage["base_sha"])), cwd=path, text=True, capture_output=True, check=True).stdout
+            if hashlib.sha256(diff.encode()).hexdigest() != str(candidate["candidate_fingerprint"]) or str(stage["diff_hash"]) != str(candidate["candidate_fingerprint"]):
+                raise PermissionError("ordinary review candidate fingerprint mismatch")
+        elif current_state == CanonicalState.NEEDS_TRIAGE.value:
+            # Reuse the reviewed historical candidate gate for live R2 provenance and diff integrity.
+            self.freeze_historical_candidate(ticket_id, attempt_number, repository=repository, allow_existing_review=True)
+        else:
+            raise PermissionError("persisted review application requires local_review or governed historical needs_triage")
+        status = self.ledger.review_reconciliation_status(ticket_id, attempt_number)
+        if status["classification"] != "valid_review_stage_pending_application":
+            raise PermissionError("persisted review application is not pending")
+        return self.ledger.apply_persisted_review(ticket_id, attempt_number)
+
     def execute(self, ticket_id: str, *, repository: Path, allow_board_writes: bool, owner: str="local-first-controller") -> bool:
         if not allow_board_writes: return False
         if self.ledger.accepted_commit(ticket_id): self.ledger.project_ticket(ticket_id,self.board); return True

@@ -15,4 +15,26 @@ class PersistedReviewApplyTests(unittest.TestCase):
   self.assertEqual(self.l.review_reconciliation_status(self.t)['classification'],'valid_review_stage_pending_application')
   one=self.l.apply_persisted_review(self.t,2); two=self.l.apply_persisted_review(self.t,2)
   self.assertEqual(one['verdict'],two['verdict']); self.assertEqual(self.l.review_reconciliation_status(self.t)['classification'],'valid_review_applied'); self.assertEqual(self.l.connection.execute('select count(*) from review_results').fetchone()[0],1)
+  def test_pass_is_persisted_without_acceptance_or_disposition(self):
+   self.assertEqual(self.l.apply_persisted_review(self.t,2)['status'],'applied_only')
+   self.assertEqual(self.l.get_ticket(self.t)['state'],CanonicalState.LOCAL_REVIEW.value)
+   self.assertEqual(self.l.connection.execute('select verdict from review_results').fetchone()[0],'pass')
+  def test_non_passing_result_is_persisted_without_repair(self):
+   self.a.write_text(json.dumps({'payload':{'verdict':'escalate','criterion_results':[],'findings':[],'suggestions':[]}}))
+   self.assertEqual(self.l.apply_persisted_review(self.t,2)['verdict'],'escalate')
+   self.assertEqual(self.l.get_ticket(self.t)['state'],CanonicalState.LOCAL_REVIEW.value)
+   self.assertEqual(self.l.connection.execute('select count(*) from events where to_state=?',(CanonicalState.REPAIRING.value,)).fetchone()[0],0)
+  def test_generic_needs_triage_cannot_bridge(self):
+   self.l.transition(self.t,CanonicalState.NEEDS_TRIAGE)
+   with self.assertRaises(PermissionError): self.l.apply_persisted_review(self.t,2)
+   self.assertEqual(self.l.connection.execute('select count(*) from review_results').fetchone()[0],0)
+  def test_historical_bridge_is_atomic_on_failure(self):
+   original=self.l._append_event
+   def fail(*args,**kwargs):
+    if kwargs.get('event_type') == 'review_recorded': raise RuntimeError('injected')
+    return original(*args,**kwargs)
+   self.l._append_event=fail
+   with self.assertRaises(RuntimeError): self.l.apply_persisted_review(self.t,2)
+   self.assertEqual(self.l.get_ticket(self.t)['state'],CanonicalState.LOCAL_REVIEW.value)
+   self.assertEqual(self.l.connection.execute('select count(*) from review_results').fetchone()[0],0)
 if __name__=='__main__': unittest.main()

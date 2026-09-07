@@ -214,6 +214,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     authorize_revalidate.add_argument("--task-id",required=True); authorize_revalidate.add_argument("--attempt-number",required=True, type=int); authorize_revalidate.add_argument("--operator-id", default="local-first-cli"); authorize_revalidate.add_argument("--reason", default="operator authorization for historical revalidation")
     attest_revalidate=commands.add_parser("attest-historical-revalidation", help="attest one preserved historical implementation; does not validate or recover")
     attest_revalidate.add_argument("--task-id",required=True); attest_revalidate.add_argument("--attempt-number",required=True, type=int); attest_revalidate.add_argument("--operator-id", default="local-first-cli")
+    apply_review=commands.add_parser("apply-persisted-review", help="apply one persisted review result without verdict disposition")
+    apply_review.add_argument("--task-id", required=True); apply_review.add_argument("--attempt-number", required=True, type=int)
     inspect=commands.add_parser("inspect"); inspect.add_argument("--task-id",required=True)
     generated=commands.add_parser("project-generated"); generated.add_argument("--allow-board-writes",action="store_true")
     activate=commands.add_parser("activate-generated"); activate.add_argument("ticket_id")
@@ -282,6 +284,10 @@ def run_command(args: argparse.Namespace) -> int:
             if args.ad_hoc_runtime: raise ValueError("historical implementation attestation requires registered operator runtime")
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
             print(json.dumps(ctl.attest_historical_revalidation_implementation(args.task_id,args.attempt_number,repository=registered.canonical_repository,operator_id=args.operator_id),sort_keys=True))
+        elif args.command=="apply-persisted-review":
+            if args.ad_hoc_runtime: raise ValueError("persisted review application requires registered operator runtime")
+            ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
+            print(json.dumps(ctl.apply_persisted_review_only(args.task_id,args.attempt_number,repository=registered.canonical_repository),sort_keys=True))
         elif args.command=="inspect": print(json.dumps(ledger.get_ticket(args.task_id),sort_keys=True))
         elif args.command=="register-dashboard":
             root=Path(args.repository).resolve(strict=True)

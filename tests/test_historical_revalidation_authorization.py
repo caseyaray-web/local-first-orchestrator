@@ -274,6 +274,39 @@ class HistoricalAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.model.calls, ["implementation", "review"])
         self.assertIsNone(self.ledger.connection.execute("SELECT * FROM review_results WHERE ticket_id=?", (self.ticket,)).fetchone())
 
+    def test_historical_review_application_bridges_atomically_without_disposition(self) -> None:
+        self.create_obsolete_failure(); self.authorize(); self.attest()
+        with self.assertRaisesRegex(RuntimeError, "candidate freeze gate"):
+            self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+        self.controller.freeze_historical_candidate(self.ticket, 1, repository=self.repo)
+        self.controller.review_historical_candidate(self.ticket, 1, repository=self.repo)
+        result = self.controller.apply_persisted_review_only(self.ticket, 1, repository=self.repo)
+        self.assertEqual(result["verdict"], "pass")
+        self.assertEqual(self.ledger.get_ticket(self.ticket)["state"], CanonicalState.LOCAL_REVIEW.value)
+        self.assertEqual(self.ledger.review_reconciliation_status(self.ticket, 1)["classification"], "valid_review_applied")
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM review_results WHERE ticket_id=?", (self.ticket,)).fetchone()[0], 1)
+        self.assertEqual(self.model.calls, ["implementation", "review"])
+        replay = self.controller.apply_persisted_review_only(self.ticket, 1, repository=self.repo)
+        self.assertEqual(replay["status"], "already_applied")
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM review_results WHERE ticket_id=?", (self.ticket,)).fetchone()[0], 1)
+
+    def test_historical_bridge_rolls_back_state_when_result_persistence_fails(self) -> None:
+        self.create_obsolete_failure(); self.authorize(); self.attest()
+        with self.assertRaisesRegex(RuntimeError, "candidate freeze gate"):
+            self.controller.revalidate_historical_implementation(self.ticket, 1, repository=self.repo)
+        self.controller.freeze_historical_candidate(self.ticket, 1, repository=self.repo)
+        self.controller.review_historical_candidate(self.ticket, 1, repository=self.repo)
+        original = self.ledger._append_event
+        def fail(*args: object, **kwargs: object) -> object:
+            if kwargs.get("event_type") == "review_recorded":
+                raise RuntimeError("injected review persistence failure")
+            return original(*args, **kwargs)
+        with mock.patch.object(self.ledger, "_append_event", side_effect=fail):
+            with self.assertRaisesRegex(RuntimeError, "injected review persistence failure"):
+                self.controller.apply_persisted_review_only(self.ticket, 1, repository=self.repo)
+        self.assertEqual(self.ledger.get_ticket(self.ticket)["state"], CanonicalState.NEEDS_TRIAGE.value)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM review_results WHERE ticket_id=?", (self.ticket,)).fetchone()[0], 0)
+
     def test_incomplete_claim_fails_closed_before_validator(self) -> None:
         self.create_obsolete_failure(); authorization = self.authorize(); attestation = self.attest()
         impl = self.ledger.model_stage(self.ticket, 1, "implementation"); assert impl is not None
