@@ -118,6 +118,39 @@ class AcceptanceOnlyTests(unittest.TestCase):
         self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)
         self.assertEqual(self.ledger.connection.execute("select count(*) from tranche_completion_rechecks").fetchone()[0], 0)
 
+    def _prepare_integration_ref(self):
+        self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)
+        self.ledger.connection.execute("insert into features(id,title,status,created_at,updated_at) values ('fixture-feature','fixture','active',0,0)")
+        self.ledger.connection.execute("insert into tranches(id,feature_id,ordinal,status,base_sha) values ('fixture-tranche','fixture-feature',0,'active',?)", (self.base,))
+        self.ledger.connection.execute("update tickets set feature_id='fixture-feature', tranche_id='fixture-tranche' where id=?", (self.ticket,))
+        self.git("update-ref", "refs/local-first/tranches/fixture-tranche/integration-head", self.base)
+
+    def test_integration_only_fast_forwards_exact_accepted_commit(self):
+        self._prepare_integration_ref()
+        result = self.controller.integrate_accepted_candidate_only(self.ticket, 1, repository=self.repo)
+        accepted = self.ledger.accepted_commit(self.ticket)
+        self.assertEqual(result["status"], "integrated")
+        self.assertEqual(self.git("rev-parse", "refs/local-first/tranches/fixture-tranche/integration-head").stdout.strip(), accepted)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from tranche_completion_rechecks").fetchone()[0], 0)
+
+    def test_integration_replay_is_exact_and_idempotent(self):
+        self._prepare_integration_ref()
+        first = self.controller.integrate_accepted_candidate_only(self.ticket, 1, repository=self.repo)
+        second = self.controller.integrate_accepted_candidate_only(self.ticket, 1, repository=self.repo)
+        self.assertEqual(first["integration_head"], second["integration_head"])
+        self.assertEqual(second["status"], "already_integrated")
+
+    def test_integration_rejects_unexpected_head(self):
+        self._prepare_integration_ref()
+        other = self.repo / "other.txt"; other.write_text("other\n", encoding="utf-8"); self.git("add", "."); self.git("commit", "-qm", "other")
+        self.git("update-ref", "refs/local-first/tranches/fixture-tranche/integration-head", self.git("rev-parse", "HEAD").stdout.strip())
+        with self.assertRaises(RuntimeError): self.controller.integrate_accepted_candidate_only(self.ticket, 1, repository=self.repo)
+
+    def test_integration_rejects_not_done_ticket(self):
+        self._prepare_integration_ref()
+        self.ledger.connection.execute("update tickets set state='local_review' where id=?", (self.ticket,))
+        with self.assertRaises(PermissionError): self.controller.integrate_accepted_candidate_only(self.ticket, 1, repository=self.repo)
+
     @staticmethod
     def git_w(path, *args):
         return subprocess.run(("git", *args), cwd=path, text=True, capture_output=True, check=True).stdout.strip()

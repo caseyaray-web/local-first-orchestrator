@@ -706,6 +706,50 @@ class LocalFirstController:
         """Commit and durably accept an applied candidate without integration."""
         return self._accept_reviewed_candidate_only(ticket_id, attempt_number, repository=repository, require_paused=True)
 
+    def integrate_accepted_candidate_only(self, ticket_id: str, attempt_number: int, *, repository: Path) -> dict[str, object]:
+        """Fast-forward only the authoritative tranche ref for one accepted candidate."""
+        if self.ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"] != 1:
+            raise PermissionError("integration-only operation requires Local First paused")
+        ticket_row = self.ledger.get_ticket(ticket_id)
+        if ticket_row["state"] != CanonicalState.DONE.value:
+            raise PermissionError("integration requires done ticket")
+        repo, worktree_root, _ = self.config.validate_execution_roots()
+        if repo != Path(repository).resolve(strict=True):
+            raise ValueError("repository mismatch with imported binding")
+        latest = self.ledger.connection.execute("SELECT MAX(attempt_number) AS latest FROM attempts WHERE ticket_id=?", (ticket_id,)).fetchone()["latest"]
+        if latest is None or int(latest) != attempt_number or self.ledger.connection.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number>?", (ticket_id, attempt_number)).fetchone():
+            raise ValueError("integration attempt is not the latest attempt")
+        evidence_rows = self.ledger.connection.execute("SELECT * FROM accepted_evidence WHERE ticket_id=?", (ticket_id,)).fetchall()
+        if len(evidence_rows) != 1:
+            raise PermissionError("exactly one accepted evidence row is required")
+        evidence = evidence_rows[0]; attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone(); candidate = self.ledger.review_candidate(ticket_id, attempt_number); review = self.ledger.connection.execute("SELECT * FROM review_results WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone(); review_stage = self.ledger.model_stage(ticket_id, attempt_number, "review")
+        if attempt is None or candidate is None or review is None or review_stage is None or attempt["accepted_commit_sha"] != evidence["accepted_commit_sha"] or review["verdict"] != "pass" or json.loads(review["payload_json"]).get("findings") or self.ledger.review_reconciliation_status(ticket_id, attempt_number)["classification"] != "valid_review_applied":
+            raise PermissionError("accepted passing review authority is incomplete")
+        accepted = str(evidence["accepted_commit_sha"]); base = str(attempt["base_sha"]); candidate_fp = str(candidate["candidate_fingerprint"]); summary = json.loads(str(evidence["diff_summary"]))
+        if summary.get("candidate_fingerprint") != candidate_fp or summary.get("base_sha") != base or summary.get("review_result_id") != review["id"] or review_stage["diff_hash"] != candidate_fp:
+            raise PermissionError("accepted evidence and review candidate identity mismatch")
+        if not ticket_row["tranche_id"]:
+            raise PermissionError("accepted ticket has no authoritative tranche")
+        provenance = json.loads(str(candidate["historical_provenance_json"]))
+        if provenance.get("authorization_hash"):
+            auth = self.ledger.connection.execute("SELECT * FROM historical_revalidation_authorizations WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone(); attestation = self.ledger.connection.execute("SELECT * FROM historical_revalidation_attestations WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone(); result = self.ledger.connection.execute("SELECT * FROM historical_revalidation_validation_results WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone(); impl_invocation = self.ledger.invocation_for_stage(ticket_id, attempt_number, "implementation")
+            if auth is None or attestation is None or result is None or impl_invocation is None or authorization_hash_from_row(auth) != auth["authorization_hash"] or attestation_hash_from_row(attestation) != attestation["attestation_hash"]:
+                raise PermissionError("historical integration provenance is invalid")
+            if auth["authorization_hash"] != provenance.get("authorization_hash") or attestation["attestation_hash"] != provenance.get("attestation_hash") or result["result_id"] != provenance.get("validation_result_id") or result["result_hash"] != provenance.get("validation_result_hash") or not bool(result["passed"]) or result["implementation_diff_hash"] != candidate_fp or auth["implementation_invocation_id"] != impl_invocation["invocation_id"]:
+                raise PermissionError("historical integration provenance conflicts with candidate")
+            if not Path(str(attestation["implementation_artifact"])).is_file() or hashlib.sha256(Path(str(result["artifact_path"])).read_bytes()).hexdigest() != str(result["artifact_sha256"]):
+                raise PermissionError("historical integration artifact integrity failed")
+        ticket = ticket_from_ledger(ticket_row); authorized = set(ticket.allowed_files) | set(ticket.new_test_files); adapter = GitWorktreeAdapter(repo, worktree_root)
+        commit_parent = subprocess.run(("git", "rev-parse", f"{accepted}^"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip(); names = subprocess.run(("git", "diff", "--name-only", base, accepted), cwd=repo, text=True, capture_output=True, check=True).stdout.splitlines(); identity_diff = subprocess.run(("git", "diff", base, accepted, "--", *ticket.allowed_files), cwd=repo, text=True, capture_output=True, check=True).stdout; current = adapter.existing_execution_base(str(ticket_row["tranche_id"]), base)
+        if commit_parent != base or not names or any(name not in authorized for name in names) or hashlib.sha256(identity_diff.encode()).hexdigest() != candidate_fp:
+            raise PermissionError("accepted commit no longer matches frozen candidate")
+        if current == accepted:
+            return {"status": "already_integrated", "integrated": True, "integration_head": accepted}
+        if current != commit_parent:
+            raise RuntimeError("integration head is not the accepted commit parent")
+        integrated = adapter.advance_integration_head(str(ticket_row["tranche_id"]), current, accepted)
+        return {"status": "integrated", "integrated": True, "integration_head": integrated}
+
     def _accept_reviewed_candidate_only(self, ticket_id: str, attempt_number: int, *, repository: Path, require_paused: bool) -> dict[str, object]:
         if require_paused and self.ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"] != 1:
             raise PermissionError("acceptance-only operation requires Local First paused")

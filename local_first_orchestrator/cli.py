@@ -218,6 +218,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     apply_review.add_argument("--task-id", required=True); apply_review.add_argument("--attempt-number", required=True, type=int)
     accept_review=commands.add_parser("accept-reviewed-candidate", help="accept one reviewed candidate without advancing integration")
     accept_review.add_argument("--task-id", required=True); accept_review.add_argument("--attempt-number", required=True, type=int)
+    integrate=commands.add_parser("integrate-accepted-candidate", help="fast-forward one accepted candidate into tranche integration")
+    integrate.add_argument("--task-id", required=True); integrate.add_argument("--attempt-number", required=True, type=int)
     inspect=commands.add_parser("inspect"); inspect.add_argument("--task-id",required=True)
     generated=commands.add_parser("project-generated"); generated.add_argument("--allow-board-writes",action="store_true")
     activate=commands.add_parser("activate-generated"); activate.add_argument("ticket_id")
@@ -294,6 +296,10 @@ def run_command(args: argparse.Namespace) -> int:
             if args.ad_hoc_runtime: raise ValueError("acceptance-only operation requires registered operator runtime")
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
             print(json.dumps(ctl.accept_reviewed_candidate_only(args.task_id,args.attempt_number,repository=registered.canonical_repository),sort_keys=True,default=str))
+        elif args.command=="integrate-accepted-candidate":
+            if args.ad_hoc_runtime: raise ValueError("integration-only operation requires registered operator runtime")
+            ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
+            print(json.dumps(ctl.integrate_accepted_candidate_only(args.task_id,args.attempt_number,repository=registered.canonical_repository),sort_keys=True,default=str))
         elif args.command=="inspect": print(json.dumps(ledger.get_ticket(args.task_id),sort_keys=True))
         elif args.command=="register-dashboard":
             root=Path(args.repository).resolve(strict=True)
