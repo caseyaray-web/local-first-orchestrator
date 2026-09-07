@@ -132,8 +132,7 @@ class LocalFirstController:
         if kind not in {"h1", "recheck"}:
             raise PermissionError("unknown predecessor completion authority kind")
         if kind == "recheck":
-            generation = authority.get("completion", {}).get("generation")
-            if not rechecks or generation is None or int(rechecks[-1]["generation"]) != int(generation) or _recheck_evidence_hash(rechecks[-1]) != str(rechecks[-1]["evidence_hash"]):
+            if not rechecks or rechecks[-1]["status"] != "recheck_passed" or _recheck_evidence_hash(rechecks[-1]) != str(rechecks[-1]["evidence_hash"]):
                 raise PermissionError("predecessor completion recheck evidence is missing or conflicting")
             authority_row = rechecks[-1]
             base = str(authority_row["current_integration_sha"])

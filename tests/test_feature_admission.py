@@ -4,6 +4,7 @@ import hashlib
 import json
 import subprocess
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -92,6 +93,18 @@ class FeatureAdmissionTests(unittest.TestCase):
         self.assertEqual(self.ledger.connection.execute("select count(*) from tickets where feature_id='C11'").fetchone()[0], 1)
         self.assertEqual(self.ledger.connection.execute("select contract_hash from feature_contracts where feature_id='C11'").fetchone()[0], self.spec().contract.contract_hash)
 
+    def test_recheck_predecessor_uses_durable_h2_provenance(self):
+        with patch("local_first_orchestrator.controller.CorrectionService.completion_authority", return_value={"authorized": True, "kind": "recheck", "completion": self.ledger.tranche_completion("C09.10-T0"), "final_integration_sha": self.ledger.tranche_completion_rechecks("C09.10-T0")[-1]["current_integration_sha"]}):
+            result = self.controller.admit_feature_contract(self.spec(), repository=self.repo)
+        h2 = self.ledger.tranche_completion_rechecks("C09.10-T0")[-1]
+        row = self.ledger.connection.execute("select predecessor_authority_kind,predecessor_generation,predecessor_evidence_hash,predecessor_final_integration_sha from feature_contracts where feature_id='C11'").fetchone()
+        self.assertEqual(row["predecessor_authority_kind"], "recheck")
+        self.assertEqual(int(row["predecessor_generation"]), int(h2["generation"]))
+        self.assertEqual(row["predecessor_evidence_hash"], h2["evidence_hash"])
+        self.assertEqual(row["predecessor_final_integration_sha"], h2["current_integration_sha"])
+        self.assertEqual(result.repo_base_sha, h2["current_integration_sha"])
+
+    def test_provenance_and_predecessor_are_persisted(self):
         result = self.controller.admit_feature_contract(self.spec(), repository=self.repo)
         contract = self.ledger.connection.execute("select * from feature_contracts where feature_id='C11'").fetchone()
         tranche = self.ledger.connection.execute("select * from tranches where id='C11-T0'").fetchone()
