@@ -1118,6 +1118,23 @@ class Ledger:
             conn.execute("INSERT INTO decomposition_plans(id,feature_id,fingerprint,plan_json,status,created_at,activated_at,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (plan_id, feature_id, fingerprint, plan_json, "validated_pending_activation", now, None, repository_identity, repo_base_sha, repo_snapshot_hash, repo_snapshot_manifest_json))
         return plan_id
 
+    def finalize_planning_run_activation(self, request_key: str, *, plan_id: str, ticket_ids: tuple[str, ...]) -> None:
+        """Finalize a planning run only after activation has succeeded."""
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM planning_runs WHERE request_key=?", (request_key,)).fetchone()
+            if row is None:
+                raise ValueError("planning run is missing")
+            if row["status"] == "activated":
+                if row["plan_id"] != plan_id or json.loads(row["ticket_ids_json"]) != list(ticket_ids):
+                    raise ValueError("activated planning run conflicts")
+                return
+            if row["status"] != "validated_pending_activation":
+                raise ValueError("planning run is not pending activation")
+            plan = conn.execute("SELECT status FROM decomposition_plans WHERE id=?", (plan_id,)).fetchone()
+            if plan is None or plan["status"] != "active":
+                raise ValueError("decomposition plan is not active")
+            conn.execute("UPDATE planning_runs SET status='activated', plan_id=?, ticket_ids_json=?, updated_at=? WHERE request_key=?", (plan_id, json.dumps(list(ticket_ids), separators=(",", ":")), self._now(), request_key))
+
     def runtime_binding(self, ticket_id: str) -> dict[str, Any]:
         row = self.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
         if row is None: raise KeyError(f"no runtime binding for {ticket_id}")

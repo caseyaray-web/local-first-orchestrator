@@ -60,6 +60,8 @@ class PlanningCoordinatorTests(unittest.TestCase):
         planner = FakeLocalPlanner(make_plan(self.feature, snap))
         result = PlanningCoordinator(self.ledger, self.config, planner).plan(self.feature)
         self.assertEqual(result.status, "activated"); self.assertEqual(planner.calls, 1)
+        run = self.ledger.connection.execute("select status,plan_id,ticket_ids_json from planning_runs").fetchone()
+        self.assertEqual((run["status"], run["plan_id"], json.loads(run["ticket_ids_json"])), ("activated", result.plan_id, list(result.activated_ticket_ids)))
         self.assertEqual(self.ledger.connection.execute("select count(*) from paid_reservations").fetchone()[0], 0)
         replay = PlanningCoordinator(self.ledger, self.config, planner).plan(self.feature)
         self.assertEqual(replay.status, "already_activated"); self.assertEqual(planner.calls, 1)
@@ -90,10 +92,24 @@ class PlanningCoordinatorTests(unittest.TestCase):
         validation = PlanValidator().validate(self.feature, proposal)
         repository = RepositoryPlanValidator().validate(proposal, snap)
         from local_first_orchestrator.decomposition import activate_validated_plan
-        activate_validated_plan(self.ledger, self.feature, proposal, validation, repository)
+        coordinator.activate_persisted_plan(self.feature, request_key=str(pending.request_key), plan_id=str(pending.plan_id))
         self.assertEqual(self.ledger.connection.execute("select status from decomposition_plans where id=?", (pending.plan_id,)).fetchone()[0], "active")
         self.assertEqual(self.ledger.connection.execute("select count(*) from tickets").fetchone()[0], 1)
+        run = self.ledger.connection.execute("select status,plan_id,ticket_ids_json from planning_runs").fetchone()
+        self.assertEqual((run["status"], run["plan_id"], json.loads(run["ticket_ids_json"])), ("activated", pending.plan_id, ["TK-1"]))
         self.assertEqual(planner.calls, 1)
+
+    def test_activation_failure_does_not_finalize_planning_run(self):
+        from unittest.mock import patch
+        from local_first_orchestrator.repository_snapshot import snapshot
+        snap = snapshot(self.repo, self.sha, self.feature)
+        planner = FakeLocalPlanner(make_plan(self.feature, snap))
+        coordinator = PlanningCoordinator(self.ledger, self.config, planner)
+        pending = coordinator.generate_plan_only(self.feature)
+        with patch("local_first_orchestrator.planning_coordinator.activate_validated_plan", side_effect=RuntimeError("activation failed")):
+            with self.assertRaisesRegex(RuntimeError, "activation failed"):
+                coordinator.activate_persisted_plan(self.feature, request_key=str(pending.request_key), plan_id=str(pending.plan_id))
+        self.assertEqual(self.ledger.connection.execute("select status from planning_runs").fetchone()[0], "validated_pending_activation")
 
     def test_plan_only_invalid_output_does_not_persist_or_materialize(self):
         from local_first_orchestrator.repository_snapshot import snapshot

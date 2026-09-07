@@ -182,7 +182,8 @@ class PlanningCoordinator:
             plan = self._load_plan(row)
             if plan.feature_contract_hash != feature.contract_hash:
                 raise ValueError("conflicting durable decomposition plan")
-            return PlanningOutcome("validated_pending_activation", feature.id, snapshot_hash=snap.snapshot_hash, plan_id=str(row["id"]))
+            run = self.ledger.connection.execute("SELECT request_key FROM planning_runs WHERE plan_id=? ORDER BY updated_at DESC LIMIT 1", (row["id"],)).fetchone()
+            return PlanningOutcome("validated_pending_activation", feature.id, request_key=run["request_key"] if run else None, snapshot_hash=snap.snapshot_hash, plan_id=str(row["id"]))
         return None
 
     def generate_plan_only(self, feature: FeatureContract, *, repository: Path | None = None, feature_terms: tuple[str, ...] = ()) -> PlanningOutcome:
@@ -238,6 +239,17 @@ class PlanningCoordinator:
         self._record(request_key, feature, snap, status="validated_pending_activation", artifact=response_path, plan_id=persisted)
         return PlanningOutcome("validated_pending_activation", feature.id, request_key, snap.snapshot_hash, persisted)
 
+    def activate_persisted_plan(self, feature: FeatureContract, *, request_key: str, plan_id: str) -> PlanningOutcome:
+        row = self.ledger.connection.execute("SELECT * FROM decomposition_plans WHERE id=?", (plan_id,)).fetchone()
+        if row is None: raise ValueError("persisted decomposition plan missing")
+        proposal = self._load_plan(row)
+        structural = self.plan_validator.validate(feature, proposal)
+        snap = snapshot(self.config.canonical_repository(self.config.repository), proposal.repo_base_sha, feature)
+        repository_validation = self.repository_validator.validate(proposal, snap)
+        activated_id, ticket_ids = activate_validated_plan(self.ledger, feature, proposal, structural, repository_validation)
+        self.ledger.finalize_planning_run_activation(request_key, plan_id=activated_id, ticket_ids=ticket_ids)
+        return PlanningOutcome("activated", feature.id, request_key, snap.snapshot_hash, activated_id, ticket_ids)
+
     def plan(self, feature: FeatureContract, *, repository: Path | None = None, feature_terms: tuple[str, ...] = ()) -> PlanningOutcome:
         """Legacy combined planning path: generate/persist, then activate."""
         outcome = self.generate_plan_only(feature, repository=repository, feature_terms=feature_terms)
@@ -245,12 +257,4 @@ class PlanningCoordinator:
             return outcome
         if outcome.status != "validated_pending_activation":
             return outcome
-        row = self.ledger.connection.execute("SELECT * FROM decomposition_plans WHERE id=?", (outcome.plan_id,)).fetchone()
-        if row is None:
-            raise ValueError("persisted decomposition plan missing")
-        proposal = self._load_plan(row)
-        structural = self.plan_validator.validate(feature, proposal)
-        snap = snapshot(self.config.canonical_repository(self.config.repository), proposal.repo_base_sha, feature, feature_terms)
-        repository_validation = self.repository_validator.validate(proposal, snap)
-        plan_id, ticket_ids = activate_validated_plan(self.ledger, feature, proposal, structural, repository_validation)
-        return PlanningOutcome("activated", feature.id, outcome.request_key, outcome.snapshot_hash, plan_id, ticket_ids)
+        return self.activate_persisted_plan(feature, request_key=str(outcome.request_key), plan_id=str(outcome.plan_id))
