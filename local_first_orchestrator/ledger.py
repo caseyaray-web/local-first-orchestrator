@@ -1118,37 +1118,39 @@ class Ledger:
             conn.execute("INSERT INTO decomposition_plans(id,feature_id,fingerprint,plan_json,status,created_at,activated_at,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (plan_id, feature_id, fingerprint, plan_json, "validated_pending_activation", now, None, repository_identity, repo_base_sha, repo_snapshot_hash, repo_snapshot_manifest_json))
         return plan_id
 
+    def _finalize_planning_run_activation(self, conn: sqlite3.Connection, request_key: str, *, plan_id: str, ticket_ids: tuple[str, ...]) -> None:
+        row = conn.execute("SELECT * FROM planning_runs WHERE request_key=?", (request_key,)).fetchone()
+        if row is None:
+            raise ValueError("planning run is missing")
+        bound_plan_id = row["plan_id"]
+        if bound_plan_id is None or bound_plan_id != plan_id:
+            raise ValueError("planning run plan identity conflicts")
+        plan = conn.execute("SELECT * FROM decomposition_plans WHERE id=? AND feature_id=?", (bound_plan_id, row["feature_id"])).fetchone()
+        if plan is None or plan["status"] != "active":
+            raise ValueError("decomposition plan is not active")
+        try:
+            plan_payload = json.loads(plan["plan_json"])["plan"]
+            active_tranche_id = next(item["id"] for item in plan_payload["tranches"] if int(item["ordinal"]) == 0)
+        except (KeyError, TypeError, ValueError, StopIteration) as exc:
+            raise ValueError("active decomposition tranche is invalid") from exc
+        actual_rows = conn.execute("SELECT t.id FROM tickets AS t JOIN tranches AS tr ON tr.id=t.tranche_id WHERE t.feature_id=? AND t.tranche_id=? ORDER BY t.id", (row["feature_id"], active_tranche_id)).fetchall()
+        actual_ticket_ids = tuple(str(item["id"]) for item in actual_rows)
+        if not actual_ticket_ids:
+            raise ValueError("active decomposition plan has no materialized tickets")
+        if tuple(ticket_ids) != actual_ticket_ids:
+            raise ValueError("planning run ticket identity conflicts")
+        if row["status"] == "activated":
+            if json.loads(row["ticket_ids_json"]) != list(actual_ticket_ids):
+                raise ValueError("activated planning run conflicts")
+            return
+        if row["status"] != "validated_pending_activation":
+            raise ValueError("planning run is not pending activation")
+        conn.execute("UPDATE planning_runs SET status='activated', plan_id=?, ticket_ids_json=?, updated_at=? WHERE request_key=?", (bound_plan_id, json.dumps(list(actual_ticket_ids), separators=(",", ":")), self._now(), request_key))
+
     def finalize_planning_run_activation(self, request_key: str, *, plan_id: str, ticket_ids: tuple[str, ...]) -> None:
         """Finalize only against the exact active plan and ledger ticket set."""
         with self._transaction() as conn:
-            row = conn.execute("SELECT * FROM planning_runs WHERE request_key=?", (request_key,)).fetchone()
-            if row is None:
-                raise ValueError("planning run is missing")
-            bound_plan_id = row["plan_id"]
-            if bound_plan_id is None or bound_plan_id != plan_id:
-                raise ValueError("planning run plan identity conflicts")
-            plan = conn.execute("SELECT * FROM decomposition_plans WHERE id=? AND feature_id=?", (bound_plan_id, row["feature_id"])).fetchone()
-            if plan is None or plan["status"] != "active":
-                raise ValueError("decomposition plan is not active")
-            try:
-                plan_payload = json.loads(plan["plan_json"])["plan"]
-                active_tranche_id = next(item["id"] for item in plan_payload["tranches"] if int(item["ordinal"]) == 0)
-            except (KeyError, TypeError, ValueError, StopIteration) as exc:
-                raise ValueError("active decomposition tranche is invalid") from exc
-            actual_rows = conn.execute("SELECT t.id FROM tickets AS t JOIN tranches AS tr ON tr.id=t.tranche_id WHERE t.feature_id=? AND t.tranche_id=? ORDER BY t.id", (row["feature_id"], active_tranche_id)).fetchall()
-            actual_ticket_ids = tuple(str(item["id"]) for item in actual_rows)
-            if not actual_ticket_ids:
-                raise ValueError("active decomposition plan has no materialized tickets")
-            supplied_ticket_ids = tuple(ticket_ids)
-            if supplied_ticket_ids != actual_ticket_ids:
-                raise ValueError("planning run ticket identity conflicts")
-            if row["status"] == "activated":
-                if row["plan_id"] != bound_plan_id or json.loads(row["ticket_ids_json"]) != list(actual_ticket_ids):
-                    raise ValueError("activated planning run conflicts")
-                return
-            if row["status"] != "validated_pending_activation":
-                raise ValueError("planning run is not pending activation")
-            conn.execute("UPDATE planning_runs SET status='activated', plan_id=?, ticket_ids_json=?, updated_at=? WHERE request_key=?", (bound_plan_id, json.dumps(list(actual_ticket_ids), separators=(",", ":")), self._now(), request_key))
+            self._finalize_planning_run_activation(conn, request_key, plan_id=plan_id, ticket_ids=ticket_ids)
 
     def runtime_binding(self, ticket_id: str) -> dict[str, Any]:
         row = self.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()

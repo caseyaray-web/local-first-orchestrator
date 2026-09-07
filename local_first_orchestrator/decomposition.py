@@ -127,6 +127,7 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
   old=c.execute('SELECT * FROM feature_contracts WHERE feature_id=?',(feature.id,)).fetchone()
   if old and old['contract_hash']!=feature.contract_hash: raise ValueError('conflicting feature contract')
   if old and any(old[key] is not None and old[key] != value for key,value in (("repository_identity",repository_identity),("repo_base_sha",repo_base_sha),("repo_snapshot_hash",repo_snapshot_hash),("repo_snapshot_manifest_json",repo_snapshot_manifest_json))): raise ValueError('repository provenance conflicts')
+  active_tranche=next(tr for tr in plan.tranches if tr.ordinal == 0)
   existing=c.execute('SELECT * FROM decomposition_plans WHERE fingerprint=?',(fp,)).fetchone()
   if existing:
    if tuple(existing[x] for x in ('repository_identity','repo_base_sha','repo_snapshot_hash','repo_snapshot_manifest_json')) != (repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json): raise ValueError('repository provenance conflicts')
@@ -142,7 +143,9 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
      if ticket_row is None or event_row is None or projection is None or (projection['operation'],projection['payload_json'],projection['idempotency_key']) != ('create_microticket',json.dumps(expected,sort_keys=True,separators=(',',':')),expected['projection_key']):
       raise ValueError('create projection conflicts')
    if existing['status'] != 'validated_pending_activation':
-    return str(existing['id']),tuple(r['id'] for r in c.execute('SELECT id FROM tickets WHERE feature_id=? AND tranche_id IN (SELECT id FROM tranches WHERE feature_id=? AND ordinal=0)',(feature.id,feature.id)))
+    canonical_ids=tuple(str(r['id']) for r in c.execute('SELECT t.id FROM tickets AS t WHERE t.feature_id=? AND t.tranche_id=? ORDER BY t.id',(feature.id,active_tranche.id)).fetchall())
+    if not canonical_ids: raise ValueError('active decomposition plan has no materialized tickets')
+    return str(existing['id']),canonical_ids
   for tr in plan.tranches:
    if tr.ordinal == 0:
     for generated in tr.microtickets:
@@ -172,6 +175,13 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
     projection = generated_card_payload(feature, tr, t, repository_identity=str(repository_identity), repo_base_sha=str(repo_base_sha), repo_snapshot_hash=str(repo_snapshot_hash))
     event_id = ledger._append_event(c, entity_type='ticket', entity_id=t.ticket_id, event_type='generated_microticket_created', actor_id='controller', to_state='draft', payload={'feature_id': feature.id, 'tranche_id': tr.id, 'projection_key': projection['projection_key']})
     ledger._enqueue_generated_create_projection_in_transaction(c, ticket_id=t.ticket_id, event_id=event_id, payload=projection, idempotency_key=projection['projection_key'])
+  activated_plan_id=str(existing['id']) if existing else pid
   if existing and existing['status'] == 'validated_pending_activation':
-   c.execute("UPDATE decomposition_plans SET status='active', activated_at=? WHERE id=?", (now, existing['id']))
- return pid,tuple(active)
+   c.execute("UPDATE decomposition_plans SET status='active', activated_at=? WHERE id=?", (now, activated_plan_id))
+  pending_runs=c.execute("SELECT request_key FROM planning_runs WHERE feature_id=? AND plan_id=? AND status='validated_pending_activation' ORDER BY request_key", (feature.id, activated_plan_id)).fetchall()
+  if len(pending_runs)>1: raise ValueError('ambiguous planning run for activation')
+  canonical_ids=tuple(str(r['id']) for r in c.execute('SELECT t.id FROM tickets AS t WHERE t.feature_id=? AND t.tranche_id=? ORDER BY t.id',(feature.id,active_tranche.id)).fetchall())
+  if pending_runs:
+   ledger._finalize_planning_run_activation(c, pending_runs[0]['request_key'], plan_id=activated_plan_id, ticket_ids=canonical_ids)
+  if not canonical_ids: raise ValueError('active decomposition plan has no materialized tickets')
+  return activated_plan_id,canonical_ids
