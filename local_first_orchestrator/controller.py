@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import shutil
 import sqlite3
 import time
 import uuid
@@ -700,6 +701,86 @@ class LocalFirstController:
         if status["classification"] != "valid_review_stage_pending_application":
             raise PermissionError("persisted review application is not pending")
         return self.ledger.apply_persisted_review(ticket_id, attempt_number)
+
+    def accept_reviewed_candidate_only(self, ticket_id: str, attempt_number: int, *, repository: Path) -> dict[str, object]:
+        """Commit and durably accept an applied candidate without integration."""
+        return self._accept_reviewed_candidate_only(ticket_id, attempt_number, repository=repository, require_paused=True)
+
+    def _accept_reviewed_candidate_only(self, ticket_id: str, attempt_number: int, *, repository: Path, require_paused: bool) -> dict[str, object]:
+        if require_paused and self.ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"] != 1:
+            raise PermissionError("acceptance-only operation requires Local First paused")
+        ticket_row = self.ledger.get_ticket(ticket_id)
+        existing = self.ledger.accepted_commit(ticket_id)
+        if existing is not None and ticket_row["state"] in {CanonicalState.ACCEPTED.value, CanonicalState.DONE.value}:
+            return {"accepted_commit_sha": existing, "status": "already_accepted", "integrated": False}
+        if ticket_row["state"] not in ({CanonicalState.LOCAL_REVIEW.value} if require_paused else {CanonicalState.LOCAL_REVIEW.value, CanonicalState.ACCEPTED.value}):
+            raise PermissionError("acceptance requires local_review")
+        binding = self.ledger.runtime_binding(ticket_id)
+        repo, worktree_root, _ = self.config.validate_execution_roots()
+        if repo != Path(repository).resolve(strict=True) or str(repo) != binding["repository_path"]:
+            raise ValueError("repository mismatch with imported binding")
+        latest = self.ledger.connection.execute("SELECT MAX(attempt_number) AS latest FROM attempts WHERE ticket_id=?", (ticket_id,)).fetchone()["latest"]
+        if latest is None or int(latest) != attempt_number or self.ledger.connection.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number>?", (ticket_id, attempt_number)).fetchone():
+            raise ValueError("accepted attempt is not the latest attempt")
+        candidate = self.ledger.review_candidate(ticket_id, attempt_number)
+        status = self.ledger.review_reconciliation_status(ticket_id, attempt_number)
+        review_row = self.ledger.connection.execute("SELECT * FROM review_results WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        review_allowed = review_row is not None and (review_row["verdict"] == "pass" or (not require_paused and review_row["verdict"] == "repair"))
+        if candidate is None or candidate["status"] != "review_pending" or status["classification"] != "valid_review_applied" or not review_allowed or (review_row is not None and json.loads(review_row["payload_json"]).get("findings")):
+            raise PermissionError("applied passing review authority is required")
+        ticket = ticket_from_ledger(ticket_row); attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone(); impl = self.ledger.model_stage(ticket_id, attempt_number, "implementation"); review_stage = self.ledger.model_stage(ticket_id, attempt_number, "review"); invocation = self.ledger.invocation_for_stage(ticket_id, attempt_number, "implementation")
+        if attempt is None or impl is None or review_stage is None or invocation is None or invocation["status"] != "completed":
+            raise PermissionError("accepted candidate implementation provenance is incomplete")
+        worktree = Path(str(attempt["worktree_path"])).resolve(); authorized_files = set(ticket.allowed_files) | set(ticket.new_test_files)
+        if not authorized_files:
+            raise PermissionError("acceptance requires authorized candidate files")
+        live_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); live_branch = subprocess.run(("git", "branch", "--show-current"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); base = str(attempt["base_sha"])
+        live_diff = subprocess.run(("git", "diff", str(base)), cwd=worktree, text=True, capture_output=True, check=True).stdout; candidate_fp = str(candidate["candidate_fingerprint"])
+        status_lines = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True).stdout.splitlines(); status_paths = [line[3:].strip() for line in status_lines if "__pycache__" not in line]
+        if live_branch != str(attempt["branch"]):
+            raise PermissionError("accepted candidate branch mismatch")
+        if any(path not in authorized_files for path in status_paths):
+            raise PermissionError("live candidate contains unauthorized changes")
+        existing = self.ledger.accepted_commit(ticket_id)
+        if existing is not None:
+            if existing != live_head or attempt["accepted_commit_sha"] not in (None, existing):
+                raise RuntimeError("conflicting accepted commit evidence")
+            return {"accepted_commit_sha": existing, "status": "already_accepted", "integrated": False}
+        identity_diff = subprocess.run(("git", "diff", str(base), "--", *ticket.allowed_files), cwd=worktree, text=True, capture_output=True, check=True).stdout
+        created_new_commit = False
+        if live_head == base:
+            if not status_paths or hashlib.sha256(identity_diff.encode()).hexdigest() != candidate_fp:
+                raise PermissionError("live candidate differs from frozen candidate")
+            for cache in sorted(worktree.rglob("__pycache__"), reverse=True):
+                if cache.is_dir(): shutil.rmtree(cache)
+            worktrees = GitWorktreeAdapter(repo, worktree_root); attempt_worktree = AttemptWorktree(ticket_id, attempt_number, base, str(attempt["branch"]), worktree, hashlib.sha256(live_diff.encode()).hexdigest())
+            accepted_sha = worktrees.accept(attempt_worktree, f"local-first: {ticket_row['title']}")
+            created_new_commit = True
+            self._crash("accepted_commit_created")
+        else:
+            parent = subprocess.run(("git", "rev-parse", "HEAD^"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); committed_diff = subprocess.run(("git", "diff", base, "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout; names = subprocess.run(("git", "diff", "--name-only", base, "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.splitlines(); clean = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() == ""
+            if parent != base or hashlib.sha256(subprocess.run(("git", "diff", base, "HEAD", "--", *ticket.allowed_files), cwd=worktree, text=True, capture_output=True, check=True).stdout.encode()).hexdigest() != candidate_fp or not names or any(name not in authorized_files for name in names) or not clean:
+                raise RuntimeError("post-commit acceptance state is ambiguous")
+            accepted_sha = live_head
+        final_parent = subprocess.run(("git", "rev-parse", "HEAD^"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); final_diff = subprocess.run(("git", "diff", base, "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout; final_names = subprocess.run(("git", "diff", "--name-only", base, "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.splitlines(); final_clean = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() == ""
+        if accepted_sha != subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() or final_parent != base or hashlib.sha256(subprocess.run(("git", "diff", base, "HEAD", "--", *ticket.allowed_files), cwd=worktree, text=True, capture_output=True, check=True).stdout.encode()).hexdigest() != candidate_fp or not final_names or any(name not in authorized_files for name in final_names) or not final_clean:
+            raise RuntimeError("accepted commit does not match frozen candidate")
+        provenance = json.loads(str(candidate["historical_provenance_json"]))
+        if provenance.get("authorization_hash"):
+            auth = self.ledger.connection.execute("SELECT * FROM historical_revalidation_authorizations WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone(); attestation = self.ledger.connection.execute("SELECT * FROM historical_revalidation_attestations WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone(); result = self.ledger.connection.execute("SELECT * FROM historical_revalidation_validation_results WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            if auth is None or attestation is None or result is None or authorization_hash_from_row(auth) != auth["authorization_hash"] or attestation_hash_from_row(attestation) != attestation["attestation_hash"]:
+                raise PermissionError("historical acceptance provenance is invalid")
+            if auth["authorization_hash"] != provenance.get("authorization_hash") or attestation["attestation_hash"] != provenance.get("attestation_hash") or result["result_id"] != provenance.get("validation_result_id") or result["result_hash"] != provenance.get("validation_result_hash") or not bool(result["passed"]):
+                raise PermissionError("historical acceptance provenance conflicts with candidate")
+            if result["implementation_diff_hash"] != candidate_fp or auth["implementation_invocation_id"] != invocation["invocation_id"]:
+                raise PermissionError("historical acceptance implementation binding mismatch")
+            if not Path(str(attestation["implementation_artifact"])).is_file():
+                raise PermissionError("historical implementation artifact is missing")
+            if hashlib.sha256(Path(str(result["artifact_path"])).read_bytes()).hexdigest() != str(result["artifact_sha256"]):
+                raise PermissionError("historical validation artifact digest mismatch")
+        diff_summary = json.dumps({"candidate_fingerprint": candidate_fp, "base_sha": base, "files": final_names, "implementation_invocation_id": invocation["invocation_id"], "authorization_hash": provenance.get("authorization_hash"), "attestation_hash": provenance.get("attestation_hash"), "validation_result_id": provenance.get("validation_result_id"), "validation_result_hash": provenance.get("validation_result_hash"), "review_result_id": review_row["id"]}, sort_keys=True)
+        evidence = self.ledger.persist_accepted_candidate(ticket_id, attempt_number, accepted_sha, candidate_fingerprint=candidate_fp, diff_summary=diff_summary, validation_summary=str(candidate["validation_evidence"]), allow_nonpass=not require_paused)
+        return {"accepted_commit_sha": accepted_sha, "status": "accepted", "integrated": False, "evidence": evidence}
 
     def execute(self, ticket_id: str, *, repository: Path, allow_board_writes: bool, owner: str="local-first-controller") -> bool:
         if not allow_board_writes: return False

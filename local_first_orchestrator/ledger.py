@@ -2095,6 +2095,43 @@ class Ledger:
             conn.execute("INSERT OR IGNORE INTO board_projections(ticket_id,event_id,state,projected_at) SELECT ticket_id,event_id,state,? FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (self._now(), ticket_id, event_id))
         return True
 
+    def persist_accepted_candidate(self, ticket_id: str, attempt_number: int, accepted_commit_sha: str, *, candidate_fingerprint: str, diff_summary: str, validation_summary: str, allow_nonpass: bool = False) -> dict[str, Any]:
+        """Atomically bind an exact accepted commit and terminal lifecycle state."""
+        with self._transaction() as conn:
+            ticket = conn.execute("SELECT state FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            attempt = conn.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            candidate = conn.execute("SELECT * FROM review_candidates WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            review = conn.execute("SELECT * FROM review_results WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            existing = conn.execute("SELECT * FROM accepted_evidence WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if existing is not None:
+                if existing["accepted_commit_sha"] != accepted_commit_sha:
+                    raise RuntimeError("conflicting accepted evidence")
+                return dict(existing)
+            if ticket is None or ticket["state"] not in {CanonicalState.LOCAL_REVIEW.value, CanonicalState.ACCEPTED.value} or attempt is None or candidate is None or review is None:
+                raise PermissionError("accepted candidate authority is incomplete")
+            if candidate["candidate_fingerprint"] != candidate_fingerprint or (review["verdict"] != "pass" and not (allow_nonpass and review["verdict"] == "repair")):
+                raise PermissionError("accepted candidate identity or verdict mismatch")
+            if json.loads(review["payload_json"]).get("findings"):
+                raise PermissionError("blocking review findings remain")
+            if attempt["accepted_commit_sha"] is not None and attempt["accepted_commit_sha"] != accepted_commit_sha:
+                raise RuntimeError("conflicting attempt accepted commit")
+            now = self._now()
+            conn.execute("INSERT INTO accepted_evidence(ticket_id,accepted_commit_sha,diff_summary,validation_summary,created_at) VALUES (?,?,?,?,?)", (ticket_id, accepted_commit_sha, diff_summary, validation_summary, now))
+            conn.execute("UPDATE attempts SET accepted_commit_sha=? WHERE ticket_id=? AND attempt_number=? AND (accepted_commit_sha IS NULL OR accepted_commit_sha=?)", (accepted_commit_sha, ticket_id, attempt_number, accepted_commit_sha))
+            event_id = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="accepted_evidence_recorded", actor_id="controller", payload={"attempt_number": attempt_number, "commit_sha": accepted_commit_sha, "candidate_fingerprint": candidate_fingerprint, "integration_advanced": False})
+            current = CanonicalState(ticket["state"])
+            targets = (CanonicalState.ACCEPTED, CanonicalState.DONE) if current == CanonicalState.LOCAL_REVIEW else (CanonicalState.DONE,)
+            for target in targets:
+                validate_transition(current, target)
+                changed = conn.execute("UPDATE tickets SET state=?, updated_at=? WHERE id=? AND state=?", (target.value, now, ticket_id, current.value))
+                if changed.rowcount != 1:
+                    raise RuntimeError("ticket changed concurrently")
+                event_id = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="state_transition", actor_id="controller", from_state=current.value, to_state=target.value, payload={"attempt_number": attempt_number, "accepted_commit_sha": accepted_commit_sha, "integration_advanced": False})
+                if target.value in self._PROJECTABLE_STATES:
+                    self._enqueue_projection_bundle_in_transaction(conn, ticket_id=ticket_id, event_id=event_id, evidence=f"state={target.value}", state_payload={"attempt_number": attempt_number, "accepted_commit_sha": accepted_commit_sha})
+                current = target
+            return dict(conn.execute("SELECT * FROM accepted_evidence WHERE ticket_id=?", (ticket_id,)).fetchone())
+
     def record_accepted_evidence(self, ticket_id: str, accepted_commit_sha: str, diff_summary: str, validation_summary: str, *, local_reasoning: str | None = None) -> None:
         """Persist only checkpoint-safe accepted evidence; local reasoning is discarded."""
         with self._transaction() as conn:
