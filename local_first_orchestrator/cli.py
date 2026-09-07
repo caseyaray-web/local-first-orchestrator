@@ -7,6 +7,8 @@ from typing import Any
 
 from .controller import LocalFirstController, RuntimeConfig
 from .admission import FeatureAdmissionSpec
+from .decomposition_planner import LocalDecompositionPlanner
+from .planning_coordinator import PlanningCoordinator
 from .corrections import AcceptedPredecessor, CorrectionService, CorrectionTicketSpec, SupplementalCorrectionPlan
 from .generated_activation import GeneratedActivationError, activate_generated_ticket
 from .generated_projection import GeneratedProjectionWorker
@@ -252,6 +254,10 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     register.add_argument("--review-model", default=LOCAL_QWEN_MODEL)
     admission=commands.add_parser("admit-feature-contract", help="admit one paused, predecessor-authorized feature contract without planning")
     admission.add_argument("--spec-file", required=True)
+    planning=commands.add_parser("plan-feature", help="generate and persist one validated decomposition plan without activation")
+    planning.add_argument("--feature-id", required=True)
+    planning.add_argument("--planner-executable", default="hermes")
+    planning.add_argument("--planner-cost-class", choices=("local",), default="local")
 def run_command(args: argparse.Namespace) -> int:
     """Run a parsed standalone or native Hermes CLI command."""
     ledger=_ledger(args.database)
@@ -307,6 +313,17 @@ def run_command(args: argparse.Namespace) -> int:
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
             spec=FeatureAdmissionSpec.from_json(json.loads(Path(args.spec_file).expanduser().read_text(encoding="utf-8")))
             print(json.dumps(ctl.admit_feature_contract(spec,repository=registered.canonical_repository).__dict__,sort_keys=True,default=str))
+        elif args.command=="plan-feature":
+            if args.ad_hoc_runtime: raise ValueError("plan-feature requires registered operator runtime")
+            ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
+            row=ledger.connection.execute("SELECT contract_json FROM feature_contracts WHERE feature_id=?", (args.feature_id,)).fetchone()
+            if row is None: raise ValueError("authoritative feature contract is missing")
+            stored=json.loads(row["contract_json"])
+            feature=FeatureAdmissionSpec.from_json(stored["spec"]).contract
+            if feature.id != args.feature_id: raise ValueError("feature contract identity mismatch")
+            planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class=args.planner_cost_class)
+            coordinator=PlanningCoordinator(ledger, ctl.config, planner)
+            print(json.dumps(coordinator.generate_plan_only(feature,repository=registered.canonical_repository).__dict__,sort_keys=True,default=str))
         elif args.command=="register-dashboard":
             root=Path(args.repository).resolve(strict=True)
             allowlist=tuple(Path(item).resolve(strict=True) for item in args.allow_repository) or (root,)

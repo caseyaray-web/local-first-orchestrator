@@ -64,6 +64,46 @@ class PlanningCoordinatorTests(unittest.TestCase):
         replay = PlanningCoordinator(self.ledger, self.config, planner).plan(self.feature)
         self.assertEqual(replay.status, "already_activated"); self.assertEqual(planner.calls, 1)
 
+    def test_plan_only_persists_pending_without_materialization_and_replays(self):
+        from local_first_orchestrator.repository_snapshot import snapshot
+        snap = snapshot(self.repo, self.sha, self.feature)
+        planner = FakeLocalPlanner(make_plan(self.feature, snap))
+        coordinator = PlanningCoordinator(self.ledger, self.config, planner)
+        first = coordinator.generate_plan_only(self.feature)
+        self.assertEqual(first.status, "validated_pending_activation")
+        self.assertEqual(planner.calls, 1)
+        self.assertEqual(self.ledger.connection.execute("select status from decomposition_plans").fetchone()[0], "validated_pending_activation")
+        self.assertEqual(self.ledger.connection.execute("select count(*) from tickets").fetchone()[0], 0)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from board_projection_outbox").fetchone()[0], 0)
+        replay = PlanningCoordinator(self.ledger, self.config, planner).generate_plan_only(self.feature)
+        self.assertEqual((replay.plan_id, replay.snapshot_hash), (first.plan_id, first.snapshot_hash))
+        self.assertEqual(planner.calls, 1)
+
+    def test_plan_only_persists_plan_that_activation_consumes(self):
+        from local_first_orchestrator.repository_snapshot import snapshot, RepositoryPlanValidator
+        snap = snapshot(self.repo, self.sha, self.feature)
+        planner = FakeLocalPlanner(make_plan(self.feature, snap))
+        coordinator = PlanningCoordinator(self.ledger, self.config, planner)
+        pending = coordinator.generate_plan_only(self.feature)
+        row = self.ledger.connection.execute("select * from decomposition_plans where id=?", (pending.plan_id,)).fetchone()
+        proposal = coordinator._load_plan(row)
+        validation = PlanValidator().validate(self.feature, proposal)
+        repository = RepositoryPlanValidator().validate(proposal, snap)
+        from local_first_orchestrator.decomposition import activate_validated_plan
+        activate_validated_plan(self.ledger, self.feature, proposal, validation, repository)
+        self.assertEqual(self.ledger.connection.execute("select status from decomposition_plans where id=?", (pending.plan_id,)).fetchone()[0], "active")
+        self.assertEqual(self.ledger.connection.execute("select count(*) from tickets").fetchone()[0], 1)
+        self.assertEqual(planner.calls, 1)
+
+    def test_plan_only_invalid_output_does_not_persist_or_materialize(self):
+        from local_first_orchestrator.repository_snapshot import snapshot
+        snap = snapshot(self.repo, self.sha, self.feature)
+        planner = FakeLocalPlanner(make_plan(self.feature, snap, make_ticket(criterion="invented")))
+        result = PlanningCoordinator(self.ledger, self.config, planner).generate_plan_only(self.feature)
+        self.assertEqual(result.status, "structural_rejected")
+        self.assertEqual(self.ledger.connection.execute("select count(*) from decomposition_plans").fetchone()[0], 0)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from tickets").fetchone()[0], 0)
+
     def test_unknown_cost_never_invokes(self):
         calls = []
         planner = LocalDecompositionPlanner(lambda *a, **k: calls.append(1))

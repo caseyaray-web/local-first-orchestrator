@@ -1104,6 +1104,20 @@ class Ledger:
         with self._transaction() as conn:
             conn.execute("INSERT OR IGNORE INTO runtime_bindings(ticket_id, repository_path, starting_sha, canonical_sha, ownership_verified, created_at) VALUES (?, ?, ?, ?, 1, ?)", (ticket_id, repository_path, starting_sha, canonical_sha or starting_sha, self._now()))
 
+    def persist_validated_decomposition_plan(self, *, plan_id: str, feature_id: str, fingerprint: str, plan_json: str, repository_identity: str, repo_base_sha: str, repo_snapshot_hash: str, repo_snapshot_manifest_json: str) -> str:
+        """Persist one validated plan without activating its tranche or tickets."""
+        now = self._now()
+        with self._transaction() as conn:
+            existing = conn.execute("SELECT * FROM decomposition_plans WHERE feature_id=?", (feature_id,)).fetchall()
+            for row in existing:
+                if (row["fingerprint"], row["repository_identity"], row["repo_base_sha"], row["repo_snapshot_hash"], row["repo_snapshot_manifest_json"]) != (fingerprint, repository_identity, repo_base_sha, repo_snapshot_hash, repo_snapshot_manifest_json):
+                    raise ValueError("conflicting durable decomposition plan")
+                if row["status"] not in ("validated_pending_activation", "active"):
+                    raise ValueError("conflicting durable decomposition plan state")
+                return str(row["id"])
+            conn.execute("INSERT INTO decomposition_plans(id,feature_id,fingerprint,plan_json,status,created_at,activated_at,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (plan_id, feature_id, fingerprint, plan_json, "validated_pending_activation", now, None, repository_identity, repo_base_sha, repo_snapshot_hash, repo_snapshot_manifest_json))
+        return plan_id
+
     def runtime_binding(self, ticket_id: str) -> dict[str, Any]:
         row = self.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
         if row is None: raise KeyError(f"no runtime binding for {ticket_id}")
