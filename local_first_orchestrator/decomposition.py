@@ -124,8 +124,9 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
   raise ValueError('repository provenance conflicts')
  raw=json.dumps({"feature":feature.__dict__,"plan":plan.__dict__},default=lambda x:x.__dict__ if hasattr(x,'__dict__') else list(x),sort_keys=True,separators=(',',':')); fp=hashlib.sha256(raw.encode()).hexdigest(); pid='plan-'+fp[:16]; now=int(time.time())
  with ledger._transaction() as c:
-  old=c.execute('SELECT contract_hash FROM feature_contracts WHERE feature_id=?',(feature.id,)).fetchone()
+  old=c.execute('SELECT * FROM feature_contracts WHERE feature_id=?',(feature.id,)).fetchone()
   if old and old['contract_hash']!=feature.contract_hash: raise ValueError('conflicting feature contract')
+  if old and any(old[key] is not None and old[key] != value for key,value in (("repository_identity",repository_identity),("repo_base_sha",repo_base_sha),("repo_snapshot_hash",repo_snapshot_hash),("repo_snapshot_manifest_json",repo_snapshot_manifest_json))): raise ValueError('repository provenance conflicts')
   existing=c.execute('SELECT * FROM decomposition_plans WHERE fingerprint=?',(fp,)).fetchone()
   if existing:
    if tuple(existing[x] for x in ('repository_identity','repo_base_sha','repo_snapshot_hash','repo_snapshot_manifest_json')) != (repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json): raise ValueError('repository provenance conflicts')
@@ -143,11 +144,20 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
     for generated in tr.microtickets:
      if c.execute('SELECT 1 FROM tickets WHERE id=?',(generated.ticket_id,)).fetchone() is not None:
       raise ValueError('conflicting activated plan')
-  c.execute('INSERT OR IGNORE INTO features(id,title,objective,status,created_at,updated_at) VALUES (?,?,?,"planned",?,?)',(feature.id,feature.title,feature.objective,now,now)); c.execute('INSERT INTO feature_contracts(feature_id,contract_hash,contract_json,created_at) VALUES (?,?,?,?)',(feature.id,feature.contract_hash,json.dumps(feature.__dict__,default=lambda x:x.__dict__,sort_keys=True),now)); c.execute('INSERT INTO decomposition_plans(id,feature_id,fingerprint,plan_json,status,created_at,activated_at,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)',(pid,feature.id,fp,raw,'active',now,now,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json))
+  c.execute('INSERT OR IGNORE INTO features(id,title,objective,status,created_at,updated_at) VALUES (?,?,?,"planned",?,?)',(feature.id,feature.title,feature.objective,now,now))
+  if old is None:
+   c.execute('INSERT INTO feature_contracts(feature_id,contract_hash,contract_json,created_at) VALUES (?,?,?,?)',(feature.id,feature.contract_hash,json.dumps(feature.__dict__,default=lambda x:x.__dict__,sort_keys=True),now))
+  c.execute('INSERT INTO decomposition_plans(id,feature_id,fingerprint,plan_json,status,created_at,activated_at,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)',(pid,feature.id,fp,raw,'active',now,now,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json))
   active=[]
   for tr in plan.tranches:
-   c.execute('INSERT INTO tranches(id,feature_id,ordinal,status,base_sha,integration_commands_json) VALUES (?,?,?, ?,?,"[]")',(tr.id,feature.id,tr.ordinal,'active' if tr.ordinal==0 else 'planned',plan.repo_base_sha))
-   for cid in tr.criterion_ids:c.execute('INSERT INTO tranche_criteria VALUES (?,?)',(tr.id,cid))
+   existing_tranche=c.execute('SELECT * FROM tranches WHERE id=?',(tr.id,)).fetchone()
+   if existing_tranche:
+    existing_criteria={r['criterion_id'] for r in c.execute('SELECT criterion_id FROM tranche_criteria WHERE tranche_id=?',(tr.id,))}
+    if existing_tranche['feature_id']!=feature.id or int(existing_tranche['ordinal'])!=tr.ordinal or str(existing_tranche['base_sha'])!=str(plan.repo_base_sha) or existing_criteria != set(tr.criterion_ids): raise ValueError('conflicting admitted tranche')
+   else:
+    c.execute('INSERT INTO tranches(id,feature_id,ordinal,status,base_sha,integration_commands_json) VALUES (?,?,?, ?,?,"[]")',(tr.id,feature.id,tr.ordinal,'active' if tr.ordinal==0 else 'planned',plan.repo_base_sha))
+   if not existing_tranche:
+    for cid in tr.criterion_ids:c.execute('INSERT INTO tranche_criteria VALUES (?,?)',(tr.id,cid))
    if tr.ordinal:
     continue
    for t in tr.microtickets:

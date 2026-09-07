@@ -9,7 +9,8 @@ from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.admission import FeatureAdmissionSpec, FileDisposition
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
-from local_first_orchestrator.decomposition import Criterion
+from local_first_orchestrator.decomposition import Criterion, DecompositionPlan, PlanValidator, Tranche, activate_validated_plan
+from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
 from local_first_orchestrator.ledger import Ledger, _hash_recheck_payload
 
 
@@ -75,7 +76,22 @@ class FeatureAdmissionTests(unittest.TestCase):
         self.assertEqual(self.ledger.connection.execute("select count(*) from feature_contracts where feature_id='C11'").fetchone()[0], 1)
         self.assertEqual(self.ledger.connection.execute("select count(*) from decomposition_plans where feature_id='C11'").fetchone()[0], 0)
 
-    def test_provenance_and_predecessor_are_persisted(self):
+    def test_admission_contract_activates_through_normal_decomposition_lifecycle(self):
+        result = self.controller.admit_feature_contract(self.spec(), repository=self.repo)
+        row = self.ledger.connection.execute("select * from feature_contracts where feature_id='C11'").fetchone()
+        self.assertEqual(row["contract_hash"], self.spec().contract.contract_hash)
+        ticket = MicroTicket("c11-export", "Verify the admitted export contract.", ("export",), "existing.js::existing", ("existing.js",), ("No unrelated files.",), PatchBudget(1, 20), VerificationProfile((("python", "-c", "print(1)"),)), "low", True, 1, ())
+        manifest = row["repo_snapshot_manifest_json"]
+        plan = DecompositionPlan(1, "C11", self.spec().contract.contract_hash, result.repo_base_sha, result.repo_snapshot_hash, ("admitted",), {"C11-T0": ("export", "restore")}, (Tranche("C11-T0", 0, self.spec().objective, ("export",), ("export", "restore"), (ticket,)),), repository_identity=str(self.repo), repo_snapshot_manifest_json=manifest)
+        validation = PlanValidator().validate(self.spec().contract, plan)
+        self.assertTrue(validation.passed, validation.reasons)
+        repository_validation = type("R", (), {"passed": True, "repository_identity": str(self.repo), "base_sha": result.repo_base_sha, "snapshot_hash": result.repo_snapshot_hash, "manifest_json": manifest})()
+        activate_validated_plan(self.ledger, self.spec().contract, plan, validation, repository_validation)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from feature_contracts where feature_id='C11'").fetchone()[0], 1)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from tranches where id='C11-T0'").fetchone()[0], 1)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from tickets where feature_id='C11'").fetchone()[0], 1)
+        self.assertEqual(self.ledger.connection.execute("select contract_hash from feature_contracts where feature_id='C11'").fetchone()[0], self.spec().contract.contract_hash)
+
         result = self.controller.admit_feature_contract(self.spec(), repository=self.repo)
         contract = self.ledger.connection.execute("select * from feature_contracts where feature_id='C11'").fetchone()
         tranche = self.ledger.connection.execute("select * from tranches where id='C11-T0'").fetchone()

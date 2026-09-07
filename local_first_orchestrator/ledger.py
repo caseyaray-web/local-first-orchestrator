@@ -601,7 +601,7 @@ class Ledger:
             if name not in plan_columns:
                 self.connection.execute(f"ALTER TABLE decomposition_plans ADD COLUMN {name} TEXT")
         feature_contract_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(feature_contracts)")}
-        for name in ("repository_identity", "repo_base_sha", "repo_snapshot_hash", "repo_snapshot_manifest_json", "predecessor_tranche_id", "predecessor_authority_kind", "predecessor_generation", "predecessor_final_integration_sha", "predecessor_evidence_hash"):
+        for name in ("repository_identity", "repo_base_sha", "repo_snapshot_hash", "repo_snapshot_manifest_json", "predecessor_tranche_id", "predecessor_authority_kind", "predecessor_generation", "predecessor_final_integration_sha", "predecessor_evidence_hash", "admission_hash"):
             if name not in feature_contract_columns:
                 self.connection.execute(f"ALTER TABLE feature_contracts ADD COLUMN {name} TEXT")
         tranche_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(tranches)")}
@@ -2162,7 +2162,8 @@ class Ledger:
             raise ValueError("repository snapshot hash mismatch")
         predecessor = dict(predecessor or {})
         contract_payload = {"spec": spec.canonical_payload, "repository_identity": repository_identity, "repo_base_sha": repo_base_sha, "repo_snapshot_hash": repo_snapshot_hash, "repo_snapshot_manifest_json": repo_snapshot_manifest_json, "predecessor": predecessor}
-        contract_hash = canonical_sha256(contract_payload)
+        admission_hash = canonical_sha256(contract_payload)
+        contract_hash = spec.contract.contract_hash
         contract_json = json.dumps(contract_payload, sort_keys=True, separators=(",", ":"))
         criteria_json = json.dumps([criterion.id for criterion in spec.acceptance_criteria], separators=(",", ":"))
         with self._transaction() as conn:
@@ -2170,9 +2171,9 @@ class Ledger:
             existing_tranche = conn.execute("SELECT * FROM tranches WHERE id=?", (spec.tranche_id,)).fetchone()
             existing_contract = conn.execute("SELECT * FROM feature_contracts WHERE feature_id=?", (spec.feature_id,)).fetchone()
             if existing_feature or existing_tranche or existing_contract:
-                if not (existing_feature and existing_tranche and existing_contract and existing_tranche["feature_id"] == spec.feature_id and existing_contract["contract_hash"] == contract_hash):
+                if not (existing_feature and existing_tranche and existing_contract and existing_tranche["feature_id"] == spec.feature_id and existing_contract["contract_hash"] == contract_hash and existing_contract["admission_hash"] == admission_hash):
                     raise ValueError("conflicting feature admission identity or contract")
-                return {"feature_id": spec.feature_id, "tranche_id": spec.tranche_id, "contract_hash": contract_hash, "repository_identity": repository_identity, "repo_base_sha": repo_base_sha, "repo_snapshot_hash": repo_snapshot_hash, "predecessor_tranche_id": predecessor.get("tranche_id"), "predecessor_authority_kind": predecessor.get("kind"), "predecessor_generation": predecessor.get("generation")}
+                return {"feature_id": spec.feature_id, "tranche_id": spec.tranche_id, "contract_hash": contract_hash, "admission_hash": admission_hash, "repository_identity": repository_identity, "repo_base_sha": repo_base_sha, "repo_snapshot_hash": repo_snapshot_hash, "predecessor_tranche_id": predecessor.get("tranche_id"), "predecessor_authority_kind": predecessor.get("kind"), "predecessor_generation": predecessor.get("generation")}
             if conn.execute("SELECT 1 FROM tranches WHERE feature_id=? AND ordinal=0", (spec.feature_id,)).fetchone():
                 raise ValueError("feature already has an initial tranche")
             now = self._now()
@@ -2180,9 +2181,9 @@ class Ledger:
             conn.execute("INSERT INTO tranches(id,feature_id,ordinal,status,base_sha,title,objective,criterion_ids_json) VALUES (?,?,?,?,?,?,?,?)", (spec.tranche_id, spec.feature_id, 0, "planned", repo_base_sha, spec.tranche_title, spec.objective, criteria_json))
             for criterion in spec.acceptance_criteria:
                 conn.execute("INSERT INTO tranche_criteria(tranche_id,criterion_id) VALUES (?,?)", (spec.tranche_id, criterion.id))
-            conn.execute("INSERT INTO feature_contracts(feature_id,contract_hash,contract_json,created_at,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json,predecessor_tranche_id,predecessor_authority_kind,predecessor_generation,predecessor_final_integration_sha,predecessor_evidence_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (spec.feature_id, contract_hash, contract_json, now, repository_identity, repo_base_sha, repo_snapshot_hash, repo_snapshot_manifest_json, predecessor.get("tranche_id"), predecessor.get("kind"), predecessor.get("generation"), predecessor.get("final_integration_sha"), predecessor.get("evidence_hash")))
+            conn.execute("INSERT INTO feature_contracts(feature_id,contract_hash,contract_json,created_at,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json,predecessor_tranche_id,predecessor_authority_kind,predecessor_generation,predecessor_final_integration_sha,predecessor_evidence_hash,admission_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (spec.feature_id, contract_hash, contract_json, now, repository_identity, repo_base_sha, repo_snapshot_hash, repo_snapshot_manifest_json, predecessor.get("tranche_id"), predecessor.get("kind"), predecessor.get("generation"), predecessor.get("final_integration_sha"), predecessor.get("evidence_hash"), admission_hash))
             self._append_event(conn, entity_type="feature", entity_id=spec.feature_id, event_type="feature_contract_admitted", actor_id="controller", payload={"tranche_id": spec.tranche_id, "contract_hash": contract_hash, "repo_base_sha": repo_base_sha, "predecessor": predecessor})
-        return {"feature_id": spec.feature_id, "tranche_id": spec.tranche_id, "contract_hash": contract_hash, "repository_identity": repository_identity, "repo_base_sha": repo_base_sha, "repo_snapshot_hash": repo_snapshot_hash, "predecessor_tranche_id": predecessor.get("tranche_id"), "predecessor_authority_kind": predecessor.get("kind"), "predecessor_generation": predecessor.get("generation")}
+        return {"feature_id": spec.feature_id, "tranche_id": spec.tranche_id, "contract_hash": contract_hash, "admission_hash": admission_hash, "repository_identity": repository_identity, "repo_base_sha": repo_base_sha, "repo_snapshot_hash": repo_snapshot_hash, "predecessor_tranche_id": predecessor.get("tranche_id"), "predecessor_authority_kind": predecessor.get("kind"), "predecessor_generation": predecessor.get("generation")}
 
     def tranche_completion(self, tranche_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT * FROM tranche_completion_evidence WHERE tranche_id=?", (tranche_id,)).fetchone()

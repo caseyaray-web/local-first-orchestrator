@@ -96,6 +96,7 @@ class FeatureAdmissionResult:
     feature_id: str
     tranche_id: str
     contract_hash: str
+    admission_hash: str
     repository_identity: str
     repo_base_sha: str
     repo_snapshot_hash: str
