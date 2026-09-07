@@ -13,7 +13,7 @@ from typing import Any, Callable
 from .context_packet import ContextPacketBuilder
 from .evidence_hash import canonical_sha256
 from .git_adapter import AttemptWorktree, GitWorktreeAdapter
-from .historical_revalidation import attestation_hash_from_row, authorization_hash_from_row, classify_obsolete_validation_failure, historical_validation_result_hash
+from .historical_revalidation import attestation_hash_from_row, authorization_hash_from_row, classify_obsolete_validation_failure, derive_obsolete_validation_failure, historical_validation_result_hash
 from .ledger import Ledger
 from .local_qwen import LocalQwenAdapter
 from .readiness import validate_ticket
@@ -376,19 +376,20 @@ class LocalFirstController:
         old_validation = self.ledger.runtime_stage(ticket_id, f"validation-{attempt_number}")
         if old_validation is None:
             raise ValueError("historical attempt lacks deterministic validation failure")
+        raw_detail = str(old_validation["detail"])
         try:
-            old_payload = json.loads(str(old_validation["detail"]))
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise ValueError("historical validation provenance is ambiguous") from exc
-        if old_payload.get("attempt_number") != attempt_number or old_payload.get("passed") is not False:
-            raise ValueError("historical attempt was not rejected by deterministic validation")
-        classification = classify_obsolete_validation_failure(ticket, old_payload)
-        if classification is None:
+            old_payload = json.loads(raw_detail)
+            if type(old_payload) is not dict:
+                raise ValueError("historical validation provenance is ambiguous")
+        except json.JSONDecodeError:
+            old_payload = raw_detail
+        derived = derive_obsolete_validation_failure(ticket, old_payload, attempt_number=attempt_number, stage=f"validation-{attempt_number}")
+        if derived is None or not (Path(str(attempt["worktree_path"])) / ticket.allowed_files[0]).is_file():
             raise ValueError("historical validation failure is not a recognized obsolete controller defect")
+        classification, evidence_identity, _evidence_kind = derived
         if str(attempt["base_sha"]) != str(impl["base_sha"]):
             raise ValueError("implementation base provenance mismatch")
         target_file = ticket.allowed_files[0]
-        evidence_identity = canonical_sha256({"attempt_number": attempt_number, "passed": False, "compact_evidence": old_payload["compact_evidence"]})
         return self.ledger.create_historical_revalidation_authorization(ticket_id=ticket_id, attempt_number=attempt_number, base_sha=str(impl["base_sha"]), repository_identity=str(repo), target_file=target_file, failure_classification=classification, failure_evidence_identity=evidence_identity, implementation_invocation_id=str(invocation["invocation_id"]), operator_id=operator_id, reason=reason)
 
     def attest_historical_revalidation_implementation(self, ticket_id: str, attempt_number: int, *, repository: Path, operator_id: str="local-first-operator") -> dict[str, object]:
@@ -486,15 +487,17 @@ class LocalFirstController:
         old_validation = self.ledger.runtime_stage(ticket_id, f"validation-{attempt_number}")
         if old_validation is None:
             raise ValueError("historical attempt lacks deterministic validation failure")
+        raw_detail = str(old_validation["detail"])
         try:
-            old_payload = json.loads(str(old_validation["detail"]))
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise ValueError("historical validation provenance is ambiguous") from exc
-        if old_payload.get("attempt_number") != attempt_number or old_payload.get("passed") is not False:
-            raise ValueError("historical attempt was not rejected by deterministic validation")
-        obsolete_classification = classify_obsolete_validation_failure(ticket, old_payload)
-        if obsolete_classification is None:
+            old_payload = json.loads(raw_detail)
+            if type(old_payload) is not dict:
+                raise ValueError("historical validation provenance is ambiguous")
+        except json.JSONDecodeError:
+            old_payload = raw_detail
+        derived = derive_obsolete_validation_failure(ticket, old_payload, attempt_number=attempt_number, stage=f"validation-{attempt_number}")
+        if derived is None:
             raise ValueError("historical validation failure is not a recognized obsolete controller defect")
+        obsolete_classification, evidence_identity, _evidence_kind = derived
         authorization = self.ledger.historical_revalidation_authorization(ticket_id, attempt_number)
         if authorization is None:
             raise PermissionError("historical revalidation authorization is required")
@@ -508,7 +511,6 @@ class LocalFirstController:
         if stored_hash != recomputed_hash:
             raise PermissionError("historical revalidation authorization hash mismatch")
         target_file = ticket.allowed_files[0]
-        evidence_identity = canonical_sha256({"attempt_number": attempt_number, "passed": False, "compact_evidence": old_payload["compact_evidence"]})
         expected_identity = {"ticket_id": ticket_id, "attempt_number": attempt_number, "base_sha": str(impl["base_sha"]), "repository_identity": str(repo), "target_file": target_file, "failure_classification": obsolete_classification, "failure_evidence_identity": evidence_identity, "implementation_invocation_id": str(invocation["invocation_id"])}
         if any(str(authorization[key]) != str(value) for key, value in expected_identity.items()):
             raise PermissionError("historical revalidation authorization identity mismatch")

@@ -111,5 +111,24 @@ def classify_obsolete_validation_failure(ticket: MicroTicket, historical: object
     return OBSOLETE_FILE_SCOPE_SYMBOL_VALIDATION
 
 
+def derive_obsolete_validation_failure(ticket: MicroTicket, historical: object, *, attempt_number: int, stage: str) -> tuple[str, str, str] | None:
+    """Derive the exact approved failure and source identity from old evidence."""
+    if type(historical) is dict:
+        if historical.get("attempt_number") != attempt_number:
+            return None
+        classification = classify_obsolete_validation_failure(ticket, historical)
+        if classification is None:
+            return None
+        compact = historical["compact_evidence"]
+        return classification, canonical_sha256({"attempt_number": attempt_number, "passed": False, "compact_evidence": compact}), "structured_validation_provenance"
+    if type(historical) is not str or contract_target_scope(ticket) != "file" or len(ticket.allowed_files) != 1 or ticket.new_test_files:
+        return None
+    target = ticket.allowed_files[0]
+    expected = _obsolete_file_scope_symbol_error(target)
+    if historical != expected:
+        return None
+    return OBSOLETE_FILE_SCOPE_SYMBOL_VALIDATION, canonical_sha256({"historical_evidence_kind": "legacy_runtime_stage_detail", "historical_stage": stage, "raw_detail_sha256": canonical_sha256({"raw_detail": historical}), "attempt_number": attempt_number, "target_file": target, "failure_classification": OBSOLETE_FILE_SCOPE_SYMBOL_VALIDATION}), "legacy_runtime_stage_detail"
+
+
 def recognized_obsolete_validation_failure(ticket: MicroTicket, historical: object) -> bool:
     return classify_obsolete_validation_failure(ticket, historical) == OBSOLETE_FILE_SCOPE_SYMBOL_VALIDATION

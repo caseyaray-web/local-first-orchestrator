@@ -12,7 +12,7 @@ from unittest import mock
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig, ticket_from_ledger
 from local_first_orchestrator.evidence_hash import canonical_sha256
 from local_first_orchestrator.hermes_board import ExternalTicket
-from local_first_orchestrator.historical_revalidation import attestation_hash, attestation_hash_from_row, attestation_identity, authorization_hash, authorization_hash_from_row, authorization_identity
+from local_first_orchestrator.historical_revalidation import attestation_hash, attestation_hash_from_row, attestation_identity, authorization_hash, authorization_hash_from_row, authorization_identity, derive_obsolete_validation_failure
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.states import CanonicalState
 from local_first_orchestrator.validation import DeterministicValidator
@@ -98,6 +98,39 @@ class HistoricalAuthorizationTests(unittest.TestCase):
     def test_controller_authorization_stores_valid_canonical_hash(self) -> None:
         self.create_obsolete_failure(); authorization = self.authorize()
         self.assertEqual(authorization["authorization_hash"], authorization_hash_from_row(authorization))
+
+    def test_exact_legacy_validation_detail_authorizes_and_binds_source_identity(self) -> None:
+        self.create_obsolete_failure()
+        raw = f"symbol scope exceeded in test file: {F1_FILE}"
+        self.ledger.connection.execute("UPDATE runtime_stages SET detail=? WHERE ticket_id=? AND stage='validation-1'", (raw, self.ticket))
+        authorization = self.authorize()
+        derived = derive_obsolete_validation_failure(ticket_from_ledger(self.ledger.get_ticket(self.ticket)), raw, attempt_number=1, stage="validation-1"); assert derived is not None
+        self.assertEqual(authorization["failure_classification"], "obsolete_file_scope_symbol_validation")
+        self.assertEqual(authorization["failure_evidence_identity"], derived[1])
+        self.assertEqual(authorization["authorization_hash"], authorization_hash_from_row(authorization))
+
+    def test_legacy_validation_detail_rejects_wrong_file_and_extra_text(self) -> None:
+        self.create_obsolete_failure()
+        for raw in ("symbol scope exceeded in test file: other.mjs", f"symbol scope exceeded in test file: {F1_FILE} "):
+            with self.subTest(raw=raw):
+                self.ledger.connection.execute("UPDATE runtime_stages SET detail=? WHERE ticket_id=? AND stage='validation-1'", (raw, self.ticket))
+                with self.assertRaisesRegex(ValueError, "recognized obsolete"):
+                    self.authorize()
+
+    def test_json_string_legacy_detail_is_ambiguous_not_legacy(self) -> None:
+        self.create_obsolete_failure()
+        raw = json.dumps(f"symbol scope exceeded in test file: {F1_FILE}")
+        self.ledger.connection.execute("UPDATE runtime_stages SET detail=? WHERE ticket_id=? AND stage='validation-1'", (raw, self.ticket))
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            self.authorize()
+
+    def test_legacy_authorization_requires_exact_validation_stage(self) -> None:
+        self.create_obsolete_failure()
+        raw = f"symbol scope exceeded in test file: {F1_FILE}"
+        self.ledger.connection.execute("UPDATE runtime_stages SET detail=? WHERE ticket_id=? AND stage='validation-1'", (raw, self.ticket))
+        self.ledger.connection.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage='validation-1'", (self.ticket,))
+        with self.assertRaisesRegex(ValueError, "deterministic validation failure"):
+            self.authorize()
 
     def test_direct_sql_correct_hash_succeeds(self) -> None:
         identity = self.raw_identity(); self.raw_insert(identity, authorization_hash(identity))
