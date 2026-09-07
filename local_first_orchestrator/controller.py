@@ -16,7 +16,7 @@ from .context_packet import ContextPacketBuilder
 from .evidence_hash import canonical_sha256
 from .git_adapter import AttemptWorktree, GitWorktreeAdapter
 from .historical_revalidation import attestation_hash_from_row, authorization_hash_from_row, classify_obsolete_validation_failure, derive_obsolete_validation_failure, historical_validation_result_hash
-from .ledger import Ledger
+from .ledger import Ledger, _completion_evidence_hash, _recheck_evidence_hash
 from .local_qwen import LocalQwenAdapter
 from .readiness import validate_ticket
 from .review import LocalReviewAdapter, ReviewPacketBuilder, SameTicketRepairCoordinator, normalize_review
@@ -128,20 +128,38 @@ class LocalFirstController:
         if not authority.get("authorized"):
             raise PermissionError("predecessor completion authority is not authorized")
         rechecks = self.ledger.tranche_completion_rechecks(spec.predecessor_tranche_id)
-        if authority.get("kind") == "recheck" and (not rechecks or int(rechecks[-1]["generation"]) != int(authority.get("completion", {}).get("generation", rechecks[-1]["generation"]))):
-            raise PermissionError("predecessor completion generation is not durable")
-        base = str(authority["final_integration_sha"])
+        kind = str(authority.get("kind") or "")
+        if kind not in {"h1", "recheck"}:
+            raise PermissionError("unknown predecessor completion authority kind")
+        if kind == "recheck":
+            generation = authority.get("completion", {}).get("generation")
+            if not rechecks or generation is None or int(rechecks[-1]["generation"]) != int(generation) or _recheck_evidence_hash(rechecks[-1]) != str(rechecks[-1]["evidence_hash"]):
+                raise PermissionError("predecessor completion recheck evidence is missing or conflicting")
+            authority_row = rechecks[-1]
+            base = str(authority_row["current_integration_sha"])
+            evidence_hash = str(authority_row["evidence_hash"])
+            generation_value = int(authority_row["generation"])
+        else:
+            h1 = authority.get("completion")
+            if h1 is None or not h1.get("evidence_hash") or _completion_evidence_hash(h1) != str(h1["evidence_hash"]):
+                raise PermissionError("predecessor H1 evidence is missing or conflicting")
+            base = str(h1["final_integration_sha"])
+            evidence_hash = str(h1["evidence_hash"])
+            generation_value = int(h1.get("generation", 0) or 0)
+        if str(authority.get("final_integration_sha")) != base:
+            raise PermissionError("predecessor integration authority conflicts")
         resolved = subprocess.run(("git", "rev-parse", "--verify", f"{base}^{{commit}}"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
         if resolved != base:
             raise ValueError("predecessor integration base is not a commit")
         for file in spec.files:
-            result = subprocess.run(("git", "cat-file", "-e", f"{base}:{file.path}"), cwd=repo, text=True, capture_output=True)
-            if file.disposition == "modify" and result.returncode != 0:
-                raise ValueError(f"modify target is absent at authoritative base: {file.path}")
+            result = subprocess.run(("git", "cat-file", "-t", f"{base}:{file.path}"), cwd=repo, text=True, capture_output=True)
+            object_type = result.stdout.strip()
+            if file.disposition == "modify" and (result.returncode != 0 or object_type != "blob"):
+                raise ValueError(f"modify target is not a Git blob at authoritative base: {file.path}")
             if file.disposition == "create" and result.returncode == 0:
                 raise ValueError(f"create target already exists at authoritative base: {file.path}")
         snap = repository_snapshot(repo, base, feature=spec.contract, feature_terms=tuple(f.path for f in spec.files), limit=32)
-        predecessor = {"tranche_id": spec.predecessor_tranche_id, "kind": authority["kind"], "generation": int(authority["completion"].get("generation", rechecks[-1]["generation"])), "final_integration_sha": base, "evidence_hash": str(rechecks[-1]["evidence_hash"])}
+        predecessor = {"tranche_id": spec.predecessor_tranche_id, "kind": authority["kind"], "generation": generation_value, "final_integration_sha": base, "evidence_hash": evidence_hash}
         result = self.ledger.admit_feature_contract(spec, repository_identity=str(repo), repo_base_sha=snap.base_sha, repo_snapshot_hash=snap.snapshot_hash, repo_snapshot_manifest_json=snap.manifest_json, predecessor=predecessor)
         return FeatureAdmissionResult(**result)
 

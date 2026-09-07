@@ -129,6 +129,35 @@ class FeatureAdmissionTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.controller.admit_feature_contract(self.spec(files=(FileDisposition("missing.js", "modify"),)), repository=self.repo)
         with self.assertRaises(ValueError): self.controller.admit_feature_contract(self.spec(files=(FileDisposition("existing.js", "create"),)), repository=self.repo)
 
+    def test_modify_directory_tree_is_rejected(self):
+        (self.repo / "tree").mkdir()
+        (self.repo / "tree" / "nested.js").write_text("export const nested = true;\n", encoding="utf-8")
+        self.git("add", ".")
+        self.git("commit", "-qm", "tree")
+        with self.assertRaises(ValueError):
+            self.controller.admit_feature_contract(self.spec(files=(FileDisposition("tree", "modify"),)), repository=self.repo)
+
+    def test_h1_only_predecessor_admits_without_recheck_row(self):
+        root = Path(TemporaryDirectory().name)
+        root.mkdir()
+        repo = root / "repo"; repo.mkdir()
+        def git(*args): return subprocess.run(("git", *args), cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+        git("init", "-q"); git("config", "user.email", "test@example.invalid"); git("config", "user.name", "Test")
+        (repo / "existing.js").write_text("export const existing = true;\n", encoding="utf-8")
+        git("add", "."); git("commit", "-qm", "base"); base = git("rev-parse", "HEAD")
+        ledger = Ledger(root / "ledger.db"); ledger.migrate(); c = ledger.connection
+        c.execute("INSERT INTO features(id,title,status,created_at,updated_at) VALUES ('C09.10','prior','planned',1,1)")
+        c.execute("INSERT INTO tranches(id,feature_id,ordinal,status,base_sha) VALUES ('C09.10-T0','C09.10',0,'active',?)", (base,))
+        ledger.record_tranche_completion({"tranche_id":"C09.10-T0","root_planning_sha":base,"final_integration_sha":base,"accepted_ticket_ids_json":"[]","accepted_commit_shas_json":"[]"})
+        c.execute("UPDATE controller_state SET paused=1 WHERE id=1")
+        controller = LocalFirstController(ledger, _Board(), RuntimeConfig(repo, root / "worktrees", root / "artifacts", (repo,)))
+        result = controller.admit_feature_contract(FeatureAdmissionSpec("C11", "C11", "C11-T0", "initial", "objective", base, (Criterion("export", "export"),), (), (), (), (FileDisposition("existing.js", "modify"),), "C09.10-T0"), repository=repo)
+        self.assertEqual(result.predecessor_authority_kind, "h1")
+        row = c.execute("SELECT predecessor_authority_kind,predecessor_generation,predecessor_evidence_hash FROM feature_contracts WHERE feature_id='C11'").fetchone()
+        self.assertEqual(row["predecessor_authority_kind"], "h1"); self.assertEqual(row["predecessor_generation"], "0"); self.assertEqual(row["predecessor_evidence_hash"], ledger.tranche_completion("C09.10-T0")["evidence_hash"])
+        self.assertEqual(c.execute("SELECT count(*) FROM tranche_completion_rechecks WHERE tranche_id='C09.10-T0'").fetchone()[0], 0)
+        ledger.close(); root_obj = root
+
     def test_incomplete_predecessor_rejects_without_rows(self):
         with self.assertRaises(PermissionError): self.controller.admit_feature_contract(self.spec(predecessor_tranche_id="C09.11-T0"), repository=self.repo)
         self.assertEqual(self.ledger.connection.execute("select count(*) from features where id='C11'").fetchone()[0], 0)
