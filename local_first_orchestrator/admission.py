@@ -84,7 +84,9 @@ class FeatureAdmissionSpec:
     @classmethod
     def from_json(cls, raw: dict[str, Any]) -> "FeatureAdmissionSpec":
         allowed = {"feature_id", "feature_title", "tranche_id", "tranche_title", "objective", "source_revision", "acceptance_criteria", "non_goals", "invariants", "constraints", "files", "predecessor_tranche_id"}
-        if set(raw) - allowed or not allowed - set(raw):
+        unknown = set(raw) - allowed
+        missing = allowed - set(raw)
+        if unknown or missing:
             raise ValueError("feature admission specification has unknown or missing fields")
         criteria = tuple(Criterion(str(x["id"]), str(x["statement"]), str(x.get("verification_hint", ""))) for x in raw["acceptance_criteria"])
         files = tuple(FileDisposition(str(x["path"]), str(x["disposition"])) for x in raw["files"])

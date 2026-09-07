@@ -77,6 +77,32 @@ class FeatureAdmissionTests(unittest.TestCase):
         self.assertEqual(self.ledger.connection.execute("select count(*) from feature_contracts where feature_id='C11'").fetchone()[0], 1)
         self.assertEqual(self.ledger.connection.execute("select count(*) from decomposition_plans where feature_id='C11'").fetchone()[0], 0)
 
+    def test_valid_c11_specification_parses_without_field_error(self):
+        parsed = FeatureAdmissionSpec.from_json(self.spec().canonical_payload)
+        self.assertEqual(parsed, self.spec())
+
+    def test_parser_rejects_unknown_field(self):
+        raw = self.spec().canonical_payload | {"unexpected": True}
+        with self.assertRaisesRegex(ValueError, "unknown or missing fields"):
+            FeatureAdmissionSpec.from_json(raw)
+
+    def test_parser_rejects_missing_required_field(self):
+        raw = self.spec().canonical_payload
+        raw.pop("objective")
+        with self.assertRaisesRegex(ValueError, "unknown or missing fields"):
+            FeatureAdmissionSpec.from_json(raw)
+
+    def test_parser_rejects_unknown_and_missing_fields(self):
+        raw = self.spec().canonical_payload
+        raw.pop("objective")
+        raw["unexpected"] = True
+        with self.assertRaisesRegex(ValueError, "unknown or missing fields"):
+            FeatureAdmissionSpec.from_json(raw)
+
+    def test_parser_preserves_all_admission_fields(self):
+        parsed = FeatureAdmissionSpec.from_json(self.spec().canonical_payload)
+        self.assertEqual(parsed.canonical_payload, self.spec().canonical_payload)
+
     def test_admission_contract_activates_through_normal_decomposition_lifecycle(self):
         result = self.controller.admit_feature_contract(self.spec(), repository=self.repo)
         row = self.ledger.connection.execute("select * from feature_contracts where feature_id='C11'").fetchone()
