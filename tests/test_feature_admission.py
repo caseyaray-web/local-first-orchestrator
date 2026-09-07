@@ -1,0 +1,132 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from local_first_orchestrator.admission import FeatureAdmissionSpec, FileDisposition
+from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
+from local_first_orchestrator.decomposition import Criterion
+from local_first_orchestrator.ledger import Ledger, _hash_recheck_payload
+
+
+class _Board:
+    is_fake = False
+
+
+class FeatureAdmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.git("init", "-q")
+        self.git("config", "user.email", "test@example.invalid")
+        self.git("config", "user.name", "Test")
+        (self.repo / "existing.js").write_text("export const existing = true;\n", encoding="utf-8")
+        self.git("add", ".")
+        self.git("commit", "-qm", "base")
+        self.base = self.git("rev-parse", "HEAD")
+        self.ledger = Ledger(self.root / "ledger.db")
+        self.ledger.migrate()
+        self._seed_predecessor_authority()
+        self.config = RuntimeConfig(self.repo, self.root / "worktrees", self.root / "artifacts", (self.repo,))
+        self.controller = LocalFirstController(self.ledger, _Board(), self.config)
+
+    def tearDown(self):
+        self.ledger.close()
+        self.tmp.cleanup()
+
+    def git(self, *args):
+        return subprocess.run(("git", *args), cwd=self.repo, text=True, capture_output=True, check=True).stdout.strip()
+
+    def _seed_predecessor_authority(self):
+        now = 1
+        c = self.ledger.connection
+        c.execute("INSERT INTO features(id,title,status,created_at,updated_at) VALUES ('C09.10','prior','planned',?,?)", (now, now))
+        c.execute("INSERT INTO tranches(id,feature_id,ordinal,status,base_sha) VALUES ('C09.10-T0','C09.10',0,'active',?)", (self.base,))
+        completion = {"tranche_id": "C09.10-T0", "root_planning_sha": self.base, "final_integration_sha": self.base, "accepted_ticket_ids_json": "[]", "accepted_commit_shas_json": "[]"}
+        self.ledger.record_tranche_completion(completion)
+        h1 = self.ledger.tranche_completion("C09.10-T0")["evidence_hash"]
+        recheck_payload={"tranche_id":"C09.10-T0","generation":1,"previous_generation":0,"previous_evidence_hash":h1,"correction_plan_ids":[],"accepted_ticket_ids":[],"accepted_commit_shas":[],"current_integration_sha":self.base,"repository_identity":str(self.repo),"repo_base_sha":self.base,"repo_snapshot_hash":"snapshot","unresolved_correction_count":0,"status":"recheck_passed"}
+        c.execute("INSERT INTO tranche_completion_rechecks(tranche_id,generation,previous_generation,previous_evidence_hash,correction_plan_ids_json,accepted_ticket_ids_json,accepted_commit_shas_json,current_integration_sha,repository_identity,repo_base_sha,repo_snapshot_hash,unresolved_correction_count,status,evidence_hash,idempotency_key,recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("C09.10-T0",1,0,h1,"[]","[]","[]",self.base,str(self.repo),self.base,"snapshot",0,"recheck_passed",_hash_recheck_payload(recheck_payload),"fixture",now))
+        self.ledger.connection.execute("UPDATE controller_state SET paused=1 WHERE id=1")
+
+    def spec(self, **changes):
+        data = dict(
+            feature_id="C11", feature_title="Meal Planner C11: export and restore", tranche_id="C11-T0", tranche_title="C11 initial tranche",
+            objective="Add complete JSON export and restore rehearsal", source_revision=self.base,
+            acceptance_criteria=(Criterion("export", "Complete canonical and history export without secrets."), Criterion("restore", "Dry-run and safe restore rehearsal preserve parity.")),
+            non_goals=("No unrelated application export expansion.",), invariants=("Household scope is mandatory.",), constraints=("RED GREEN REFACTOR verification is required.",),
+            files=(FileDisposition("existing.js", "modify"), FileDisposition("new-test.mjs", "create")), predecessor_tranche_id="C09.10-T0",
+        )
+        data.update(changes)
+        return FeatureAdmissionSpec(**data)
+
+    def test_admission_api_persists_feature_tranche_contract_atomically(self):
+        result = self.controller.admit_feature_contract(self.spec(), repository=self.repo)
+        self.assertEqual(result.feature_id, "C11")
+        self.assertEqual(result.tranche_id, "C11-T0")
+        self.assertEqual(self.ledger.connection.execute("select count(*) from features where id='C11'").fetchone()[0], 1)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from tranches where id='C11-T0'").fetchone()[0], 1)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from feature_contracts where feature_id='C11'").fetchone()[0], 1)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from decomposition_plans where feature_id='C11'").fetchone()[0], 0)
+
+    def test_provenance_and_predecessor_are_persisted(self):
+        result = self.controller.admit_feature_contract(self.spec(), repository=self.repo)
+        contract = self.ledger.connection.execute("select * from feature_contracts where feature_id='C11'").fetchone()
+        tranche = self.ledger.connection.execute("select * from tranches where id='C11-T0'").fetchone()
+        self.assertEqual(contract["repo_base_sha"], self.base)
+        self.assertEqual(contract["predecessor_tranche_id"], "C09.10-T0")
+        self.assertEqual(contract["predecessor_authority_kind"], "h1")
+        self.assertEqual(contract["repo_snapshot_hash"], result.repo_snapshot_hash)
+        self.assertEqual(json.loads(tranche["criterion_ids_json"]), ["export", "restore"])
+
+    def test_immutable_contract_cannot_be_updated_or_deleted(self):
+        self.controller.admit_feature_contract(self.spec(), repository=self.repo)
+        with self.assertRaises(Exception): self.ledger.connection.execute("update feature_contracts set contract_json='{}' where feature_id='C11'")
+        with self.assertRaises(Exception): self.ledger.connection.execute("delete from feature_contracts where feature_id='C11'")
+
+    def test_conflicting_tranche_identity_fails_closed(self):
+        self.controller.admit_feature_contract(self.spec(), repository=self.repo)
+        with self.assertRaises(ValueError): self.controller.admit_feature_contract(self.spec(tranche_id="C11-T1"), repository=self.repo)
+
+    def test_no_attempts_or_model_activity_are_created(self):
+        self.controller.admit_feature_contract(self.spec(), repository=self.repo)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from attempts").fetchone()[0], 0)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from model_invocations").fetchone()[0], 0)
+
+    def test_identical_replay_is_idempotent_and_conflict_fails(self):
+        first = self.controller.admit_feature_contract(self.spec(), repository=self.repo)
+        second = self.controller.admit_feature_contract(self.spec(), repository=self.repo)
+        self.assertEqual(first.contract_hash, second.contract_hash)
+        with self.assertRaises(ValueError):
+            self.controller.admit_feature_contract(self.spec(objective="different objective"), repository=self.repo)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from features where id='C11'").fetchone()[0], 1)
+
+    def test_paths_are_strictly_validated(self):
+        with self.assertRaises(ValueError): self.controller.admit_feature_contract(self.spec(files=(FileDisposition("../escape.js", "modify"),)), repository=self.repo)
+        with self.assertRaises(ValueError): self.controller.admit_feature_contract(self.spec(files=(FileDisposition("/absolute.js", "create"),)), repository=self.repo)
+        with self.assertRaises(ValueError): self.controller.admit_feature_contract(self.spec(files=(FileDisposition("missing.js", "modify"),)), repository=self.repo)
+        with self.assertRaises(ValueError): self.controller.admit_feature_contract(self.spec(files=(FileDisposition("existing.js", "create"),)), repository=self.repo)
+
+    def test_incomplete_predecessor_rejects_without_rows(self):
+        with self.assertRaises(PermissionError): self.controller.admit_feature_contract(self.spec(predecessor_tranche_id="C09.11-T0"), repository=self.repo)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from features where id='C11'").fetchone()[0], 0)
+
+    def test_transaction_failure_leaves_no_partial_rows(self):
+        original = self.ledger._append_event
+        def fail(*args, **kwargs): raise RuntimeError("injected")
+        self.ledger._append_event = fail
+        with self.assertRaises(RuntimeError): self.controller.admit_feature_contract(self.spec(), repository=self.repo)
+        self.ledger._append_event = original
+        self.assertEqual(self.ledger.connection.execute("select count(*) from features where id='C11'").fetchone()[0], 0)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from tranches where id='C11-T0'").fetchone()[0], 0)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from feature_contracts where feature_id='C11'").fetchone()[0], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

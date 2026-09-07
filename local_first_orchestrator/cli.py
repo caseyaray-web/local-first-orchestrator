@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .controller import LocalFirstController, RuntimeConfig
+from .admission import FeatureAdmissionSpec
 from .corrections import AcceptedPredecessor, CorrectionService, CorrectionTicketSpec, SupplementalCorrectionPlan
 from .generated_activation import GeneratedActivationError, activate_generated_ticket
 from .generated_projection import GeneratedProjectionWorker
@@ -249,8 +250,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     register.add_argument("--review-profile", default="worker-code-local")
     register.add_argument("--review-provider", default=LOCAL_QWEN_PROVIDER)
     register.add_argument("--review-model", default=LOCAL_QWEN_MODEL)
-
-
+    admission=commands.add_parser("admit-feature-contract", help="admit one paused, predecessor-authorized feature contract without planning")
+    admission.add_argument("--spec-file", required=True)
 def run_command(args: argparse.Namespace) -> int:
     """Run a parsed standalone or native Hermes CLI command."""
     ledger=_ledger(args.database)
@@ -301,6 +302,11 @@ def run_command(args: argparse.Namespace) -> int:
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
             print(json.dumps(ctl.integrate_accepted_candidate_only(args.task_id,args.attempt_number,repository=registered.canonical_repository),sort_keys=True,default=str))
         elif args.command=="inspect": print(json.dumps(ledger.get_ticket(args.task_id),sort_keys=True))
+        elif args.command=="admit-feature-contract":
+            if args.ad_hoc_runtime: raise ValueError("feature admission requires registered operator runtime")
+            ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
+            spec=FeatureAdmissionSpec.from_json(json.loads(Path(args.spec_file).expanduser().read_text(encoding="utf-8")))
+            print(json.dumps(ctl.admit_feature_contract(spec,repository=registered.canonical_repository).__dict__,sort_keys=True,default=str))
         elif args.command=="register-dashboard":
             root=Path(args.repository).resolve(strict=True)
             allowlist=tuple(Path(item).resolve(strict=True) for item in args.allow_repository) or (root,)

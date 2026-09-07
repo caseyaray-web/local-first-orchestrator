@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .admission import FeatureAdmissionResult, FeatureAdmissionSpec
 from .context_packet import ContextPacketBuilder
 from .evidence_hash import canonical_sha256
 from .git_adapter import AttemptWorktree, GitWorktreeAdapter
@@ -19,6 +20,8 @@ from .ledger import Ledger
 from .local_qwen import LocalQwenAdapter
 from .readiness import validate_ticket
 from .review import LocalReviewAdapter, ReviewPacketBuilder, SameTicketRepairCoordinator, normalize_review
+from .repository_snapshot import snapshot as repository_snapshot
+from .corrections import CorrectionService
 from .states import CanonicalState
 from .ticket import MicroTicket, PatchBudget, VerificationProfile
 from .validation import DeterministicValidator
@@ -112,6 +115,35 @@ class LocalFirstController:
     def dry_run(self, task_id: str) -> dict[str, object]:
         row=self.ledger.get_ticket(task_id); binding=self.ledger.runtime_binding(task_id)
         return {"ticket_id":task_id,"state":row["state"],"repository":binding["repository_path"],"starting_sha":binding["starting_sha"],"would_invoke_model":False,"would_write_board":False,"would_modify_repository":False}
+
+    def admit_feature_contract(self, spec: FeatureAdmissionSpec, *, repository: Path) -> FeatureAdmissionResult:
+        """Admit one human-approved feature contract without planning or projection."""
+        paused = self.ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+        if paused is None or int(paused["paused"]) != 1:
+            raise PermissionError("feature admission requires Local First paused")
+        repo = self.config.canonical_repository(Path(repository))
+        if spec.predecessor_tranche_id is None:
+            raise ValueError("feature admission requires an authoritative predecessor tranche")
+        authority = CorrectionService(self.ledger, repo).completion_authority(spec.predecessor_tranche_id)
+        if not authority.get("authorized"):
+            raise PermissionError("predecessor completion authority is not authorized")
+        rechecks = self.ledger.tranche_completion_rechecks(spec.predecessor_tranche_id)
+        if authority.get("kind") == "recheck" and (not rechecks or int(rechecks[-1]["generation"]) != int(authority.get("completion", {}).get("generation", rechecks[-1]["generation"]))):
+            raise PermissionError("predecessor completion generation is not durable")
+        base = str(authority["final_integration_sha"])
+        resolved = subprocess.run(("git", "rev-parse", "--verify", f"{base}^{{commit}}"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+        if resolved != base:
+            raise ValueError("predecessor integration base is not a commit")
+        for file in spec.files:
+            result = subprocess.run(("git", "cat-file", "-e", f"{base}:{file.path}"), cwd=repo, text=True, capture_output=True)
+            if file.disposition == "modify" and result.returncode != 0:
+                raise ValueError(f"modify target is absent at authoritative base: {file.path}")
+            if file.disposition == "create" and result.returncode == 0:
+                raise ValueError(f"create target already exists at authoritative base: {file.path}")
+        snap = repository_snapshot(repo, base, feature=spec.contract, feature_terms=tuple(f.path for f in spec.files), limit=32)
+        predecessor = {"tranche_id": spec.predecessor_tranche_id, "kind": authority["kind"], "generation": int(authority["completion"].get("generation", rechecks[-1]["generation"])), "final_integration_sha": base, "evidence_hash": str(rechecks[-1]["evidence_hash"])}
+        result = self.ledger.admit_feature_contract(spec, repository_identity=str(repo), repo_base_sha=snap.base_sha, repo_snapshot_hash=snap.snapshot_hash, repo_snapshot_manifest_json=snap.manifest_json, predecessor=predecessor)
+        return FeatureAdmissionResult(**result)
 
     def _crash(self, stage: str) -> None:
         if self.fault_injector: self.fault_injector(stage)
