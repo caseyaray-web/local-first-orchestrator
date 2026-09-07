@@ -111,6 +111,19 @@ class PlanningCoordinatorTests(unittest.TestCase):
                 coordinator.activate_persisted_plan(self.feature, request_key=str(pending.request_key), plan_id=str(pending.plan_id))
         self.assertEqual(self.ledger.connection.execute("select status from planning_runs").fetchone()[0], "validated_pending_activation")
 
+    def test_finalizer_rejects_wrong_plan_and_ticket_identity_from_terra_exploit(self):
+        from local_first_orchestrator.repository_snapshot import snapshot
+        planner = FakeLocalPlanner(make_plan(self.feature, snapshot(self.repo, self.sha, self.feature)))
+        coordinator = PlanningCoordinator(self.ledger, self.config, planner)
+        pending = coordinator.generate_plan_only(self.feature)
+        coordinator.activate_persisted_plan(self.feature, request_key=str(pending.request_key), plan_id=str(pending.plan_id))
+        with self.assertRaisesRegex(ValueError, "ticket identity"):
+            self.ledger.finalize_planning_run_activation(str(pending.request_key), plan_id=str(pending.plan_id), ticket_ids=("wrong-ticket",))
+        with self.assertRaisesRegex(ValueError, "plan identity"):
+            self.ledger.finalize_planning_run_activation(str(pending.request_key), plan_id="plan-other", ticket_ids=("TK-1",))
+        run = self.ledger.connection.execute("select status,plan_id,ticket_ids_json from planning_runs").fetchone()
+        self.assertEqual((run["status"], run["plan_id"], json.loads(run["ticket_ids_json"])), ("activated", pending.plan_id, ["TK-1"]))
+
     def test_plan_only_invalid_output_does_not_persist_or_materialize(self):
         from local_first_orchestrator.repository_snapshot import snapshot
         snap = snapshot(self.repo, self.sha, self.feature)
