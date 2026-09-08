@@ -4,9 +4,29 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class PatchBudgetPolicy:
+    normal_max_files: int = 2
+    normal_max_changed_lines: int = 180
+    minimum_exception_reason_length: int = 12
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "normal_max_files": self.normal_max_files,
+            "normal_max_changed_lines": self.normal_max_changed_lines,
+            "declared_paths": "allowed_files + new_test_files",
+            "declared_paths_must_be_unique": True,
+            "broader_budget_requires_exception_reason": True,
+            "minimum_exception_reason_length": self.minimum_exception_reason_length,
+        }
+
+
+PATCH_BUDGET_POLICY = PatchBudgetPolicy()
+
+
+@dataclass(frozen=True)
 class PatchBudget:
-    max_files: int = 2
-    max_changed_lines: int = 180
+    max_files: int = PATCH_BUDGET_POLICY.normal_max_files
+    max_changed_lines: int = PATCH_BUDGET_POLICY.normal_max_changed_lines
     exception_reason: str | None = None
 
 

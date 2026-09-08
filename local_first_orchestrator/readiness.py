@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .source_languages import is_supported_source, is_test_path, normalized_repository_path
-from .ticket import MicroTicket
+from .ticket import MicroTicket, PATCH_BUDGET_POLICY
 
 
 class ReadinessError(ValueError):
@@ -11,7 +11,7 @@ class ReadinessError(ValueError):
 _VAGUE = ("improve", "clean up", "fix things", "as needed", "etc", "all files", "anything")
 
 
-def validate_ticket(ticket: MicroTicket) -> MicroTicket:
+def validate_ticket(ticket: MicroTicket, *, budget_policy=PATCH_BUDGET_POLICY) -> MicroTicket:
     objective = ticket.objective.strip()
     if len(objective) < 12 or any(word in objective.lower() for word in _VAGUE):
         raise ReadinessError("objective is missing, vague, or unsafe")
@@ -31,7 +31,7 @@ def validate_ticket(ticket: MicroTicket) -> MicroTicket:
     if ticket.risk not in {"low", "medium", "high"} or not 1 <= ticket.max_attempts <= 2:
         raise ReadinessError("risk and maximum two attempts are required")
     budget = ticket.patch_budget
-    if budget.max_files > 2 or budget.max_changed_lines > 180:
-        if not budget.exception_reason or len(budget.exception_reason.strip()) < 12:
+    if budget.max_files > budget_policy.normal_max_files or budget.max_changed_lines > budget_policy.normal_max_changed_lines:
+        if not budget.exception_reason or len(budget.exception_reason.strip()) < budget_policy.minimum_exception_reason_length:
             raise ReadinessError("broader patch budget requires a bounded exception reason")
     return ticket
