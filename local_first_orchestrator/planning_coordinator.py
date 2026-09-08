@@ -32,6 +32,11 @@ from .ledger import Ledger
 
 class Planner(Protocol):
     cost_class: str
+    role: str
+    provider: str
+    model: str
+    profile: str
+    routing_source: str
 
 
 @dataclass(frozen=True)
@@ -69,22 +74,49 @@ class PlanningCoordinator:
 
     def _cost_class(self) -> str:
         value = getattr(self.planner, "cost_class", "unknown")
-        return value if value in {"local", "paid", "unknown"} else "unknown"
+        return value if value in {"local", "standard", "paid", "unknown"} else "unknown"
+
+    def _route(self) -> dict[str, str]:
+        values = {key: getattr(self.planner, key, None) for key in ("role", "provider", "model", "profile", "routing_source")}
+        if not all(isinstance(value, str) and value.strip() for value in values.values()):
+            raise ValueError("planner route identity is incomplete")
+        cost_class = self._cost_class()
+        if cost_class == "unknown":
+            raise ValueError("planner cost class is not trusted")
+        return {**values, "cost_class": cost_class}
 
     def _request_key(self, feature: FeatureContract, snap: RepositorySnapshot) -> str:
         material = {
             "architecture_purpose": PaidPurpose.ARCHITECTURE.value,
+            "planner_request_version": 2,
             "feature_id": feature.id,
             "contract_hash": feature.contract_hash,
             "repo_base_sha": snap.base_sha,
             "repo_snapshot_hash": snap.snapshot_hash,
             "repository_identity": snap.repository_id,
             "planner_identity": self.planner_identity,
+            "planner_route": self._route(),
         }
         return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     def _artifact_dir(self, feature: FeatureContract, request_key: str) -> Path:
         return self.artifact_root / feature.id / request_key
+
+    def _assert_prior_route(self, prior: Any) -> None:
+        route = self._route()
+        fields = {
+            "planner_role": route["role"],
+            "planner_provider": route["provider"],
+            "planner_model": route["model"],
+            "planner_profile": route["profile"],
+            "planner_routing_source": route["routing_source"],
+        }
+        for field, expected in fields.items():
+            actual = prior[field]
+            if actual is None or str(actual) != expected:
+                raise ValueError("conflicting durable planner route provenance")
+        if str(prior["cost_class"]) != route["cost_class"]:
+            raise ValueError("conflicting durable planner route provenance")
 
     @staticmethod
     def _plan_json(plan: DecompositionPlan) -> str:
@@ -94,10 +126,10 @@ class PlanningCoordinator:
         now = self.ledger._now()
         with self.ledger._transaction() as conn:
             conn.execute(
-                """INSERT INTO planning_runs(request_key,feature_id,contract_hash,repo_base_sha,repo_snapshot_hash,planner_identity,cost_class,status,response_artifact,structural_reasons_json,repository_reasons_json,plan_id,ticket_ids_json,created_at,updated_at,repository_identity,repo_snapshot_manifest_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """INSERT INTO planning_runs(request_key,feature_id,contract_hash,repo_base_sha,repo_snapshot_hash,planner_identity,cost_class,status,response_artifact,structural_reasons_json,repository_reasons_json,plan_id,ticket_ids_json,created_at,updated_at,repository_identity,repo_snapshot_manifest_json,planner_role,planner_provider,planner_model,planner_profile,planner_routing_source)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(request_key) DO UPDATE SET status=excluded.status,response_artifact=excluded.response_artifact,structural_reasons_json=excluded.structural_reasons_json,repository_reasons_json=excluded.repository_reasons_json,plan_id=excluded.plan_id,ticket_ids_json=excluded.ticket_ids_json,updated_at=excluded.updated_at""",
-                (request_key, feature.id, feature.contract_hash, snap.base_sha, snap.snapshot_hash, self.planner_identity, self._cost_class(), status, str(artifact) if artifact else None, json.dumps(structural), json.dumps(repository), plan_id, json.dumps(ticket_ids), now, now, snap.repository_id, snap.manifest_json),
+                (request_key, feature.id, feature.contract_hash, snap.base_sha, snap.snapshot_hash, self.planner_identity, self._cost_class(), status, str(artifact) if artifact else None, json.dumps(structural), json.dumps(repository), plan_id, json.dumps(ticket_ids), now, now, snap.repository_id, snap.manifest_json, self._route()["role"], self._route()["provider"], self._route()["model"], self._route()["profile"], self._route()["routing_source"]),
             )
 
     def _existing_activated(self, feature: FeatureContract, snap: RepositorySnapshot) -> PlanningOutcome | None:
@@ -210,8 +242,9 @@ class PlanningCoordinator:
         prior = self.ledger.connection.execute("SELECT * FROM planning_runs WHERE request_key=?", (request_key,)).fetchone()
         try:
             if prior is not None and prior["status"] in {"structural_rejected", "repository_rejected", "validated_pending_activation", "completed"} and prior["response_artifact"] and Path(prior["response_artifact"]).exists():
+                self._assert_prior_route(prior)
                 proposal = parse(Path(prior["response_artifact"]).read_text(encoding="utf-8"))
-            elif self._cost_class() == "local":
+            elif getattr(self.planner, "role", None) == "decomposition" and callable(getattr(self.planner, "propose", None)):
                 proposal = self.planner.propose(feature, snap, artifact_dir=artifact_dir, repository=repo)  # type: ignore[attr-defined]
                 if not response_path.exists():
                     response_path.write_text(self._plan_json(proposal), encoding="utf-8")

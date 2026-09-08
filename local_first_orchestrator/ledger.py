@@ -618,6 +618,9 @@ class Ledger:
         for name in ("repository_identity", "repo_snapshot_manifest_json"):
             if name not in run_columns:
                 self.connection.execute(f"ALTER TABLE planning_runs ADD COLUMN {name} TEXT")
+        for name in ("planner_role", "planner_provider", "planner_model", "planner_profile", "planner_routing_source"):
+            if name not in run_columns:
+                self.connection.execute(f"ALTER TABLE planning_runs ADD COLUMN {name} TEXT")
         reconciliation_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(failed_attempt_reconciliations)")}
         if "forensic_artifact_paths_json" not in reconciliation_columns:
             self.connection.execute("ALTER TABLE failed_attempt_reconciliations ADD COLUMN forensic_artifact_paths_json TEXT NOT NULL DEFAULT '[]'")

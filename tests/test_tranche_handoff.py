@@ -24,6 +24,11 @@ def ticket(ticket_id: str, objective: str, criterion: str, symbol: str, path: st
 
 class NextPlanner:
     cost_class = "local"
+    role = "decomposition"
+    provider = "fixture-provider"
+    model = "fixture-planner"
+    profile = "fixture-profile"
+    routing_source = "fixture"
     def __init__(self, proposal):
         self.proposal = proposal
         self.calls = []

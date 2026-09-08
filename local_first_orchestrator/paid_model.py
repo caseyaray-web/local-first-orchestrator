@@ -23,6 +23,11 @@ class InjectedPaidModelAdapter:
     """Test-only adapter. The injected callable is the sole possible invocation path."""
     is_paid = True
     cost_class = "paid"
+    role = "decomposition"
+    provider = "injected"
+    model = "injected-paid-planner"
+    profile = "fixture"
+    routing_source = "injected-fixture"
 
     def __init__(self, ledger: Ledger, governor: UsageGovernor, runner: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
         self.ledger, self.governor, self.runner = ledger, governor, runner

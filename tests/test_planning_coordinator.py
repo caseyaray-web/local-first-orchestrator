@@ -19,10 +19,26 @@ from local_first_orchestrator.usage_governor import PaidPurpose, UsageGovernor
 
 class FakeLocalPlanner:
     cost_class = "local"
+    role = "decomposition"
+    provider = "fixture-provider"
+    model = "fixture-local-planner"
+    profile = "fixture-profile"
+    routing_source = "fixture"
     def __init__(self, proposal): self.proposal, self.calls, self.repository = proposal, 0, None
     def propose(self, feature, snapshot, *, artifact_dir, repository=None):
         self.calls += 1; self.repository = repository
         return self.proposal
+
+
+class FakeStandardPlanner(FakeLocalPlanner):
+    cost_class = "standard"
+    model = "fixture-standard-planner"
+
+
+class RejectOnceValidator:
+    def validate(self, feature, proposal):
+        from local_first_orchestrator.decomposition import PlanValidationResult
+        return PlanValidationResult(False, ("criterion_uncovered",))
 
 
 def make_ticket(primary="app.py::calculate", criterion="AC-1"):
@@ -59,6 +75,60 @@ class PlanningCoordinatorTests(unittest.TestCase):
         self.feature = make_feature(self.sha)
 
     def tearDown(self): self.ledger.close(); self.tmp.cleanup()
+
+    def test_route_bound_identity_allows_luna_rejection_then_terra_fresh_plan(self):
+        from local_first_orchestrator.repository_snapshot import snapshot
+        snap = snapshot(self.repo, self.sha, self.feature)
+        luna = FakeLocalPlanner(make_plan(self.feature, snap))
+        first_coordinator = PlanningCoordinator(self.ledger, self.config, luna, plan_validator=RejectOnceValidator())
+        first = first_coordinator.generate_plan_only(self.feature)
+        self.assertEqual(first.status, "structural_rejected")
+        self.assertEqual(luna.calls, 1)
+        first_key = first.request_key
+        first_artifact = first_coordinator._artifact_dir(self.feature, str(first_key))
+        first_row = dict(self.ledger.connection.execute("select * from planning_runs where request_key=?", (first_key,)).fetchone())
+
+        terra = FakeStandardPlanner(make_plan(self.feature, snap))
+        second_coordinator = PlanningCoordinator(self.ledger, self.config, terra)
+        second = second_coordinator.generate_plan_only(self.feature)
+        self.assertEqual(second.status, "validated_pending_activation")
+        self.assertEqual(terra.calls, 1)
+        self.assertNotEqual(first_key, second.request_key)
+        self.assertTrue(first_artifact.exists())
+        self.assertTrue(second_coordinator._artifact_dir(self.feature, str(second.request_key)).exists())
+        self.assertEqual(dict(self.ledger.connection.execute("select * from planning_runs where request_key=?", (first_key,)).fetchone()), first_row)
+        replay = second_coordinator.generate_plan_only(self.feature)
+        self.assertEqual(replay.plan_id, second.plan_id)
+        self.assertEqual(terra.calls, 1)
+
+    def test_route_components_change_request_identity_and_same_route_repeats(self):
+        from local_first_orchestrator.repository_snapshot import snapshot
+        snap = snapshot(self.repo, self.sha, self.feature)
+        def key(**changes):
+            planner = FakeStandardPlanner(make_plan(self.feature, snap))
+            for name, value in changes.items(): setattr(planner, name, value)
+            return PlanningCoordinator(self.ledger, self.config, planner)._request_key(self.feature, snap)
+        baseline = key()
+        self.assertNotEqual(baseline, key(provider="other-provider"))
+        self.assertNotEqual(baseline, key(model="other-model"))
+        self.assertNotEqual(baseline, key(profile="other-profile"))
+        self.assertNotEqual(baseline, key(cost_class="local"))
+        self.assertEqual(baseline, key())
+
+    def test_conflicting_route_provenance_for_same_request_fails_closed(self):
+        from local_first_orchestrator.repository_snapshot import snapshot
+        snap = snapshot(self.repo, self.sha, self.feature)
+        planner = FakeStandardPlanner(make_plan(self.feature, snap))
+        coordinator = PlanningCoordinator(self.ledger, self.config, planner)
+        key = coordinator._request_key(self.feature, snap)
+        artifact = coordinator._artifact_dir(self.feature, key); artifact.mkdir(parents=True)
+        (artifact / "planner-response.json").write_text(coordinator._plan_json(planner.proposal))
+        coordinator._record(key, self.feature, snap, status="structural_rejected", artifact=artifact / "planner-response.json", structural=("criterion_uncovered",))
+        self.ledger.connection.execute("update planning_runs set planner_model='conflicting-model' where request_key=?", (key,))
+        result = coordinator.generate_plan_only(self.feature)
+        self.assertEqual(result.status, "planner_failed")
+        self.assertIn("conflicting durable planner route provenance", result.reasons)
+        self.assertEqual(planner.calls, 0)
 
     def test_local_success_is_once_and_has_no_paid_reservation(self):
         from local_first_orchestrator.repository_snapshot import snapshot
