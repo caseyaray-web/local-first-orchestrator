@@ -64,6 +64,27 @@ class CreateFilesTests(unittest.TestCase):
         plan = DecompositionPlan(1, "C11", feature.contract_hash, sha, snap.snapshot_hash, (), {"A": ("T",)}, (Tranche("T0", 0, "restore", (), ("A",), (ticket,)),), repository_identity=snap.repository_id, repo_snapshot_manifest_json=snap.manifest_json)
         self.assertTrue(RepositoryPlanValidator().validate(plan, snap).passed)
 
+    def test_authorized_non_source_blob_is_reserved_without_symbols(self):
+        (self.repo / "docs").mkdir(); (self.repo / "docs/README.md").write_text("run_app documentation\n")
+        subprocess.run(("git", "add", "."), cwd=self.repo, check=True); subprocess.run(("git", "commit", "-m", "add docs"), cwd=self.repo, check=True, capture_output=True)
+        sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=self.repo, check=True, text=True, capture_output=True).stdout.strip()
+        feature = FeatureContract("F", "Document run_app with existing_function", "Document run_app", (Criterion("A", "document"),), (), (), (), sha)
+        snap = snapshot(self.repo, sha, feature, feature_terms=("run_app", "existing_function"), limit=2, authorized_modify_paths=("docs/README.md",))
+        entry = next(e for e in snap.entries if e.path == "docs/README.md")
+        self.assertEqual(entry.reason, "authorized_modify_target"); self.assertEqual(entry.symbols, ()); self.assertEqual(entry.content_hash, __import__('hashlib').sha256(b"run_app documentation\n").hexdigest())
+        self.assertEqual(next(m for m in snap.manifest if m.path == "docs/README.md").kind, "blob")
+        self.sha = sha; self.feature = feature; self.snap = snap
+        ticket = self.ticket(allowed=("docs/README.md",), create=(), anchor="existing.py::existing_function")
+        plan = self.plan(ticket)
+        self.assertTrue(RepositoryPlanValidator().validate(plan, snap).passed)
+
+    def test_unauthorized_non_source_blob_is_not_manifest_admitted(self):
+        (self.repo / "README.md").write_text("unrelated\n")
+        subprocess.run(("git", "add", "."), cwd=self.repo, check=True); subprocess.run(("git", "commit", "-m", "add readme"), cwd=self.repo, check=True, capture_output=True)
+        sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=self.repo, check=True, text=True, capture_output=True).stdout.strip()
+        snap = snapshot(self.repo, sha, self.feature, limit=2)
+        self.assertNotIn("README.md", {m.path for m in snap.manifest})
+
     def test_duplicate_and_counted_paths(self):
         with self.assertRaisesRegex(ReadinessError, "declared file categories"):
             validate_ticket(self.ticket(allowed=("existing.py",), create=("existing.py",), budget=PatchBudget(2, 100)))

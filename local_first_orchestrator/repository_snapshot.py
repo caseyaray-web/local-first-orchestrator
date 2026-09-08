@@ -26,12 +26,19 @@ def terms(feature:FeatureContract|None,extra:tuple[str,...])->tuple[str,...]:
  return tuple(sorted({x.lower() for x in re.findall(r'[A-Za-z_][A-Za-z_0-9]{2,}',text) if x.lower() not in _STOP}))
 def snapshot(repository:Path,requested_sha:str,feature:FeatureContract|None=None,feature_terms:tuple[str,...]=(),limit:int=32,authorized_modify_paths:tuple[str,...]=(),authorized_create_paths:tuple[str,...]=())->RepositorySnapshot:
  repo=Path(repository).resolve(); run=lambda *a:subprocess.run(('git',*a),cwd=repo,text=True,capture_output=True,check=True).stdout
- base=run('rev-parse','--verify',requested_sha+'^{commit}').strip(); paths=[p for p in run('ls-tree','-r','--name-only',base).splitlines() if is_supported_repository_file(p)]
- manifest=tuple(ManifestEntry(p,'test' if is_test_path(p) else 'source') for p in paths); manifest_paths=set(paths); required=tuple(sorted(set(authorized_modify_paths)))
+ base=run('rev-parse','--verify',requested_sha+'^{commit}').strip(); required=tuple(sorted(set(authorized_modify_paths)))
+ all_paths=run('ls-tree','-r','--name-only',base).splitlines()
+ paths=[p for p in all_paths if is_supported_repository_file(p)]
+ for p in required:
+  if normalized_repository_path(p) is None or p not in all_paths: raise ValueError(f'authorized modify path is not a repository blob: {p}')
+  tree=run('ls-tree','-r',base,'--',p).splitlines()
+  if not tree or tree[0].split(None,3)[0] not in {'100644','100755'}: raise ValueError(f'authorized modify path is not a regular Git blob: {p}')
+  if p not in paths: paths.append(p)
+ paths=sorted(set(paths)); manifest=tuple(ManifestEntry(p,'test' if is_test_path(p) else ('source' if is_supported_source(p) else 'blob')) for p in paths); manifest_paths=set(paths)
  if len(required)>limit: raise ValueError('authorized modify evidence exceeds evidence limit')
  required_entries=[]
  for p in required:
-  if normalized_repository_path(p) is None or p not in manifest_paths: raise ValueError(f'authorized modify path is not a supported base blob: {p}')
+  if p not in manifest_paths: raise ValueError(f'authorized modify path is not a repository blob: {p}')
   data=run('show',base+':'+p); required_entries.append(Evidence(p,hashlib.sha256(data.encode()).hexdigest(),'authorized_modify_target',symbols_for(p,data),10**9))
  q=terms(feature,feature_terms); candidates=[]
  for m in manifest:
