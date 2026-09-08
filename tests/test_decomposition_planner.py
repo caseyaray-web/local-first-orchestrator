@@ -60,6 +60,12 @@ class Planner(unittest.TestCase):
                 LocalDecompositionPlanner(lambda *a, **k: subprocess.CompletedProcess(a, 0, json.dumps(value), ''), cost_class='local').propose(f, s, artifact_dir=Path(d))
             self.assertTrue((Path(d) / 'planner-request.json').exists()); self.assertTrue((Path(d) / 'planner-response.json').exists())
 
+    def test_legacy_id_only_ticket_document_remains_valid(self):
+        f, s, raw = self.raw_plan(); value = json.loads(raw); ticket = value['tranches'][0]['microtickets'][0]; legacy_id = ticket.pop('ticket_id'); ticket['id'] = legacy_id
+        with TemporaryDirectory() as d:
+            got = LocalDecompositionPlanner(lambda *a, **k: subprocess.CompletedProcess(a, 0, json.dumps(value), ''), cost_class='local').propose(f, s, artifact_dir=Path(d))
+            self.assertEqual(got.tranches[0].microtickets[0].ticket_id, legacy_id)
+
     def test_schema_rejection_still_records_protected_postcheck(self):
         f, s, raw = self.raw_plan(); value = json.loads(raw); value['tranches'][0]['implementation'] = 'completed'
         with TemporaryDirectory() as d:

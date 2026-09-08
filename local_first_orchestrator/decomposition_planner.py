@@ -45,9 +45,9 @@ def _commands(value: object, path: str) -> tuple[tuple[str, ...], ...]:
     return tuple(result)
 
 def _ticket(x: dict, path: str) -> MicroTicket:
-    data = _strict_object(x, path=path, required={'ticket_id','objective','criterion_ids','primary_symbol','allowed_files','forbidden_changes','patch_budget','verification','risk','review_required','max_attempts','dependencies'}, optional={'id','new_test_files'})
+    data = _strict_object(x, path=path, required={'objective','criterion_ids','primary_symbol','allowed_files','forbidden_changes','patch_budget','verification','risk','review_required','max_attempts','dependencies'}, optional={'id','ticket_id','new_test_files'})
     ticket_id = data.get('ticket_id', data.get('id'))
-    if ticket_id is None: raise PlannerError(f"missing planner fields at {path}: ticket_id")
+    if ticket_id is None: raise PlannerError(f"missing planner fields at {path}: ticket_id or id")
     if 'ticket_id' in data and 'id' in data and data['ticket_id'] != data['id']: raise PlannerError(f"planner schema at {path}: id conflicts with ticket_id")
     budget = _strict_object(data['patch_budget'], path=f"{path}.patch_budget", required={'max_files','max_changed_lines'}, optional={'exception_reason'})
     patch_budget = PatchBudget(_integer(budget['max_files'], f"{path}.patch_budget.max_files"), _integer(budget['max_changed_lines'], f"{path}.patch_budget.max_changed_lines"), None if budget.get('exception_reason') is None else _string(budget['exception_reason'], f"{path}.patch_budget.exception_reason"))
