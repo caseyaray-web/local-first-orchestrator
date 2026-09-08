@@ -1,7 +1,7 @@
 import json, subprocess, unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from local_first_orchestrator.decomposition_planner import LocalDecompositionPlanner, PlannerError, packet
+from local_first_orchestrator.decomposition_planner import LocalDecompositionPlanner, PlannerError, packet, planner_schema, minimal_plan_example, PLANNER_SCHEMA
 from local_first_orchestrator.repository_snapshot import RepositorySnapshot, ManifestEntry, Evidence
 from tests.test_decomposition import Plans
 
@@ -11,6 +11,15 @@ class Planner(unittest.TestCase):
         raw = {'plan_version': plan.plan_version, 'feature_id': plan.feature_id, 'feature_contract_hash': plan.feature_contract_hash, 'repo_base_sha': plan.repo_base_sha, 'repo_snapshot_hash': plan.repo_snapshot_hash, 'architecture_decisions': list(plan.architecture_decisions), 'criterion_coverage': plan.criterion_coverage, 'tranches': [{'id': t.id, 'ordinal': t.ordinal, 'objective': t.objective, 'capabilities': list(t.capabilities), 'criterion_ids': list(t.criterion_ids), 'microtickets': [x.contract() | {'id': x.ticket_id} for x in t.microtickets]} for t in plan.tranches]}
         return f, s, json.dumps(raw)
 
+    def test_packet_contains_canonical_schema_paths_and_context_mapping(self):
+        f, s, _ = self.raw_plan(); value = json.loads(packet(f, s)); contract = value['output_contract']
+        self.assertEqual(contract['schema'], planner_schema()); self.assertEqual(contract['schema'], PLANNER_SCHEMA)
+        self.assertEqual(contract['context_to_output']['feature.contract_hash'], 'feature_contract_hash'); self.assertEqual(contract['context_to_output']['repository.base_sha'], 'repo_base_sha')
+        self.assertEqual(contract['allowed_paths'], [{'path': 'app.py', 'disposition': 'modify'}, {'path': 'test_app.py', 'disposition': 'create'}])
+
+    def test_generated_minimal_example_passes_production_parser(self):
+        f, s, _ = self.raw_plan(); example = minimal_plan_example(f, s); parsed = __import__('local_first_orchestrator.decomposition_planner', fromlist=['parse']).parse(json.dumps(example))
+        self.assertEqual(parsed.feature_id, f.id); self.assertEqual(parsed.tranches[0].microtickets[0].ticket_id, 'TK-1')
     def test_tool_free_surface_cwd_and_provenance(self):
         f, s, raw = self.raw_plan(); calls = []
         def run(argv, **kw): calls.append((argv, kw)); return subprocess.CompletedProcess(argv, 0, raw, '')

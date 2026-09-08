@@ -322,7 +322,8 @@ def run_command(args: argparse.Namespace) -> int:
             feature=FeatureAdmissionSpec.from_json(stored["spec"]).contract
             if feature.id != args.feature_id: raise ValueError("feature contract identity mismatch")
             identity=resolve_hermes_identity(args.planner_executable)
-            planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class=args.planner_cost_class,provider=identity['provider'],model=identity['model'],profile=identity['profile'])
+            allowed_paths=tuple((item["path"], item["disposition"]) for item in stored["spec"]["files"])
+            planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class=args.planner_cost_class,provider=identity['provider'],model=identity['model'],profile=identity['profile'],allowed_paths=allowed_paths)
             coordinator=PlanningCoordinator(ledger, ctl.config, planner)
             print(json.dumps(coordinator.generate_plan_only(feature,repository=registered.canonical_repository).__dict__,sort_keys=True,default=str))
         elif args.command=="register-dashboard":

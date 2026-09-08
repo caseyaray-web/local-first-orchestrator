@@ -8,8 +8,31 @@ from .repository_snapshot import RepositorySnapshot
 class PlannerError(RuntimeError):
     pass
 
-def packet(feature: FeatureContract, snapshot: RepositorySnapshot, *, max_active: int = 4, max_files: int = 3, max_lines: int = 200, prior_decisions: tuple[str, ...] = ()) -> str:
-    return json.dumps({'feature': {**feature.__dict__, 'contract_hash': feature.contract_hash}, 'repository': {'id': snapshot.repository_id, 'base_sha': snapshot.base_sha, 'snapshot_hash': snapshot.snapshot_hash, 'manifest': [x.__dict__ for x in snapshot.manifest], 'evidence': [x.__dict__ for x in snapshot.entries], 'omitted_count': snapshot.omitted_count}, 'limits': {'active': max_active, 'max_files': max_files, 'max_lines': max_lines}, 'prior_decisions': prior_decisions, 'rules': ['planning only: return one DecompositionPlan JSON object', 'never edit, execute, inspect, or report repository changes', 'do not output prose, diffs, patches, implementation reports, or test results', 'do not invent criteria or broaden scope', 'use supplied repository-relative path::symbol only', 'materialize active tranche only', 'output JSON only']}, sort_keys=True, separators=(',', ':'), default=lambda x: x.__dict__ if hasattr(x, '__dict__') else list(x))
+PLANNER_SCHEMA = {
+    'root': {'required': ['plan_version','feature_id','feature_contract_hash','repo_base_sha','repo_snapshot_hash','architecture_decisions','criterion_coverage','tranches'], 'optional': ['scope_change_proposals','unresolved_questions','repository_identity','repo_snapshot_manifest_json']},
+    'tranche': {'required': ['id','ordinal','objective','capabilities','criterion_ids','microtickets'], 'optional': []},
+    'microticket': {'required': ['objective','criterion_ids','primary_symbol','allowed_files','forbidden_changes','patch_budget','verification','risk','review_required','max_attempts','dependencies'], 'optional': ['id','ticket_id','new_test_files'], 'identity_alternatives': ['ticket_id','id']},
+    'patch_budget': {'required': ['max_files','max_changed_lines'], 'optional': ['exception_reason']},
+    'verification': {'required': ['commands'], 'optional': ['working_directory','timeout_seconds','output_limit']},
+    'criterion_coverage': {'key_type': 'criterion ID', 'value_type': 'array of ticket IDs'},
+}
+DEFAULT_ALLOWED_PATHS = ({'path': 'app.py', 'disposition': 'modify'}, {'path': 'test_app.py', 'disposition': 'create'})
+
+def planner_schema() -> dict:
+    return json.loads(json.dumps(PLANNER_SCHEMA))
+
+def _normalized_allowed_paths(allowed_paths) -> tuple[dict[str,str], ...]:
+    return tuple({'path': item[0], 'disposition': item[1]} if isinstance(item, (tuple, list)) else {'path': item['path'], 'disposition': item['disposition']} for item in allowed_paths)
+
+def minimal_plan_example(feature: FeatureContract, snapshot: RepositorySnapshot, allowed_paths=DEFAULT_ALLOWED_PATHS) -> dict:
+    paths = _normalized_allowed_paths(allowed_paths) or DEFAULT_ALLOWED_PATHS
+    existing = next((x['path'] for x in paths if x['disposition'] == 'modify'), paths[0]['path'])
+    new = next((x['path'] for x in paths if x['disposition'] == 'create'), 'test_planner_example.py')
+    criterion = feature.acceptance_criteria[0].id if feature.acceptance_criteria else 'criterion-1'
+    return {'plan_version': 1, 'feature_id': feature.id, 'feature_contract_hash': feature.contract_hash, 'repo_base_sha': snapshot.base_sha, 'repo_snapshot_hash': snapshot.snapshot_hash, 'architecture_decisions': ['Keep the bounded change at one architectural seam.'], 'criterion_coverage': {criterion: ['TK-1']}, 'tranches': [{'id': 'T-0', 'ordinal': 0, 'objective': 'Implement the bounded architectural concern.', 'capabilities': ['bounded-change'], 'criterion_ids': [criterion], 'microtickets': [{'ticket_id': 'TK-1', 'objective': 'Implement and verify the bounded concern.', 'criterion_ids': [criterion], 'primary_symbol': f'{existing}::bounded_change', 'allowed_files': [existing, new], 'forbidden_changes': ['Do not change unrelated behavior.'], 'patch_budget': {'max_files': 2, 'max_changed_lines': 40}, 'verification': {'commands': [['python', '-m', 'unittest']], 'working_directory': '.', 'timeout_seconds': 60, 'output_limit': 20000}, 'risk': 'low', 'review_required': True, 'max_attempts': 2, 'dependencies': [], 'new_test_files': [new]}]}]}
+
+def packet(feature: FeatureContract, snapshot: RepositorySnapshot, *, max_active: int = 4, max_files: int = 3, max_lines: int = 200, prior_decisions: tuple[str, ...] = (), allowed_paths=DEFAULT_ALLOWED_PATHS) -> str:
+    return json.dumps({'feature': {**feature.__dict__, 'contract_hash': feature.contract_hash}, 'repository': {'id': snapshot.repository_id, 'base_sha': snapshot.base_sha, 'snapshot_hash': snapshot.snapshot_hash, 'manifest': [x.__dict__ for x in snapshot.manifest], 'evidence': [x.__dict__ for x in snapshot.entries], 'omitted_count': snapshot.omitted_count}, 'limits': {'active': max_active, 'max_files': max_files, 'max_lines': max_lines}, 'prior_decisions': prior_decisions, 'output_contract': {'schema': planner_schema(), 'allowed_paths': list(_normalized_allowed_paths(allowed_paths)), 'context_to_output': {'feature.contract_hash': 'feature_contract_hash', 'repository.base_sha': 'repo_base_sha', 'repository.snapshot_hash': 'repo_snapshot_hash'}, 'minimal_example': minimal_plan_example(feature, snapshot, allowed_paths)}, 'rules': ['planning only: return exactly one object matching output_contract.schema', 'planning output only: never edit, execute, inspect, or report repository changes', 'JSON only: no prose, Markdown, diffs, patches, implementation reports, changed_files, commands_run, or test-result reports', 'field names and nesting must match output_contract.schema exactly; do not use an alternate schema', 'do not invent criteria or broaden scope', 'microticket allowed_files must be a subset of output_contract.allowed_paths and preserve each disposition', 'materialize active tranche only']}, sort_keys=True, separators=(',', ':'), default=lambda x: x.__dict__ if hasattr(x,'__dict__') else list(x))
 
 def _strict_object(value: object, *, path: str, required: set[str], optional: set[str] = set()) -> dict:
     if type(value) is not dict:
@@ -21,6 +44,14 @@ def _strict_object(value: object, *, path: str, required: set[str], optional: se
     if missing:
         raise PlannerError(f"missing planner fields at {path}: {', '.join(missing)}")
     return value
+
+def _schema_fields(name: str) -> tuple[set[str], set[str]]:
+    spec = PLANNER_SCHEMA[name]
+    return set(spec.get('required', ())), set(spec.get('optional', ()))
+
+def _strict_schema_object(value: object, *, path: str, name: str) -> dict:
+    required, optional = _schema_fields(name)
+    return _strict_object(value, path=path, required=required, optional=optional)
 
 def _string(value: object, path: str) -> str:
     if type(value) is not str: raise PlannerError(f"planner schema at {path}: expected string")
@@ -45,13 +76,13 @@ def _commands(value: object, path: str) -> tuple[tuple[str, ...], ...]:
     return tuple(result)
 
 def _ticket(x: dict, path: str) -> MicroTicket:
-    data = _strict_object(x, path=path, required={'objective','criterion_ids','primary_symbol','allowed_files','forbidden_changes','patch_budget','verification','risk','review_required','max_attempts','dependencies'}, optional={'id','ticket_id','new_test_files'})
+    data = _strict_schema_object(x, path=path, name='microticket')
     ticket_id = data.get('ticket_id', data.get('id'))
     if ticket_id is None: raise PlannerError(f"missing planner fields at {path}: ticket_id or id")
     if 'ticket_id' in data and 'id' in data and data['ticket_id'] != data['id']: raise PlannerError(f"planner schema at {path}: id conflicts with ticket_id")
-    budget = _strict_object(data['patch_budget'], path=f"{path}.patch_budget", required={'max_files','max_changed_lines'}, optional={'exception_reason'})
+    budget = _strict_schema_object(data['patch_budget'], path=f"{path}.patch_budget", name='patch_budget')
     patch_budget = PatchBudget(_integer(budget['max_files'], f"{path}.patch_budget.max_files"), _integer(budget['max_changed_lines'], f"{path}.patch_budget.max_changed_lines"), None if budget.get('exception_reason') is None else _string(budget['exception_reason'], f"{path}.patch_budget.exception_reason"))
-    verification = _strict_object(data['verification'], path=f"{path}.verification", required={'commands'}, optional={'working_directory','timeout_seconds','output_limit'})
+    verification = _strict_schema_object(data['verification'], path=f"{path}.verification", name='verification')
     profile = VerificationProfile(_commands(verification['commands'], f"{path}.verification.commands"), _string(verification.get('working_directory','.'), f"{path}.verification.working_directory"), _integer(verification.get('timeout_seconds',60), f"{path}.verification.timeout_seconds"), _integer(verification.get('output_limit',20000), f"{path}.verification.output_limit"))
     return MicroTicket(_string(ticket_id, f"{path}.ticket_id"), _string(data['objective'], f"{path}.objective"), _strings(data['criterion_ids'], f"{path}.criterion_ids"), _string(data['primary_symbol'], f"{path}.primary_symbol"), _strings(data['allowed_files'], f"{path}.allowed_files"), _strings(data['forbidden_changes'], f"{path}.forbidden_changes"), patch_budget, profile, _string(data['risk'], f"{path}.risk"), _boolean(data['review_required'], f"{path}.review_required"), _integer(data['max_attempts'], f"{path}.max_attempts"), _strings(data['dependencies'], f"{path}.dependencies"), _strings(data.get('new_test_files',[]), f"{path}.new_test_files"))
 
@@ -59,13 +90,13 @@ def parse(raw: str) -> DecompositionPlan:
     try: x=json.loads(raw)
     except json.JSONDecodeError as exc: raise PlannerError('malformed planner JSON') from exc
     try:
-        root=_strict_object(x,path='root',required={'plan_version','feature_id','feature_contract_hash','repo_base_sha','repo_snapshot_hash','architecture_decisions','criterion_coverage','tranches'},optional={'scope_change_proposals','unresolved_questions','repository_identity','repo_snapshot_manifest_json'})
+        root=_strict_schema_object(x,path='root',name='root')
         coverage=root['criterion_coverage']
         if type(coverage) is not dict or any(type(k) is not str for k in coverage) : raise PlannerError('planner schema at root.criterion_coverage: expected string mapping')
         coverage={k:_strings(v,f"root.criterion_coverage.{k}") for k,v in coverage.items()}
         tranches=[]
         for i, raw_tranche in enumerate(root['tranches']):
-            path=f'root.tranches[{i}]'; t=_strict_object(raw_tranche,path=path,required={'id','ordinal','objective','capabilities','criterion_ids','microtickets'})
+            path=f'root.tranches[{i}]'; t=_strict_schema_object(raw_tranche,path=path,name='tranche')
             if type(t['microtickets']) is not list: raise PlannerError(f"planner schema at {path}.microtickets: expected array")
             tranches.append(Tranche(_string(t['id'],f'{path}.id'),_integer(t['ordinal'],f'{path}.ordinal'),_string(t['objective'],f'{path}.objective'),_strings(t['capabilities'],f'{path}.capabilities'),_strings(t['criterion_ids'],f'{path}.criterion_ids'),tuple(_ticket(v,f'{path}.microtickets[{j}]') for j,v in enumerate(t['microtickets']))))
         return DecompositionPlan(_integer(root['plan_version'],'root.plan_version'),_string(root['feature_id'],'root.feature_id'),_string(root['feature_contract_hash'],'root.feature_contract_hash'),_string(root['repo_base_sha'],'root.repo_base_sha'),_string(root['repo_snapshot_hash'],'root.repo_snapshot_hash'),_strings(root['architecture_decisions'],'root.architecture_decisions'),coverage,tuple(tranches),_strings(root.get('scope_change_proposals',[]),'root.scope_change_proposals'),_strings(root.get('unresolved_questions',[]),'root.unresolved_questions'),_string(root.get('repository_identity',''),'root.repository_identity'),_string(root.get('repo_snapshot_manifest_json',''),'root.repo_snapshot_manifest_json'))
@@ -102,12 +133,12 @@ def resolve_hermes_identity(executable='hermes') -> dict[str,str]:
     return {'provider': match.group(2), 'model': match.group(1), 'profile': 'default'}
 
 class LocalDecompositionPlanner:
-    def __init__(self, runner=subprocess.run, executable='hermes', cost_class: str = 'unknown', provider='unresolved', model='unresolved', profile='unresolved'):
+    def __init__(self, runner=subprocess.run, executable='hermes', cost_class: str = 'unknown', provider='unresolved', model='unresolved', profile='unresolved', allowed_paths=DEFAULT_ALLOWED_PATHS):
         if cost_class not in {'local', 'paid', 'unknown'}:
             raise ValueError('invalid planner cost class')
         self.runner, self.executable, self.cost_class = runner, executable, cost_class
         self.provider, self.model, self.profile = provider, model, profile
-
+        self.allowed_paths = tuple(allowed_paths)
     @property
     def is_paid(self):
         return self.cost_class == 'paid'
@@ -115,7 +146,7 @@ class LocalDecompositionPlanner:
     def propose(self, feature, snapshot, *, artifact_dir: Path, prior_decisions=(), repository: Path | None = None):
         if self.cost_class == 'unknown':
             raise PlannerError('unknown planner cost class')
-        payload = packet(feature, snapshot, prior_decisions=prior_decisions)
+        payload = packet(feature, snapshot, prior_decisions=prior_decisions, allowed_paths=self.allowed_paths)
         artifact_dir.mkdir(parents=True, exist_ok=True)
         scratch = artifact_dir / 'planner-scratch'
         scratch.mkdir(exist_ok=True)
