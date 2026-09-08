@@ -11,16 +11,16 @@ def ticket(i,criteria=('A',),deps=()):return MicroTicket(i,'Return fixture value
 class Plans(unittest.TestCase):
  def feature(self):return FeatureContract('F','Feature','objective',(Criterion('A','a'),Criterion('B','b')),("no",),("safe",),(),"sha")
  def plan(self,**kw):
-  f=self.feature(); tr=(Tranche('now',0,'now',('c',),('A','B'),(ticket('one',('A',)),ticket('two',('B',),('one',)))),Tranche('later',1,'later',('c',),('B',),()))
+  f=self.feature(); tr=(Tranche('now',0,'now',('c',),('A','B'),(ticket('one',('A',)),ticket('two',('B',),('one',)))),Tranche('later',1,'later',('c',),('B',),(ticket('two',('B',)),)))
   manifest=canonical_json({'repository_identity':'fixture-repo','repo_base_sha':'a','manifest':[],'evidence':[],'omitted_count':0})
-  d=dict(plan_version=1,feature_id='F',feature_contract_hash=f.contract_hash,repo_base_sha='a',repo_snapshot_hash=hashlib.sha256(manifest.encode()).hexdigest(),architecture_decisions=('d',),criterion_coverage={'now':('A','B')},tranches=tr,repository_identity='fixture-repo',repo_snapshot_manifest_json=manifest);d.update(kw);return DecompositionPlan(**d)
+  d=dict(plan_version=1,feature_id='F',feature_contract_hash=f.contract_hash,repo_base_sha='a',repo_snapshot_hash=hashlib.sha256(manifest.encode()).hexdigest(),architecture_decisions=('d',),criterion_coverage={'A':('one',),'B':('two',)},tranches=tr,repository_identity='fixture-repo',repo_snapshot_manifest_json=manifest);d.update(kw);return DecompositionPlan(**d)
  def repository_validation(self,plan):
   return type('R',(),{'passed':True,'repository_identity':plan.repository_identity,'base_sha':plan.repo_base_sha,'snapshot_hash':plan.repo_snapshot_hash,'manifest_json':plan.repo_snapshot_manifest_json})()
  def test_valid_hash_and_coarse_future(self):
   f=self.feature();self.assertEqual(f.contract_hash,self.feature().contract_hash);self.assertTrue(PlanValidator().validate(f,self.plan()).passed)
  def test_rejections(self):
   f=self.feature()
-  for p,reason in [(self.plan(feature_contract_hash='old'),'stale_feature_contract'),(self.plan(criterion_coverage={'now':('A',)}),'criterion_uncovered'),(self.plan(tranches=(Tranche('n',0,'n',(),('A',),(ticket('x',('A',),('bad',)),)),)),'invalid_dependency')]:self.assertIn(reason,PlanValidator().validate(f,p).reasons)
+  for p,reason in [(self.plan(feature_contract_hash='old'),'stale_feature_contract'),(self.plan(criterion_coverage={'A':('one',)}),'criterion_uncovered'),(self.plan(tranches=(Tranche('n',0,'n',(),('A',),(ticket('x',('A',),('bad',)),)),)),'invalid_dependency')]:self.assertIn(reason,PlanValidator().validate(f,p).reasons)
  def test_activation_persists_active_generated_tickets_and_create_projections(self):
   d=TemporaryDirectory(); l=Ledger(Path(d.name)/'x.db');l.migrate(); f=self.feature();p=self.plan();v=PlanValidator().validate(f,p); ok=self.repository_validation(p); ticket_ids=activate_validated_plan(l,f,p,v,ok)[1]
   self.assertEqual(len(ticket_ids), 2)

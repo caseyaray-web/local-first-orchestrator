@@ -51,13 +51,13 @@ def make_feature(sha):
 
 def make_plan(feature, snap, ticket=None):
     ticket = ticket or make_ticket()
-    return DecompositionPlan(1, feature.id, feature.contract_hash, snap.base_sha, snap.snapshot_hash, ("Validate at calculation boundary",), {"scope": ("AC-1",)}, (Tranche("T-1", 0, "Implement the guard", ("calculation",), ("AC-1",), (ticket,)),))
+    return DecompositionPlan(1, feature.id, feature.contract_hash, snap.base_sha, snap.snapshot_hash, ("Validate at calculation boundary",), {"AC-1": (ticket.ticket_id,)}, (Tranche("T-1", 0, "Implement the guard", ("calculation",), ("AC-1",), (ticket,)),))
 
 
 def make_multi_plan(feature, snap):
     first = MicroTicket("TK-2", "Implement the bounded calculation guard.", ("AC-1",), "app.py::calculate", ("app.py", "test_app.py"), ("Do not change public APIs.",), PatchBudget(), VerificationProfile((("python", "-m", "unittest"),)), "low", True, 2, ())
     second = MicroTicket("TK-1", "Verify the bounded calculation guard.", ("AC-1",), "test_app.py::test_calculate", ("app.py", "test_app.py"), ("Do not change public APIs.",), PatchBudget(), VerificationProfile((("python", "-m", "unittest"),)), "low", True, 2, ("TK-2",))
-    return DecompositionPlan(1, feature.id, feature.contract_hash, snap.base_sha, snap.snapshot_hash, ("Validate at calculation boundary",), {"scope": ("AC-1",)}, (Tranche("T-1", 0, "Implement the guard", ("calculation",), ("AC-1",), (first, second)),))
+    return DecompositionPlan(1, feature.id, feature.contract_hash, snap.base_sha, snap.snapshot_hash, ("Validate at calculation boundary",), {"AC-1": (first.ticket_id, second.ticket_id)}, (Tranche("T-1", 0, "Implement the guard", ("calculation",), ("AC-1",), (first, second)),))
 
 
 class PlanningCoordinatorTests(unittest.TestCase):

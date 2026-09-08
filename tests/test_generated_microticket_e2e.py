@@ -134,7 +134,7 @@ class GeneratedMicroticketEndToEndTests(unittest.TestCase):
             repository_snapshot.base_sha,
             repository_snapshot.snapshot_hash,
             ("Edit only the fixture function.",),
-            {"active": ("AC-1",)},
+            {"AC-1": ("generated-value",)},
             (Tranche("active", 0, "Implement fixture value", ("value",), ("AC-1",), (ticket,)),),
             repository_identity=repository_snapshot.repository_id,
             repo_snapshot_manifest_json=repository_snapshot.manifest_json,
@@ -228,7 +228,7 @@ class GeneratedMicroticketEndToEndTests(unittest.TestCase):
             repository_snapshot.base_sha,
             repository_snapshot.snapshot_hash,
             ("Edit only the fixture function.",),
-            {"active": ("AC-1",)},
+            {"AC-1": ("generated-greeting",)},
             (Tranche("active", 0, "Implement fixture greeting", ("greeting",), ("AC-1",), (ticket,)),),
             repository_identity=repository_snapshot.repository_id,
             repo_snapshot_manifest_json=repository_snapshot.manifest_json,
@@ -352,7 +352,7 @@ class GeneratedMicroticketEndToEndTests(unittest.TestCase):
         a_ticket = MicroTicket("generated-a", "Make the alpha fixture return accepted.", ("AC-A",), "a.py::alpha", ("a.py",), ("No API change.",), PatchBudget(1, 10), VerificationProfile((("python", "-c", "from a import alpha; assert alpha() == 'accepted'"),)), "low", True, 1, ())
         b_ticket = MicroTicket("generated-b", "Make the beta fixture return accepted.", ("AC-B",), "b.py::beta", ("b.py",), ("No API change.",), PatchBudget(1, 10), VerificationProfile((("python", "-c", "from b import beta; assert beta() == 'accepted'"),)), "low", True, 1, (a_ticket.ticket_id,))
         tranche = Tranche("serialized", 0, "Serialize dependent fixture changes", ("alpha", "beta"), ("AC-A", "AC-B"), (a_ticket, b_ticket))
-        plan = DecompositionPlan(1, feature.id, feature.contract_hash, repository_snapshot.base_sha, repository_snapshot.snapshot_hash, ("Use the rolling integration head.",), {"active": ("AC-A", "AC-B")}, (tranche,), repository_identity=repository_snapshot.repository_id, repo_snapshot_manifest_json=repository_snapshot.manifest_json)
+        plan = DecompositionPlan(1, feature.id, feature.contract_hash, repository_snapshot.base_sha, repository_snapshot.snapshot_hash, ("Use the rolling integration head.",), {"AC-A": (a_ticket.ticket_id,), "AC-B": (b_ticket.ticket_id,)}, (tranche,), repository_identity=repository_snapshot.repository_id, repo_snapshot_manifest_json=repository_snapshot.manifest_json)
         plan_validation = PlanValidator().validate(feature, plan)
         repository_validation = RepositoryPlanValidator().validate(plan, repository_snapshot)
         self.assertTrue(plan_validation.passed, plan_validation.reasons)

@@ -50,7 +50,7 @@ class TrancheHandoffTests(unittest.TestCase):
         self.s1 = snapshot(self.repo, self.base, self.feature)
         self.a = ticket("A", "Change alpha", "A", "alpha", "alpha.py")
         self.b = ticket("B", "Change beta implementation", "B", "beta", "beta.py")
-        self.initial = DecompositionPlan(1, "F", self.feature.contract_hash, self.base, self.s1.snapshot_hash, (), {"all": ("A", "B")}, (Tranche("T1", 0, "alpha", (), ("A",), (self.a,)), Tranche("T2", 1, "beta", (), ("B",), ())))
+        self.initial = DecompositionPlan(1, "F", self.feature.contract_hash, self.base, self.s1.snapshot_hash, (), {"A": ("A",), "B": ("B",)}, (Tranche("T1", 0, "alpha", (), ("A",), (self.a,)), Tranche("T2", 1, "beta", (), ("B",), (self.b,))))
         self.initial = DecompositionPlan(self.initial.plan_version, self.initial.feature_id, self.initial.feature_contract_hash, self.initial.repo_base_sha, self.initial.repo_snapshot_hash, self.initial.architecture_decisions, self.initial.criterion_coverage, self.initial.tranches, repository_identity=self.s1.repository_id, repo_snapshot_manifest_json=self.s1.manifest_json)
         pv = PlanValidator().validate(self.feature, self.initial); rv = RepositoryPlanValidator().validate(self.initial, self.s1)
         self.assertTrue(pv.passed, pv.reasons); self.assertTrue(rv.passed, rv.reasons)

@@ -107,9 +107,9 @@ class FeatureAdmissionTests(unittest.TestCase):
         result = self.controller.admit_feature_contract(self.spec(), repository=self.repo)
         row = self.ledger.connection.execute("select * from feature_contracts where feature_id='C11'").fetchone()
         self.assertEqual(row["contract_hash"], self.spec().contract.contract_hash)
-        ticket = MicroTicket("c11-export", "Verify the admitted export contract.", ("export",), "existing.js::existing", ("existing.js",), ("No unrelated files.",), PatchBudget(1, 20), VerificationProfile((("python", "-c", "print(1)"),)), "low", True, 1, ())
+        ticket = MicroTicket("c11-export", "Verify the admitted export contract.", ("export", "restore"), "existing.js::existing", ("existing.js",), ("No unrelated files.",), PatchBudget(1, 20), VerificationProfile((("python", "-c", "print(1)"),)), "low", True, 1, ())
         manifest = row["repo_snapshot_manifest_json"]
-        plan = DecompositionPlan(1, "C11", self.spec().contract.contract_hash, result.repo_base_sha, result.repo_snapshot_hash, ("admitted",), {"C11-T0": ("export", "restore")}, (Tranche("C11-T0", 0, self.spec().objective, ("export",), ("export", "restore"), (ticket,)),), repository_identity=str(self.repo), repo_snapshot_manifest_json=manifest)
+        plan = DecompositionPlan(1, "C11", self.spec().contract.contract_hash, result.repo_base_sha, result.repo_snapshot_hash, ("admitted",), {"export": ("c11-export",), "restore": ("c11-export",)}, (Tranche("C11-T0", 0, self.spec().objective, ("export",), ("export", "restore"), (ticket,)),), repository_identity=str(self.repo), repo_snapshot_manifest_json=manifest)
         validation = PlanValidator().validate(self.spec().contract, plan)
         self.assertTrue(validation.passed, validation.reasons)
         repository_validation = type("R", (), {"passed": True, "repository_identity": str(self.repo), "base_sha": result.repo_base_sha, "snapshot_hash": result.repo_snapshot_hash, "manifest_json": manifest})()

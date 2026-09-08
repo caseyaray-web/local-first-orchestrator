@@ -90,7 +90,7 @@ class NewTestFilesContractTests(unittest.TestCase):
         feature = self.feature()
         snap = snapshot(self.repo, self.base, feature)
         plan = DecompositionPlan(
-            1, feature.id, feature.contract_hash, self.base, snap.snapshot_hash, (), {"all": ("AC-1",)},
+            1, feature.id, feature.contract_hash, self.base, snap.snapshot_hash, (), {"AC-1": (ticket.ticket_id,)},
             (Tranche("TR-new-test", 0, feature.objective, (), ("AC-1",), (ticket,)),),
             repository_identity=snap.repository_id, repo_snapshot_manifest_json=snap.manifest_json,
         )

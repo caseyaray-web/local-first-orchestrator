@@ -46,8 +46,20 @@ class PlanValidator:
   r=[]; criteria={c.id for c in feature.acceptance_criteria}
   if plan.feature_id!=feature.id:r.append('feature_mismatch')
   if plan.feature_contract_hash!=feature.contract_hash:r.append('stale_feature_contract')
-  covered=set().union(*[set(x) for x in plan.criterion_coverage.values()]) if plan.criterion_coverage else set()
-  if not criteria<=covered:r.append('criterion_uncovered')
+  coverage = plan.criterion_coverage or {}
+  coverage_keys = set(coverage)
+  if not criteria <= coverage_keys:r.append('criterion_uncovered')
+  if not coverage_keys <= criteria:r.append('unknown_criterion')
+  ticket_locations = {ticket.ticket_id: tranche for tranche in plan.tranches for ticket in tranche.microtickets}
+  for criterion in sorted(criteria & coverage_keys):
+   ticket_ids = coverage[criterion]
+   if not ticket_ids:r.append('invalid_criterion_coverage'); continue
+   for ticket_id in ticket_ids:
+    tranche = ticket_locations.get(ticket_id)
+    if tranche is None:r.append('invalid_criterion_ticket_reference'); continue
+    ticket = next(ticket for ticket in tranche.microtickets if ticket.ticket_id == ticket_id)
+    if criterion not in ticket.criterion_ids:r.append('criterion_ticket_mismatch')
+    if criterion not in tranche.criterion_ids:r.append('criterion_tranche_mismatch')
   active=next((x for x in plan.tranches if x.ordinal==0),None)
   if active is None:r.append('invalid_microticket'); return PlanValidationResult(False,tuple(r))
   if len(active.microtickets)>self.max_active_tickets:r.append('active_tranche_limit_exceeded')
