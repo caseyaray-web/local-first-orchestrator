@@ -9,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.controller import RuntimeConfig
+from local_first_orchestrator.admission import FeatureAdmissionSpec, FileDisposition
 from local_first_orchestrator.decomposition import Criterion, DecompositionPlan, FeatureContract, PlanValidator, Tranche, activate_validated_plan
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.tranche_completion import completion_evidence
@@ -47,6 +48,8 @@ class TrancheHandoffTests(unittest.TestCase):
         self.ledger = Ledger(self.root / "ledger.db"); self.ledger.migrate()
         self.config = RuntimeConfig(self.repo, self.root / "worktrees", self.root / "artifacts", (self.repo,))
         self.feature = FeatureContract("F", "Two tranche", "Apply alpha then beta", (Criterion("A", "alpha accepted"), Criterion("B", "beta accepted")), (), (), (), self.base)
+        admitted = FeatureAdmissionSpec("F", "Two tranche", "T1", "alpha", self.feature.objective, self.base, self.feature.acceptance_criteria, (), (), (), (FileDisposition("alpha.py", "modify"), FileDisposition("beta.py", "modify")), None)
+        self.ledger.connection.execute("insert into feature_contracts(feature_id,contract_hash,contract_json,created_at) values (?,?,?,?)", ("F", self.feature.contract_hash, json.dumps({"spec": admitted.canonical_payload}, sort_keys=True, separators=(",", ":")), 1))
         self.s1 = snapshot(self.repo, self.base, self.feature)
         self.a = ticket("A", "Change alpha", "A", "alpha", "alpha.py")
         self.b = ticket("B", "Change beta implementation", "B", "beta", "beta.py")

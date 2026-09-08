@@ -23,6 +23,7 @@ from .decomposition import (
     activate_validated_plan,
 )
 from .decomposition_planner import PlannerError, LocalDecompositionPlanner, packet, parse, planner_contract_hash
+from .admission import decode_persisted_admission_envelope
 from .paid_model import PaidInvocationError, PaidModelAdapter
 from .repository_snapshot import RepositoryPlanValidator, RepositorySnapshot, snapshot
 from .usage_governor import PaidPurpose
@@ -88,12 +89,11 @@ class PlanningCoordinator:
         return {**values, "cost_class": cost_class}
 
     def _authorized_modify_paths(self, feature_id: str) -> tuple[str, ...]:
-        row = self.ledger.connection.execute("SELECT contract_json FROM feature_contracts WHERE feature_id=?", (feature_id,)).fetchone()
+        row = self.ledger.connection.execute("SELECT contract_json,contract_hash FROM feature_contracts WHERE feature_id=?", (feature_id,)).fetchone()
         if row is None:
-            return ()
-        raw = json.loads(row["contract_json"])
-        spec = raw.get("spec", raw)
-        return tuple(sorted(x["path"] for x in spec.get("files", ()) if x.get("disposition") == "modify"))
+            raise ValueError("persisted feature contract authority is missing")
+        spec = decode_persisted_admission_envelope(row["contract_json"], expected_feature_id=feature_id, expected_contract_hash=row["contract_hash"])
+        return tuple(sorted(file.path for file in spec.files if file.disposition == "modify"))
 
     def _snapshot_for_feature(self, feature: FeatureContract, base_sha: str, *, feature_terms: tuple[str, ...] = ()) -> RepositorySnapshot:
         repo = self.config.canonical_repository(self.config.repository)
@@ -173,9 +173,8 @@ class PlanningCoordinator:
         row = self.ledger.connection.execute("SELECT * FROM feature_contracts WHERE feature_id=?", (feature_id,)).fetchone()
         stored_plan = self.ledger.connection.execute("SELECT * FROM decomposition_plans WHERE feature_id=? ORDER BY created_at LIMIT 1", (feature_id,)).fetchone()
         if row is None or stored_plan is None: return PlanningOutcome("planner_failed", feature_id, reasons=("feature plan missing",))
-        raw = json.loads(row["contract_json"])
-        from .decomposition import Criterion
-        feature = FeatureContract(raw["id"], raw["title"], raw["objective"], tuple(Criterion(x["id"], x["statement"], x.get("verification_hint", "")) for x in raw["acceptance_criteria"]), tuple(raw["non_goals"]), tuple(raw["invariants"]), tuple(raw["constraints"]), raw["source_revision"])
+        spec = decode_persisted_admission_envelope(row["contract_json"], expected_feature_id=feature_id, expected_contract_hash=row["contract_hash"])
+        feature = spec.contract
         stored = json.loads(stored_plan["plan_json"]); coarse_plan = parse(json.dumps(stored["plan"], sort_keys=True, separators=(",", ":")))
         active_row = self.ledger.connection.execute("SELECT * FROM tranches WHERE feature_id=? AND status='active' ORDER BY ordinal", (feature_id,)).fetchone()
         if active_row is None: return PlanningOutcome("planner_failed", feature_id, reasons=("active tranche missing",))

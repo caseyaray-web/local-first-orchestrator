@@ -7,12 +7,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.controller import RuntimeConfig
+from local_first_orchestrator.admission import FeatureAdmissionSpec, FileDisposition
 from local_first_orchestrator.decomposition import Criterion, DecompositionPlan, FeatureContract, PlanValidator, Tranche
 from local_first_orchestrator.decomposition_planner import LocalDecompositionPlanner, planner_contract, planner_contract_hash
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.paid_model import InjectedPaidModelAdapter
 from local_first_orchestrator.planning_coordinator import PlanningCoordinator
-from local_first_orchestrator.repository_snapshot import RepositoryPlanValidator
+from local_first_orchestrator.repository_snapshot import RepositoryPlanValidator, snapshot
 from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
 from local_first_orchestrator.usage_governor import PaidPurpose, UsageGovernor
 
@@ -63,7 +64,7 @@ def make_multi_plan(feature, snap):
 
 class PlanningCoordinatorTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = TemporaryDirectory(); root = Path(self.tmp.name)
+        self.tmp = TemporaryDirectory(); root = Path(self.tmp.name); self.root = root
         self.repo = root / "repo"; self.repo.mkdir()
         (self.repo / "app.py").write_text("def calculate(quantity):\n    return quantity\n")
         (self.repo / "test_app.py").write_text("def test_calculate(): pass\n")
@@ -74,6 +75,8 @@ class PlanningCoordinatorTests(unittest.TestCase):
         self.ledger = Ledger(root / "ledger.db"); self.ledger.migrate()
         self.config = RuntimeConfig(self.repo, root / "worktrees", root / "artifacts", (self.repo,))
         self.feature = make_feature(self.sha)
+        admitted = FeatureAdmissionSpec(self.feature.id, self.feature.title, "T-1", "Implement the guard", self.feature.objective, self.sha, self.feature.acceptance_criteria, (), (), (), (FileDisposition("app.py", "modify"), FileDisposition("test_app.py", "modify")), None)
+        self.ledger.connection.execute("insert into feature_contracts(feature_id,contract_hash,contract_json,created_at) values (?,?,?,?)", (self.feature.id, self.feature.contract_hash, json.dumps({"spec": admitted.canonical_payload}, sort_keys=True, separators=(",", ":")), 1))
 
     def tearDown(self): self.ledger.close(); self.tmp.cleanup()
 
@@ -136,11 +139,23 @@ class PlanningCoordinatorTests(unittest.TestCase):
         self.assertEqual(replay.request_key, second.request_key); self.assertEqual(v2.calls, 1)
         self.assertEqual(self.ledger.connection.execute("select count(*) from planning_runs where request_key=?", (first.request_key,)).fetchone()[0], 1)
 
+    def test_missing_or_malformed_persisted_contract_fails_closed_before_snapshot(self):
+        missing = Ledger(self.root / "missing.db"); missing.migrate()
+        with self.assertRaisesRegex(ValueError, "persisted feature contract authority is missing"):
+            PlanningCoordinator(missing, self.config, FakeStandardPlanner(make_plan(self.feature, snapshot(self.repo, self.sha, self.feature)))).generate_plan_only(self.feature)
+        missing.close()
+        admitted = FeatureAdmissionSpec(self.feature.id, self.feature.title, "T-1", "Implement the guard", self.feature.objective, self.sha, self.feature.acceptance_criteria, (), (), (), (FileDisposition("app.py", "modify"),), None)
+        malformed = Ledger(self.root / "malformed.db"); malformed.migrate(); malformed.connection.execute("insert into feature_contracts(feature_id,contract_hash,contract_json,created_at) values (?,?,?,?)", (self.feature.id, self.feature.contract_hash, "{}", 1))
+        with self.assertRaisesRegex(ValueError, "persisted feature contract envelope is malformed"):
+            PlanningCoordinator(malformed, self.config, FakeStandardPlanner(make_plan(self.feature, snapshot(self.repo, self.sha, self.feature)))).generate_plan_only(self.feature)
+        malformed.close()
+
     def test_conflicting_route_provenance_for_same_request_fails_closed(self):
         from local_first_orchestrator.repository_snapshot import snapshot
         snap = snapshot(self.repo, self.sha, self.feature)
         planner = FakeStandardPlanner(make_plan(self.feature, snap))
         coordinator = PlanningCoordinator(self.ledger, self.config, planner)
+        snap = coordinator._snapshot_for_feature(self.feature, self.sha)
         key = coordinator._request_key(self.feature, snap)
         artifact = coordinator._artifact_dir(self.feature, key); artifact.mkdir(parents=True)
         (artifact / "planner-response.json").write_text(coordinator._plan_json(planner.proposal))

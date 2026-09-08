@@ -93,6 +93,18 @@ class FeatureAdmissionSpec:
         return cls(str(raw["feature_id"]), str(raw["feature_title"]), str(raw["tranche_id"]), str(raw["tranche_title"]), str(raw["objective"]), str(raw["source_revision"]), criteria, tuple(map(str, raw["non_goals"])), tuple(map(str, raw["invariants"])), tuple(map(str, raw["constraints"])), files, None if raw["predecessor_tranche_id"] is None else str(raw["predecessor_tranche_id"]))
 
 
+def decode_persisted_admission_envelope(value: str | dict[str, Any], *, expected_feature_id: str | None = None, expected_contract_hash: str | None = None) -> FeatureAdmissionSpec:
+    raw = json.loads(value) if isinstance(value, str) else value
+    if type(raw) is not dict or type(raw.get("spec")) is not dict:
+        raise ValueError("persisted feature contract envelope is malformed")
+    spec = FeatureAdmissionSpec.from_json(raw["spec"])
+    if expected_feature_id is not None and spec.feature_id != expected_feature_id:
+        raise ValueError("persisted feature contract identity conflicts")
+    if expected_contract_hash is not None and spec.contract.contract_hash != expected_contract_hash:
+        raise ValueError("persisted feature contract hash conflicts")
+    return spec
+
+
 @dataclass(frozen=True)
 class FeatureAdmissionResult:
     feature_id: str
