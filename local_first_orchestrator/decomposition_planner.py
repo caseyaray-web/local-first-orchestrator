@@ -133,11 +133,13 @@ def resolve_hermes_identity(executable='hermes') -> dict[str,str]:
     return {'provider': match.group(2), 'model': match.group(1), 'profile': 'default'}
 
 class LocalDecompositionPlanner:
-    def __init__(self, runner=subprocess.run, executable='hermes', cost_class: str = 'unknown', provider='unresolved', model='unresolved', profile='unresolved', allowed_paths=DEFAULT_ALLOWED_PATHS):
+    def __init__(self, runner=subprocess.run, executable='hermes', cost_class: str = 'unknown', provider='unresolved', model='unresolved', profile='unresolved', allowed_paths=DEFAULT_ALLOWED_PATHS, role='decomposition', routing_source='operator-config'):
+
         if cost_class not in {'local', 'paid', 'unknown'}:
             raise ValueError('invalid planner cost class')
         self.runner, self.executable, self.cost_class = runner, executable, cost_class
         self.provider, self.model, self.profile = provider, model, profile
+        self.role, self.routing_source = role, routing_source
         self.allowed_paths = tuple(allowed_paths)
     @property
     def is_paid(self):
@@ -150,7 +152,7 @@ class LocalDecompositionPlanner:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         scratch = artifact_dir / 'planner-scratch'
         scratch.mkdir(exist_ok=True)
-        provenance = {'provider': self.provider, 'model': self.model, 'profile': self.profile, 'cost_class': self.cost_class, 'mechanism': 'hermes-chat', 'tool_mode': 'safe-no-mutation-tools', 'toolsets': ['safe'], 'cwd': str(scratch)}
+        provenance = {'role': self.role, 'routing_source': self.routing_source, 'provider': self.provider, 'model': self.model, 'profile': self.profile, 'cost_class': self.cost_class, 'mechanism': 'hermes-chat', 'tool_mode': 'safe-no-mutation-tools', 'toolsets': ['safe'], 'cwd': str(scratch)}
         (artifact_dir / 'planner-request.json').write_text(payload, encoding='utf-8')
         (artifact_dir / 'planner-provenance.json').write_text(json.dumps(provenance, sort_keys=True, separators=(',', ':')), encoding='utf-8')
         before = _protected_fingerprint(repository) if repository is not None else None

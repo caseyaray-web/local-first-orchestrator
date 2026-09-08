@@ -16,6 +16,7 @@ from pathlib import Path
 _CONFIG_ENV = "LOCAL_FIRST_OPERATOR_CONFIG"
 _LEGACY_FIELDS = frozenset({"ledger_path", "canonical_repository", "repository_allowlist", "implementation", "review"})
 _RUNTIME_FIELDS = frozenset({"worktree_root", "artifact_root", "implementation_timeout_seconds", "review_timeout_seconds"})
+_ROUTING_FIELDS = frozenset({"decomposition"})
 
 
 def default_config_path() -> Path:
@@ -62,6 +63,14 @@ class OperatorConfig:
     artifact_root: Path | None = None
     implementation_timeout_seconds: int | None = None
     review_timeout_seconds: int | None = None
+    decomposition: tuple[tuple[str, ModelRegistration], ...] = ()
+
+    def decomposition_route(self, cost_class: str) -> ModelRegistration:
+        routes = dict(self.decomposition)
+        route = routes.get(cost_class)
+        if route is None:
+            raise ValueError(f"decomposition route is not configured for cost class: {cost_class}")
+        return route
 
     def validated(self, *, require_ledger: bool) -> "OperatorConfig":
         ledger = self.ledger_path.expanduser().resolve(strict=require_ledger)
@@ -78,7 +87,7 @@ class OperatorConfig:
             raise ValueError("execution_runtime_not_configured")
         if self.worktree_root is not None and (not isinstance(self.worktree_root, Path) or not isinstance(self.artifact_root, Path) or not isinstance(self.implementation_timeout_seconds, int) or not isinstance(self.review_timeout_seconds, int)):
             raise ValueError("execution_runtime_not_configured")
-        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review, self.worktree_root, self.artifact_root, self.implementation_timeout_seconds, self.review_timeout_seconds)
+        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review, self.worktree_root, self.artifact_root, self.implementation_timeout_seconds, self.review_timeout_seconds, self.decomposition)
 
     @property
     def execution_configured(self) -> bool:
@@ -97,7 +106,7 @@ class OperatorConfig:
     def as_json(self) -> dict[str, object]:
         if not self.execution_configured:
             raise ValueError("execution_runtime_not_configured")
-        return {
+        result = {
             "ledger_path": str(self.ledger_path),
             "canonical_repository": str(self.canonical_repository),
             "repository_allowlist": [str(path) for path in self.repository_allowlist],
@@ -108,6 +117,9 @@ class OperatorConfig:
             "implementation_timeout_seconds": self.implementation_timeout_seconds,
             "review_timeout_seconds": self.review_timeout_seconds,
         }
+        if self.decomposition:
+            result["decomposition"] = {cost: asdict(route) for cost, route in self.decomposition}
+        return result
 
 
 def load_operator_config(path: Path | None = None) -> OperatorConfig:
@@ -118,7 +130,7 @@ def load_operator_config(path: Path | None = None) -> OperatorConfig:
         raise ValueError("operator dashboard is not registered") from exc
     except json.JSONDecodeError as exc:
         raise ValueError("operator registration is not valid JSON") from exc
-    if not isinstance(raw, dict) or set(raw) not in {_LEGACY_FIELDS, _LEGACY_FIELDS | _RUNTIME_FIELDS}:
+    if not isinstance(raw, dict) or set(raw) not in { _LEGACY_FIELDS, _LEGACY_FIELDS | _RUNTIME_FIELDS, _LEGACY_FIELDS | _ROUTING_FIELDS, _LEGACY_FIELDS | _RUNTIME_FIELDS | _ROUTING_FIELDS }:
         raise ValueError("operator registration has unexpected fields")
     paths = raw["repository_allowlist"]
     if not isinstance(paths, list) or not paths or not all(isinstance(item, str) for item in paths):
@@ -131,7 +143,12 @@ def load_operator_config(path: Path | None = None) -> OperatorConfig:
         runtime = (Path(raw["worktree_root"]), Path(raw["artifact_root"]), raw["implementation_timeout_seconds"], raw["review_timeout_seconds"])
     else:
         runtime = (None, None, None, None)
-    return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review"), *runtime).validated(require_ledger=True)
+    decomposition = ()
+    if "decomposition" in raw:
+        if not isinstance(raw["decomposition"], dict) or not raw["decomposition"]:
+            raise ValueError("decomposition must be a non-empty cost-class route mapping")
+        decomposition = tuple(sorted((str(cost), ModelRegistration.parse(value, f"decomposition.{cost}")) for cost, value in raw["decomposition"].items()))
+    return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review"), *runtime, decomposition).validated(require_ledger=True)
 
 
 def save_operator_config(config: OperatorConfig, path: Path | None = None) -> Path:

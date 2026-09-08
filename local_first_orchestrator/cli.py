@@ -252,12 +252,18 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     register.add_argument("--review-profile", default="worker-code-local")
     register.add_argument("--review-provider", default=LOCAL_QWEN_PROVIDER)
     register.add_argument("--review-model", default=LOCAL_QWEN_MODEL)
+    register.add_argument("--decomposition-local-profile")
+    register.add_argument("--decomposition-local-provider")
+    register.add_argument("--decomposition-local-model")
+    register.add_argument("--decomposition-standard-profile")
+    register.add_argument("--decomposition-standard-provider")
+    register.add_argument("--decomposition-standard-model")
     admission=commands.add_parser("admit-feature-contract", help="admit one paused, predecessor-authorized feature contract without planning")
     admission.add_argument("--spec-file", required=True)
     planning=commands.add_parser("plan-feature", help="generate and persist one validated decomposition plan without activation")
     planning.add_argument("--feature-id", required=True)
     planning.add_argument("--planner-executable", default="hermes")
-    planning.add_argument("--planner-cost-class", choices=("local",), default="local")
+    planning.add_argument("--planner-cost-class", choices=("local", "standard"), default="local", help="budget class within the configured decomposition role; never selects implementation routing")
 def run_command(args: argparse.Namespace) -> int:
     """Run a parsed standalone or native Hermes CLI command."""
     ledger=_ledger(args.database)
@@ -321,9 +327,9 @@ def run_command(args: argparse.Namespace) -> int:
             stored=json.loads(row["contract_json"])
             feature=FeatureAdmissionSpec.from_json(stored["spec"]).contract
             if feature.id != args.feature_id: raise ValueError("feature contract identity mismatch")
-            identity=resolve_hermes_identity(args.planner_executable)
+            route=registered.decomposition_route(args.planner_cost_class)
             allowed_paths=tuple((item["path"], item["disposition"]) for item in stored["spec"]["files"])
-            planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class=args.planner_cost_class,provider=identity['provider'],model=identity['model'],profile=identity['profile'],allowed_paths=allowed_paths)
+            planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class=args.planner_cost_class,provider=route.provider,model=route.model,profile=route.profile,allowed_paths=allowed_paths,role="decomposition",routing_source="operator-config.decomposition")
             coordinator=PlanningCoordinator(ledger, ctl.config, planner)
             print(json.dumps(coordinator.generate_plan_only(feature,repository=registered.canonical_repository).__dict__,sort_keys=True,default=str))
         elif args.command=="register-dashboard":
@@ -332,6 +338,16 @@ def run_command(args: argparse.Namespace) -> int:
             worktree_root, artifact_root = default_execution_roots(root)
             if args.worktree_root: worktree_root = Path(args.worktree_root).expanduser()
             if args.artifact_root: artifact_root = Path(args.artifact_root).expanduser()
+            decomposition_routes = {}
+            for cost in ("local", "standard"):
+                profile = getattr(args, f"decomposition_{cost}_profile")
+                provider = getattr(args, f"decomposition_{cost}_provider")
+                model = getattr(args, f"decomposition_{cost}_model")
+                supplied = (profile, provider, model)
+                if any(value is not None for value in supplied):
+                    if not all(isinstance(value, str) and value.strip() for value in supplied):
+                        raise ValueError(f"decomposition {cost} route requires profile, provider, and model together")
+                    decomposition_routes[cost] = ModelRegistration(profile, provider, model)
             config=OperatorConfig(
                 ledger_path=Path(args.database),
                 canonical_repository=root,
@@ -342,6 +358,7 @@ def run_command(args: argparse.Namespace) -> int:
                 artifact_root=artifact_root,
                 implementation_timeout_seconds=args.implementation_timeout_seconds or 300,
                 review_timeout_seconds=args.review_timeout_seconds or 900,
+                decomposition=tuple(sorted(decomposition_routes.items())),
             )
             path=save_operator_config(config, Path(args.config_path) if args.config_path else None)
             print(json.dumps({"registered": str(path)}, sort_keys=True))
