@@ -48,6 +48,9 @@ class SnapshotRevalidationTests(unittest.TestCase):
         now = 1
         envelope = json.dumps({"spec": self.spec.canonical_payload}, sort_keys=True, separators=(",", ":"))
         self.ledger.connection.execute("INSERT INTO feature_contracts(feature_id,contract_hash,contract_json,created_at,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json) VALUES (?,?,?,?,?,?,?,?)", ("F", self.feature.contract_hash, envelope, now, str(self.repo.resolve()), self.base, self.s1.snapshot_hash, self.s1.manifest_json))
+        self.ledger.connection.execute("INSERT INTO features(id,title,objective,status,created_at,updated_at) VALUES (?,?,?,?,?,?)", ("F", "Feature", "Objective", "planned", now, now))
+        self.ledger.connection.execute("INSERT INTO tranches(id,feature_id,ordinal,status,base_sha,title,objective,criterion_ids_json) VALUES (?,?,?,?,?,?,?,?)", ("F1-T0", "F", 0, "planned", self.base, "Tranche", "Objective", "[\"A\"]"))
+        self.ledger.connection.execute("INSERT INTO tranche_criteria(tranche_id,criterion_id) VALUES (?,?)", ("F1-T0", "A"))
 
     def tearDown(self):
         self.ledger.close()
@@ -73,6 +76,9 @@ class SnapshotRevalidationTests(unittest.TestCase):
         self.assertEqual(revalidated["revalidation_hash"], expected)
         activated = self.coordinator.activate_persisted_plan(self.feature, request_key="req", plan_id="plan-test")
         self.assertEqual(activated.activated_ticket_ids, ("TK-1",))
+        self.assertEqual(self.ledger.connection.execute("select id from tickets where id='TK-1'").fetchone()[0], "TK-1")
+        self.assertEqual(self.ledger.connection.execute("select tranche_id from tickets where id='TK-1'").fetchone()[0], "F1-T0")
+        self.assertIsNone(self.ledger.connection.execute("select 1 from tranches where id='T0'").fetchone())
         self.assertEqual(self.ledger.feature_snapshot_authority("F")["snapshot_hash"], s2.snapshot_hash)
 
     def test_chain_and_exact_replay_are_guarded(self):

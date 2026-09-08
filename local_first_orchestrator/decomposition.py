@@ -135,6 +135,18 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
  if (plan.repository_identity,plan.repo_base_sha,plan.repo_snapshot_hash,plan.repo_snapshot_manifest_json)!=(repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json):
   raise ValueError('repository provenance conflicts')
  raw=json.dumps({"feature":feature.__dict__,"plan":plan.__dict__},default=lambda x:x.__dict__ if hasattr(x,'__dict__') else list(x),sort_keys=True,separators=(',',':')); fp=hashlib.sha256(raw.encode()).hexdigest(); pid='plan-'+fp[:16]; now=int(time.time())
+ def resolve(c,tranche):
+  slot=c.execute('SELECT * FROM tranches WHERE feature_id=? AND ordinal=?',(feature.id,tranche.ordinal)).fetchone()
+  if slot is None:
+   slot=c.execute('SELECT * FROM tranches WHERE id=?',(tranche.id,)).fetchone()
+   if slot is None:
+    if old is not None and old['repository_identity'] is not None: raise ValueError('admitted tranche authority is missing')
+    return None
+  if slot['feature_id']!=feature.id or int(slot['ordinal'])!=tranche.ordinal or str(slot['base_sha'])!=str(plan.repo_base_sha): raise ValueError('conflicting admitted tranche')
+  criteria={r['criterion_id'] for r in c.execute('SELECT criterion_id FROM tranche_criteria WHERE tranche_id=?',(slot['id'],))}
+  if criteria and criteria != set(tranche.criterion_ids): raise ValueError('conflicting admitted tranche criteria')
+  if slot['status'] not in {'planned','active'}: raise ValueError('incompatible admitted tranche lifecycle')
+  return slot
  with ledger._transaction() as c:
   old=c.execute('SELECT * FROM feature_contracts WHERE feature_id=?',(feature.id,)).fetchone()
   if old and old['contract_hash']!=feature.contract_hash: raise ValueError('conflicting feature contract')
@@ -142,22 +154,26 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
    authority=ledger.feature_snapshot_authority(feature.id)
    if any(authority[key] is not None for key in ("repository_identity","repo_base_sha","snapshot_hash")) and (authority["feature_contract_hash"],authority["repository_identity"],authority["repo_base_sha"],authority["snapshot_hash"]) != (feature.contract_hash,repository_identity,repo_base_sha,repo_snapshot_hash): raise ValueError('repository provenance conflicts')
   active_tranche=next(tr for tr in plan.tranches if tr.ordinal == 0)
+  resolved_active=resolve(c,active_tranche)
+  durable_active_id=str(resolved_active['id']) if resolved_active is not None else active_tranche.id
   existing=c.execute('SELECT * FROM decomposition_plans WHERE fingerprint=?',(fp,)).fetchone()
   if existing:
    if tuple(existing[x] for x in ('repository_identity','repo_base_sha','repo_snapshot_hash','repo_snapshot_manifest_json')) != (repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json): raise ValueError('repository provenance conflicts')
    active_tranche=next(tr for tr in plan.tranches if tr.ordinal == 0)
+
    if existing['status'] == 'validated_pending_activation':
     pass
    else:
     for generated in active_tranche.microtickets:
-     expected=generated_card_payload(feature, active_tranche, generated, repository_identity=str(repository_identity), repo_base_sha=str(repo_base_sha), repo_snapshot_hash=str(repo_snapshot_hash))
-     ticket_row=c.execute('SELECT id FROM tickets WHERE id=? AND feature_id=? AND tranche_id=? AND state=?',(generated.ticket_id,feature.id,active_tranche.id,'draft')).fetchone()
+     durable_active=active_tranche if durable_active_id == active_tranche.id else Tranche(durable_active_id, active_tranche.ordinal, active_tranche.objective, active_tranche.capabilities, active_tranche.criterion_ids, active_tranche.microtickets)
+     expected=generated_card_payload(feature, durable_active, generated, repository_identity=str(repository_identity), repo_base_sha=str(repo_base_sha), repo_snapshot_hash=str(repo_snapshot_hash))
+     ticket_row=c.execute('SELECT id FROM tickets WHERE id=? AND feature_id=? AND tranche_id=? AND state=?',(generated.ticket_id,feature.id,durable_active_id,'draft')).fetchone()
      event_row=c.execute("SELECT id FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='generated_microticket_created' ORDER BY id DESC LIMIT 1",(generated.ticket_id,)).fetchone()
      projection=c.execute('SELECT operation,payload_json,idempotency_key FROM board_projection_outbox WHERE ticket_id=? AND event_id=?',(generated.ticket_id,event_row['id'] if event_row else -1)).fetchone()
      if ticket_row is None or event_row is None or projection is None or (projection['operation'],projection['payload_json'],projection['idempotency_key']) != ('create_microticket',json.dumps(expected,sort_keys=True,separators=(',',':')),expected['projection_key']):
       raise ValueError('create projection conflicts')
    if existing['status'] != 'validated_pending_activation':
-    canonical_ids=tuple(str(r['id']) for r in c.execute('SELECT t.id FROM tickets AS t WHERE t.feature_id=? AND t.tranche_id=? ORDER BY t.id',(feature.id,active_tranche.id)).fetchall())
+    canonical_ids=tuple(str(r['id']) for r in c.execute('SELECT t.id FROM tickets AS t WHERE t.feature_id=? AND t.tranche_id=? ORDER BY t.id',(feature.id,durable_active_id)).fetchall())
     if not canonical_ids: raise ValueError('active decomposition plan has no materialized tickets')
     return str(existing['id']),canonical_ids
   for tr in plan.tranches:
@@ -172,9 +188,10 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
    c.execute('INSERT INTO decomposition_plans(id,feature_id,fingerprint,plan_json,status,created_at,activated_at,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)',(pid,feature.id,fp,raw,'active',now,now,repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json))
   active=[]
   for tr in plan.tranches:
-   existing_tranche=c.execute('SELECT * FROM tranches WHERE id=?',(tr.id,)).fetchone()
+   existing_tranche=resolve(c,tr)
+   durable_tranche_id=str(existing_tranche['id']) if existing_tranche is not None else tr.id
    if existing_tranche:
-    existing_criteria={r['criterion_id'] for r in c.execute('SELECT criterion_id FROM tranche_criteria WHERE tranche_id=?',(tr.id,))}
+    existing_criteria={r['criterion_id'] for r in c.execute('SELECT criterion_id FROM tranche_criteria WHERE tranche_id=?',(durable_tranche_id,))}
     if existing_tranche['feature_id']!=feature.id or int(existing_tranche['ordinal'])!=tr.ordinal or str(existing_tranche['base_sha'])!=str(plan.repo_base_sha) or existing_criteria != set(tr.criterion_ids): raise ValueError('conflicting admitted tranche')
    else:
     c.execute('INSERT INTO tranches(id,feature_id,ordinal,status,base_sha,integration_commands_json) VALUES (?,?,?, ?,?,"[]")',(tr.id,feature.id,tr.ordinal,'active' if tr.ordinal==0 else 'planned',plan.repo_base_sha))
@@ -183,18 +200,19 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
    if tr.ordinal:
     continue
    for t in tr.microtickets:
-    q=t.contract(); c.execute('INSERT INTO tickets(id,feature_id,tranche_id,title,objective,criterion_ids_json,primary_symbol,allowed_files_json,create_files_json,new_test_files_json,forbidden_changes_json,patch_budget_json,verification_json,risk,review_required,max_attempts,dependencies_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(t.ticket_id,feature.id,tr.id,t.ticket_id,q['objective'],json.dumps(q['criterion_ids']),q['primary_symbol'],json.dumps(q['allowed_files']),json.dumps(q.get('create_files',[])),json.dumps(q.get('new_test_files',[])),json.dumps(q['forbidden_changes']),json.dumps(q['patch_budget']),json.dumps(q['verification']),q['risk'],int(t.review_required),t.max_attempts,json.dumps(q['dependencies']),'draft',now,now)); active.append(t.ticket_id)
+    q=t.contract(); c.execute('INSERT INTO tickets(id,feature_id,tranche_id,title,objective,criterion_ids_json,primary_symbol,allowed_files_json,create_files_json,new_test_files_json,forbidden_changes_json,patch_budget_json,verification_json,risk,review_required,max_attempts,dependencies_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(t.ticket_id,feature.id,durable_tranche_id,t.ticket_id,q['objective'],json.dumps(q['criterion_ids']),q['primary_symbol'],json.dumps(q['allowed_files']),json.dumps(q.get('create_files',[])),json.dumps(q.get('new_test_files',[])),json.dumps(q['forbidden_changes']),json.dumps(q['patch_budget']),json.dumps(q['verification']),q['risk'],int(t.review_required),t.max_attempts,json.dumps(q['dependencies']),'draft',now,now)); active.append(t.ticket_id)
     for cid in t.criterion_ids:c.execute('INSERT INTO ticket_criteria VALUES (?,?)',(t.ticket_id,cid))
     ledger._inject_failure('after_generated_ticket')
-    projection = generated_card_payload(feature, tr, t, repository_identity=str(repository_identity), repo_base_sha=str(repo_base_sha), repo_snapshot_hash=str(repo_snapshot_hash))
-    event_id = ledger._append_event(c, entity_type='ticket', entity_id=t.ticket_id, event_type='generated_microticket_created', actor_id='controller', to_state='draft', payload={'feature_id': feature.id, 'tranche_id': tr.id, 'projection_key': projection['projection_key']})
+    durable_tranche = tr if durable_tranche_id == tr.id else Tranche(durable_tranche_id, tr.ordinal, tr.objective, tr.capabilities, tr.criterion_ids, tr.microtickets)
+    projection = generated_card_payload(feature, durable_tranche, t, repository_identity=str(repository_identity), repo_base_sha=str(repo_base_sha), repo_snapshot_hash=str(repo_snapshot_hash))
+    event_id = ledger._append_event(c, entity_type='ticket', entity_id=t.ticket_id, event_type='generated_microticket_created', actor_id='controller', to_state='draft', payload={'feature_id': feature.id, 'tranche_id': durable_tranche_id, 'plan_tranche_id': tr.id, 'projection_key': projection['projection_key']})
     ledger._enqueue_generated_create_projection_in_transaction(c, ticket_id=t.ticket_id, event_id=event_id, payload=projection, idempotency_key=projection['projection_key'])
   activated_plan_id=str(existing['id']) if existing else pid
   if existing and existing['status'] == 'validated_pending_activation':
    c.execute("UPDATE decomposition_plans SET status='active', activated_at=? WHERE id=?", (now, activated_plan_id))
   pending_runs=c.execute("SELECT request_key FROM planning_runs WHERE feature_id=? AND plan_id=? AND status='validated_pending_activation' ORDER BY request_key", (feature.id, activated_plan_id)).fetchall()
   if len(pending_runs)>1: raise ValueError('ambiguous planning run for activation')
-  canonical_ids=tuple(str(r['id']) for r in c.execute('SELECT t.id FROM tickets AS t WHERE t.feature_id=? AND t.tranche_id=? ORDER BY t.id',(feature.id,active_tranche.id)).fetchall())
+  canonical_ids=tuple(str(r['id']) for r in c.execute('SELECT t.id FROM tickets AS t WHERE t.feature_id=? AND t.tranche_id=? ORDER BY t.id',(feature.id,durable_active_id)).fetchall())
   if pending_runs:
    ledger._finalize_planning_run_activation(c, pending_runs[0]['request_key'], plan_id=activated_plan_id, ticket_ids=canonical_ids)
   if not canonical_ids: raise ValueError('active decomposition plan has no materialized tickets')

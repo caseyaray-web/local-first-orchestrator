@@ -1196,7 +1196,7 @@ class Ledger:
             active_tranche_id = next(item["id"] for item in plan_payload["tranches"] if int(item["ordinal"]) == 0)
         except (KeyError, TypeError, ValueError, StopIteration) as exc:
             raise ValueError("active decomposition tranche is invalid") from exc
-        actual_rows = conn.execute("SELECT t.id FROM tickets AS t JOIN tranches AS tr ON tr.id=t.tranche_id WHERE t.feature_id=? AND t.tranche_id=? ORDER BY t.id", (row["feature_id"], active_tranche_id)).fetchall()
+        actual_rows = conn.execute("SELECT t.id FROM tickets AS t JOIN tranches AS tr ON tr.id=t.tranche_id WHERE t.feature_id=? AND tr.ordinal=? ORDER BY t.id", (row["feature_id"], 0)).fetchall()
         actual_ticket_ids = tuple(str(item["id"]) for item in actual_rows)
         if not actual_ticket_ids:
             raise ValueError("active decomposition plan has no materialized tickets")
