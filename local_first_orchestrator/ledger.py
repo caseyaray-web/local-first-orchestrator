@@ -523,6 +523,39 @@ class Ledger:
     def close(self) -> None:
         self.connection.close()
 
+    @staticmethod
+    def snapshot_revalidation_hash(*, feature_id: str, feature_contract_hash: str, repository_identity: str, repo_base_sha: str, source_snapshot_hash: str, target_snapshot_hash: str, generation: int) -> str:
+        value = {"feature_id": feature_id, "feature_contract_hash": feature_contract_hash, "repository_identity": repository_identity, "repo_base_sha": repo_base_sha, "source_snapshot_hash": source_snapshot_hash, "target_snapshot_hash": target_snapshot_hash, "generation": generation}
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def feature_snapshot_authority(self, feature_id: str) -> dict[str, Any]:
+        contract = self.connection.execute("SELECT * FROM feature_contracts WHERE feature_id=?", (feature_id,)).fetchone()
+        if contract is None: raise ValueError("feature contract authority is missing")
+        current = {"feature_id": feature_id, "feature_contract_hash": contract["contract_hash"], "repository_identity": contract["repository_identity"], "repo_base_sha": contract["repo_base_sha"], "snapshot_hash": contract["repo_snapshot_hash"], "generation": 0}
+        rows = self.connection.execute("SELECT * FROM feature_repository_snapshot_revalidations WHERE feature_id=? ORDER BY generation", (feature_id,)).fetchall()
+        for row in rows:
+            expected = self.snapshot_revalidation_hash(feature_id=row["feature_id"], feature_contract_hash=row["feature_contract_hash"], repository_identity=row["repository_identity"], repo_base_sha=row["repo_base_sha"], source_snapshot_hash=row["source_snapshot_hash"], target_snapshot_hash=row["target_snapshot_hash"], generation=int(row["generation"]))
+            if row["feature_contract_hash"] != current["feature_contract_hash"] or row["repository_identity"] != current["repository_identity"] or row["repo_base_sha"] != current["repo_base_sha"] or row["source_snapshot_hash"] != current["snapshot_hash"] or int(row["generation"]) != current["generation"] + 1 or row["revalidation_hash"] != expected:
+                raise ValueError("invalid feature snapshot revalidation chain")
+            current = {**current, "snapshot_hash": row["target_snapshot_hash"], "generation": int(row["generation"]), "revalidation_hash": row["revalidation_hash"]}
+        return current
+
+    def append_feature_snapshot_revalidation(self, *, feature_id: str, feature_contract_hash: str, repository_identity: str, repo_base_sha: str, source_snapshot_hash: str, target_snapshot_hash: str, generation: int, revalidation_hash: str) -> dict[str, Any]:
+        authority = self.feature_snapshot_authority(feature_id)
+        if (feature_contract_hash, repository_identity, repo_base_sha, source_snapshot_hash, generation) != (authority["feature_contract_hash"], authority["repository_identity"], authority["repo_base_sha"], authority["snapshot_hash"], authority["generation"] + 1):
+            raise ValueError("snapshot revalidation source or generation conflicts")
+        expected = self.snapshot_revalidation_hash(feature_id=feature_id, feature_contract_hash=feature_contract_hash, repository_identity=repository_identity, repo_base_sha=repo_base_sha, source_snapshot_hash=source_snapshot_hash, target_snapshot_hash=target_snapshot_hash, generation=generation)
+        if revalidation_hash != expected: raise ValueError("snapshot revalidation hash mismatch")
+        existing = self.connection.execute("SELECT * FROM feature_repository_snapshot_revalidations WHERE feature_id=? AND generation=?", (feature_id, generation)).fetchone()
+        if existing is not None:
+            values = (existing["feature_contract_hash"], existing["repository_identity"], existing["repo_base_sha"], existing["source_snapshot_hash"], existing["target_snapshot_hash"], int(existing["generation"]), existing["revalidation_hash"])
+            if values != (feature_contract_hash, repository_identity, repo_base_sha, source_snapshot_hash, target_snapshot_hash, generation, revalidation_hash): raise ValueError("conflicting snapshot revalidation")
+            return dict(existing)
+        now = int(time.time())
+        with self._transaction() as c:
+            c.execute("INSERT INTO feature_repository_snapshot_revalidations(feature_id,feature_contract_hash,repository_identity,repo_base_sha,source_snapshot_hash,target_snapshot_hash,generation,revalidation_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?)", (feature_id, feature_contract_hash, repository_identity, repo_base_sha, source_snapshot_hash, target_snapshot_hash, generation, revalidation_hash, now))
+        return dict(self.connection.execute("SELECT * FROM feature_repository_snapshot_revalidations WHERE feature_id=? AND generation=?", (feature_id, generation)).fetchone())
+
     def migrate(self) -> None:
         self.connection.executescript(_SCHEMA)
         binding_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(runtime_bindings)")}
@@ -559,6 +592,19 @@ class Ledger:
                 BEGIN SELECT RAISE(ABORT, 'tranche completion recheck evidence hash is invalid'); END""")
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS feature_contracts (feature_id TEXT PRIMARY KEY, contract_hash TEXT NOT NULL, contract_json TEXT NOT NULL, created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS feature_repository_snapshot_revalidations (
+            feature_id TEXT NOT NULL REFERENCES feature_contracts(feature_id),
+            feature_contract_hash TEXT NOT NULL,
+            repository_identity TEXT NOT NULL,
+            repo_base_sha TEXT NOT NULL,
+            source_snapshot_hash TEXT NOT NULL,
+            target_snapshot_hash TEXT NOT NULL,
+            generation INTEGER NOT NULL CHECK(generation > 0),
+            revalidation_hash TEXT NOT NULL UNIQUE,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(feature_id, generation),
+            UNIQUE(feature_id, source_snapshot_hash, target_snapshot_hash, generation)
+        );
         CREATE TABLE IF NOT EXISTS decomposition_plans (id TEXT PRIMARY KEY, feature_id TEXT NOT NULL, fingerprint TEXT NOT NULL UNIQUE, plan_json TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, activated_at INTEGER, repository_identity TEXT, repo_base_sha TEXT, repo_snapshot_hash TEXT, repo_snapshot_manifest_json TEXT, UNIQUE(feature_id, fingerprint));
         CREATE TABLE IF NOT EXISTS planning_runs (
             request_key TEXT PRIMARY KEY, feature_id TEXT NOT NULL, contract_hash TEXT NOT NULL,
@@ -613,6 +659,10 @@ class Ledger:
             BEFORE UPDATE ON feature_contracts BEGIN SELECT RAISE(ABORT, 'feature contracts are immutable'); END;
             CREATE TRIGGER IF NOT EXISTS feature_contracts_immutable_delete
             BEFORE DELETE ON feature_contracts BEGIN SELECT RAISE(ABORT, 'feature contracts are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS feature_snapshot_revalidations_immutable_update
+            BEFORE UPDATE ON feature_repository_snapshot_revalidations BEGIN SELECT RAISE(ABORT, 'snapshot revalidations are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS feature_snapshot_revalidations_immutable_delete
+            BEFORE DELETE ON feature_repository_snapshot_revalidations BEGIN SELECT RAISE(ABORT, 'snapshot revalidations are append-only'); END;
         """)
         run_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(planning_runs)")}
         for name in ("repository_identity", "repo_snapshot_manifest_json"):

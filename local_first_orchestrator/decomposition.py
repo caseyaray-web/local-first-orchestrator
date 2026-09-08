@@ -138,7 +138,9 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
  with ledger._transaction() as c:
   old=c.execute('SELECT * FROM feature_contracts WHERE feature_id=?',(feature.id,)).fetchone()
   if old and old['contract_hash']!=feature.contract_hash: raise ValueError('conflicting feature contract')
-  if old and any(old[key] is not None and old[key] != value for key,value in (("repository_identity",repository_identity),("repo_base_sha",repo_base_sha),("repo_snapshot_hash",repo_snapshot_hash),("repo_snapshot_manifest_json",repo_snapshot_manifest_json))): raise ValueError('repository provenance conflicts')
+  if old is not None:
+   authority=ledger.feature_snapshot_authority(feature.id)
+   if any(authority[key] is not None for key in ("repository_identity","repo_base_sha","snapshot_hash")) and (authority["feature_contract_hash"],authority["repository_identity"],authority["repo_base_sha"],authority["snapshot_hash"]) != (feature.contract_hash,repository_identity,repo_base_sha,repo_snapshot_hash): raise ValueError('repository provenance conflicts')
   active_tranche=next(tr for tr in plan.tranches if tr.ordinal == 0)
   existing=c.execute('SELECT * FROM decomposition_plans WHERE fingerprint=?',(fp,)).fetchone()
   if existing:

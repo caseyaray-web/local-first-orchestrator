@@ -294,6 +294,21 @@ class PlanningCoordinator:
         self._record(request_key, feature, snap, status="validated_pending_activation", artifact=response_path, plan_id=persisted)
         return PlanningOutcome("validated_pending_activation", feature.id, request_key, snap.snapshot_hash, persisted)
 
+    def revalidate_feature_repository_snapshot(self, feature_id: str) -> dict[str, Any]:
+        feature = self._persisted_feature_spec(feature_id).contract
+        authority = self.ledger.feature_snapshot_authority(feature_id)
+        if not authority["repository_identity"] or not authority["repo_base_sha"] or not authority["snapshot_hash"]:
+            raise ValueError("feature snapshot authority is incomplete")
+        snap = self._snapshot_for_feature(feature, str(authority["repo_base_sha"]))
+        if (snap.repository_id, snap.base_sha) != (authority["repository_identity"], authority["repo_base_sha"]):
+            raise ValueError("repository identity or base SHA changed")
+        if snap.snapshot_hash == authority["snapshot_hash"]:
+            return {**authority, "status": "already_current", "target_snapshot_hash": snap.snapshot_hash}
+        generation = int(authority["generation"]) + 1
+        revalidation_hash = self.ledger.snapshot_revalidation_hash(feature_id=feature_id, feature_contract_hash=feature.contract_hash, repository_identity=snap.repository_id, repo_base_sha=snap.base_sha, source_snapshot_hash=authority["snapshot_hash"], target_snapshot_hash=snap.snapshot_hash, generation=generation)
+        row = self.ledger.append_feature_snapshot_revalidation(feature_id=feature_id, feature_contract_hash=feature.contract_hash, repository_identity=snap.repository_id, repo_base_sha=snap.base_sha, source_snapshot_hash=authority["snapshot_hash"], target_snapshot_hash=snap.snapshot_hash, generation=generation, revalidation_hash=revalidation_hash)
+        return {**row, "status": "revalidated"}
+
     def activate_persisted_plan(self, feature: FeatureContract, *, request_key: str, plan_id: str) -> PlanningOutcome:
         row = self.ledger.connection.execute("SELECT * FROM decomposition_plans WHERE id=?", (plan_id,)).fetchone()
         if row is None: raise ValueError("persisted decomposition plan missing")

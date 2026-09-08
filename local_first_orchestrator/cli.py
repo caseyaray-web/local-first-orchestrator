@@ -264,6 +264,9 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     planning.add_argument("--feature-id", required=True)
     planning.add_argument("--planner-executable", default="hermes")
     planning.add_argument("--planner-cost-class", choices=("local", "standard"), default="local", help="budget class within the configured decomposition role; never selects implementation routing")
+    snapshot_revalidate=commands.add_parser("revalidate-feature-snapshot", help="append one deterministic feature repository snapshot revalidation")
+    snapshot_revalidate.add_argument("--feature-id", required=True)
+    snapshot_revalidate.add_argument("--planner-executable", default="hermes")
 def run_command(args: argparse.Namespace) -> int:
     """Run a parsed standalone or native Hermes CLI command."""
     ledger=_ledger(args.database)
@@ -332,6 +335,16 @@ def run_command(args: argparse.Namespace) -> int:
             planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class=args.planner_cost_class,provider=route.provider,model=route.model,profile=route.profile,allowed_paths=allowed_paths,role="decomposition",routing_source="operator-config.decomposition")
             coordinator=PlanningCoordinator(ledger, ctl.config, planner)
             print(json.dumps(coordinator.generate_plan_only(feature,repository=registered.canonical_repository).__dict__,sort_keys=True,default=str))
+        elif args.command=="revalidate-feature-snapshot":
+            if args.ad_hoc_runtime: raise ValueError("feature snapshot revalidation requires registered operator runtime")
+            ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
+            row=ledger.connection.execute("SELECT contract_json FROM feature_contracts WHERE feature_id=?", (args.feature_id,)).fetchone()
+            if row is None: raise ValueError("authoritative feature contract is missing")
+            feature=FeatureAdmissionSpec.from_json(json.loads(row["contract_json"])["spec"]).contract
+            route=registered.decomposition_route("standard")
+            planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class="standard",provider=route.provider,model=route.model,profile=route.profile,allowed_paths=(),role="decomposition",routing_source="operator-config.decomposition")
+            coordinator=PlanningCoordinator(ledger, ctl.config, planner)
+            print(json.dumps(coordinator.revalidate_feature_repository_snapshot(args.feature_id),sort_keys=True,default=str))
         elif args.command=="register-dashboard":
             root=Path(args.repository).resolve(strict=True)
             allowlist=tuple(Path(item).resolve(strict=True) for item in args.allow_repository) or (root,)
