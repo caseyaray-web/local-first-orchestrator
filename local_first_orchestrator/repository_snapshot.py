@@ -25,7 +25,14 @@ def terms(feature:FeatureContract|None,extra:tuple[str,...])->tuple[str,...]:
  text=' '.join(extra) if feature is None else ' '.join((feature.title,feature.objective,*[x.statement for x in feature.acceptance_criteria]))
  return tuple(sorted({x.lower() for x in re.findall(r'[A-Za-z_][A-Za-z_0-9]{2,}',text) if x.lower() not in _STOP}))
 def snapshot(repository:Path,requested_sha:str,feature:FeatureContract|None=None,feature_terms:tuple[str,...]=(),limit:int=32,authorized_modify_paths:tuple[str,...]=(),authorized_create_paths:tuple[str,...]=())->RepositorySnapshot:
- repo=Path(repository).resolve(); run=lambda *a:subprocess.run(('git',*a),cwd=repo,text=True,capture_output=True,check=True).stdout
+ repo=Path(repository).resolve(); run=lambda *a:subprocess.run(('git',*a),cwd=repo,text=True,capture_output=True,check=True).stdout; run_bytes=lambda *a:subprocess.run(('git',*a),cwd=repo,capture_output=True,check=True).stdout
+ def blob(path): return run_bytes('show',base+':'+path)
+ def evidence(path, reason, score, raw):
+  try: decoded=raw.decode('utf-8') if is_supported_source(path) else None
+  except UnicodeDecodeError:
+   if path in required: raise ValueError(f'authorized source blob is not decodable: {path}')
+   decoded=None
+  return Evidence(path,hashlib.sha256(raw).hexdigest(),reason, symbols_for(path,decoded) if decoded is not None else (), score)
  base=run('rev-parse','--verify',requested_sha+'^{commit}').strip(); required=tuple(sorted(set(authorized_modify_paths)))
  all_paths=run('ls-tree','-r','--name-only',base).splitlines()
  paths=[p for p in all_paths if is_supported_repository_file(p)]
@@ -39,14 +46,14 @@ def snapshot(repository:Path,requested_sha:str,feature:FeatureContract|None=None
  required_entries=[]
  for p in required:
   if p not in manifest_paths: raise ValueError(f'authorized modify path is not a repository blob: {p}')
-  data=run('show',base+':'+p); required_entries.append(Evidence(p,hashlib.sha256(data.encode()).hexdigest(),'authorized_modify_target',symbols_for(p,data),10**9))
+  data=blob(p); required_entries.append(evidence(p,'authorized_modify_target',10**9,data))
  q=terms(feature,feature_terms); candidates=[]
  for m in manifest:
-  data=run('show',base+':'+m.path); lower=data.lower(); score=sum(3 for x in q if x in Path(m.path).name.lower())+sum(1 for x in q if x in lower)
+  data=blob(m.path); lower=data.decode('utf-8',errors='ignore').lower(); score=sum(3 for x in q if x in Path(m.path).name.lower())+sum(1 for x in q if x in lower)
   if m.path not in required and (score or not q):candidates.append((m.path,score,data))
  chosen=sorted(candidates,key=lambda x:(-x[1],x[0]))[:limit-len(required)]; out=list(required_entries)
  for p,score,data in chosen:
-  out.append(Evidence(p,hashlib.sha256(data.encode()).hexdigest(),'feature_term_match',symbols_for(p,data),score))
+  out.append(evidence(p,'feature_term_match',score,data))
  return RepositorySnapshot(str(repo),base,manifest,tuple(out),max(0,len(candidates)-len(chosen)),required,tuple(sorted(set(authorized_create_paths))),bool(authorized_modify_paths or authorized_create_paths))
 @dataclass(frozen=True)
 class RepositoryValidation:

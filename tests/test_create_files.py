@@ -1,4 +1,5 @@
 import json
+import hashlib
 import subprocess
 import unittest
 from pathlib import Path
@@ -84,6 +85,24 @@ class CreateFilesTests(unittest.TestCase):
         sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=self.repo, check=True, text=True, capture_output=True).stdout.strip()
         snap = snapshot(self.repo, sha, self.feature, limit=2)
         self.assertNotIn("README.md", {m.path for m in snap.manifest})
+
+    def test_authorized_crlf_blob_hashes_exact_git_bytes(self):
+        raw = b"# guide\r\nanchor\r\n"; (self.repo / "docs").mkdir(); (self.repo / "docs/CRLF.md").write_bytes(raw)
+        subprocess.run(("git", "add", "."), cwd=self.repo, check=True); subprocess.run(("git", "commit", "-m", "crlf"), cwd=self.repo, check=True, capture_output=True)
+        sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=self.repo, check=True, text=True, capture_output=True).stdout.strip()
+        feature = FeatureContract("F", "Document existing_function", "Document existing_function", (Criterion("A", "document"),), (), (), (), sha)
+        snap = snapshot(self.repo, sha, feature, limit=1, authorized_modify_paths=("docs/CRLF.md",))
+        entry = next(e for e in snap.entries if e.path == "docs/CRLF.md")
+        self.assertEqual(entry.content_hash, hashlib.sha256(raw).hexdigest()); self.assertNotEqual(entry.content_hash, hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest())
+
+    def test_authorized_non_utf8_opaque_blob_hashes_and_stays_symbolless(self):
+        raw = b"opaque\xff\x00\xfe"; (self.repo / "docs").mkdir(); (self.repo / "docs/binary.md").write_bytes(raw)
+        subprocess.run(("git", "add", "."), cwd=self.repo, check=True); subprocess.run(("git", "commit", "-m", "opaque"), cwd=self.repo, check=True, capture_output=True)
+        sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=self.repo, check=True, text=True, capture_output=True).stdout.strip()
+        feature = FeatureContract("F", "Document existing_function", "Document existing_function", (Criterion("A", "document"),), (), (), (), sha)
+        snap = snapshot(self.repo, sha, feature, limit=1, authorized_modify_paths=("docs/binary.md",))
+        entry = next(e for e in snap.entries if e.path == "docs/binary.md")
+        self.assertEqual(entry.content_hash, hashlib.sha256(raw).hexdigest()); self.assertEqual(entry.symbols, ())
 
     def test_duplicate_and_counted_paths(self):
         with self.assertRaisesRegex(ReadinessError, "declared file categories"):
