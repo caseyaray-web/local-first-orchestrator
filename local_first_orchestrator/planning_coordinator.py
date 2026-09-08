@@ -153,7 +153,7 @@ class PlanningCoordinator:
         artifact_dir = self._artifact_dir(feature, self._request_key(feature, snap) + "-" + next_coarse.id); artifact_dir.mkdir(parents=True, exist_ok=True)
         try:
             proposer = getattr(self.planner, "propose_next", None) or getattr(self.planner, "propose")
-            proposal = proposer(feature, snap, coarse_tranche=next_coarse, completion_evidence=completion, artifact_dir=artifact_dir) if getattr(self.planner, "propose_next", None) else proposer(feature, snap, artifact_dir=artifact_dir)
+            proposal = proposer(feature, snap, coarse_tranche=next_coarse, completion_evidence=completion, artifact_dir=artifact_dir, repository=repository) if getattr(self.planner, "propose_next", None) else proposer(feature, snap, artifact_dir=artifact_dir, repository=repository)
         except TypeError:
             proposal = self.planner.propose(feature, snap, artifact_dir=artifact_dir)  # type: ignore[attr-defined]
         proposal = replace(proposal, feature_id=feature.id, feature_contract_hash=feature.contract_hash, repository_identity=snap.repository_id, repo_base_sha=snap.base_sha, repo_snapshot_hash=snap.snapshot_hash, repo_snapshot_manifest_json=snap.manifest_json, tranches=(replace(proposal.tranches[0], id=next_coarse.id, ordinal=0),))

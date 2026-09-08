@@ -7,7 +7,7 @@ from typing import Any
 
 from .controller import LocalFirstController, RuntimeConfig
 from .admission import FeatureAdmissionSpec
-from .decomposition_planner import LocalDecompositionPlanner
+from .decomposition_planner import LocalDecompositionPlanner, resolve_hermes_identity
 from .planning_coordinator import PlanningCoordinator
 from .corrections import AcceptedPredecessor, CorrectionService, CorrectionTicketSpec, SupplementalCorrectionPlan
 from .generated_activation import GeneratedActivationError, activate_generated_ticket
@@ -321,7 +321,8 @@ def run_command(args: argparse.Namespace) -> int:
             stored=json.loads(row["contract_json"])
             feature=FeatureAdmissionSpec.from_json(stored["spec"]).contract
             if feature.id != args.feature_id: raise ValueError("feature contract identity mismatch")
-            planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class=args.planner_cost_class)
+            identity=resolve_hermes_identity(args.planner_executable)
+            planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class=args.planner_cost_class,provider=identity['provider'],model=identity['model'],profile=identity['profile'])
             coordinator=PlanningCoordinator(ledger, ctl.config, planner)
             print(json.dumps(coordinator.generate_plan_only(feature,repository=registered.canonical_repository).__dict__,sort_keys=True,default=str))
         elif args.command=="register-dashboard":
