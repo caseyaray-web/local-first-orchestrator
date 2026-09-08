@@ -17,6 +17,27 @@ PLANNER_SCHEMA = {
     'criterion_coverage': {'key_type': 'criterion ID', 'value_type': 'array of ticket IDs'},
 }
 DEFAULT_ALLOWED_PATHS = ({'path': 'app.py', 'disposition': 'modify'}, {'path': 'test_app.py', 'disposition': 'create'})
+PLANNER_CONTRACT_VERSION = 1
+
+def planner_contract(*, budget_policy=PATCH_BUDGET_POLICY) -> dict:
+    return {
+        'planner_contract_version': PLANNER_CONTRACT_VERSION,
+        'schema': planner_schema(),
+        'context_to_output': {'feature.contract_hash': 'feature_contract_hash', 'repository.base_sha': 'repo_base_sha', 'repository.snapshot_hash': 'repo_snapshot_hash'},
+        'patch_budget_policy': budget_policy.as_json(),
+        'output_rules': [
+            'return exactly one object matching output_contract.schema',
+            'field names and nesting must match output_contract.schema exactly; do not use an alternate schema',
+            'microticket allowed_files must be a subset of output_contract.allowed_paths and preserve each disposition',
+            f'prefer normal bounded tickets: at most {budget_policy.normal_max_files} declared paths and {budget_policy.normal_max_changed_lines} changed lines',
+            'declared paths are allowed_files plus new_test_files and must be unique',
+            f'broader budgets require a concrete exception_reason of at least {budget_policy.minimum_exception_reason_length} non-whitespace characters; do not use broader budgets for convenience',
+        ],
+    }
+
+def planner_contract_hash(*, budget_policy=PATCH_BUDGET_POLICY, contract=None) -> str:
+    value = planner_contract(budget_policy=budget_policy) if contract is None else contract
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 def planner_schema() -> dict:
     return json.loads(json.dumps(PLANNER_SCHEMA))
@@ -32,7 +53,8 @@ def minimal_plan_example(feature: FeatureContract, snapshot: RepositorySnapshot,
     return {'plan_version': 1, 'feature_id': feature.id, 'feature_contract_hash': feature.contract_hash, 'repo_base_sha': snapshot.base_sha, 'repo_snapshot_hash': snapshot.snapshot_hash, 'architecture_decisions': ['Keep the bounded change at one architectural seam.'], 'criterion_coverage': {criterion: ['TK-1']}, 'tranches': [{'id': 'T-0', 'ordinal': 0, 'objective': 'Implement the bounded architectural concern.', 'capabilities': ['bounded-change'], 'criterion_ids': [criterion], 'microtickets': [{'ticket_id': 'TK-1', 'objective': 'Implement and verify the bounded concern.', 'criterion_ids': [criterion], 'primary_symbol': f'{existing}::bounded_change', 'allowed_files': [existing], 'forbidden_changes': ['Do not change unrelated behavior.'], 'patch_budget': {'max_files': 2, 'max_changed_lines': 40}, 'verification': {'commands': [['python', '-m', 'unittest']], 'working_directory': '.', 'timeout_seconds': 60, 'output_limit': 20000}, 'risk': 'low', 'review_required': True, 'max_attempts': 2, 'dependencies': [], 'new_test_files': [new]}]}]}
 
 def packet(feature: FeatureContract, snapshot: RepositorySnapshot, *, max_active: int = 4, max_files: int = 3, max_lines: int = 200, prior_decisions: tuple[str, ...] = (), allowed_paths=DEFAULT_ALLOWED_PATHS, budget_policy=PATCH_BUDGET_POLICY) -> str:
-    return json.dumps({'feature': {**feature.__dict__, 'contract_hash': feature.contract_hash}, 'repository': {'id': snapshot.repository_id, 'base_sha': snapshot.base_sha, 'snapshot_hash': snapshot.snapshot_hash, 'manifest': [x.__dict__ for x in snapshot.manifest], 'evidence': [x.__dict__ for x in snapshot.entries], 'omitted_count': snapshot.omitted_count}, 'limits': {'active_tranche_max_tickets': max_active, 'absolute_max_files': max_files, 'absolute_max_changed_lines': max_lines}, 'patch_budget_policy': budget_policy.as_json(), 'prior_decisions': prior_decisions, 'output_contract': {'schema': planner_schema(), 'allowed_paths': list(_normalized_allowed_paths(allowed_paths)), 'context_to_output': {'feature.contract_hash': 'feature_contract_hash', 'repository.base_sha': 'repo_base_sha', 'repository.snapshot_hash': 'repo_snapshot_hash'}, 'minimal_example': minimal_plan_example(feature, snapshot, allowed_paths)}, 'rules': ['planning only: return exactly one object matching output_contract.schema', 'planning output only: never edit, execute, inspect, or report repository changes', 'JSON only: no prose, Markdown, diffs, patches, implementation reports, changed_files, commands_run, or test-result reports', 'field names and nesting must match output_contract.schema exactly; do not use an alternate schema', 'do not invent criteria or broaden scope', 'microticket allowed_files must be a subset of output_contract.allowed_paths and preserve each disposition', f'prefer normal bounded tickets: at most {budget_policy.normal_max_files} declared paths and {budget_policy.normal_max_changed_lines} changed lines', 'declared paths are allowed_files plus new_test_files and must be unique', f'broader budgets require a concrete exception_reason of at least {budget_policy.minimum_exception_reason_length} non-whitespace characters; do not use broader budgets for convenience', 'materialize active tranche only']}, sort_keys=True, separators=(',', ':'), default=lambda x: x.__dict__ if hasattr(x,'__dict__') else list(x))
+    rules = ['planning only: return exactly one object matching output_contract.schema', 'planning output only: never edit, execute, inspect, or report repository changes', 'JSON only: no prose, Markdown, diffs, patches, implementation reports, changed_files, commands_run, or test-result reports', *planner_contract(budget_policy=budget_policy)['output_rules'], 'do not invent criteria or broaden scope', 'materialize active tranche only']
+    return json.dumps({'planner_contract_hash': planner_contract_hash(budget_policy=budget_policy), 'feature': {**feature.__dict__, 'contract_hash': feature.contract_hash}, 'repository': {'id': snapshot.repository_id, 'base_sha': snapshot.base_sha, 'snapshot_hash': snapshot.snapshot_hash, 'manifest': [x.__dict__ for x in snapshot.manifest], 'evidence': [x.__dict__ for x in snapshot.entries], 'omitted_count': snapshot.omitted_count}, 'limits': {'active_tranche_max_tickets': max_active, 'absolute_max_files': max_files, 'absolute_max_changed_lines': max_lines}, 'patch_budget_policy': budget_policy.as_json(), 'prior_decisions': prior_decisions, 'output_contract': {'schema': planner_schema(), 'allowed_paths': list(_normalized_allowed_paths(allowed_paths)), 'context_to_output': planner_contract(budget_policy=budget_policy)['context_to_output'], 'minimal_example': minimal_plan_example(feature, snapshot, allowed_paths)}, 'rules': rules}, sort_keys=True, separators=(',', ':'), default=lambda x: x.__dict__ if hasattr(x,'__dict__') else list(x))
 
 def _strict_object(value: object, *, path: str, required: set[str], optional: set[str] = set()) -> dict:
     if type(value) is not dict:
@@ -140,6 +162,7 @@ class LocalDecompositionPlanner:
         self.runner, self.executable, self.cost_class = runner, executable, cost_class
         self.provider, self.model, self.profile = provider, model, profile
         self.role, self.routing_source = role, routing_source
+        self.planner_contract_hash = planner_contract_hash()
         self.allowed_paths = tuple(allowed_paths)
     @property
     def is_paid(self):
@@ -152,7 +175,7 @@ class LocalDecompositionPlanner:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         scratch = artifact_dir / 'planner-scratch'
         scratch.mkdir(exist_ok=True)
-        provenance = {'role': self.role, 'routing_source': self.routing_source, 'provider': self.provider, 'model': self.model, 'profile': self.profile, 'cost_class': self.cost_class, 'mechanism': 'hermes-chat', 'tool_mode': 'safe-no-mutation-tools', 'toolsets': ['safe'], 'cwd': str(scratch)}
+        provenance = {'role': self.role, 'routing_source': self.routing_source, 'planner_contract_hash': self.planner_contract_hash, 'provider': self.provider, 'model': self.model, 'profile': self.profile, 'cost_class': self.cost_class, 'mechanism': 'hermes-chat', 'tool_mode': 'safe-no-mutation-tools', 'toolsets': ['safe'], 'cwd': str(scratch)}
         (artifact_dir / 'planner-request.json').write_text(payload, encoding='utf-8')
         (artifact_dir / 'planner-provenance.json').write_text(json.dumps(provenance, sort_keys=True, separators=(',', ':')), encoding='utf-8')
         before = _protected_fingerprint(repository) if repository is not None else None

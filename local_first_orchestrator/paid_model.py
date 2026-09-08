@@ -28,6 +28,7 @@ class InjectedPaidModelAdapter:
     model = "injected-paid-planner"
     profile = "fixture"
     routing_source = "injected-fixture"
+    planner_contract_hash = "injected-fixture-contract"
 
     def __init__(self, ledger: Ledger, governor: UsageGovernor, runner: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
         self.ledger, self.governor, self.runner = ledger, governor, runner

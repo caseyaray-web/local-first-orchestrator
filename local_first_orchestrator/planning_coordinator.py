@@ -22,7 +22,7 @@ from .decomposition import (
     PlanValidator,
     activate_validated_plan,
 )
-from .decomposition_planner import PlannerError, LocalDecompositionPlanner, packet, parse
+from .decomposition_planner import PlannerError, LocalDecompositionPlanner, packet, parse, planner_contract_hash
 from .paid_model import PaidInvocationError, PaidModelAdapter
 from .repository_snapshot import RepositoryPlanValidator, RepositorySnapshot, snapshot
 from .usage_governor import PaidPurpose
@@ -37,6 +37,7 @@ class Planner(Protocol):
     model: str
     profile: str
     routing_source: str
+    planner_contract_hash: str
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,7 @@ class PlanningCoordinator:
 
     def _route(self) -> dict[str, str]:
         values = {key: getattr(self.planner, key, None) for key in ("role", "provider", "model", "profile", "routing_source")}
+        values["planner_contract_hash"] = getattr(self.planner, "planner_contract_hash", planner_contract_hash())
         if not all(isinstance(value, str) and value.strip() for value in values.values()):
             raise ValueError("planner route identity is incomplete")
         cost_class = self._cost_class()
@@ -110,6 +112,7 @@ class PlanningCoordinator:
             "planner_model": route["model"],
             "planner_profile": route["profile"],
             "planner_routing_source": route["routing_source"],
+            "planner_contract_hash": route["planner_contract_hash"],
         }
         for field, expected in fields.items():
             actual = prior[field]
@@ -126,10 +129,10 @@ class PlanningCoordinator:
         now = self.ledger._now()
         with self.ledger._transaction() as conn:
             conn.execute(
-                """INSERT INTO planning_runs(request_key,feature_id,contract_hash,repo_base_sha,repo_snapshot_hash,planner_identity,cost_class,status,response_artifact,structural_reasons_json,repository_reasons_json,plan_id,ticket_ids_json,created_at,updated_at,repository_identity,repo_snapshot_manifest_json,planner_role,planner_provider,planner_model,planner_profile,planner_routing_source)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """INSERT INTO planning_runs(request_key,feature_id,contract_hash,repo_base_sha,repo_snapshot_hash,planner_identity,cost_class,status,response_artifact,structural_reasons_json,repository_reasons_json,plan_id,ticket_ids_json,created_at,updated_at,repository_identity,repo_snapshot_manifest_json,planner_role,planner_provider,planner_model,planner_profile,planner_routing_source,planner_contract_hash)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(request_key) DO UPDATE SET status=excluded.status,response_artifact=excluded.response_artifact,structural_reasons_json=excluded.structural_reasons_json,repository_reasons_json=excluded.repository_reasons_json,plan_id=excluded.plan_id,ticket_ids_json=excluded.ticket_ids_json,updated_at=excluded.updated_at""",
-                (request_key, feature.id, feature.contract_hash, snap.base_sha, snap.snapshot_hash, self.planner_identity, self._cost_class(), status, str(artifact) if artifact else None, json.dumps(structural), json.dumps(repository), plan_id, json.dumps(ticket_ids), now, now, snap.repository_id, snap.manifest_json, self._route()["role"], self._route()["provider"], self._route()["model"], self._route()["profile"], self._route()["routing_source"]),
+                (request_key, feature.id, feature.contract_hash, snap.base_sha, snap.snapshot_hash, self.planner_identity, self._cost_class(), status, str(artifact) if artifact else None, json.dumps(structural), json.dumps(repository), plan_id, json.dumps(ticket_ids), now, now, snap.repository_id, snap.manifest_json, self._route()["role"], self._route()["provider"], self._route()["model"], self._route()["profile"], self._route()["routing_source"], self._route()["planner_contract_hash"]),
             )
 
     def _existing_activated(self, feature: FeatureContract, snap: RepositorySnapshot) -> PlanningOutcome | None:

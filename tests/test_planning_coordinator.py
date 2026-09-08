@@ -97,6 +97,9 @@ class PlanningCoordinatorTests(unittest.TestCase):
         self.assertTrue(first_artifact.exists())
         self.assertTrue(second_coordinator._artifact_dir(self.feature, str(second.request_key)).exists())
         self.assertEqual(dict(self.ledger.connection.execute("select * from planning_runs where request_key=?", (first_key,)).fetchone()), first_row)
+        terra_run = self.ledger.connection.execute("select planner_contract_hash from planning_runs where request_key=?", (second.request_key,)).fetchone()
+        from local_first_orchestrator.decomposition_planner import planner_contract_hash
+        self.assertEqual(terra_run["planner_contract_hash"], getattr(terra, "planner_contract_hash", planner_contract_hash()))
         replay = second_coordinator.generate_plan_only(self.feature)
         self.assertEqual(replay.plan_id, second.plan_id)
         self.assertEqual(terra.calls, 1)
