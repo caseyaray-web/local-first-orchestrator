@@ -4,6 +4,7 @@ from pathlib import Path
 from .decomposition import FeatureContract, DecompositionPlan, Tranche
 from .ticket import MicroTicket, PatchBudget, VerificationProfile, PATCH_BUDGET_POLICY
 from .repository_snapshot import RepositorySnapshot
+from .source_languages import is_test_path
 
 class PlannerError(RuntimeError):
     pass
@@ -11,7 +12,7 @@ class PlannerError(RuntimeError):
 PLANNER_SCHEMA = {
     'root': {'required': ['plan_version','feature_id','feature_contract_hash','repo_base_sha','repo_snapshot_hash','architecture_decisions','criterion_coverage','tranches'], 'optional': ['scope_change_proposals','unresolved_questions','repository_identity','repo_snapshot_manifest_json']},
     'tranche': {'required': ['id','ordinal','objective','capabilities','criterion_ids','microtickets'], 'optional': []},
-    'microticket': {'required': ['objective','criterion_ids','primary_symbol','allowed_files','forbidden_changes','patch_budget','verification','risk','review_required','max_attempts','dependencies'], 'optional': ['id','ticket_id','new_test_files'], 'identity_alternatives': ['ticket_id','id']},
+    'microticket': {'required': ['objective','criterion_ids','primary_symbol','allowed_files','forbidden_changes','patch_budget','verification','risk','review_required','max_attempts','dependencies'], 'optional': ['id','ticket_id','create_files','new_test_files'], 'identity_alternatives': ['ticket_id','id']},
     'patch_budget': {'required': ['max_files','max_changed_lines'], 'optional': ['exception_reason']},
     'verification': {'required': ['commands'], 'optional': ['working_directory','timeout_seconds','output_limit']},
     'criterion_coverage': {'key_type': 'criterion ID', 'value_type': 'array of ticket IDs'},
@@ -30,9 +31,9 @@ def planner_contract(*, budget_policy=PATCH_BUDGET_POLICY) -> dict:
             'planning output only: never edit, execute, inspect, or report repository changes',
             'JSON only: no prose, Markdown, diffs, patches, implementation reports, changed_files, commands_run, or test-result reports',
             'field names and nesting must match output_contract.schema exactly; do not use an alternate schema',
-            'microticket allowed_files must be a subset of output_contract.allowed_paths and preserve each disposition',
+            'allowed_files are existing contract-authorized modify paths; create_files are absent contract-authorized non-test create paths; new_test_files are absent contract-authorized test creations',
             f'prefer normal bounded tickets: at most {budget_policy.normal_max_files} declared paths and {budget_policy.normal_max_changed_lines} changed lines',
-            'declared paths are allowed_files plus new_test_files and must be unique',
+            'declared paths are allowed_files plus create_files plus new_test_files and must be unique; primary_symbol is an existing selected-evidence anchor and never a future create symbol',
             f'broader budgets require a concrete exception_reason of at least {budget_policy.minimum_exception_reason_length} non-whitespace characters; do not use broader budgets for convenience',
             'do not invent criteria or broaden scope',
             'materialize active tranche only',
@@ -53,8 +54,11 @@ def minimal_plan_example(feature: FeatureContract, snapshot: RepositorySnapshot,
     paths = _normalized_allowed_paths(allowed_paths) or DEFAULT_ALLOWED_PATHS
     existing = next((x['path'] for x in paths if x['disposition'] == 'modify'), paths[0]['path'])
     new = next((x['path'] for x in paths if x['disposition'] == 'create'), 'test_planner_example.py')
+    create_file = new if new != 'test_planner_example.py' and not is_test_path(new) else None
+    test_file = new if new == 'test_planner_example.py' or is_test_path(new) else None
     criterion = feature.acceptance_criteria[0].id if feature.acceptance_criteria else 'criterion-1'
-    return {'plan_version': 1, 'feature_id': feature.id, 'feature_contract_hash': feature.contract_hash, 'repo_base_sha': snapshot.base_sha, 'repo_snapshot_hash': snapshot.snapshot_hash, 'architecture_decisions': ['Keep the bounded change at one architectural seam.'], 'criterion_coverage': {criterion: ['TK-1']}, 'tranches': [{'id': 'T-0', 'ordinal': 0, 'objective': 'Implement the bounded architectural concern.', 'capabilities': ['bounded-change'], 'criterion_ids': [criterion], 'microtickets': [{'ticket_id': 'TK-1', 'objective': 'Implement and verify the bounded concern.', 'criterion_ids': [criterion], 'primary_symbol': f'{existing}::bounded_change', 'allowed_files': [existing], 'forbidden_changes': ['Do not change unrelated behavior.'], 'patch_budget': {'max_files': 2, 'max_changed_lines': 40}, 'verification': {'commands': [['python', '-m', 'unittest']], 'working_directory': '.', 'timeout_seconds': 60, 'output_limit': 20000}, 'risk': 'low', 'review_required': True, 'max_attempts': 2, 'dependencies': [], 'new_test_files': [new]}]}]}
+    ticket = {'ticket_id': 'TK-1', 'objective': 'Implement and verify the bounded concern.', 'criterion_ids': [criterion], 'primary_symbol': f'{existing}::bounded_change', 'allowed_files': [existing], 'create_files': [create_file] if create_file else [], 'new_test_files': [test_file] if test_file else [], 'forbidden_changes': ['Do not change unrelated behavior.'], 'patch_budget': {'max_files': 2, 'max_changed_lines': 40}, 'verification': {'commands': [['python', '-m', 'unittest']], 'working_directory': '.', 'timeout_seconds': 60, 'output_limit': 20000}, 'risk': 'low', 'review_required': True, 'max_attempts': 2, 'dependencies': []}
+    return {'plan_version': 1, 'feature_id': feature.id, 'feature_contract_hash': feature.contract_hash, 'repo_base_sha': snapshot.base_sha, 'repo_snapshot_hash': snapshot.snapshot_hash, 'architecture_decisions': ['Keep the bounded change at one architectural seam.'], 'criterion_coverage': {criterion: ['TK-1']}, 'tranches': [{'id': 'T-0', 'ordinal': 0, 'objective': 'Implement the bounded architectural concern.', 'capabilities': ['bounded-change'], 'criterion_ids': [criterion], 'microtickets': [ticket]}]}
 
 def packet(feature: FeatureContract, snapshot: RepositorySnapshot, *, max_active: int = 4, max_files: int = 3, max_lines: int = 200, prior_decisions: tuple[str, ...] = (), allowed_paths=DEFAULT_ALLOWED_PATHS, budget_policy=PATCH_BUDGET_POLICY) -> str:
     rules = [*planner_contract(budget_policy=budget_policy)['output_rules']]
@@ -110,7 +114,7 @@ def _ticket(x: dict, path: str) -> MicroTicket:
     patch_budget = PatchBudget(_integer(budget['max_files'], f"{path}.patch_budget.max_files"), _integer(budget['max_changed_lines'], f"{path}.patch_budget.max_changed_lines"), None if budget.get('exception_reason') is None else _string(budget['exception_reason'], f"{path}.patch_budget.exception_reason"))
     verification = _strict_schema_object(data['verification'], path=f"{path}.verification", name='verification')
     profile = VerificationProfile(_commands(verification['commands'], f"{path}.verification.commands"), _string(verification.get('working_directory','.'), f"{path}.verification.working_directory"), _integer(verification.get('timeout_seconds',60), f"{path}.verification.timeout_seconds"), _integer(verification.get('output_limit',20000), f"{path}.verification.output_limit"))
-    return MicroTicket(_string(ticket_id, f"{path}.ticket_id"), _string(data['objective'], f"{path}.objective"), _strings(data['criterion_ids'], f"{path}.criterion_ids"), _string(data['primary_symbol'], f"{path}.primary_symbol"), _strings(data['allowed_files'], f"{path}.allowed_files"), _strings(data['forbidden_changes'], f"{path}.forbidden_changes"), patch_budget, profile, _string(data['risk'], f"{path}.risk"), _boolean(data['review_required'], f"{path}.review_required"), _integer(data['max_attempts'], f"{path}.max_attempts"), _strings(data['dependencies'], f"{path}.dependencies"), _strings(data.get('new_test_files',[]), f"{path}.new_test_files"))
+    return MicroTicket(_string(ticket_id, f"{path}.ticket_id"), _string(data['objective'], f"{path}.objective"), _strings(data['criterion_ids'], f"{path}.criterion_ids"), _string(data['primary_symbol'], f"{path}.primary_symbol"), _strings(data['allowed_files'], f"{path}.allowed_files"), _strings(data['forbidden_changes'], f"{path}.forbidden_changes"), patch_budget, profile, _string(data['risk'], f"{path}.risk"), _boolean(data['review_required'], f"{path}.review_required"), _integer(data['max_attempts'], f"{path}.max_attempts"), _strings(data['dependencies'], f"{path}.dependencies"), create_files=_strings(data.get('create_files', []), f"{path}.create_files"), new_test_files=_strings(data.get('new_test_files', []), f"{path}.new_test_files"))
 
 def parse(raw: str) -> DecompositionPlan:
     try: x=json.loads(raw)

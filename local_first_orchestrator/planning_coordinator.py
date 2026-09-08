@@ -23,7 +23,7 @@ from .decomposition import (
     activate_validated_plan,
 )
 from .decomposition_planner import PlannerError, LocalDecompositionPlanner, packet, parse, planner_contract_hash
-from .admission import decode_persisted_admission_envelope
+from .admission import FeatureAdmissionSpec, decode_persisted_admission_envelope
 from .paid_model import PaidInvocationError, PaidModelAdapter
 from .repository_snapshot import RepositoryPlanValidator, RepositorySnapshot, snapshot
 from .usage_governor import PaidPurpose
@@ -88,16 +88,17 @@ class PlanningCoordinator:
             raise ValueError("planner cost class is not trusted")
         return {**values, "cost_class": cost_class}
 
-    def _authorized_modify_paths(self, feature_id: str) -> tuple[str, ...]:
+    def _persisted_feature_spec(self, feature_id: str) -> FeatureAdmissionSpec:
         row = self.ledger.connection.execute("SELECT contract_json,contract_hash FROM feature_contracts WHERE feature_id=?", (feature_id,)).fetchone()
         if row is None:
             raise ValueError("persisted feature contract authority is missing")
         spec = decode_persisted_admission_envelope(row["contract_json"], expected_feature_id=feature_id, expected_contract_hash=row["contract_hash"])
-        return tuple(sorted(file.path for file in spec.files if file.disposition == "modify"))
+        return spec
 
     def _snapshot_for_feature(self, feature: FeatureContract, base_sha: str, *, feature_terms: tuple[str, ...] = ()) -> RepositorySnapshot:
         repo = self.config.canonical_repository(self.config.repository)
-        return snapshot(repo, base_sha, feature, feature_terms, authorized_modify_paths=self._authorized_modify_paths(feature.id))
+        spec = self._persisted_feature_spec(feature.id)
+        return snapshot(repo, base_sha, feature, feature_terms, authorized_modify_paths=tuple(file.path for file in spec.files if file.disposition == "modify"), authorized_create_paths=tuple(file.path for file in spec.files if file.disposition == "create"))
 
     def _request_key(self, feature: FeatureContract, snap: RepositorySnapshot) -> str:
         material = {

@@ -17,13 +17,19 @@ def validate_ticket(ticket: MicroTicket, *, budget_policy=PATCH_BUDGET_POLICY) -
         raise ReadinessError("objective is missing, vague, or unsafe")
     if not ticket.criterion_ids or not ticket.primary_symbol or "::" not in ticket.primary_symbol:
         raise ReadinessError("criterion IDs and a bounded primary symbol are required")
-    paths = (*ticket.allowed_files, *ticket.new_test_files)
-    if not paths or len(set(paths)) != len(paths) or len(paths) > ticket.patch_budget.max_files:
+    paths = (*ticket.allowed_files, *ticket.create_files, *ticket.new_test_files)
+    if not paths:
+        raise ReadinessError("declared files exceed bounded patch budget")
+    if len(set(paths)) != len(paths):
+        raise ReadinessError("declared file categories must not overlap")
+    if len(paths) > ticket.patch_budget.max_files:
         raise ReadinessError("declared files exceed bounded patch budget")
     if any(normalized_repository_path(path) is None for path in paths):
         raise ReadinessError("declared files must be explicit normalized repository-relative files")
-    if set(ticket.allowed_files) & set(ticket.new_test_files):
-        raise ReadinessError("existing and new test file declarations must not overlap")
+    if len(set(paths)) != len(paths):
+        raise ReadinessError("declared file categories must not overlap")
+    if any(not is_supported_source(path) or is_test_path(path) for path in ticket.create_files):
+        raise ReadinessError("create files must be supported non-test artifacts")
     if any(not is_supported_source(path) or not is_test_path(path) for path in ticket.new_test_files):
         raise ReadinessError("new files must be supported test artifacts")
     if not ticket.forbidden_changes or not ticket.verification.commands:

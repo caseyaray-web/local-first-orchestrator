@@ -13,7 +13,7 @@ class PatchBudgetPolicy:
         return {
             "normal_max_files": self.normal_max_files,
             "normal_max_changed_lines": self.normal_max_changed_lines,
-            "declared_paths": "allowed_files + new_test_files",
+            "declared_paths": "allowed_files + create_files + new_test_files",
             "declared_paths_must_be_unique": True,
             "broader_budget_requires_exception_reason": True,
             "minimum_exception_reason_length": self.minimum_exception_reason_length,
@@ -52,9 +52,8 @@ class MicroTicket:
     review_required: bool
     max_attempts: int
     dependencies: tuple[str, ...]
-    # Additive: absent from legacy serialized contracts when empty so their
-    # canonical JSON and historical hashes remain unchanged.
     new_test_files: tuple[str, ...] = ()
+    create_files: tuple[str, ...] = ()
 
     def contract(self) -> dict[str, object]:
         contract: dict[str, object] = {
@@ -67,6 +66,8 @@ class MicroTicket:
             }, "risk": self.risk, "review_required": self.review_required,
             "max_attempts": self.max_attempts, "dependencies": list(self.dependencies),
         }
+        if self.create_files:
+            contract["create_files"] = list(self.create_files)
         if self.new_test_files:
             contract["new_test_files"] = list(self.new_test_files)
         return contract

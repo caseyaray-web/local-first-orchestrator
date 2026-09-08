@@ -40,7 +40,7 @@ def _ticket(raw: Mapping[str, Any]) -> MicroTicket:
             patch_budget=PatchBudget(max_files=int(budget.get("max_files", 0)), max_changed_lines=int(budget.get("max_changed_lines", 0)), exception_reason=budget.get("exception_reason")),
             verification=VerificationProfile(tuple(tuple(command) for command in commands)), risk=_text(raw.get("risk"), "ticket.risk"),
             review_required=raw.get("review_required") is True, max_attempts=int(raw.get("max_attempts", 0)), dependencies=tuple(raw.get("dependencies", [])),
-            new_test_files=tuple(raw.get("new_test_files", [])),
+            new_test_files=tuple(raw.get("new_test_files", [])), create_files=tuple(raw.get("create_files", [])),
         ))
     except (KeyError, TypeError, ValueError, ReadinessError) as exc:
         raise ArchitectureError(f"invalid microticket: {exc}") from exc

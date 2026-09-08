@@ -22,9 +22,9 @@ class PatchBudgetPolicyTests(unittest.TestCase):
         self.assertEqual(body["patch_budget_policy"]["normal_max_files"], PATCH_BUDGET_POLICY.normal_max_files)
         self.assertEqual(body["patch_budget_policy"]["normal_max_changed_lines"], PATCH_BUDGET_POLICY.normal_max_changed_lines)
         self.assertEqual(body["patch_budget_policy"]["minimum_exception_reason_length"], PATCH_BUDGET_POLICY.minimum_exception_reason_length)
-        self.assertEqual(body["patch_budget_policy"]["declared_paths"], "allowed_files + new_test_files")
+        self.assertEqual(body["patch_budget_policy"]["declared_paths"], "allowed_files + create_files + new_test_files")
         self.assertTrue(body["patch_budget_policy"]["declared_paths_must_be_unique"])
-        self.assertTrue(any("combined" not in rule and "declared paths are allowed_files plus new_test_files" in rule for rule in body["rules"]))
+        self.assertTrue(any("allowed_files plus create_files plus new_test_files" in rule for rule in body["rules"]))
         self.assertIn("absolute_max_files", body["limits"])
         self.assertEqual(body["limits"]["absolute_max_files"], 3)
         self.assertEqual(body["limits"]["absolute_max_changed_lines"], 200)
@@ -43,7 +43,7 @@ class PatchBudgetPolicyTests(unittest.TestCase):
         validate_ticket(self.ticket(allowed=("app.py",), new=("test_app.py",)))
 
     def test_duplicate_allowed_and_new_path_rejects(self):
-        with self.assertRaisesRegex(ReadinessError, "declared files exceed"):
+        with self.assertRaisesRegex(ReadinessError, "declared file categories"):
             validate_ticket(self.ticket(allowed=("app.py",), new=("app.py",)))
 
     def test_three_file_ticket_without_exception_rejects(self):
