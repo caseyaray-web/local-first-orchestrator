@@ -11,19 +11,66 @@ class PlannerError(RuntimeError):
 def packet(feature: FeatureContract, snapshot: RepositorySnapshot, *, max_active: int = 4, max_files: int = 3, max_lines: int = 200, prior_decisions: tuple[str, ...] = ()) -> str:
     return json.dumps({'feature': {**feature.__dict__, 'contract_hash': feature.contract_hash}, 'repository': {'id': snapshot.repository_id, 'base_sha': snapshot.base_sha, 'snapshot_hash': snapshot.snapshot_hash, 'manifest': [x.__dict__ for x in snapshot.manifest], 'evidence': [x.__dict__ for x in snapshot.entries], 'omitted_count': snapshot.omitted_count}, 'limits': {'active': max_active, 'max_files': max_files, 'max_lines': max_lines}, 'prior_decisions': prior_decisions, 'rules': ['planning only: return one DecompositionPlan JSON object', 'never edit, execute, inspect, or report repository changes', 'do not output prose, diffs, patches, implementation reports, or test results', 'do not invent criteria or broaden scope', 'use supplied repository-relative path::symbol only', 'materialize active tranche only', 'output JSON only']}, sort_keys=True, separators=(',', ':'), default=lambda x: x.__dict__ if hasattr(x, '__dict__') else list(x))
 
-def _ticket(x: dict) -> MicroTicket:
-    v = x['verification']
-    return MicroTicket(x.get('id', x.get('ticket_id')), x['objective'], tuple(x['criterion_ids']), x['primary_symbol'], tuple(x['allowed_files']), tuple(x['forbidden_changes']), PatchBudget(**x['patch_budget']), VerificationProfile(tuple(tuple(a) for a in v['commands']), v.get('working_directory', '.')), x['risk'], x['review_required'], x['max_attempts'], tuple(x.get('dependencies', ())), tuple(x.get('new_test_files', ())))
+def _strict_object(value: object, *, path: str, required: set[str], optional: set[str] = set()) -> dict:
+    if type(value) is not dict:
+        raise PlannerError(f"planner schema at {path}: expected object")
+    unknown = sorted(set(value) - required - optional)
+    if unknown:
+        raise PlannerError(f"unknown planner fields at {path}: {', '.join(unknown)}")
+    missing = sorted(required - set(value))
+    if missing:
+        raise PlannerError(f"missing planner fields at {path}: {', '.join(missing)}")
+    return value
+
+def _string(value: object, path: str) -> str:
+    if type(value) is not str: raise PlannerError(f"planner schema at {path}: expected string")
+    return value
+
+def _integer(value: object, path: str) -> int:
+    if type(value) is not int: raise PlannerError(f"planner schema at {path}: expected integer")
+    return value
+
+def _boolean(value: object, path: str) -> bool:
+    if type(value) is not bool: raise PlannerError(f"planner schema at {path}: expected boolean")
+    return value
+
+def _strings(value: object, path: str) -> tuple[str, ...]:
+    if type(value) is not list or any(type(x) is not str for x in value): raise PlannerError(f"planner schema at {path}: expected string array")
+    return tuple(value)
+
+def _commands(value: object, path: str) -> tuple[tuple[str, ...], ...]:
+    if type(value) is not list: raise PlannerError(f"planner schema at {path}: expected command array")
+    result=[]
+    for i, command in enumerate(value): result.append(_strings(command, f"{path}[{i}]"))
+    return tuple(result)
+
+def _ticket(x: dict, path: str) -> MicroTicket:
+    data = _strict_object(x, path=path, required={'ticket_id','objective','criterion_ids','primary_symbol','allowed_files','forbidden_changes','patch_budget','verification','risk','review_required','max_attempts','dependencies'}, optional={'id','new_test_files'})
+    ticket_id = data.get('ticket_id', data.get('id'))
+    if ticket_id is None: raise PlannerError(f"missing planner fields at {path}: ticket_id")
+    if 'ticket_id' in data and 'id' in data and data['ticket_id'] != data['id']: raise PlannerError(f"planner schema at {path}: id conflicts with ticket_id")
+    budget = _strict_object(data['patch_budget'], path=f"{path}.patch_budget", required={'max_files','max_changed_lines'}, optional={'exception_reason'})
+    patch_budget = PatchBudget(_integer(budget['max_files'], f"{path}.patch_budget.max_files"), _integer(budget['max_changed_lines'], f"{path}.patch_budget.max_changed_lines"), None if budget.get('exception_reason') is None else _string(budget['exception_reason'], f"{path}.patch_budget.exception_reason"))
+    verification = _strict_object(data['verification'], path=f"{path}.verification", required={'commands'}, optional={'working_directory','timeout_seconds','output_limit'})
+    profile = VerificationProfile(_commands(verification['commands'], f"{path}.verification.commands"), _string(verification.get('working_directory','.'), f"{path}.verification.working_directory"), _integer(verification.get('timeout_seconds',60), f"{path}.verification.timeout_seconds"), _integer(verification.get('output_limit',20000), f"{path}.verification.output_limit"))
+    return MicroTicket(_string(ticket_id, f"{path}.ticket_id"), _string(data['objective'], f"{path}.objective"), _strings(data['criterion_ids'], f"{path}.criterion_ids"), _string(data['primary_symbol'], f"{path}.primary_symbol"), _strings(data['allowed_files'], f"{path}.allowed_files"), _strings(data['forbidden_changes'], f"{path}.forbidden_changes"), patch_budget, profile, _string(data['risk'], f"{path}.risk"), _boolean(data['review_required'], f"{path}.review_required"), _integer(data['max_attempts'], f"{path}.max_attempts"), _strings(data['dependencies'], f"{path}.dependencies"), _strings(data.get('new_test_files',[]), f"{path}.new_test_files"))
 
 def parse(raw: str) -> DecompositionPlan:
+    try: x=json.loads(raw)
+    except json.JSONDecodeError as exc: raise PlannerError('malformed planner JSON') from exc
     try:
-        x = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise PlannerError('malformed planner JSON') from exc
-    try:
-        return DecompositionPlan(x['plan_version'], x['feature_id'], x['feature_contract_hash'], x['repo_base_sha'], x['repo_snapshot_hash'], tuple(x['architecture_decisions']), {k: tuple(v) for k, v in x['criterion_coverage'].items()}, tuple(Tranche(t['id'], t['ordinal'], t['objective'], tuple(t['capabilities']), tuple(t['criterion_ids']), tuple(_ticket(y) for y in t.get('microtickets', ()))) for t in x['tranches']), tuple(x.get('scope_change_proposals', ())), tuple(x.get('unresolved_questions', ())), x.get('repository_identity', ''), x.get('repo_snapshot_manifest_json', ''))
-    except (KeyError, TypeError, ValueError) as exc:
-        raise PlannerError('invalid planner schema') from exc
+        root=_strict_object(x,path='root',required={'plan_version','feature_id','feature_contract_hash','repo_base_sha','repo_snapshot_hash','architecture_decisions','criterion_coverage','tranches'},optional={'scope_change_proposals','unresolved_questions','repository_identity','repo_snapshot_manifest_json'})
+        coverage=root['criterion_coverage']
+        if type(coverage) is not dict or any(type(k) is not str for k in coverage) : raise PlannerError('planner schema at root.criterion_coverage: expected string mapping')
+        coverage={k:_strings(v,f"root.criterion_coverage.{k}") for k,v in coverage.items()}
+        tranches=[]
+        for i, raw_tranche in enumerate(root['tranches']):
+            path=f'root.tranches[{i}]'; t=_strict_object(raw_tranche,path=path,required={'id','ordinal','objective','capabilities','criterion_ids','microtickets'})
+            if type(t['microtickets']) is not list: raise PlannerError(f"planner schema at {path}.microtickets: expected array")
+            tranches.append(Tranche(_string(t['id'],f'{path}.id'),_integer(t['ordinal'],f'{path}.ordinal'),_string(t['objective'],f'{path}.objective'),_strings(t['capabilities'],f'{path}.capabilities'),_strings(t['criterion_ids'],f'{path}.criterion_ids'),tuple(_ticket(v,f'{path}.microtickets[{j}]') for j,v in enumerate(t['microtickets']))))
+        return DecompositionPlan(_integer(root['plan_version'],'root.plan_version'),_string(root['feature_id'],'root.feature_id'),_string(root['feature_contract_hash'],'root.feature_contract_hash'),_string(root['repo_base_sha'],'root.repo_base_sha'),_string(root['repo_snapshot_hash'],'root.repo_snapshot_hash'),_strings(root['architecture_decisions'],'root.architecture_decisions'),coverage,tuple(tranches),_strings(root.get('scope_change_proposals',[]),'root.scope_change_proposals'),_strings(root.get('unresolved_questions',[]),'root.unresolved_questions'),_string(root.get('repository_identity',''),'root.repository_identity'),_string(root.get('repo_snapshot_manifest_json',''),'root.repo_snapshot_manifest_json'))
+    except PlannerError: raise
+    except (KeyError,TypeError,ValueError) as exc: raise PlannerError('invalid planner schema') from exc
 
 def _protected_fingerprint(repository: Path) -> dict:
     repo = Path(repository).resolve()

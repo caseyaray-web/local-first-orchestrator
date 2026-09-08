@@ -45,4 +45,33 @@ class Planner(unittest.TestCase):
         with TemporaryDirectory() as d:
             got = LocalDecompositionPlanner(run, cost_class='local').propose(f, s, artifact_dir=Path(d)); self.assertEqual(got.feature_id, 'F'); self.assertIn('planning only', packet(f, s)); self.assertTrue((Path(d) / 'planner-response.json').exists())
 
+    def test_unknown_fields_are_rejected_recursively_with_locations(self):
+        f, s, raw = self.raw_plan(); base = json.loads(raw)
+        cases = [('root', base | {'status': 'completed'}, 'unknown planner fields at root: status'), ('tranche', (lambda x: (x['tranches'][0].update({'implementation': 'completed'}), x)[1])(json.loads(raw)), 'root.tranches[0]'), ('ticket', (lambda x: (x['tranches'][0]['microtickets'][0].update({'changed_files': []}), x)[1])(json.loads(raw)), 'root.tranches[0].microtickets[0]')]
+        for name, value, location in cases:
+            with self.subTest(name=name):
+                with self.assertRaises(PlannerError) as ctx: LocalDecompositionPlanner(lambda *a, **k: subprocess.CompletedProcess(a, 0, json.dumps(value), ''), cost_class='local').propose(f, s, artifact_dir=Path(TemporaryDirectory().name))
+                self.assertIn(location, str(ctx.exception))
+
+    def test_implementation_shaped_valid_json_rejects_all_unknown_root_fields(self):
+        f, s, raw = self.raw_plan(); value = json.loads(raw); value.update({'status': 'completed', 'changed_files': ['src/lib/export/json.js'], 'implementation': 'done', 'verification': {'tests': 'passed'}, 'patch': 'diff', 'commands_run': []})
+        with TemporaryDirectory() as d:
+            with self.assertRaisesRegex(PlannerError, 'unknown planner fields at root: changed_files, commands_run, implementation, patch, status, verification'):
+                LocalDecompositionPlanner(lambda *a, **k: subprocess.CompletedProcess(a, 0, json.dumps(value), ''), cost_class='local').propose(f, s, artifact_dir=Path(d))
+            self.assertTrue((Path(d) / 'planner-request.json').exists()); self.assertTrue((Path(d) / 'planner-response.json').exists())
+
+    def test_schema_rejection_still_records_protected_postcheck(self):
+        f, s, raw = self.raw_plan(); value = json.loads(raw); value['tranches'][0]['implementation'] = 'completed'
+        with TemporaryDirectory() as d:
+            root = Path(d); repo = root / 'repo'; repo.mkdir(); (repo / 'a.py').write_text('x\\n')
+            subprocess.run(('git', 'init', '-q'), cwd=repo, check=True); subprocess.run(('git', 'add', '.'), cwd=repo, check=True); subprocess.run(('git', '-c', 'user.name=T', '-c', 'user.email=t@t', 'commit', '-qm', 'base'), cwd=repo, check=True)
+            with self.assertRaises(PlannerError): LocalDecompositionPlanner(lambda *a, **k: subprocess.CompletedProcess(a, 0, json.dumps(value), ''), cost_class='local').propose(f, s, artifact_dir=root / 'artifacts', repository=repo)
+            self.assertTrue((root / 'artifacts' / 'protected-before.json').exists()); self.assertTrue((root / 'artifacts' / 'protected-after.json').exists()); self.assertTrue((root / 'artifacts' / 'planner-provenance.json').exists())
+
+    def test_strict_types_reject_bool_as_integer_and_object_as_string(self):
+        f, s, raw = self.raw_plan(); value = json.loads(raw); value['plan_version'] = True
+        with self.assertRaisesRegex(PlannerError, 'expected integer'): LocalDecompositionPlanner(lambda *a, **k: subprocess.CompletedProcess(a, 0, json.dumps(value), ''), cost_class='local').propose(f, s, artifact_dir=Path(TemporaryDirectory().name))
+        value = json.loads(raw); value['architecture_decisions'] = {'bad': 'shape'}
+        with self.assertRaisesRegex(PlannerError, 'expected string array'): LocalDecompositionPlanner(lambda *a, **k: subprocess.CompletedProcess(a, 0, json.dumps(value), ''), cost_class='local').propose(f, s, artifact_dir=Path(TemporaryDirectory().name))
+
 if __name__ == '__main__': unittest.main()
