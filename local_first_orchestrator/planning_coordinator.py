@@ -95,6 +95,10 @@ class PlanningCoordinator:
         spec = raw.get("spec", raw)
         return tuple(sorted(x["path"] for x in spec.get("files", ()) if x.get("disposition") == "modify"))
 
+    def _snapshot_for_feature(self, feature: FeatureContract, base_sha: str, *, feature_terms: tuple[str, ...] = ()) -> RepositorySnapshot:
+        repo = self.config.canonical_repository(self.config.repository)
+        return snapshot(repo, base_sha, feature, feature_terms, authorized_modify_paths=self._authorized_modify_paths(feature.id))
+
     def _request_key(self, feature: FeatureContract, snap: RepositorySnapshot) -> str:
         material = {
             "architecture_purpose": PaidPurpose.ARCHITECTURE.value,
@@ -194,7 +198,7 @@ class PlanningCoordinator:
             self.ledger.record_tranche_completion(completion)
             return PlanningOutcome("feature_complete_candidate", feature_id, reasons=("no later coarse tranche",))
         final = authority["final_integration_sha"]
-        snap = snapshot(self.config.canonical_repository(self.config.repository), final, feature)
+        snap = self._snapshot_for_feature(feature, final)
         artifact_dir = self._artifact_dir(feature, self._request_key(feature, snap) + "-" + next_coarse.id); artifact_dir.mkdir(parents=True, exist_ok=True)
         try:
             proposer = getattr(self.planner, "propose_next", None) or getattr(self.planner, "propose")
@@ -244,7 +248,7 @@ class PlanningCoordinator:
         if repository is not None and self.config.canonical_repository(repository) != repo:
             raise ValueError("repository is not the controller-approved canonical repository")
         base = feature.source_revision.strip() or subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
-        snap = snapshot(repo, base, feature, feature_terms, authorized_modify_paths=self._authorized_modify_paths(feature.id))
+        snap = self._snapshot_for_feature(feature, base, feature_terms=feature_terms)
         request_key = self._request_key(feature, snap)
         active = self._existing_activated(feature, snap)
         if active:
@@ -295,7 +299,7 @@ class PlanningCoordinator:
         if row is None: raise ValueError("persisted decomposition plan missing")
         proposal = self._load_plan(row)
         structural = self.plan_validator.validate(feature, proposal)
-        snap = snapshot(self.config.canonical_repository(self.config.repository), proposal.repo_base_sha, feature)
+        snap = self._snapshot_for_feature(feature, proposal.repo_base_sha)
         repository_validation = self.repository_validator.validate(proposal, snap)
         activated_id, ticket_ids = activate_validated_plan(self.ledger, feature, proposal, structural, repository_validation)
         self.ledger.finalize_planning_run_activation(request_key, plan_id=activated_id, ticket_ids=ticket_ids)

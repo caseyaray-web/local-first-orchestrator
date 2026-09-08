@@ -85,6 +85,13 @@ class MultilanguageEvidenceTests(unittest.TestCase):
         result = snapshot(self.repo, sha, feature, limit=2, authorized_modify_paths=("quiet.py",))
         self.assertEqual(tuple(x.path for x in result.entries), ("quiet.py", "payment.py"))
 
+    def test_create_paths_are_not_reserved_as_existing_modify_evidence(self):
+        (self.repo / "existing.py").write_text("def existing(): pass\n")
+        sha = self.commit()
+        result = snapshot(self.repo, sha, limit=2, authorized_modify_paths=("existing.py",))
+        self.assertEqual(result.entries[0].path, "existing.py")
+        self.assertNotIn("new_restore.mjs", {x.path for x in result.entries})
+
     def test_authorized_modify_capacity_overflow_fails_closed(self):
         (self.repo / "a.py").write_text("def a(): pass\n")
         (self.repo / "b.py").write_text("def b(): pass\n")
