@@ -1163,9 +1163,22 @@ class Ledger:
             event_id = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="retired_attempt_cleanup_confirmed", actor_id=operator_id, payload={"retired_attempt":retired_attempt_number,"checked_paths":json.loads(encoded_paths)})
             return {"ticket_id":ticket_id,"retired_attempt_number":retired_attempt_number,"status":"confirmed","event_id":event_id}
 
-    def bind_runtime(self, ticket_id: str, repository_path: str, starting_sha: str, canonical_sha: str | None = None) -> None:
-        with self._transaction() as conn:
-            conn.execute("INSERT OR IGNORE INTO runtime_bindings(ticket_id, repository_path, starting_sha, canonical_sha, ownership_verified, created_at) VALUES (?, ?, ?, ?, 1, ?)", (ticket_id, repository_path, starting_sha, canonical_sha or starting_sha, self._now()))
+    def bind_runtime(self, ticket_id: str, repository_path: str, starting_sha: str, canonical_sha: str | None = None, ownership_verified: int = 1) -> dict[str, Any]:
+        requested = (str(repository_path), str(starting_sha), str(canonical_sha or starting_sha), int(ownership_verified))
+        def verify(row: sqlite3.Row) -> dict[str, Any]:
+            actual = (str(row["repository_path"]), str(row["starting_sha"]), str(row["canonical_sha"]), int(row["ownership_verified"]))
+            if actual != requested: raise ValueError("conflicting runtime binding")
+            return dict(row)
+        try:
+            with self._transaction() as conn:
+                existing = conn.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
+                if existing is not None: return verify(existing)
+                conn.execute("INSERT INTO runtime_bindings(ticket_id, repository_path, starting_sha, canonical_sha, ownership_verified, created_at) VALUES (?, ?, ?, ?, ?, ?)", (ticket_id, *requested, self._now()))
+                return verify(conn.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone())
+        except sqlite3.IntegrityError:
+            existing = self.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if existing is None: raise
+            return verify(existing)
 
     def persist_validated_decomposition_plan(self, *, plan_id: str, feature_id: str, fingerprint: str, plan_json: str, repository_identity: str, repo_base_sha: str, repo_snapshot_hash: str, repo_snapshot_manifest_json: str) -> str:
         """Persist one validated plan without activating its tranche or tickets."""
