@@ -65,6 +65,12 @@ class PlannerRoutingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_operator_config(self.config_path)
 
+    def test_standard_route_constructs_planner_without_worker_fallback(self):
+        cfg = self.config({"standard": ModelRegistration("planner-profile", "planner-provider", "planner-model")})
+        route = cfg.decomposition_route("standard")
+        planner = LocalDecompositionPlanner(cost_class="standard", provider=route.provider, model=route.model, profile=route.profile, role="decomposition", routing_source="operator-config.decomposition")
+        self.assertEqual((planner.cost_class, planner.role, planner.model), ("standard", "decomposition", "planner-model"))
+
     def test_provenance_contains_role_and_routing_source(self):
         calls = []
         def runner(argv, **kwargs):

@@ -135,7 +135,7 @@ def resolve_hermes_identity(executable='hermes') -> dict[str,str]:
 class LocalDecompositionPlanner:
     def __init__(self, runner=subprocess.run, executable='hermes', cost_class: str = 'unknown', provider='unresolved', model='unresolved', profile='unresolved', allowed_paths=DEFAULT_ALLOWED_PATHS, role='decomposition', routing_source='operator-config'):
 
-        if cost_class not in {'local', 'paid', 'unknown'}:
+        if cost_class not in {'local', 'standard', 'paid', 'unknown'}:
             raise ValueError('invalid planner cost class')
         self.runner, self.executable, self.cost_class = runner, executable, cost_class
         self.provider, self.model, self.profile = provider, model, profile
