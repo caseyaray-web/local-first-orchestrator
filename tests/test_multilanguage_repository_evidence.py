@@ -56,6 +56,59 @@ class MultilanguageEvidenceTests(unittest.TestCase):
         result = snapshot(self.repo, sha, feature, limit=1)
         self.assertEqual(result.entries[0].path, "z_payment.ts")
 
+    def test_authorized_modify_target_is_reserved_before_ranked_context(self):
+        (self.repo / "quiet.py").write_text("def build_household_export():\n    return {}\n")
+        (self.repo / "payment.py").write_text("def payment():\n    return 1\n")
+        sha = self.commit()
+        feature = FeatureContract("f", "Payment", "payment", (Criterion("A", "payment"),), (), (), (), sha)
+        result = snapshot(self.repo, sha, feature, limit=1, authorized_modify_paths=("quiet.py",))
+        self.assertEqual(tuple(x.path for x in result.entries), ("quiet.py",))
+        self.assertEqual(result.entries[0].reason, "authorized_modify_target")
+        self.assertEqual(result.entries[0].symbols, ("build_household_export",))
+        self.assertEqual(result.entries[0].content_hash, __import__("hashlib").sha256((self.repo / "quiet.py").read_bytes()).hexdigest())
+
+    def test_c11_shaped_json_modify_target_is_evidence_valid(self):
+        (self.repo / "src/lib/export").mkdir(parents=True)
+        (self.repo / "src/lib/export/json.js").write_text("export function buildHouseholdExport() { return {}; }\n")
+        (self.repo / "context.py").write_text("def meal_planner_context(): return {}\n")
+        sha = self.commit()
+        feature = FeatureContract("C11", "Meal Planner", "meal planner export", (Criterion("export-completeness", "export"),), (), (), (), sha)
+        result = snapshot(self.repo, sha, feature, limit=1, authorized_modify_paths=("src/lib/export/json.js",))
+        self.assertEqual(result.entries[0].path, "src/lib/export/json.js")
+        self.assertIn("buildHouseholdExport", result.entries[0].symbols)
+
+    def test_required_entries_precede_deterministic_ranked_capacity(self):
+        (self.repo / "quiet.py").write_text("def quiet(): pass\n")
+        (self.repo / "payment.py").write_text("def calculate_payment(): return 1\n")
+        sha = self.commit()
+        feature = FeatureContract("f", "Payment", "calculate payment", (Criterion("A", "payment"),), (), (), (), sha)
+        result = snapshot(self.repo, sha, feature, limit=2, authorized_modify_paths=("quiet.py",))
+        self.assertEqual(tuple(x.path for x in result.entries), ("quiet.py", "payment.py"))
+
+    def test_authorized_modify_capacity_overflow_fails_closed(self):
+        (self.repo / "a.py").write_text("def a(): pass\n")
+        (self.repo / "b.py").write_text("def b(): pass\n")
+        sha = self.commit()
+        with self.assertRaisesRegex(ValueError, "exceeds evidence limit"):
+            snapshot(self.repo, sha, limit=1, authorized_modify_paths=("a.py", "b.py"))
+
+    def test_unauthorized_existing_path_is_not_reserved(self):
+        (self.repo / "target.py").write_text("def target(): pass\n")
+        sha = self.commit()
+        result = snapshot(self.repo, sha, limit=1, authorized_modify_paths=())
+        self.assertNotEqual(result.entries[0].reason, "authorized_modify_target")
+
+    def test_required_modify_symbol_validates_and_invented_symbol_rejects(self):
+        (self.repo / "export.js").write_text("export function buildHouseholdExport() { return {}; }\n")
+        sha = self.commit(); feature = FeatureContract("f", "Export", "export", (Criterion("A", "export"),), (), (), (), sha)
+        snap = snapshot(self.repo, sha, feature, limit=1, authorized_modify_paths=("export.js",))
+        ticket = MicroTicket("T", "Change the export behavior.", ("A",), "export.js::buildHouseholdExport", ("export.js",), (), PatchBudget(1, 20), VerificationProfile((("true",),)), "low", True, 1, ())
+        plan = DecompositionPlan(1, "f", feature.contract_hash, sha, snap.snapshot_hash, (), {"A": ("T",)}, (Tranche("tr", 0, "export", (), ("A",), (ticket,)),), repository_identity=snap.repository_id, repo_snapshot_manifest_json=snap.manifest_json)
+        self.assertTrue(RepositoryPlanValidator().validate(plan, snap).passed)
+        bad = MicroTicket(**{**ticket.__dict__, "primary_symbol": "export.js::invented"})
+        bad_plan = DecompositionPlan(**{**plan.__dict__, "tranches": (Tranche("tr", 0, "export", (), ("A",), (bad,)),)})
+        self.assertEqual(RepositoryPlanValidator().validate(bad_plan, snap).reasons, ("unknown_symbol",))
+
     def test_snapshot_is_deterministic_and_dirty_checkout_is_ignored(self):
         (self.repo / "payment.ts").write_text("export function calculatePayment() { return 1; }\n")
         (self.repo / "service.py").write_text("def calculate_payment():\n    return 1\n")

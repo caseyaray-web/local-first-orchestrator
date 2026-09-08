@@ -87,6 +87,14 @@ class PlanningCoordinator:
             raise ValueError("planner cost class is not trusted")
         return {**values, "cost_class": cost_class}
 
+    def _authorized_modify_paths(self, feature_id: str) -> tuple[str, ...]:
+        row = self.ledger.connection.execute("SELECT contract_json FROM feature_contracts WHERE feature_id=?", (feature_id,)).fetchone()
+        if row is None:
+            return ()
+        raw = json.loads(row["contract_json"])
+        spec = raw.get("spec", raw)
+        return tuple(sorted(x["path"] for x in spec.get("files", ()) if x.get("disposition") == "modify"))
+
     def _request_key(self, feature: FeatureContract, snap: RepositorySnapshot) -> str:
         material = {
             "architecture_purpose": PaidPurpose.ARCHITECTURE.value,
@@ -236,7 +244,7 @@ class PlanningCoordinator:
         if repository is not None and self.config.canonical_repository(repository) != repo:
             raise ValueError("repository is not the controller-approved canonical repository")
         base = feature.source_revision.strip() or subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
-        snap = snapshot(repo, base, feature, feature_terms)
+        snap = snapshot(repo, base, feature, feature_terms, authorized_modify_paths=self._authorized_modify_paths(feature.id))
         request_key = self._request_key(feature, snap)
         active = self._existing_activated(feature, snap)
         if active:

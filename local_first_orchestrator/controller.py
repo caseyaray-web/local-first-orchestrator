@@ -157,7 +157,7 @@ class LocalFirstController:
                 raise ValueError(f"modify target is not a Git blob at authoritative base: {file.path}")
             if file.disposition == "create" and result.returncode == 0:
                 raise ValueError(f"create target already exists at authoritative base: {file.path}")
-        snap = repository_snapshot(repo, base, feature=spec.contract, feature_terms=tuple(f.path for f in spec.files), limit=32)
+        snap = repository_snapshot(repo, base, feature=spec.contract, feature_terms=tuple(f.path for f in spec.files), limit=32, authorized_modify_paths=tuple(f.path for f in spec.files if f.disposition == "modify"))
         predecessor = {"tranche_id": spec.predecessor_tranche_id, "kind": authority["kind"], "generation": generation_value, "final_integration_sha": base, "evidence_hash": evidence_hash}
         result = self.ledger.admit_feature_contract(spec, repository_identity=str(repo), repo_base_sha=snap.base_sha, repo_snapshot_hash=snap.snapshot_hash, repo_snapshot_manifest_json=snap.manifest_json, predecessor=predecessor)
         return FeatureAdmissionResult(**result)

@@ -24,14 +24,20 @@ def canonical_json(value:object)->str:return json.dumps(value,sort_keys=True,sep
 def terms(feature:FeatureContract|None,extra:tuple[str,...])->tuple[str,...]:
  text=' '.join(extra) if feature is None else ' '.join((feature.title,feature.objective,*[x.statement for x in feature.acceptance_criteria]))
  return tuple(sorted({x.lower() for x in re.findall(r'[A-Za-z_][A-Za-z_0-9]{2,}',text) if x.lower() not in _STOP}))
-def snapshot(repository:Path,requested_sha:str,feature:FeatureContract|None=None,feature_terms:tuple[str,...]=(),limit:int=32)->RepositorySnapshot:
+def snapshot(repository:Path,requested_sha:str,feature:FeatureContract|None=None,feature_terms:tuple[str,...]=(),limit:int=32,authorized_modify_paths:tuple[str,...]=())->RepositorySnapshot:
  repo=Path(repository).resolve(); run=lambda *a:subprocess.run(('git',*a),cwd=repo,text=True,capture_output=True,check=True).stdout
  base=run('rev-parse','--verify',requested_sha+'^{commit}').strip(); paths=[p for p in run('ls-tree','-r','--name-only',base).splitlines() if is_supported_repository_file(p)]
- manifest=tuple(ManifestEntry(p,'test' if is_test_path(p) else 'source') for p in paths); q=terms(feature,feature_terms); candidates=[]
+ manifest=tuple(ManifestEntry(p,'test' if is_test_path(p) else 'source') for p in paths); manifest_paths=set(paths); required=tuple(sorted(set(authorized_modify_paths)))
+ if len(required)>limit: raise ValueError('authorized modify evidence exceeds evidence limit')
+ required_entries=[]
+ for p in required:
+  if normalized_repository_path(p) is None or p not in manifest_paths: raise ValueError(f'authorized modify path is not a supported base blob: {p}')
+  data=run('show',base+':'+p); required_entries.append(Evidence(p,hashlib.sha256(data.encode()).hexdigest(),'authorized_modify_target',symbols_for(p,data),10**9))
+ q=terms(feature,feature_terms); candidates=[]
  for m in manifest:
   data=run('show',base+':'+m.path); lower=data.lower(); score=sum(3 for x in q if x in Path(m.path).name.lower())+sum(1 for x in q if x in lower)
-  if score or not q:candidates.append((m.path,score,data))
- chosen=sorted(candidates,key=lambda x:(-x[1],x[0]))[:limit]; out=[]
+  if m.path not in required and (score or not q):candidates.append((m.path,score,data))
+ chosen=sorted(candidates,key=lambda x:(-x[1],x[0]))[:limit-len(required)]; out=list(required_entries)
  for p,score,data in chosen:
   out.append(Evidence(p,hashlib.sha256(data.encode()).hexdigest(),'feature_term_match',symbols_for(p,data),score))
  return RepositorySnapshot(str(repo),base,manifest,tuple(out),max(0,len(candidates)-len(chosen)))
