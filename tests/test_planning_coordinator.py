@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.controller import RuntimeConfig
 from local_first_orchestrator.decomposition import Criterion, DecompositionPlan, FeatureContract, PlanValidator, Tranche
-from local_first_orchestrator.decomposition_planner import LocalDecompositionPlanner
+from local_first_orchestrator.decomposition_planner import LocalDecompositionPlanner, planner_contract, planner_contract_hash
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.paid_model import InjectedPaidModelAdapter
 from local_first_orchestrator.planning_coordinator import PlanningCoordinator
@@ -24,6 +24,7 @@ class FakeLocalPlanner:
     model = "fixture-local-planner"
     profile = "fixture-profile"
     routing_source = "fixture"
+    planner_contract_hash = planner_contract_hash()
     def __init__(self, proposal): self.proposal, self.calls, self.repository = proposal, 0, None
     def propose(self, feature, snapshot, *, artifact_dir, repository=None):
         self.calls += 1; self.repository = repository
@@ -117,6 +118,23 @@ class PlanningCoordinatorTests(unittest.TestCase):
         self.assertNotEqual(baseline, key(profile="other-profile"))
         self.assertNotEqual(baseline, key(cost_class="local"))
         self.assertEqual(baseline, key())
+
+    def test_pending_plan_contract_change_invokes_fresh_planner_then_replays_v2(self):
+        from local_first_orchestrator.repository_snapshot import snapshot
+        snap = snapshot(self.repo, self.sha, self.feature)
+        v1 = FakeStandardPlanner(make_plan(self.feature, snap))
+        first = PlanningCoordinator(self.ledger, self.config, v1).generate_plan_only(self.feature)
+        changed = planner_contract(); changed["output_rules"] = list(changed["output_rules"]) + ["Use a separate bounded seam."]
+        v2 = FakeStandardPlanner(make_plan(self.feature, snap)); v2.planner_contract_hash = planner_contract_hash(contract=changed)
+        second_coordinator = PlanningCoordinator(self.ledger, self.config, v2)
+        second = second_coordinator.generate_plan_only(self.feature)
+        self.assertEqual(first.status, "validated_pending_activation")
+        self.assertEqual(second.status, "validated_pending_activation")
+        self.assertNotEqual(first.request_key, second.request_key)
+        self.assertEqual(v1.calls, 1); self.assertEqual(v2.calls, 1)
+        replay = second_coordinator.generate_plan_only(self.feature)
+        self.assertEqual(replay.request_key, second.request_key); self.assertEqual(v2.calls, 1)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from planning_runs where request_key=?", (first.request_key,)).fetchone()[0], 1)
 
     def test_conflicting_route_provenance_for_same_request_fails_closed(self):
         from local_first_orchestrator.repository_snapshot import snapshot
@@ -302,7 +320,7 @@ class PlanningCoordinatorTests(unittest.TestCase):
         self.assertIsNotNone(planner.repository); self.assertEqual(Path(planner.repository or "").resolve(), self.repo.resolve())
 
     def test_coordinator_mutation_tripwire_fails_closed(self):
-        from local_first_orchestrator.decomposition_planner import LocalDecompositionPlanner
+        from local_first_orchestrator.decomposition_planner import LocalDecompositionPlanner, planner_contract, planner_contract_hash
         from local_first_orchestrator.repository_snapshot import snapshot
         snap = snapshot(self.repo, self.sha, self.feature); raw = PlanningCoordinator(self.ledger, self.config, FakeLocalPlanner(make_plan(self.feature, snap)))._plan_json(make_plan(self.feature, snap)); target = self.repo / "app.py"
         def run(argv, **kwargs):
@@ -315,7 +333,7 @@ class PlanningCoordinatorTests(unittest.TestCase):
         self.assertTrue((artifact / "protected-before.json").exists()); self.assertTrue((artifact / "protected-after.json").exists())
 
     def test_coordinator_timeout_retains_post_fingerprint(self):
-        from local_first_orchestrator.decomposition_planner import LocalDecompositionPlanner
+        from local_first_orchestrator.decomposition_planner import LocalDecompositionPlanner, planner_contract, planner_contract_hash
         def run(argv, **kwargs): raise subprocess.TimeoutExpired(argv, 1)
         planner = LocalDecompositionPlanner(run, cost_class="local", provider="p", model="m")
         result = PlanningCoordinator(self.ledger, self.config, planner).generate_plan_only(self.feature)

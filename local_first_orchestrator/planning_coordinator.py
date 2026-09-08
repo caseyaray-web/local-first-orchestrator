@@ -143,7 +143,9 @@ class PlanningCoordinator:
                 plan = parse(json.dumps(stored["plan"], sort_keys=True, separators=(",", ":")))
             except (PlannerError, KeyError, TypeError, ValueError):
                 continue
-            if (plan.feature_contract_hash == feature.contract_hash and plan.repository_identity == snap.repository_id and plan.repo_base_sha == snap.base_sha and plan.repo_snapshot_hash == snap.snapshot_hash and plan.repo_snapshot_manifest_json == snap.manifest_json and row["repository_identity"] == snap.repository_id and row["repo_base_sha"] == snap.base_sha and row["repo_snapshot_hash"] == snap.snapshot_hash and row["repo_snapshot_manifest_json"] == snap.manifest_json):
+            run = self.ledger.connection.execute("SELECT * FROM planning_runs WHERE plan_id=? ORDER BY updated_at DESC LIMIT 1", (row["id"],)).fetchone()
+            if (run is not None and run["request_key"] == self._request_key(feature, snap) and plan.feature_contract_hash == feature.contract_hash and plan.repository_identity == snap.repository_id and plan.repo_base_sha == snap.base_sha and plan.repo_snapshot_hash == snap.snapshot_hash and plan.repo_snapshot_manifest_json == snap.manifest_json and row["repository_identity"] == snap.repository_id and row["repo_base_sha"] == snap.base_sha and row["repo_snapshot_hash"] == snap.snapshot_hash and row["repo_snapshot_manifest_json"] == snap.manifest_json):
+                self._assert_prior_route(run)
                 ids = tuple(r["id"] for r in self.ledger.connection.execute("SELECT t.id FROM tickets t JOIN tranches tr ON tr.id=t.tranche_id WHERE t.feature_id=? AND tr.ordinal=0 ORDER BY t.id", (feature.id,)))
                 return PlanningOutcome("already_activated", feature.id, snapshot_hash=snap.snapshot_hash, plan_id=str(row["id"]), activated_ticket_ids=ids)
         return None
@@ -209,7 +211,7 @@ class PlanningCoordinator:
         raw = json.dumps({"feature": feature.__dict__, "plan": asdict(proposal)}, default=lambda x: x.__dict__ if hasattr(x, "__dict__") else list(x), sort_keys=True, separators=(",", ":"))
         return "plan-" + hashlib.sha256(raw.encode()).hexdigest()[:16], hashlib.sha256(raw.encode()).hexdigest(), raw
 
-    def _existing_pending(self, feature: FeatureContract, snap: RepositorySnapshot) -> PlanningOutcome | None:
+    def _existing_pending(self, feature: FeatureContract, snap: RepositorySnapshot, current_key: str) -> PlanningOutcome | None:
         rows = self.ledger.connection.execute("SELECT * FROM decomposition_plans WHERE feature_id=? ORDER BY created_at", (feature.id,)).fetchall()
         for row in rows:
             if row["status"] != "validated_pending_activation":
@@ -219,8 +221,11 @@ class PlanningCoordinator:
             plan = self._load_plan(row)
             if plan.feature_contract_hash != feature.contract_hash:
                 raise ValueError("conflicting durable decomposition plan")
-            run = self.ledger.connection.execute("SELECT request_key FROM planning_runs WHERE plan_id=? ORDER BY updated_at DESC LIMIT 1", (row["id"],)).fetchone()
-            return PlanningOutcome("validated_pending_activation", feature.id, request_key=run["request_key"] if run else None, snapshot_hash=snap.snapshot_hash, plan_id=str(row["id"]))
+            run = self.ledger.connection.execute("SELECT * FROM planning_runs WHERE plan_id=? ORDER BY updated_at DESC LIMIT 1", (row["id"],)).fetchone()
+            if run is None or run["request_key"] != current_key:
+                continue
+            self._assert_prior_route(run)
+            return PlanningOutcome("validated_pending_activation", feature.id, request_key=current_key, snapshot_hash=snap.snapshot_hash, plan_id=str(row["id"]))
         return None
 
     def generate_plan_only(self, feature: FeatureContract, *, repository: Path | None = None, feature_terms: tuple[str, ...] = ()) -> PlanningOutcome:
@@ -232,13 +237,13 @@ class PlanningCoordinator:
             raise ValueError("repository is not the controller-approved canonical repository")
         base = feature.source_revision.strip() or subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
         snap = snapshot(repo, base, feature, feature_terms)
+        request_key = self._request_key(feature, snap)
         active = self._existing_activated(feature, snap)
         if active:
             return active
-        pending = self._existing_pending(feature, snap)
+        pending = self._existing_pending(feature, snap, request_key)
         if pending:
             return pending
-        request_key = self._request_key(feature, snap)
         artifact_dir = self._artifact_dir(feature, request_key)
         artifact_dir.mkdir(parents=True, exist_ok=True)
         response_path = artifact_dir / "planner-response.json"
