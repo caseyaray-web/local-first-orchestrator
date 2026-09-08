@@ -541,19 +541,28 @@ class Ledger:
         return current
 
     def append_feature_snapshot_revalidation(self, *, feature_id: str, feature_contract_hash: str, repository_identity: str, repo_base_sha: str, source_snapshot_hash: str, target_snapshot_hash: str, generation: int, revalidation_hash: str) -> dict[str, Any]:
+        requested = (feature_id, feature_contract_hash, repository_identity, repo_base_sha, source_snapshot_hash, target_snapshot_hash, generation, revalidation_hash)
+        existing = self.connection.execute("SELECT * FROM feature_repository_snapshot_revalidations WHERE feature_id=? AND generation=?", (feature_id, generation)).fetchone()
+        if existing is not None:
+            values = (existing["feature_id"], existing["feature_contract_hash"], existing["repository_identity"], existing["repo_base_sha"], existing["source_snapshot_hash"], existing["target_snapshot_hash"], int(existing["generation"]), existing["revalidation_hash"])
+            expected = self.snapshot_revalidation_hash(feature_id=existing["feature_id"], feature_contract_hash=existing["feature_contract_hash"], repository_identity=existing["repository_identity"], repo_base_sha=existing["repo_base_sha"], source_snapshot_hash=existing["source_snapshot_hash"], target_snapshot_hash=existing["target_snapshot_hash"], generation=int(existing["generation"]))
+            if existing["revalidation_hash"] != expected or values != requested: raise ValueError("conflicting snapshot revalidation")
+            return dict(existing)
+        expected = self.snapshot_revalidation_hash(feature_id=feature_id, feature_contract_hash=feature_contract_hash, repository_identity=repository_identity, repo_base_sha=repo_base_sha, source_snapshot_hash=source_snapshot_hash, target_snapshot_hash=target_snapshot_hash, generation=generation)
+        if revalidation_hash != expected: raise ValueError("snapshot revalidation hash mismatch")
         authority = self.feature_snapshot_authority(feature_id)
         if (feature_contract_hash, repository_identity, repo_base_sha, source_snapshot_hash, generation) != (authority["feature_contract_hash"], authority["repository_identity"], authority["repo_base_sha"], authority["snapshot_hash"], authority["generation"] + 1):
             raise ValueError("snapshot revalidation source or generation conflicts")
-        expected = self.snapshot_revalidation_hash(feature_id=feature_id, feature_contract_hash=feature_contract_hash, repository_identity=repository_identity, repo_base_sha=repo_base_sha, source_snapshot_hash=source_snapshot_hash, target_snapshot_hash=target_snapshot_hash, generation=generation)
-        if revalidation_hash != expected: raise ValueError("snapshot revalidation hash mismatch")
-        existing = self.connection.execute("SELECT * FROM feature_repository_snapshot_revalidations WHERE feature_id=? AND generation=?", (feature_id, generation)).fetchone()
-        if existing is not None:
-            values = (existing["feature_contract_hash"], existing["repository_identity"], existing["repo_base_sha"], existing["source_snapshot_hash"], existing["target_snapshot_hash"], int(existing["generation"]), existing["revalidation_hash"])
-            if values != (feature_contract_hash, repository_identity, repo_base_sha, source_snapshot_hash, target_snapshot_hash, generation, revalidation_hash): raise ValueError("conflicting snapshot revalidation")
-            return dict(existing)
         now = int(time.time())
-        with self._transaction() as c:
-            c.execute("INSERT INTO feature_repository_snapshot_revalidations(feature_id,feature_contract_hash,repository_identity,repo_base_sha,source_snapshot_hash,target_snapshot_hash,generation,revalidation_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?)", (feature_id, feature_contract_hash, repository_identity, repo_base_sha, source_snapshot_hash, target_snapshot_hash, generation, revalidation_hash, now))
+        try:
+            with self._transaction() as c:
+                c.execute("INSERT INTO feature_repository_snapshot_revalidations(feature_id,feature_contract_hash,repository_identity,repo_base_sha,source_snapshot_hash,target_snapshot_hash,generation,revalidation_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?)", (feature_id, feature_contract_hash, repository_identity, repo_base_sha, source_snapshot_hash, target_snapshot_hash, generation, revalidation_hash, now))
+        except sqlite3.IntegrityError:
+            raced = self.connection.execute("SELECT * FROM feature_repository_snapshot_revalidations WHERE feature_id=? AND generation=?", (feature_id, generation)).fetchone()
+            if raced is None: raise
+            values = (raced["feature_id"], raced["feature_contract_hash"], raced["repository_identity"], raced["repo_base_sha"], raced["source_snapshot_hash"], raced["target_snapshot_hash"], int(raced["generation"]), raced["revalidation_hash"])
+            if values != requested or raced["revalidation_hash"] != self.snapshot_revalidation_hash(feature_id=raced["feature_id"], feature_contract_hash=raced["feature_contract_hash"], repository_identity=raced["repository_identity"], repo_base_sha=raced["repo_base_sha"], source_snapshot_hash=raced["source_snapshot_hash"], target_snapshot_hash=raced["target_snapshot_hash"], generation=int(raced["generation"])): raise ValueError("conflicting snapshot revalidation")
+            return dict(raced)
         return dict(self.connection.execute("SELECT * FROM feature_repository_snapshot_revalidations WHERE feature_id=? AND generation=?", (feature_id, generation)).fetchone())
 
     def migrate(self) -> None:
