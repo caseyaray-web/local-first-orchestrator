@@ -155,6 +155,8 @@ class PlanningCoordinator:
             proposer = getattr(self.planner, "propose_next", None) or getattr(self.planner, "propose")
             proposal = proposer(feature, snap, coarse_tranche=next_coarse, completion_evidence=completion, artifact_dir=artifact_dir, repository=repository) if getattr(self.planner, "propose_next", None) else proposer(feature, snap, artifact_dir=artifact_dir, repository=repository)
         except TypeError:
+            if isinstance(self.planner, LocalDecompositionPlanner):
+                raise PlannerError("protected planner signature mismatch")
             proposal = self.planner.propose(feature, snap, artifact_dir=artifact_dir)  # type: ignore[attr-defined]
         proposal = replace(proposal, feature_id=feature.id, feature_contract_hash=feature.contract_hash, repository_identity=snap.repository_id, repo_base_sha=snap.base_sha, repo_snapshot_hash=snap.snapshot_hash, repo_snapshot_manifest_json=snap.manifest_json, tranches=(replace(proposal.tranches[0], id=next_coarse.id, ordinal=0),))
         validation = self.plan_validator.validate_tranche(feature, proposal.tranches[0], next_coarse)
@@ -210,7 +212,7 @@ class PlanningCoordinator:
             if prior is not None and prior["status"] in {"structural_rejected", "repository_rejected", "validated_pending_activation", "completed"} and prior["response_artifact"] and Path(prior["response_artifact"]).exists():
                 proposal = parse(Path(prior["response_artifact"]).read_text(encoding="utf-8"))
             elif self._cost_class() == "local":
-                proposal = self.planner.propose(feature, snap, artifact_dir=artifact_dir)  # type: ignore[attr-defined]
+                proposal = self.planner.propose(feature, snap, artifact_dir=artifact_dir, repository=repo)  # type: ignore[attr-defined]
                 if not response_path.exists():
                     response_path.write_text(self._plan_json(proposal), encoding="utf-8")
             else:

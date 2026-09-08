@@ -19,9 +19,9 @@ from local_first_orchestrator.usage_governor import PaidPurpose, UsageGovernor
 
 class FakeLocalPlanner:
     cost_class = "local"
-    def __init__(self, proposal): self.proposal, self.calls = proposal, 0
-    def propose(self, feature, snapshot, *, artifact_dir):
-        self.calls += 1
+    def __init__(self, proposal): self.proposal, self.calls, self.repository = proposal, 0, None
+    def propose(self, feature, snapshot, *, artifact_dir, repository=None):
+        self.calls += 1; self.repository = repository
         return self.proposal
 
 
@@ -221,5 +221,33 @@ class PlanningCoordinatorTests(unittest.TestCase):
         self.assertEqual(result.status, "repository_rejected")
         self.assertEqual(self.ledger.connection.execute("select count(*) from decomposition_plans").fetchone()[0], 0)
 
+
+    def test_coordinator_passes_canonical_repository_to_planner(self):
+        from local_first_orchestrator.repository_snapshot import snapshot
+        snap = snapshot(self.repo, self.sha, self.feature); planner = FakeLocalPlanner(make_plan(self.feature, snap)); coordinator = PlanningCoordinator(self.ledger, self.config, planner)
+        coordinator.generate_plan_only(self.feature)
+        self.assertIsNotNone(planner.repository); self.assertEqual(Path(planner.repository or "").resolve(), self.repo.resolve())
+
+    def test_coordinator_mutation_tripwire_fails_closed(self):
+        from local_first_orchestrator.decomposition_planner import LocalDecompositionPlanner
+        from local_first_orchestrator.repository_snapshot import snapshot
+        snap = snapshot(self.repo, self.sha, self.feature); raw = PlanningCoordinator(self.ledger, self.config, FakeLocalPlanner(make_plan(self.feature, snap)))._plan_json(make_plan(self.feature, snap)); target = self.repo / "app.py"
+        def run(argv, **kwargs):
+            target.write_text("mutated by planner\\n")
+            return subprocess.CompletedProcess(argv, 0, raw, "")
+        planner = LocalDecompositionPlanner(run, cost_class="local", provider="p", model="m")
+        result = PlanningCoordinator(self.ledger, self.config, planner).generate_plan_only(self.feature)
+        self.assertEqual(result.status, "planner_failed"); self.assertEqual(self.ledger.connection.execute("select count(*) from decomposition_plans").fetchone()[0], 0); self.assertIn("mutated", target.read_text())
+        artifact = PlanningCoordinator(self.ledger, self.config, planner)._artifact_dir(self.feature, str(result.request_key))
+        self.assertTrue((artifact / "protected-before.json").exists()); self.assertTrue((artifact / "protected-after.json").exists())
+
+    def test_coordinator_timeout_retains_post_fingerprint(self):
+        from local_first_orchestrator.decomposition_planner import LocalDecompositionPlanner
+        def run(argv, **kwargs): raise subprocess.TimeoutExpired(argv, 1)
+        planner = LocalDecompositionPlanner(run, cost_class="local", provider="p", model="m")
+        result = PlanningCoordinator(self.ledger, self.config, planner).generate_plan_only(self.feature)
+        self.assertEqual(result.status, "planner_timeout")
+        artifact = PlanningCoordinator(self.ledger, self.config, planner)._artifact_dir(self.feature, str(result.request_key))
+        self.assertTrue((artifact / "protected-before.json").exists()); self.assertTrue((artifact / "protected-after.json").exists())
 
 if __name__ == "__main__": unittest.main()
