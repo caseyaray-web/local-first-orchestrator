@@ -75,7 +75,7 @@ class RuntimeConfig:
 
 def ticket_from_ledger(row: dict[str, Any]) -> MicroTicket:
     verification = json.loads(row["verification_json"])
-    return MicroTicket(row["id"], row["objective"], tuple(json.loads(row["criterion_ids_json"])), row["primary_symbol"], tuple(json.loads(row["allowed_files_json"])), tuple(json.loads(row["forbidden_changes_json"])), PatchBudget(**json.loads(row["patch_budget_json"])), VerificationProfile(tuple(tuple(c) for c in verification["commands"]), verification.get("working_directory", "."), int(verification.get("timeout_seconds", 60)), int(verification.get("output_limit", 20000))), row["risk"], bool(row["review_required"]), int(row["max_attempts"]), tuple(json.loads(row["dependencies_json"])), tuple(json.loads(row.get("new_test_files_json") or "[]")))
+    return MicroTicket(row["id"], row["objective"], tuple(json.loads(row["criterion_ids_json"])), row["primary_symbol"], tuple(json.loads(row["allowed_files_json"])), tuple(json.loads(row["forbidden_changes_json"])), PatchBudget(**json.loads(row["patch_budget_json"])), VerificationProfile(tuple(tuple(c) for c in verification["commands"]), verification.get("working_directory", "."), int(verification.get("timeout_seconds", 60)), int(verification.get("output_limit", 20000))), row["risk"], bool(row["review_required"]), int(row["max_attempts"]), tuple(json.loads(row["dependencies_json"])), tuple(json.loads(row.get("new_test_files_json") or "[]")), tuple(json.loads(row.get("create_files_json") or "[]")))
 
 
 class InjectedCrash(RuntimeError):
@@ -199,7 +199,7 @@ class LocalFirstController:
             raise RuntimeError("canonical_head_moved_since_admission")
         if git(attempt_path, "status", "--porcelain=v1"):
             raise RuntimeError("attempt_not_clean_before_inference")
-        for relative in ticket.new_test_files:
+        for relative in (*ticket.create_files, *ticket.new_test_files):
             if (attempt_path / relative).exists():
                 raise RuntimeError("new_test_file_present_before_inference")
         for relative in ticket.allowed_files:
@@ -681,7 +681,7 @@ class LocalFirstController:
         diff = subprocess.run(("git", "diff", base), cwd=path, text=True, capture_output=True, check=True).stdout
         if hashlib.sha256(diff.encode()).hexdigest() != str(candidate["candidate_fingerprint"]):
             raise PermissionError("historical candidate fingerprint mismatch")
-        selected_files = {relative: (path / relative).read_text(encoding="utf-8") for relative in (*ticket.allowed_files, *ticket.new_test_files) if (path / relative).is_file()}
+        selected_files = {relative: (path / relative).read_text(encoding="utf-8") for relative in (*ticket.allowed_files, *ticket.create_files, *ticket.new_test_files) if (path / relative).is_file()}
         packet = ReviewPacketBuilder().build(ticket, diff=diff, selected_files=selected_files, validation_evidence=str(candidate["validation_evidence"]))
         artifacts_root = artifact_root / ticket_id / str(attempt_number); artifacts_root.mkdir(parents=True, exist_ok=True)
         invocation_id = uuid.uuid4().hex
@@ -788,8 +788,8 @@ class LocalFirstController:
                 raise PermissionError("historical integration provenance conflicts with candidate")
             if not Path(str(attestation["implementation_artifact"])).is_file() or hashlib.sha256(Path(str(result["artifact_path"])).read_bytes()).hexdigest() != str(result["artifact_sha256"]):
                 raise PermissionError("historical integration artifact integrity failed")
-        ticket = ticket_from_ledger(ticket_row); authorized = set(ticket.allowed_files) | set(ticket.new_test_files); adapter = GitWorktreeAdapter(repo, worktree_root)
-        commit_parent = subprocess.run(("git", "rev-parse", f"{accepted}^"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip(); names = subprocess.run(("git", "diff", "--name-only", base, accepted), cwd=repo, text=True, capture_output=True, check=True).stdout.splitlines(); identity_diff = subprocess.run(("git", "diff", base, accepted, "--", *ticket.allowed_files), cwd=repo, text=True, capture_output=True, check=True).stdout; current = adapter.existing_execution_base(str(ticket_row["tranche_id"]), base)
+        ticket = ticket_from_ledger(ticket_row); authorized = set(ticket.allowed_files) | set(ticket.create_files) | set(ticket.new_test_files); adapter = GitWorktreeAdapter(repo, worktree_root)
+        commit_parent = subprocess.run(("git", "rev-parse", f"{accepted}^"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip(); names = subprocess.run(("git", "diff", "--name-only", base, accepted), cwd=repo, text=True, capture_output=True, check=True).stdout.splitlines(); identity_diff = subprocess.run(("git", "diff", base, accepted, "--", *(*ticket.allowed_files, *ticket.create_files, *ticket.new_test_files)), cwd=repo, text=True, capture_output=True, check=True).stdout; current = adapter.existing_execution_base(str(ticket_row["tranche_id"]), base)
         if commit_parent != base or not names or any(name not in authorized for name in names) or hashlib.sha256(identity_diff.encode()).hexdigest() != candidate_fp:
             raise PermissionError("accepted commit no longer matches frozen candidate")
         if current == accepted:
@@ -824,7 +824,7 @@ class LocalFirstController:
         ticket = ticket_from_ledger(ticket_row); attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone(); impl = self.ledger.model_stage(ticket_id, attempt_number, "implementation"); review_stage = self.ledger.model_stage(ticket_id, attempt_number, "review"); invocation = self.ledger.invocation_for_stage(ticket_id, attempt_number, "implementation")
         if attempt is None or impl is None or review_stage is None or invocation is None or invocation["status"] != "completed":
             raise PermissionError("accepted candidate implementation provenance is incomplete")
-        worktree = Path(str(attempt["worktree_path"])).resolve(); authorized_files = set(ticket.allowed_files) | set(ticket.new_test_files)
+        worktree = Path(str(attempt["worktree_path"])).resolve(); authorized_files = set(ticket.allowed_files) | set(ticket.create_files) | set(ticket.new_test_files)
         if not authorized_files:
             raise PermissionError("acceptance requires authorized candidate files")
         live_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); live_branch = subprocess.run(("git", "branch", "--show-current"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); base = str(attempt["base_sha"])
@@ -839,7 +839,7 @@ class LocalFirstController:
             if existing != live_head or attempt["accepted_commit_sha"] not in (None, existing):
                 raise RuntimeError("conflicting accepted commit evidence")
             return {"accepted_commit_sha": existing, "status": "already_accepted", "integrated": False}
-        identity_diff = subprocess.run(("git", "diff", str(base), "--", *ticket.allowed_files), cwd=worktree, text=True, capture_output=True, check=True).stdout
+        identity_diff = subprocess.run(("git", "diff", str(base), "--", *(*ticket.allowed_files, *ticket.create_files, *ticket.new_test_files)), cwd=worktree, text=True, capture_output=True, check=True).stdout
         created_new_commit = False
         if live_head == base:
             if not status_paths or hashlib.sha256(identity_diff.encode()).hexdigest() != candidate_fp:
@@ -852,11 +852,11 @@ class LocalFirstController:
             self._crash("accepted_commit_created")
         else:
             parent = subprocess.run(("git", "rev-parse", "HEAD^"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); committed_diff = subprocess.run(("git", "diff", base, "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout; names = subprocess.run(("git", "diff", "--name-only", base, "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.splitlines(); clean = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() == ""
-            if parent != base or hashlib.sha256(subprocess.run(("git", "diff", base, "HEAD", "--", *ticket.allowed_files), cwd=worktree, text=True, capture_output=True, check=True).stdout.encode()).hexdigest() != candidate_fp or not names or any(name not in authorized_files for name in names) or not clean:
+            if parent != base or hashlib.sha256(subprocess.run(("git", "diff", base, "HEAD", "--", *(*ticket.allowed_files, *ticket.create_files, *ticket.new_test_files)), cwd=worktree, text=True, capture_output=True, check=True).stdout.encode()).hexdigest() != candidate_fp or not names or any(name not in authorized_files for name in names) or not clean:
                 raise RuntimeError("post-commit acceptance state is ambiguous")
             accepted_sha = live_head
         final_parent = subprocess.run(("git", "rev-parse", "HEAD^"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); final_diff = subprocess.run(("git", "diff", base, "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout; final_names = subprocess.run(("git", "diff", "--name-only", base, "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.splitlines(); final_clean = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() == ""
-        if accepted_sha != subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() or final_parent != base or hashlib.sha256(subprocess.run(("git", "diff", base, "HEAD", "--", *ticket.allowed_files), cwd=worktree, text=True, capture_output=True, check=True).stdout.encode()).hexdigest() != candidate_fp or not final_names or any(name not in authorized_files for name in final_names) or not final_clean:
+        if accepted_sha != subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() or final_parent != base or hashlib.sha256(subprocess.run(("git", "diff", base, "HEAD", "--", *(*ticket.allowed_files, *ticket.create_files, *ticket.new_test_files)), cwd=worktree, text=True, capture_output=True, check=True).stdout.encode()).hexdigest() != candidate_fp or not final_names or any(name not in authorized_files for name in final_names) or not final_clean:
             raise RuntimeError("accepted commit does not match frozen candidate")
         provenance = json.loads(str(candidate["historical_provenance_json"]))
         if provenance.get("authorization_hash"):
@@ -887,7 +887,7 @@ class LocalFirstController:
                 return after_state != before_state
             ticket=result["ticket"]; base=str(result["base"]); worktrees=result["worktrees"]; attempt=result["attempt"]; artifacts_root=result["artifacts_root"]; validation=result["validation"]; diff=str(result["diff"]); attempt_number=int(result["attempt_number"])
             try:
-                review_packet=ReviewPacketBuilder().build(ticket,diff=diff,selected_files={p:(attempt.path/p).read_text() for p in (*ticket.allowed_files, *ticket.new_test_files) if (attempt.path/p).exists()},validation_evidence=validation.compact_evidence)
+                review_packet=ReviewPacketBuilder().build(ticket,diff=diff,selected_files={p:(attempt.path/p).read_text() for p in (*ticket.allowed_files, *ticket.create_files, *ticket.new_test_files) if (attempt.path/p).exists()},validation_evidence=validation.compact_evidence)
                 review_stage=self.ledger.model_stage(ticket_id,attempt_number,"review")
                 if review_stage and Path(review_stage["response_artifact"]).exists(): review=normalize_review(json.loads(Path(review_stage["response_artifact"]).read_text()).get("payload",{}),ticket)
                 else:

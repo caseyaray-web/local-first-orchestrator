@@ -23,6 +23,10 @@ class PatchBudgetPolicy:
 PATCH_BUDGET_POLICY = PatchBudgetPolicy()
 
 
+def declared_ticket_paths(ticket: "MicroTicket") -> tuple[str, ...]:
+    return (*ticket.allowed_files, *ticket.create_files, *ticket.new_test_files)
+
+
 @dataclass(frozen=True)
 class PatchBudget:
     max_files: int = PATCH_BUDGET_POLICY.normal_max_files

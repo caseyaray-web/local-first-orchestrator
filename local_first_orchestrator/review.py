@@ -73,7 +73,7 @@ def normalize_review(payload: object, ticket: MicroTicket) -> ReviewResult:
         criterion_id, file, symbol = _text(item.get("criterion_id")), _text(item.get("file")), _text(item.get("symbol"))
         evidence, repair, verification, fingerprint_input = (_text(item.get(key)) for key in ("evidence", "minimal_repair", "verification", "fingerprint_input"))
         is_blocking = _text(item.get("severity")) == "blocking"
-        valid = is_blocking and criterion_id in ticket.criterion_ids and file in {*ticket.allowed_files, *ticket.new_test_files} and bool(symbol and evidence and repair and verification and fingerprint_input)
+        valid = is_blocking and criterion_id in ticket.criterion_ids and file in {*ticket.allowed_files, *ticket.create_files, *ticket.new_test_files} and bool(symbol and evidence and repair and verification and fingerprint_input)
         if not valid:
             suggestions.append("review finding downgraded: malformed or outside ticket criterion/file scope")
             continue

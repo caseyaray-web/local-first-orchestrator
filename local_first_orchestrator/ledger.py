@@ -1872,7 +1872,7 @@ class Ledger:
         with self._transaction() as conn:
             row = conn.execute("""
                 SELECT b.*, t.id AS resolved_ticket_id, t.state AS ticket_state, t.feature_id, t.tranche_id,
-                       t.objective, t.criterion_ids_json, t.primary_symbol, t.allowed_files_json, t.new_test_files_json AS ticket_new_test_files_json,
+                       t.objective, t.criterion_ids_json, t.primary_symbol, t.allowed_files_json, t.create_files_json, t.new_test_files_json AS ticket_new_test_files_json,
                        t.forbidden_changes_json, t.patch_budget_json, t.verification_json, t.risk, t.review_required,
                        t.max_attempts, t.dependencies_json, e.entity_type, e.entity_id, e.event_type
                 FROM board_projection_outbox b
@@ -1898,7 +1898,7 @@ class Ledger:
                 raise ValueError("generated projection reconciliation idempotency mismatch")
             provenance = (identity["repository_identity"], identity["repo_base_sha"], identity["repo_snapshot_hash"])
             verification = json.loads(row["verification_json"])
-            ticket = MicroTicket(ticket_id, row["objective"], tuple(json.loads(row["criterion_ids_json"])), row["primary_symbol"], tuple(json.loads(row["allowed_files_json"])), tuple(json.loads(row["forbidden_changes_json"])), PatchBudget(**json.loads(row["patch_budget_json"])), VerificationProfile(tuple(tuple(command) for command in verification["commands"]), verification.get("working_directory", "."), int(verification.get("timeout_seconds", 60)), int(verification.get("output_limit", 20000))), row["risk"], bool(row["review_required"]), int(row["max_attempts"]), tuple(json.loads(row["dependencies_json"])), tuple(json.loads(row["ticket_new_test_files_json"] or "[]")))
+            ticket = MicroTicket(ticket_id, row["objective"], tuple(json.loads(row["criterion_ids_json"])), row["primary_symbol"], tuple(json.loads(row["allowed_files_json"])), tuple(json.loads(row["forbidden_changes_json"])), PatchBudget(**json.loads(row["patch_budget_json"])), VerificationProfile(tuple(tuple(command) for command in verification["commands"]), verification.get("working_directory", "."), int(verification.get("timeout_seconds", 60)), int(verification.get("output_limit", 20000))), row["risk"], bool(row["review_required"]), int(row["max_attempts"]), tuple(json.loads(row["dependencies_json"])), tuple(json.loads(row["ticket_new_test_files_json"] or "[]")), tuple(json.loads(row["create_files_json"] or "[]")))
             feature = type("PersistedFeature", (), {"id": str(row["feature_id"])})()
             tranche = type("PersistedTranche", (), {"id": str(row["tranche_id"])})()
             payload = generated_card_payload(feature, tranche, ticket, repository_identity=str(provenance[0]), repo_base_sha=str(provenance[1]), repo_snapshot_hash=str(provenance[2]))
@@ -2367,7 +2367,7 @@ class Ledger:
                 existing_ticket = conn.execute("SELECT id FROM tickets WHERE id=?", (t.ticket_id,)).fetchone()
                 if existing_ticket: continue
                 q = t.contract()
-                conn.execute("INSERT INTO tickets(id,feature_id,tranche_id,title,objective,criterion_ids_json,primary_symbol,allowed_files_json,new_test_files_json,forbidden_changes_json,patch_budget_json,verification_json,risk,review_required,max_attempts,dependencies_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (t.ticket_id, feature.id, tranche.id, t.ticket_id, q["objective"], json.dumps(q["criterion_ids"]), q["primary_symbol"], json.dumps(q["allowed_files"]), json.dumps(q.get("new_test_files", [])), json.dumps(q["forbidden_changes"]), json.dumps(q["patch_budget"]), json.dumps(q["verification"]), q["risk"], int(t.review_required), t.max_attempts, json.dumps(q["dependencies"]), "draft", now, now))
+                conn.execute("INSERT INTO tickets(id,feature_id,tranche_id,title,objective,criterion_ids_json,primary_symbol,allowed_files_json,create_files_json,new_test_files_json,forbidden_changes_json,patch_budget_json,verification_json,risk,review_required,max_attempts,dependencies_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (t.ticket_id, feature.id, tranche.id, t.ticket_id, q["objective"], json.dumps(q["criterion_ids"]), q["primary_symbol"], json.dumps(q["allowed_files"]), json.dumps(q.get("create_files", [])), json.dumps(q.get("new_test_files", [])), json.dumps(q["forbidden_changes"]), json.dumps(q["patch_budget"]), json.dumps(q["verification"]), q["risk"], int(t.review_required), t.max_attempts, json.dumps(q["dependencies"]), "draft", now, now))
                 for cid in t.criterion_ids: conn.execute("INSERT INTO ticket_criteria VALUES (?,?)", (t.ticket_id, cid))
                 payload = generated_card_payload(feature, tranche, t, repository_identity=str(provenance["repository_identity"]), repo_base_sha=str(provenance["repo_base_sha"]), repo_snapshot_hash=str(provenance["repo_snapshot_hash"]))
                 event_id = self._append_event(conn, entity_type="ticket", entity_id=t.ticket_id, event_type="generated_microticket_created", actor_id="controller", to_state="draft", payload={"feature_id": feature.id, "tranche_id": tranche.id, "projection_key": payload["projection_key"]})

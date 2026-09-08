@@ -171,11 +171,12 @@ class CorrectionService:
 
     def _feature_scope(self, feature_id: str, tranche_id: str) -> set[str]:
         rows = self.ledger.connection.execute(
-            "SELECT allowed_files_json,new_test_files_json FROM tickets WHERE feature_id=? AND tranche_id=?", (feature_id, tranche_id)
+            "SELECT allowed_files_json,create_files_json,new_test_files_json FROM tickets WHERE feature_id=? AND tranche_id=?", (feature_id, tranche_id)
         ).fetchall()
         scope: set[str] = set()
         for row in rows:
             scope.update(json.loads(row["allowed_files_json"]))
+            scope.update(json.loads(row["create_files_json"]))
             scope.update(json.loads(row["new_test_files_json"]))
         if not scope:
             raise ValueError("authoritative parent scope is unavailable")
@@ -276,7 +277,7 @@ class CorrectionService:
                 if conn.execute("SELECT 1 FROM tickets WHERE id=?", (ticket_id,)).fetchone():
                     raise RuntimeError("correction ticket identity collision")
                 microticket = replace(spec, dependencies=tuple(sibling_map[d] for d in spec.dependencies)).ticket(ticket_id); contract = microticket.contract()
-                conn.execute("INSERT INTO tickets(id,feature_id,tranche_id,title,objective,criterion_ids_json,primary_symbol,allowed_files_json,new_test_files_json,forbidden_changes_json,patch_budget_json,verification_json,risk,review_required,max_attempts,dependencies_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (ticket_id, plan.feature_id, plan.tranche_id, ticket_id, contract["objective"], _canonical(contract["criterion_ids"]), contract["primary_symbol"], _canonical(contract["allowed_files"]), _canonical(contract.get("new_test_files", [])), _canonical(contract["forbidden_changes"]), _canonical(contract["patch_budget"]), _canonical(contract["verification"]), contract["risk"], int(microticket.review_required), microticket.max_attempts, _canonical(contract["dependencies"]), "draft", now, now))
+                conn.execute("INSERT INTO tickets(id,feature_id,tranche_id,title,objective,criterion_ids_json,primary_symbol,allowed_files_json,create_files_json,new_test_files_json,forbidden_changes_json,patch_budget_json,verification_json,risk,review_required,max_attempts,dependencies_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (ticket_id, plan.feature_id, plan.tranche_id, ticket_id, contract["objective"], _canonical(contract["criterion_ids"]), contract["primary_symbol"], _canonical(contract["allowed_files"]), _canonical(contract.get("create_files", [])), _canonical(contract.get("new_test_files", [])), _canonical(contract["forbidden_changes"]), _canonical(contract["patch_budget"]), _canonical(contract["verification"]), contract["risk"], int(microticket.review_required), microticket.max_attempts, _canonical(contract["dependencies"]), "draft", now, now))
                 conn.execute("INSERT INTO supplemental_correction_tickets(correction_plan_id,ticket_id,ordinal,admission_head) VALUES (?,?,?,NULL)", (correction_plan_id, ticket_id, index))
                 for predecessor in plan.predecessors:
                     conn.execute("INSERT INTO correction_ticket_predecessors(correction_ticket_id,ticket_id,accepted_commit_sha) VALUES (?,?,?)", (ticket_id, predecessor.ticket_id, predecessor.accepted_commit_sha))

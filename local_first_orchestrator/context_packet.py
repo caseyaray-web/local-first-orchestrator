@@ -76,7 +76,7 @@ class ContextPacketBuilder:
             selected[symbol.path] += ("\n" if selected[symbol.path] else "") + symbol.text
         packet = self.build(
             ticket, selected,
-            repository_rules=(repository_rules + "\nNew test files are absent from the base and must be created exactly at: " + ", ".join(ticket.new_test_files)) if ticket.new_test_files else repository_rules,
+            repository_rules=(repository_rules + "\nCreate files are absent from the base and may be created exactly at: " + ", ".join(ticket.create_files) + "\nNew test files are absent from the base and must be created exactly at: " + ", ".join(ticket.new_test_files)) if ticket.create_files or ticket.new_test_files else repository_rules,
             failure_evidence=failure_evidence,
         )
         packet.manifest["scope_verification"] = "verified"

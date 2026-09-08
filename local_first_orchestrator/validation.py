@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .ticket import MicroTicket
+from .ticket import MicroTicket, declared_ticket_paths
 from .source_languages import is_supported_source, is_test_path, normalized_repository_path
 from .symbols import contract_target_scope, enforce_symbol_scope
 
@@ -147,19 +147,22 @@ class DeterministicValidator:
                 names.append(candidate)
         errors = ["no_changes: model produced no effective diff"] if not names else []
         allowed = set(ticket.allowed_files)
-        declared_new = set(ticket.new_test_files)
-        errors += [f"changed path outside allowlist: {p}" for p in names if p not in allowed and p not in declared_new]
+        declared_create = set(ticket.create_files)
+        declared_new = declared_create | set(ticket.new_test_files)
+        errors += [f"changed path outside allowlist: {p}" for p in names if p not in set(declared_ticket_paths(ticket))]
         for path in names:
             if path not in declared_new:
                 continue
-            if not is_supported_source(path) or not is_test_path(path):
+            if path in declared_create:
+                if not is_supported_source(path) or is_test_path(path): errors.append(f"declared create path is not a supported non-test artifact: {path}")
+            elif not is_supported_source(path) or not is_test_path(path):
                 errors.append(f"declared new path is not a supported test artifact: {path}")
             candidate = (worktree / path).resolve()
             raw_candidate = worktree / path
             if worktree not in candidate.parents or raw_candidate.is_symlink() or not candidate.is_file():
-                errors.append(f"declared new test file is unsafe or missing: {path}")
+                errors.append(f"declared new file is unsafe or missing: {path}")
             if self._git(worktree, "ls-tree", "-r", "--name-only", base_sha, "--", path).strip() == path:
-                errors.append(f"declared new test file existed at base: {path}")
+                errors.append(f"declared new file existed at base: {path}")
         errors += [f"forbidden file type: {p}" for p in names if p.endswith(self.denied_suffixes)]
         errors += [error for path in names if (error := self._secret_scan_error(worktree, path))]
         if contract_target_scope(ticket) == "file":
