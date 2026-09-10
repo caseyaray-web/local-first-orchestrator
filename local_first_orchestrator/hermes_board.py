@@ -90,3 +90,7 @@ class HermesBoardAdapter:
         if not self.allow_writes:
             raise PermissionError("real board writes require --allow-board-writes")
         self._run("comment", ticket_id, comment, "--author", "local-first-orchestrator")
+
+    def deliver_comment(self, ticket_id: str, comment: str, *, idempotency_key: str) -> None:
+        """Comment-worker boundary; the persisted marker supplies reconciliation identity."""
+        self.add_comment(ticket_id, comment)

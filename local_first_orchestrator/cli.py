@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from .hermes_board import HermesBoardAdapter
 from .ledger import Ledger
 from .local_qwen import LOCAL_QWEN_MODEL, LOCAL_QWEN_PROVIDER, LocalQwenAdapter
 from .operator_config import ModelRegistration, OperatorConfig, default_execution_roots, load_operator_config, save_operator_config
+from .scheduler import ProcessNextScheduler
 from .ticket import MicroTicket, PatchBudget, VerificationProfile
 
 
@@ -209,6 +211,10 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     status=commands.add_parser("status"); status.add_argument("--active",action="store_true")
     imported=commands.add_parser("import"); imported.add_argument("--task-id",required=True)
     run=commands.add_parser("run-once"); run.add_argument("--task-id",required=True); run.add_argument("--dry-run",action="store_true",default=True); run.add_argument("--execute",action="store_true"); run.add_argument("--allow-board-writes",action="store_true")
+    process_next=commands.add_parser("process-next", help="run at most one durable Local First control stage; dry-run by default")
+    process_next.add_argument("--execute", action="store_true")
+    process_next.add_argument("--allow-board-writes", action="store_true")
+    process_next.add_argument("--worker-id", default="local-first-process-next")
     implementation=commands.add_parser("implementation-only", aliases=("implement-only",), help="run exactly implementation and deterministic validation; never review or accept")
     implementation.add_argument("--task-id",required=True)
     revalidate=commands.add_parser("revalidate-implementation", help="revalidate an existing implementation; never retry implementation or review")
@@ -287,6 +293,16 @@ def run_command(args: argparse.Namespace) -> int:
             if not args.execute: print(json.dumps(ctl.dry_run(args.task_id),sort_keys=True))
             elif not args.allow_board_writes: raise PermissionError("--execute requires --allow-board-writes; no write-enabled execution without both")
             else: print(json.dumps({"executed":ctl.execute(args.task_id,repository=repository,allow_board_writes=True)}))
+        elif args.command=="process-next":
+            if args.ad_hoc_runtime: raise ValueError("process-next requires registered operator runtime")
+            if not args.execute:
+                print(json.dumps({"status":"dry_run","would_execute":False,"would_write_board":False},sort_keys=True))
+            else:
+                if not args.allow_board_writes: raise PermissionError("process-next --execute requires --allow-board-writes")
+                if not args.hermes_executable or not args.board: raise ValueError("process-next execution requires --hermes-executable and --board")
+                ctl, _ = _registered_controller(ledger,args,allow_board_writes=True)
+                result=ProcessNextScheduler(ledger,ctl.board,worker_id=args.worker_id,lease_seconds=ctl.config.lease_seconds).process_next()
+                print(json.dumps(asdict(result),sort_keys=True))
         elif args.command in {"implementation-only", "implement-only"}:
             if args.ad_hoc_runtime: raise ValueError("implementation-only execution requires registered operator runtime")
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)

@@ -79,6 +79,27 @@ CREATE TABLE IF NOT EXISTS controller_state (
     paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
     updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS scheduler_tick_lease (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    lease_owner TEXT NOT NULL,
+    lease_token TEXT NOT NULL,
+    lease_expires_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS scheduler_stage_claims (
+    claim_id TEXT PRIMARY KEY,
+    ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('claimed', 'completed', 'failed')),
+    lease_owner TEXT,
+    lease_expires_at INTEGER,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+    result_json TEXT,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(ticket_id, stage)
+);
 CREATE TABLE IF NOT EXISTS features (
     id TEXT PRIMARY KEY,
     external_id TEXT UNIQUE,
@@ -567,6 +588,24 @@ class Ledger:
 
     def migrate(self) -> None:
         self.connection.executescript(_SCHEMA)
+        tick_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(scheduler_tick_lease)")}
+        if "lease_token" not in tick_columns:
+            with self._transaction() as conn:
+                conn.execute("ALTER TABLE scheduler_tick_lease ADD COLUMN lease_token TEXT")
+                # Pre-fencing leases cannot prove ownership after restart. Dropping
+                # only this ephemeral row is safer than letting it block or release
+                # a token-fenced tick; durable stage/outbox claims remain intact.
+                conn.execute("DELETE FROM scheduler_tick_lease")
+        self.connection.executescript("""
+            CREATE TRIGGER IF NOT EXISTS scheduler_tick_lease_token_insert
+            BEFORE INSERT ON scheduler_tick_lease
+            WHEN NEW.lease_token IS NULL OR typeof(NEW.lease_token) != 'text' OR length(NEW.lease_token) = 0
+            BEGIN SELECT RAISE(ABORT, 'scheduler tick lease token is required'); END;
+            CREATE TRIGGER IF NOT EXISTS scheduler_tick_lease_token_update
+            BEFORE UPDATE ON scheduler_tick_lease
+            WHEN NEW.lease_token IS NULL OR typeof(NEW.lease_token) != 'text' OR length(NEW.lease_token) = 0
+            BEGIN SELECT RAISE(ABORT, 'scheduler tick lease token is required'); END;
+        """)
         binding_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(runtime_bindings)")}
         if "canonical_sha" not in binding_columns:
             self.connection.execute("ALTER TABLE runtime_bindings ADD COLUMN canonical_sha TEXT")
@@ -1340,6 +1379,115 @@ class Ledger:
         self.transition(ticket_id, CanonicalState.READY_LOCAL, actor_id="readiness", payload={"reason":"dependencies_satisfied"})
         return TicketReadinessResult("ready")
 
+    def claim_scheduler_tick(self, owner: str, lease_token: str, *, lease_seconds: int, now: int | None = None) -> str:
+        """Serialize bounded ticks and recover automatically after process loss."""
+        if not owner or not lease_token or lease_seconds < 1:
+            raise ValueError("scheduler tick requires an owner, token, and positive lease")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or paused["paused"]:
+                return "paused"
+            current = conn.execute("SELECT * FROM scheduler_tick_lease WHERE id=1").fetchone()
+            if current is not None and int(current["lease_expires_at"]) > now:
+                return "busy"
+            conn.execute(
+                "INSERT INTO scheduler_tick_lease(id,lease_owner,lease_token,lease_expires_at,updated_at) VALUES (1,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET lease_owner=excluded.lease_owner,lease_token=excluded.lease_token,lease_expires_at=excluded.lease_expires_at,updated_at=excluded.updated_at",
+                (owner, lease_token, now + lease_seconds, now),
+            )
+            self._append_event(conn, entity_type="controller", entity_id="scheduler", event_type="scheduler_tick_claimed", actor_id=owner, payload={"lease_expires_at": now + lease_seconds, "recovered": current is not None and int(current["lease_expires_at"]) <= now})
+            return "claimed"
+
+    def release_scheduler_tick(self, owner: str, lease_token: str) -> bool:
+        with self._transaction() as conn:
+            changed = conn.execute("DELETE FROM scheduler_tick_lease WHERE id=1 AND lease_owner=? AND lease_token=?", (owner, lease_token))
+            if changed.rowcount:
+                self._append_event(conn, entity_type="controller", entity_id="scheduler", event_type="scheduler_tick_released", actor_id=owner)
+            return changed.rowcount == 1
+
+    def scheduler_claim(self, claim_id: str) -> dict[str, Any]:
+        row = self.connection.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+        if row is None:
+            raise KeyError(claim_id)
+        return dict(row)
+
+    def claim_next_scheduler_readiness(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+        """Claim one dependency-ready admission stage, including expired replay."""
+        if not owner or lease_seconds < 1:
+            raise ValueError("scheduler claim requires an owner and positive lease")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or paused["paused"]:
+                return None
+            replay = conn.execute(
+                "SELECT * FROM scheduler_stage_claims WHERE stage='dependency_readiness' AND status='claimed' "
+                "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+            ).fetchone()
+            if replay is not None:
+                changed = conn.execute(
+                    "UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? "
+                    "WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?",
+                    (owner, now + lease_seconds, now, replay["claim_id"], now),
+                )
+                if changed.rowcount != 1:
+                    return None
+                self._append_event(conn, entity_type="ticket", entity_id=str(replay["ticket_id"]), event_type="scheduler_stage_reclaimed", actor_id=owner, payload={"claim_id": replay["claim_id"], "stage": replay["stage"], "lease_expires_at": now + lease_seconds})
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
+            candidate = conn.execute("""
+                SELECT t.id FROM tickets t
+                JOIN runtime_bindings rb ON rb.ticket_id=t.id
+                WHERE t.state=?
+                  AND json_valid(t.dependencies_json)=1
+                  AND json_type(t.dependencies_json)='array'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM json_each(CASE WHEN json_valid(t.dependencies_json) THEN t.dependencies_json ELSE '[]' END) requested
+                    LEFT JOIN tickets dependency ON dependency.id=requested.value
+                    LEFT JOIN accepted_evidence evidence ON evidence.ticket_id=dependency.id
+                    WHERE dependency.id IS NULL
+                       OR dependency.state NOT IN (?, ?)
+                       OR (dependency.state=? AND evidence.ticket_id IS NULL)
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM scheduler_stage_claims claim
+                    WHERE claim.ticket_id=t.id AND claim.stage='dependency_readiness'
+                  )
+                ORDER BY t.created_at,t.id LIMIT 1
+            """, (CanonicalState.DRAFT.value, CanonicalState.ACCEPTED.value, CanonicalState.DONE.value, CanonicalState.DONE.value)).fetchone()
+            if candidate is None:
+                return None
+            ticket_id = str(candidate["id"])
+            claim_id = hashlib.sha256(f"dependency_readiness:{ticket_id}".encode()).hexdigest()[:32]
+            conn.execute(
+                "INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,created_at,updated_at) "
+                "VALUES (?,?,?,'claimed',?,?,1,?,?)",
+                (claim_id, ticket_id, "dependency_readiness", owner, now + lease_seconds, now, now),
+            )
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_claimed", actor_id=owner, payload={"claim_id": claim_id, "stage": "dependency_readiness", "lease_expires_at": now + lease_seconds})
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
+    def complete_scheduler_claim(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        now = self._now() if now is None else now
+        encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if row is None:
+                raise KeyError(claim_id)
+            if row["status"] == "completed":
+                if row["result_json"] != encoded:
+                    raise RuntimeError("scheduler claim result conflicts")
+                return dict(row)
+            changed = conn.execute(
+                "UPDATE scheduler_stage_claims SET status='completed',lease_owner=NULL,lease_expires_at=NULL,result_json=?,updated_at=? "
+                "WHERE claim_id=? AND status='claimed' AND lease_owner=? AND lease_expires_at>?",
+                (encoded, now, claim_id, owner, now),
+            )
+            if changed.rowcount != 1:
+                raise PermissionError("scheduler claim lease is not owned")
+            self._append_event(conn, entity_type="ticket", entity_id=str(row["ticket_id"]), event_type="scheduler_stage_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": row["stage"], "result": result})
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
     def record_runtime_stage(self, ticket_id: str, stage: str, detail: str, *, attempt_number: int | None = None, artifact_path: str | None = None, artifact_sha256: str | None = None, base_sha: str | None = None) -> bool:
         with self._transaction() as conn:
             try: conn.execute("INSERT INTO runtime_stages(ticket_id, stage, detail, attempt_number, artifact_path, artifact_sha256, base_sha, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (ticket_id, stage, detail, attempt_number, artifact_path, artifact_sha256, base_sha, self._now()))
@@ -2048,7 +2196,14 @@ class Ledger:
     def status(self) -> dict[str, Any]:
         paused = self.connection.execute("SELECT paused FROM controller_state WHERE id = 1").fetchone()
         states = self.connection.execute("SELECT state, COUNT(*) AS count FROM tickets GROUP BY state ORDER BY state").fetchall()
-        return {"paused": bool(paused["paused"]) if paused else False, "tickets": {row["state"]: row["count"] for row in states}}
+        tick = self.connection.execute("SELECT lease_owner,lease_expires_at,updated_at FROM scheduler_tick_lease WHERE id=1").fetchone()
+        claims = self.connection.execute("SELECT claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,updated_at FROM scheduler_stage_claims WHERE status='claimed' ORDER BY created_at,claim_id").fetchall()
+        return {
+            "paused": bool(paused["paused"]) if paused else False,
+            "tickets": {row["state"]: row["count"] for row in states},
+            "scheduler_tick": dict(tick) if tick else None,
+            "scheduler_claims": [dict(row) for row in claims],
+        }
 
     def operator_status(self, *, active_limit: int = 25) -> dict[str, Any]:
         """Return a bounded, non-evidence dashboard read model.
