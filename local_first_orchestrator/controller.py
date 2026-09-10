@@ -412,6 +412,121 @@ class LocalFirstController:
             "replayed": False,
         }
 
+    def execute_deterministic_validation_only(self, ticket_id: str, *, repository: Path) -> dict[str, object]:
+        """Validate one scheduler-claimed implementation candidate, without review or repair."""
+        binding = self.ledger.runtime_binding(ticket_id)
+        raw_repository = Path(repository).resolve(strict=True)
+        repo, worktree_root, artifact_root = self.config.validate_execution_roots()
+        if repo != raw_repository or str(repo) != binding["repository_path"]:
+            raise ValueError("repository mismatch with imported binding")
+        ticket_row = self.ledger.get_ticket(ticket_id)
+        if ticket_row["state"] not in {CanonicalState.VERIFYING.value, CanonicalState.LOCAL_REVIEW.value, CanonicalState.NEEDS_TRIAGE.value}:
+            raise RuntimeError("deterministic validation requires verifying state")
+        claim_row = self.ledger.connection.execute(
+            "SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage LIKE 'validation:%' AND status='claimed' ORDER BY created_at DESC LIMIT 1",
+            (ticket_id,),
+        ).fetchone()
+        if claim_row is None or not claim_row["candidate_identity_json"]:
+            raise RuntimeError("validation_reconciliation_required: identity-bound scheduler claim is missing")
+        identity = json.loads(str(claim_row["candidate_identity_json"]))
+        attempt_number = int(identity["attempt_number"])
+        implementation = self.ledger.model_stage(ticket_id, attempt_number, "implementation")
+        invocation = self.ledger.invocation_for_stage(ticket_id, attempt_number, "implementation")
+        attempt = self.ledger.connection.execute(
+            "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)
+        ).fetchone()
+        if implementation is None or invocation is None or attempt is None or invocation["status"] != "completed":
+            raise RuntimeError("validation_reconciliation_required: implementation provenance is incomplete")
+        expected = {
+            "ticket_id": ticket_id,
+            "attempt_number": attempt_number,
+            "implementation_artifact": str(implementation["response_artifact"]),
+            "implementation_artifact_sha256": hashlib.sha256(Path(str(implementation["response_artifact"])).read_bytes()).hexdigest(),
+            "worktree_path": str(implementation["worktree_path"]),
+            "base_sha": str(implementation["base_sha"]),
+            "implementation_diff_hash": str(implementation["diff_hash"]),
+            "validation_policy_hash": self.ledger._validation_policy_hash(ticket_row),
+        }
+        if identity != expected or str(invocation["model_artifact"] or "") != expected["implementation_artifact"]:
+            raise RuntimeError("validation_reconciliation_required: durable candidate identity drift")
+        path = Path(expected["worktree_path"]).resolve()
+        artifact = Path(expected["implementation_artifact"])
+        if not path.is_dir() or not artifact.is_file() or str(attempt["worktree_path"] or "") != expected["worktree_path"]:
+            raise RuntimeError("validation_reconciliation_required: implementation evidence is incomplete")
+        worktrees = GitWorktreeAdapter(repo, worktree_root)
+        try:
+            live_root = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            live_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            live_diff_hash = worktrees.diff_hash(path)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError("validation_reconciliation_required: live worktree inspection failed") from exc
+        if live_root != str(path) or live_head != expected["base_sha"] or live_diff_hash != expected["implementation_diff_hash"]:
+            raise RuntimeError("validation_reconciliation_required: live candidate identity drift")
+        existing = self.ledger.runtime_stage(ticket_id, f"validation-{attempt_number}")
+        if existing is not None:
+            try:
+                record = json.loads(str(existing["detail"]))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("validation_reconciliation_required: persisted validation detail is malformed") from exc
+            existing_artifact = Path(str(existing["artifact_path"] or ""))
+            if (
+                record.get("candidate_identity") != identity
+                or not existing_artifact.is_file()
+                or hashlib.sha256(existing_artifact.read_bytes()).hexdigest() != str(existing["artifact_sha256"] or "")
+            ):
+                raise RuntimeError("validation_reconciliation_required: persisted validation evidence is incomplete")
+        else:
+            validation = DeterministicValidator(artifact_root=artifact_root / ticket_id / str(attempt_number)).validate(
+                path, ticket_from_ledger(ticket_row), base_sha=expected["base_sha"]
+            )
+            validation_path = Path(validation.full_evidence_path).resolve()
+            # Commands are an external effect.  Rebuild the complete candidate
+            # identity after they return before accepting their evidence.
+            post_ticket = self.ledger.get_ticket(ticket_id)
+            post_identity = {
+                **expected,
+                "validation_policy_hash": self.ledger._validation_policy_hash(post_ticket),
+            }
+            try:
+                post_root = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+                post_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+                post_diff_hash = worktrees.diff_hash(path)
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RuntimeError("validation_reconciliation_required: post-validation worktree inspection failed") from exc
+            if (
+                post_identity != identity
+                or not artifact.is_file()
+                or hashlib.sha256(artifact.read_bytes()).hexdigest() != expected["implementation_artifact_sha256"]
+                or post_root != str(path)
+                or post_head != expected["base_sha"]
+                or post_diff_hash != expected["implementation_diff_hash"]
+            ):
+                raise RuntimeError("validation_reconciliation_required: live candidate changed during validation")
+            validation_sha256 = hashlib.sha256(validation_path.read_bytes()).hexdigest()
+            record = {
+                "candidate_identity": identity,
+                "passed": validation.passed,
+                "compact_evidence": validation.compact_evidence,
+                "validation_artifact": str(validation_path),
+                "validation_artifact_sha256": validation_sha256,
+            }
+            if not self.ledger.record_runtime_stage(ticket_id, f"validation-{attempt_number}", json.dumps(record, sort_keys=True), attempt_number=attempt_number, artifact_path=str(validation_path), artifact_sha256=validation_sha256, base_sha=expected["base_sha"]):
+                raise RuntimeError("validation_reconciliation_required: validation artifact persistence conflicted")
+            self.ledger.record_runtime_stage(ticket_id, "validation_completed", json.dumps(record, sort_keys=True), attempt_number=attempt_number, artifact_path=str(validation_path), artifact_sha256=validation_sha256, base_sha=expected["base_sha"])
+        passed = bool(record.get("passed"))
+        target = CanonicalState.LOCAL_REVIEW if passed else CanonicalState.NEEDS_TRIAGE
+        if self.ledger.get_ticket(ticket_id)["state"] == CanonicalState.VERIFYING.value:
+            self.ledger.transition(ticket_id, target, payload={"validation": str(record["compact_evidence"]), "attempt_number": attempt_number})
+        return {
+            "ticket_id": ticket_id,
+            "candidate_identity": identity,
+            "validation_artifact": str(record["validation_artifact"]),
+            "validation_artifact_sha256": str(record["validation_artifact_sha256"]),
+            "passed": passed,
+            "compact_evidence": str(record["compact_evidence"]),
+            "replayed": existing is not None,
+        }
+
     def _implementation_stage(self, ticket_id: str, *, repository: Path, owner: str, allow_validation_repair: bool, failure_evidence: str = "", explicit_operator: bool = False) -> dict[str, object] | None:
         """Run implementation through validation and candidate freezing only.
 

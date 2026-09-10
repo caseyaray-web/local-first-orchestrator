@@ -73,6 +73,22 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     if comment is not None:
         return ProcessNextPreview(next_stage="evidence_comment", ticket_id=str(comment["ticket_id"]), would_write_board=True)
 
+    validation_replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage LIKE 'validation:%' AND status='claimed' "
+        "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+    ).fetchone()
+    if validation_replay is not None:
+        return ProcessNextPreview(next_stage="validation", ticket_id=str(validation_replay["ticket_id"]), would_execute=True)
+    validation = ledger.connection.execute(
+        "SELECT t.id FROM tickets t JOIN model_stage_artifacts m ON m.ticket_id=t.id AND m.stage='implementation' "
+        "AND m.attempt_number=(SELECT MAX(latest.attempt_number) FROM model_stage_artifacts latest WHERE latest.ticket_id=t.id AND latest.stage='implementation') "
+        "WHERE t.state='implementing' AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('validation:' || m.attempt_number)) "
+        "AND NOT EXISTS (SELECT 1 FROM runtime_stages r WHERE r.ticket_id=t.id AND r.stage=('validation-' || m.attempt_number)) "
+        "ORDER BY t.created_at,t.id LIMIT 1"
+    ).fetchone()
+    if validation is not None:
+        return ProcessNextPreview(next_stage="validation", ticket_id=str(validation["id"]), would_execute=True)
+
     implementation_replay = ledger.connection.execute(
         "SELECT ticket_id FROM scheduler_stage_claims WHERE stage='implementation' AND status='claimed' "
         "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
@@ -146,6 +162,7 @@ class ProcessNextScheduler:
         lease_seconds: int = 60,
         clock: Callable[[], int] | None = None,
         implementation_runner: Callable[[str], dict[str, Any]] | None = None,
+        validation_runner: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         if not worker_id or lease_seconds < 1:
             raise ValueError("process-next requires a worker id and positive lease")
@@ -160,6 +177,7 @@ class ProcessNextScheduler:
         self.lease_seconds = lease_seconds
         self.clock = clock or Ledger._now
         self.implementation_runner = implementation_runner
+        self.validation_runner = validation_runner
 
     def process_next(self) -> ProcessNextResult:
         now = int(self.clock())
@@ -197,6 +215,42 @@ class ProcessNextScheduler:
                 "evidence_comment",
                 str(row["ticket_id"]) if row else None,
             )
+
+        if self.validation_runner is not None:
+            validation_claim = self.ledger.claim_next_scheduler_validation(
+                execution_owner, lease_seconds=self.lease_seconds, now=now
+            )
+            if validation_claim is not None:
+                claim_id = str(validation_claim["claim_id"])
+                ticket_id = str(validation_claim["ticket_id"])
+                current = self.ledger.scheduler_claim(claim_id)
+                if current.get("side_effect_completed_at") is not None and current.get("result_json"):
+                    validation_result = json.loads(str(current["result_json"]))
+                    self.ledger.complete_scheduler_validation_effect(
+                        claim_id, execution_owner, validation_result, now=now
+                    )
+                else:
+                    started = current.get("side_effect_started_at") is not None
+                    if started:
+                        identity: dict[str, Any] = {}
+                        try:
+                            identity = json.loads(str(current.get("candidate_identity_json") or ""))
+                            evidence = self.ledger.runtime_stage(ticket_id, f"validation-{int(identity['attempt_number'])}")
+                            detail = json.loads(str(evidence["detail"])) if evidence else {}
+                        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                            detail = {}
+                        if detail.get("candidate_identity") != identity:
+                            raise RuntimeError("validation_reconciliation_required: started validation outcome is unknown")
+                    else:
+                        self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+                    validation_result = self.validation_runner(ticket_id)
+                    self.ledger.complete_scheduler_validation_effect(
+                        claim_id, execution_owner, validation_result, now=now
+                    )
+                self.ledger.complete_scheduler_claim(
+                    claim_id, execution_owner, validation_result, now=now
+                )
+                return ProcessNextResult("completed", "validation", ticket_id, claim_id)
 
         if self.implementation_runner is not None:
             implementation_claim = self.ledger.claim_next_scheduler_implementation(

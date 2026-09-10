@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import unittest
+from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -32,6 +33,8 @@ class Board:
     writes_enabled = True
     timeout_seconds = 1
     def set_state(self, ticket_id: str, state: object, *, idempotency_key: str) -> None: pass
+    def find_comment_marker(self, ticket_id: str, marker: str) -> str: return "not_found"
+    def deliver_comment(self, ticket_id: str, comment: str, *, idempotency_key: str) -> None: pass
 
 
 class LifecycleModel:
@@ -134,6 +137,184 @@ class InvocationLifecycleTests(unittest.TestCase):
         row = self.ledger.get_ticket(ticket)
         self.assertIsNone(row["lease_owner"])
         self.assertIsNone(row["lease_expires_at"])
+
+    def test_scheduler_validation_stage_persists_evidence_without_review_or_candidate_freeze(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        implementation = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="scheduler-implementation",
+            lease_seconds=30,
+            clock=lambda: 100,
+            implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(ticket_id, repository=self.repo),
+        ).process_next()
+        self.assertEqual(implementation.stage, "implementation")
+
+        validation = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="scheduler-validation",
+            lease_seconds=30,
+            clock=lambda: 101,
+            validation_runner=lambda ticket_id: ctl.execute_deterministic_validation_only(ticket_id, repository=self.repo),
+        ).process_next()
+
+        self.assertEqual((validation.stage, validation.status, validation.ticket_id), ("validation", "completed", ticket))
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "local_review")
+        self.assertIsNotNone(self.ledger.runtime_stage(ticket, "validation-1"))
+        self.assertIsNotNone(self.ledger.runtime_stage(ticket, "validation_completed"))
+        self.assertEqual(self.ledger.review_invocations(ticket, 1), [])
+        self.assertIsNone(self.ledger.review_candidate(ticket))
+        claim = self.ledger.scheduler_claim(str(validation.claim_id))
+        self.assertEqual(claim["status"], "completed")
+        self.assertIsNotNone(claim["side_effect_started_at"])
+        self.assertIsNotNone(claim["side_effect_completed_at"])
+        self.assertIsNotNone(claim["finalized_at"])
+        row = self.ledger.get_ticket(ticket)
+        self.assertIsNone(row["lease_owner"])
+        self.assertIsNone(row["lease_expires_at"])
+
+    def test_scheduler_validation_rejects_post_validation_worktree_drift(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler-implementation", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(ticket_id, repository=self.repo),
+        ).process_next()
+        claim = self.ledger.claim_next_scheduler_validation("scheduler-validation", lease_seconds=30, now=101)
+        assert claim is not None
+        self.ledger.begin_scheduler_claim_effect(str(claim["claim_id"]), "scheduler-validation", now=101)
+        from local_first_orchestrator.validation import DeterministicValidator
+        original_validate = DeterministicValidator.validate
+
+        def mutate_after_validation(validator, worktree, ticket_value, *, base_sha):
+            result = original_validate(validator, worktree, ticket_value, base_sha=base_sha)
+            (worktree / "app.py").write_text("def value():\n    return 'drifted'\n", encoding="utf-8")
+            return result
+
+        with mock.patch.object(DeterministicValidator, "validate", new=mutate_after_validation):
+            with self.assertRaisesRegex(RuntimeError, "validation_reconciliation_required"):
+                ctl.execute_deterministic_validation_only(ticket, repository=self.repo)
+
+        self.assertIsNone(self.ledger.runtime_stage(ticket, "validation-1"))
+        self.assertIsNone(self.ledger.runtime_stage(ticket, "validation_completed"))
+        self.assertIsNone(self.ledger.scheduler_claim(str(claim["claim_id"]))["side_effect_completed_at"])
+
+    def test_scheduler_validation_rejects_changed_implementation_artifact(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler-implementation", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(ticket_id, repository=self.repo),
+        ).process_next()
+        claim = self.ledger.claim_next_scheduler_validation("scheduler-validation", lease_seconds=30, now=101)
+        assert claim is not None
+        self.ledger.begin_scheduler_claim_effect(str(claim["claim_id"]), "scheduler-validation", now=101)
+        implementation = self.ledger.model_stage(ticket, 1, "implementation")
+        assert implementation is not None
+        Path(str(implementation["response_artifact"])).write_text('{"tampered":true}', encoding="utf-8")
+
+        with self.assertRaisesRegex(RuntimeError, "validation_reconciliation_required"):
+            ctl.execute_deterministic_validation_only(ticket, repository=self.repo)
+
+        self.assertIsNone(self.ledger.runtime_stage(ticket, "validation-1"))
+
+    def test_scheduler_validation_claim_is_scoped_to_the_implementation_attempt(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler-implementation", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(ticket_id, repository=self.repo),
+        ).process_next()
+        first = self.ledger.claim_next_scheduler_validation("scheduler-validation-a", lease_seconds=30, now=101)
+        assert first is not None
+        implementation = self.ledger.model_stage(ticket, 1, "implementation")
+        assert implementation is not None
+        self.ledger.ensure_attempt(ticket, 2)
+        self.assertTrue(self.ledger.record_model_stage(
+            ticket, 2, "implementation", purpose="implementation", adapter="fixture",
+            request_hash="request-2", response_artifact=str(implementation["response_artifact"]),
+            worktree_path=str(implementation["worktree_path"]), base_sha=str(implementation["base_sha"]),
+            diff_hash=str(implementation["diff_hash"]),
+        ))
+        self.ledger.connection.execute("UPDATE tickets SET state='implementing' WHERE id=?", (ticket,))
+
+        second = self.ledger.claim_next_scheduler_validation("scheduler-validation-b", lease_seconds=30, now=102)
+
+        assert second is not None
+        self.assertNotEqual(second["claim_id"], first["claim_id"])
+        self.assertEqual(json.loads(second["candidate_identity_json"])["attempt_number"], 2)
+
+    def test_scheduler_validation_rejects_tampered_completed_effect_on_finalization_recovery(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler-implementation", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(ticket_id, repository=self.repo),
+        ).process_next()
+        claim = self.ledger.claim_next_scheduler_validation("crashed-worker", lease_seconds=1, now=101)
+        assert claim is not None
+        claim_id = str(claim["claim_id"])
+        self.ledger.begin_scheduler_claim_effect(claim_id, "crashed-worker", now=101)
+        result = ctl.execute_deterministic_validation_only(ticket, repository=self.repo)
+        self.ledger.complete_scheduler_validation_effect(claim_id, "crashed-worker", result, now=101)
+        Path(str(result["validation_artifact"])).write_text('{"tampered":true}', encoding="utf-8")
+
+        resumed = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler-recovery", lease_seconds=30, clock=lambda: 103,
+            validation_runner=lambda ticket_id: (_ for _ in ()).throw(AssertionError("completed effect must not invoke runner")),
+        )
+        with self.assertRaisesRegex(RuntimeError, "validation_reconciliation_required"):
+            for _ in range(4):
+                resumed.process_next()
+
+        self.assertEqual(self.ledger.scheduler_claim(claim_id)["status"], "claimed")
+
+    def test_scheduler_validation_rejects_tampered_persisted_evidence_on_recovery(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler-implementation", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(ticket_id, repository=self.repo),
+        ).process_next()
+        claim = self.ledger.claim_next_scheduler_validation("crashed-worker", lease_seconds=1, now=101)
+        assert claim is not None
+        claim_id = str(claim["claim_id"])
+        self.ledger.begin_scheduler_claim_effect(claim_id, "crashed-worker", now=101)
+        result = ctl.execute_deterministic_validation_only(ticket, repository=self.repo)
+        Path(str(result["validation_artifact"])).write_text('{"tampered":true}', encoding="utf-8")
+
+        resumed = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler-recovery", lease_seconds=30, clock=lambda: 103,
+            validation_runner=lambda ticket_id: ctl.execute_deterministic_validation_only(ticket_id, repository=self.repo),
+        )
+        with self.assertRaisesRegex(RuntimeError, "validation_reconciliation_required"):
+            for _ in range(4):
+                resumed.process_next()
+
+        self.assertIsNone(self.ledger.scheduler_claim(claim_id)["side_effect_completed_at"])
+
+    def test_scheduler_finalizes_completed_validation_claim_after_expiry_without_rerunning(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler-implementation", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(ticket_id, repository=self.repo),
+        ).process_next()
+        claim = self.ledger.claim_next_scheduler_validation("crashed-worker", lease_seconds=1, now=101)
+        assert claim is not None
+        claim_id = str(claim["claim_id"])
+        self.ledger.begin_scheduler_claim_effect(claim_id, "crashed-worker", now=101)
+        result = ctl.execute_deterministic_validation_only(ticket, repository=self.repo)
+        self.assertFalse(result["replayed"])
+        calls: list[str] = []
+
+        resumed = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler-recovery", lease_seconds=30, clock=lambda: 103,
+            validation_runner=lambda ticket_id: calls.append(ticket_id) or ctl.execute_deterministic_validation_only(ticket_id, repository=self.repo),
+        )
+        stages = [resumed.process_next() for _ in range(4)]
+
+        final = next(stage for stage in stages if stage.stage == "validation")
+        self.assertEqual((final.status, final.ticket_id), ("completed", ticket))
+        self.assertEqual(calls, [ticket])
+        self.assertEqual(self.ledger.scheduler_claim(claim_id)["status"], "completed")
+        self.assertIsNone(self.ledger.get_ticket(ticket)["lease_owner"])
+        self.assertIsNone(self.ledger.get_ticket(ticket)["lease_expires_at"])
 
     def test_scheduler_replays_persisted_implementation_after_crash_without_reinvocation(self) -> None:
         model = LifecycleModel(); crashing, ticket = self.controller(model, "implementation_completed")
