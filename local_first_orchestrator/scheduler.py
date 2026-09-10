@@ -186,6 +186,27 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     if git_candidate is not None:
         return ProcessNextPreview(next_stage="git_integration", ticket_id=str(git_candidate["id"]), would_execute=True)
 
+    completion_replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage LIKE 'completion:%' AND status='claimed' "
+        "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+    ).fetchone()
+    if completion_replay is not None:
+        return ProcessNextPreview(next_stage="completion", ticket_id=str(completion_replay["ticket_id"]), would_execute=True)
+    completion = ledger.connection.execute("""
+        SELECT t.id FROM tickets t
+        JOIN accepted_candidates ac ON ac.ticket_id=t.id
+        JOIN git_commit_evidence ge ON ge.ticket_id=t.id AND ge.attempt_number=ac.attempt_number
+        JOIN git_commit_intents gi ON gi.ticket_id=t.id AND gi.attempt_number=ac.attempt_number
+        WHERE t.state='accepted'
+          AND gi.status='completed'
+          AND gi.commit_sha=ge.commit_sha
+          AND NOT EXISTS (SELECT 1 FROM accepted_evidence ae WHERE ae.ticket_id=t.id)
+          AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('completion:' || ac.attempt_number))
+        ORDER BY t.created_at,t.id LIMIT 1
+    """).fetchone()
+    if completion is not None:
+        return ProcessNextPreview(next_stage="completion", ticket_id=str(completion["id"]), would_execute=True)
+
     implementation_replay = ledger.connection.execute(
         "SELECT ticket_id FROM scheduler_stage_claims WHERE (stage='implementation' OR stage LIKE 'implementation:%') AND status='claimed' "
         "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
@@ -502,6 +523,27 @@ class ProcessNextScheduler:
                     claim_id, execution_owner, git_result, now=now
                 )
                 return ProcessNextResult("completed", "git_integration", ticket_id, claim_id)
+
+        completion_claim = self.ledger.claim_next_scheduler_completion(
+            execution_owner, lease_seconds=self.lease_seconds, now=now
+        )
+        if completion_claim is not None:
+            claim_id = str(completion_claim["claim_id"])
+            ticket_id = str(completion_claim["ticket_id"])
+            current = self.ledger.scheduler_claim(claim_id)
+            if current.get("side_effect_completed_at") is not None and current.get("result_json"):
+                completion_result = json.loads(str(current["result_json"]))
+            else:
+                if current.get("side_effect_started_at") is None:
+                    self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+                current = self.ledger.apply_scheduler_completion_effect(
+                    claim_id, execution_owner, now=now
+                )
+                completion_result = json.loads(str(current["result_json"]))
+            self.ledger.complete_scheduler_claim(
+                claim_id, execution_owner, completion_result, now=now
+            )
+            return ProcessNextResult("completed", "completion", ticket_id, claim_id)
 
         if self.implementation_runner is not None:
             implementation_claim = self.ledger.claim_next_scheduler_implementation(

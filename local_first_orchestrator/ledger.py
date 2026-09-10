@@ -1823,6 +1823,270 @@ class Ledger:
         row = self.connection.execute("SELECT * FROM git_commit_evidence WHERE ticket_id=?", (ticket_id,)).fetchone()
         return dict(row) if row else None
 
+    def claim_next_scheduler_completion(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+        """Claim one accepted, durably committed candidate for local completion."""
+        if not owner or lease_seconds < 1:
+            raise ValueError("completion scheduler claim requires owner and positive lease")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
+                return None
+            replay = conn.execute(
+                "SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'completion:%' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
+                (now,),
+            ).fetchone()
+            if replay is not None:
+                ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (replay["ticket_id"],)).fetchone()
+                accepted = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (replay["ticket_id"],)).fetchone()
+                git_evidence = conn.execute("SELECT * FROM git_commit_evidence WHERE ticket_id=?", (replay["ticket_id"],)).fetchone()
+                if ticket is None or accepted is None or git_evidence is None:
+                    raise RuntimeError("completion_reconciliation_required: completion authority is missing")
+                expected_state = CanonicalState.DONE.value if replay["side_effect_completed_at"] is not None else CanonicalState.ACCEPTED.value
+                if ticket["state"] != expected_state:
+                    raise RuntimeError("completion_reconciliation_required: completion state does not match claim progress")
+                try:
+                    identity = json.loads(str(replay["candidate_identity_json"] or ""))
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("completion_reconciliation_required: claim identity malformed") from exc
+                expected = self._scheduler_completion_identity(accepted, git_evidence)
+                if identity != expected:
+                    raise RuntimeError("completion_reconciliation_required: claim identity drift")
+                changed = conn.execute(
+                    "UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?",
+                    (owner, now + lease_seconds, now, replay["claim_id"], now),
+                )
+                if changed.rowcount != 1:
+                    return None
+                conn.execute(
+                    "UPDATE tickets SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=?",
+                    (owner, now + lease_seconds, now, replay["ticket_id"]),
+                )
+                self._append_event(
+                    conn,
+                    entity_type="ticket",
+                    entity_id=str(replay["ticket_id"]),
+                    event_type="scheduler_stage_reclaimed",
+                    actor_id=owner,
+                    payload={"claim_id": replay["claim_id"], "stage": "completion", "lease_expires_at": now + lease_seconds},
+                )
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
+
+            row = conn.execute("""
+                SELECT t.id,ac.attempt_number
+                FROM tickets t
+                JOIN accepted_candidates ac ON ac.ticket_id=t.id
+                JOIN git_commit_evidence ge ON ge.ticket_id=t.id AND ge.attempt_number=ac.attempt_number
+                JOIN git_commit_intents gi ON gi.ticket_id=t.id AND gi.attempt_number=ac.attempt_number
+                WHERE t.state='accepted'
+                  AND gi.status='completed'
+                  AND gi.commit_sha=ge.commit_sha
+                  AND NOT EXISTS (SELECT 1 FROM accepted_evidence ae WHERE ae.ticket_id=t.id)
+                  AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('completion:' || ac.attempt_number))
+                ORDER BY t.created_at,t.id LIMIT 1
+            """).fetchone()
+            if row is None:
+                return None
+            accepted = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (row["id"],)).fetchone()
+            git_evidence = conn.execute("SELECT * FROM git_commit_evidence WHERE ticket_id=?", (row["id"],)).fetchone()
+            identity = self._scheduler_completion_identity(accepted, git_evidence)
+            encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+            stage = f"completion:{identity['attempt_number']}"
+            claim_id = hashlib.sha256((stage + ":" + encoded).encode()).hexdigest()[:32]
+            changed = conn.execute(
+                "UPDATE tickets SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=? AND state='accepted' AND (lease_expires_at IS NULL OR lease_expires_at<=?)",
+                (owner, now + lease_seconds, now, row["id"], now),
+            )
+            if changed.rowcount != 1:
+                return None
+            conn.execute(
+                "INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,created_at,updated_at) VALUES (?,?,?,'claimed',?,?,1,?,?,?)",
+                (claim_id, row["id"], stage, owner, now + lease_seconds, encoded, now, now),
+            )
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=str(row["id"]),
+                event_type="scheduler_stage_claimed",
+                actor_id=owner,
+                payload={"claim_id": claim_id, "stage": "completion", "candidate_identity": identity},
+            )
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
+    @staticmethod
+    def _scheduler_completion_identity(accepted: sqlite3.Row, git_evidence: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "ticket_id": str(accepted["ticket_id"]),
+            "attempt_number": int(accepted["attempt_number"]),
+            "accepted_evidence_hash": str(accepted["evidence_hash"]),
+            "candidate_fingerprint": str(accepted["candidate_fingerprint"]),
+            "base_sha": str(accepted["base_sha"]),
+            "worktree_path": str(accepted["worktree_path"]),
+            "commit_sha": str(git_evidence["commit_sha"]),
+            "branch": str(git_evidence["branch"]),
+            "tranche_id": None if git_evidence["tranche_id"] is None else str(git_evidence["tranche_id"]),
+            "integration_head_before": str(git_evidence["integration_head_before"]),
+            "integration_head_after": str(git_evidence["integration_head_after"]),
+        }
+
+    def apply_scheduler_completion_effect(self, claim_id: str, owner: str, *, now: int | None = None) -> dict[str, Any]:
+        """Atomically record local completion and enqueue Hermes projection intents."""
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if claim is None or not str(claim["stage"]).startswith("completion:"):
+                raise ValueError("scheduler claim is not completion")
+            if claim["side_effect_started_at"] is None:
+                raise RuntimeError("scheduler claim effect was not durably started")
+            if claim["lease_owner"] != owner or claim["lease_expires_at"] is None or int(claim["lease_expires_at"]) <= now:
+                raise PermissionError("scheduler claim lease is not owned")
+            if claim["side_effect_completed_at"] is not None:
+                return dict(claim)
+            try:
+                identity = json.loads(str(claim["candidate_identity_json"] or ""))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("completion_reconciliation_required: claim identity malformed") from exc
+            ticket_id = str(claim["ticket_id"])
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            accepted = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket_id,)).fetchone()
+            git_evidence = conn.execute("SELECT * FROM git_commit_evidence WHERE ticket_id=?", (ticket_id,)).fetchone()
+            git_intent = conn.execute("SELECT * FROM git_commit_intents WHERE ticket_id=?", (ticket_id,)).fetchone()
+            attempt = None if accepted is None else conn.execute(
+                "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?",
+                (ticket_id, accepted["attempt_number"]),
+            ).fetchone()
+            if ticket is None or accepted is None or git_evidence is None or git_intent is None or attempt is None:
+                raise RuntimeError("completion_reconciliation_required: completion evidence is incomplete")
+            if ticket["state"] != CanonicalState.ACCEPTED.value:
+                raise RuntimeError("completion_reconciliation_required: ticket is not accepted")
+            expected = self._scheduler_completion_identity(accepted, git_evidence)
+            if identity != expected:
+                raise RuntimeError("completion_reconciliation_required: completion identity drift")
+            if (
+                git_intent["status"] != "completed"
+                or str(git_intent["commit_sha"] or "") != str(git_evidence["commit_sha"])
+                or str(attempt["accepted_commit_sha"] or "") != str(git_evidence["commit_sha"])
+                or str(git_evidence["accepted_evidence_hash"]) != str(accepted["evidence_hash"])
+                or str(git_evidence["candidate_fingerprint"]) != str(accepted["candidate_fingerprint"])
+                or str(git_evidence["base_sha"]) != str(accepted["base_sha"])
+                or str(git_evidence["worktree_path"]) != str(accepted["worktree_path"])
+                or str(git_evidence["integration_head_after"]) != str(git_evidence["commit_sha"])
+            ):
+                raise RuntimeError("completion_reconciliation_required: Git/acceptance evidence drift")
+            ticket_tranche = None if ticket["tranche_id"] is None else str(ticket["tranche_id"])
+            evidence_tranche = None if git_evidence["tranche_id"] is None else str(git_evidence["tranche_id"])
+            if ticket_tranche != evidence_tranche:
+                raise RuntimeError("completion_reconciliation_required: tranche identity drift")
+
+            diff_summary = json.dumps(
+                {
+                    "candidate_fingerprint": str(accepted["candidate_fingerprint"]),
+                    "base_sha": str(accepted["base_sha"]),
+                    "worktree_path": str(accepted["worktree_path"]),
+                    "branch": str(git_evidence["branch"]),
+                    "commit_message": str(git_evidence["commit_message"]),
+                    "accepted_evidence_hash": str(accepted["evidence_hash"]),
+                    "integration_head_before": str(git_evidence["integration_head_before"]),
+                    "integration_head_after": str(git_evidence["integration_head_after"]),
+                    "tranche_id": evidence_tranche,
+                },
+                sort_keys=True,
+            )
+            validation_summary = json.dumps(
+                {
+                    "accepted_evidence_hash": str(accepted["evidence_hash"]),
+                    "validation_artifact": str(accepted["validation_artifact"]),
+                    "validation_artifact_sha256": str(accepted["validation_artifact_sha256"]),
+                    "review_artifact": str(accepted["review_artifact"]),
+                    "review_artifact_sha256": str(accepted["review_artifact_sha256"]),
+                    "review_result_id": int(accepted["review_result_id"]),
+                },
+                sort_keys=True,
+            )
+            existing = conn.execute("SELECT * FROM accepted_evidence WHERE ticket_id=?", (ticket_id,)).fetchone()
+            expected_evidence = (
+                str(git_evidence["commit_sha"]),
+                diff_summary,
+                validation_summary,
+            )
+            if existing is not None:
+                actual = (str(existing["accepted_commit_sha"]), str(existing["diff_summary"]), str(existing["validation_summary"]))
+                if actual != expected_evidence:
+                    raise RuntimeError("completion_reconciliation_required: accepted evidence conflicts")
+                raise RuntimeError("completion_reconciliation_required: accepted evidence exists before atomic completion")
+            conn.execute(
+                "INSERT INTO accepted_evidence(ticket_id,accepted_commit_sha,diff_summary,validation_summary,created_at) VALUES (?,?,?,?,?)",
+                (ticket_id, *expected_evidence, now),
+            )
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=ticket_id,
+                event_type="accepted_evidence_recorded",
+                actor_id="completion",
+                payload={
+                    "attempt_number": int(accepted["attempt_number"]),
+                    "commit_sha": str(git_evidence["commit_sha"]),
+                    "candidate_fingerprint": str(accepted["candidate_fingerprint"]),
+                    "accepted_evidence_hash": str(accepted["evidence_hash"]),
+                    "integration_advanced": evidence_tranche is not None,
+                },
+            )
+            validate_transition(CanonicalState.ACCEPTED, CanonicalState.DONE)
+            changed = conn.execute(
+                "UPDATE tickets SET state=?,updated_at=? WHERE id=? AND state=?",
+                (CanonicalState.DONE.value, now, ticket_id, CanonicalState.ACCEPTED.value),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("ticket changed concurrently")
+            state_payload = {
+                "attempt_number": int(accepted["attempt_number"]),
+                "accepted_commit_sha": str(git_evidence["commit_sha"]),
+                "accepted_evidence_hash": str(accepted["evidence_hash"]),
+            }
+            event_id = self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=ticket_id,
+                event_type="state_transition",
+                actor_id="completion",
+                from_state=CanonicalState.ACCEPTED.value,
+                to_state=CanonicalState.DONE.value,
+                payload=state_payload,
+            )
+            bundle = self._enqueue_projection_bundle_in_transaction(
+                conn,
+                ticket_id=ticket_id,
+                event_id=event_id,
+                evidence=f"completed commit={git_evidence['commit_sha']} accepted_evidence={accepted['evidence_hash']}",
+                state_payload=state_payload,
+            )
+            result = {
+                "ticket_id": ticket_id,
+                "attempt_number": int(accepted["attempt_number"]),
+                "candidate_identity": identity,
+                "accepted_commit_sha": str(git_evidence["commit_sha"]),
+                "accepted_evidence_hash": str(accepted["evidence_hash"]),
+                "state_event_id": int(event_id),
+                "state_projection_idempotency_key": str(bundle["state"]["idempotency_key"]),
+                "evidence_comment_idempotency_key": str(bundle["comment"]["idempotency_key"]),
+            }
+            encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+            changed = conn.execute(
+                "UPDATE scheduler_stage_claims SET side_effect_completed_at=?,result_json=?,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_owner=? AND lease_expires_at>? AND side_effect_completed_at IS NULL",
+                (now, encoded, now, claim_id, owner, now),
+            )
+            if changed.rowcount != 1:
+                raise PermissionError("scheduler claim lease is not owned")
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=ticket_id,
+                event_type="scheduler_stage_effect_completed",
+                actor_id=owner,
+                payload={"claim_id": claim_id, "stage": "completion", "result": result},
+            )
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
 
     def claim_next_scheduler_git_integration(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
         """Claim one immutable accepted candidate for commit/integration only."""
@@ -2812,7 +3076,7 @@ class Ledger:
             if changed.rowcount != 1:
                 raise PermissionError("scheduler claim lease is not owned")
             self._append_event(conn, entity_type="ticket", entity_id=str(row["ticket_id"]), event_type="scheduler_stage_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": row["stage"], "result": result})
-            if row["stage"] == "implementation" or str(row["stage"]).startswith("implementation:") or str(row["stage"]).startswith("validation:") or str(row["stage"]).startswith("review:") or str(row["stage"]).startswith("repair_routing:") or str(row["stage"]).startswith("triage:") or str(row["stage"]).startswith("acceptance:") or str(row["stage"]).startswith("git_integration:"):
+            if row["stage"] == "implementation" or str(row["stage"]).startswith("implementation:") or str(row["stage"]).startswith("validation:") or str(row["stage"]).startswith("review:") or str(row["stage"]).startswith("repair_routing:") or str(row["stage"]).startswith("triage:") or str(row["stage"]).startswith("acceptance:") or str(row["stage"]).startswith("git_integration:") or str(row["stage"]).startswith("completion:"):
                 conn.execute(
                     "UPDATE tickets SET lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND lease_owner=?",
                     (now, row["ticket_id"], owner),

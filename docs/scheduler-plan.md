@@ -80,6 +80,15 @@ Already complete or substantially complete:
    - append-only commit evidence is persisted before any later completion projection
    - the ticket remains `accepted`; completion is a separate later stage
 
+9. **Completion / Hermes projection stage — Complete for the current scheduler slice**
+   - only accepted tickets with immutable accepted-candidate and Git commit evidence are eligible
+   - completion claim identity binds the accepted evidence hash, exact commit, branch, base/worktree, tranche, and integration-head provenance
+   - legacy-compatible `accepted_evidence` is derived deterministically from immutable scheduler evidence
+   - `accepted → done`, accepted evidence, and Hermes state/comment outbox intents are one SQLite transaction
+   - completion effect persistence is atomic with the local terminal transition
+   - post-effect restart finalizes without repeating completion
+   - Hermes state/evidence delivery failures retry through existing outboxes without repeating model, validation, review, acceptance, or Git work
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage — Complete
@@ -187,7 +196,7 @@ Completion condition: an accepted candidate produces exactly one durable commit 
 
 **Current status:** Complete for this scheduler milestone. The stage claims only immutable accepted candidates, persists an immutable commit intent before Git mutation, re-checks repository/worktree/base/branch/diff/authorized-path identity, creates exactly one isolated child commit through `GitWorktreeAdapter.accept`, and records append-only `git_commit_evidence` before completion projection. Replays recover an exact single child commit when the process dies after `git commit`, recover an already-advanced tranche integration ref after CAS, and refuse ambiguous commits, missing launch intent, candidate drift, conflicting tranche heads, or untracked bytes that were not part of the accepted fingerprint. The ticket remains `accepted`, and no `done` transition or completion projection occurs in this stage.
 
-## 9. Completion / Hermes projection stage
+## 9. Completion / Hermes projection stage — Complete
 
 Project locally accepted and committed work back to Hermes without repeating prior side effects.
 
@@ -200,6 +209,8 @@ Required slices:
 - Keep evidence delivery idempotent to the extent supported by the current Hermes read/write contract.
 
 Completion condition: board-write failures are independently retryable and can never force a repeat of already-successful implementation, validation, review, or Git work.
+
+**Current status:** Complete for this scheduler milestone. Completion claims only `accepted` tickets whose immutable `accepted_candidates`, completed `git_commit_intents`, `git_commit_evidence`, and attempt commit identity all agree. The completion effect deterministically materializes the existing `accepted_evidence` compatibility record, records the exact commit/evidence provenance, transitions `accepted → done`, and enqueues the existing Hermes state-projection and evidence-comment intents in the same SQLite transaction. If that transaction commits but scheduler finalization is interrupted, replay resumes from `done` and finalizes without duplicating the terminal transition or evidence. Hermes state/comment delivery then proceeds through the existing independently retryable outboxes, so remote write failures cannot repeat implementation, validation, review, acceptance, or Git integration.
 
 ## 10. Native dependency release stage
 

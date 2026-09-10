@@ -1226,6 +1226,113 @@ class InvocationLifecycleTests(unittest.TestCase):
         self.assertIsNone(self.ledger.git_commit_intent(ticket))
         self.assertIsNone(self.ledger.git_commit_evidence(ticket))
 
+    def test_scheduler_completion_records_done_and_projection_intents(self) -> None:
+        ctl, ticket, _ = self.prepare_scheduler_accepted()
+        git_calls: list[str] = []
+        git_scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="git", lease_seconds=30, clock=lambda: 100,
+            git_integration_runner=lambda value: git_calls.append(value) or ctl.execute_git_integration_only(value, repository=self.repo),
+        )
+        self.assertEqual(git_scheduler.process_next().stage, "git_integration")
+        self.assertEqual(git_calls, [ticket])
+        git_evidence = self.ledger.git_commit_evidence(ticket)
+        self.assertEqual(preview_next(self.ledger, now=100).next_stage, "completion")
+
+        completion_scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="completion", lease_seconds=30, clock=lambda: 100,
+            git_integration_runner=lambda value: (_ for _ in ()).throw(AssertionError("Git integration must not rerun")),
+        )
+        result = completion_scheduler.process_next()
+        self.assertEqual((result.stage, result.status, result.ticket_id), ("completion", "completed", ticket))
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "done")
+        accepted = self.ledger.connection.execute("SELECT * FROM accepted_evidence WHERE ticket_id=?", (ticket,)).fetchone()
+        self.assertEqual(accepted["accepted_commit_sha"], git_evidence["commit_sha"])
+        diff_summary = json.loads(str(accepted["diff_summary"]))
+        validation_summary = json.loads(str(accepted["validation_summary"]))
+        frozen = self.ledger.accepted_candidate(ticket)
+        self.assertEqual(diff_summary["candidate_fingerprint"], frozen["candidate_fingerprint"])
+        self.assertEqual(diff_summary["accepted_evidence_hash"], frozen["evidence_hash"])
+        self.assertEqual(validation_summary["accepted_evidence_hash"], frozen["evidence_hash"])
+        self.assertEqual(validation_summary["validation_artifact_sha256"], frozen["validation_artifact_sha256"])
+        done_events = [e for e in self.ledger.events_for(ticket) if e["event_type"] == "state_transition" and e["to_state"] == "done"]
+        self.assertEqual(len(done_events), 1)
+        done_event = done_events[0]
+        state_outbox = self.ledger.connection.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket, done_event["id"])).fetchone()
+        comment_outbox = self.ledger.connection.execute("SELECT * FROM evidence_comment_outbox WHERE ticket_id=? AND event_id=?", (ticket, done_event["id"])).fetchone()
+        self.assertIsNotNone(state_outbox)
+        self.assertIsNotNone(comment_outbox)
+        self.assertIsNone(state_outbox["acknowledged_at"])
+        self.assertEqual(comment_outbox["status"], "pending")
+        claim = self.ledger.scheduler_claim(str(result.claim_id))
+        completion_result = json.loads(str(claim["result_json"]))
+        self.assertEqual(completion_result["state_event_id"], done_event["id"])
+        self.assertEqual(completion_result["accepted_commit_sha"], git_evidence["commit_sha"])
+        self.assertEqual(git_calls, [ticket])
+
+    def test_scheduler_completion_restarts_after_effect_without_duplicate_completion(self) -> None:
+        ctl, ticket, _ = self.prepare_scheduler_accepted()
+        git_scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="git", lease_seconds=30, clock=lambda: 100,
+            git_integration_runner=lambda value: ctl.execute_git_integration_only(value, repository=self.repo),
+        )
+        self.assertEqual(git_scheduler.process_next().stage, "git_integration")
+        claim = self.ledger.claim_next_scheduler_completion("crashed", lease_seconds=1, now=101)
+        assert claim is not None
+        claim_id = str(claim["claim_id"])
+        self.ledger.begin_scheduler_claim_effect(claim_id, "crashed", now=101)
+        applied = self.ledger.apply_scheduler_completion_effect(claim_id, "crashed", now=101)
+        self.assertIsNotNone(applied["side_effect_completed_at"])
+        self.assertIsNone(applied["finalized_at"])
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "done")
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM accepted_evidence WHERE ticket_id=?", (ticket,)).fetchone()[0], 1)
+
+        resumed = ProcessNextScheduler(self.ledger, Board(), worker_id="completion-recovery", lease_seconds=30, clock=lambda: 103)
+        result = self.run_until_stage(resumed, "completion", limit=6)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(self.ledger.scheduler_claim(claim_id)["status"], "completed")
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM accepted_evidence WHERE ticket_id=?", (ticket,)).fetchone()[0], 1)
+        done_events = [e for e in self.ledger.events_for(ticket) if e["event_type"] == "state_transition" and e["to_state"] == "done"]
+        self.assertEqual(len(done_events), 1)
+
+    def test_scheduler_completion_projection_failure_retries_without_repeating_git(self) -> None:
+        ctl, ticket, _ = self.prepare_scheduler_accepted()
+        git_scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="git", lease_seconds=30, clock=lambda: 100,
+            git_integration_runner=lambda value: ctl.execute_git_integration_only(value, repository=self.repo),
+        )
+        self.assertEqual(git_scheduler.process_next().stage, "git_integration")
+        completion = ProcessNextScheduler(self.ledger, Board(), worker_id="completion", lease_seconds=30, clock=lambda: 100)
+        self.assertEqual(completion.process_next().stage, "completion")
+        commit_sha = self.ledger.git_commit_evidence(ticket)["commit_sha"]
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "done")
+
+        board = Board()
+        state_calls: list[str] = []
+        def fail_state(ticket_id: str, state: object, *, idempotency_key: str) -> None:
+            state_calls.append(idempotency_key)
+            raise RuntimeError("simulated Hermes state failure")
+        board.set_state = fail_state  # type: ignore[method-assign]
+        retry_scheduler = ProcessNextScheduler(
+            self.ledger, board, worker_id="projection", lease_seconds=30, clock=lambda: 101,
+            git_integration_runner=lambda value: (_ for _ in ()).throw(AssertionError("Git integration must not rerun")),
+        )
+        with self.assertRaisesRegex(RuntimeError, "simulated Hermes state failure"):
+            retry_scheduler.process_next()
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "done")
+        self.assertEqual(self.ledger.git_commit_evidence(ticket)["commit_sha"], commit_sha)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM accepted_evidence WHERE ticket_id=?", (ticket,)).fetchone()[0], 1)
+
+        board.set_state = lambda ticket_id, state, *, idempotency_key: state_calls.append(idempotency_key)  # type: ignore[method-assign]
+        delivered = retry_scheduler.process_next()
+        self.assertEqual(delivered.stage, "state_projection")
+        self.assertEqual(delivered.status, "delivered")
+        self.assertEqual(len(state_calls), 2)
+        comment = retry_scheduler.process_next()
+        self.assertEqual(comment.stage, "evidence_comment")
+        self.assertIn(comment.status, {"delivered", "reconciled_delivered"})
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "done")
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM accepted_evidence WHERE ticket_id=?", (ticket,)).fetchone()[0], 1)
+
     def test_scheduler_repair_routing_finalizes_after_restart_without_duplicate_transition(self) -> None:
         model = SequencedLifecycleModel(["still-bad"]); ctl, ticket = self.controller(model)
         scheduler = ProcessNextScheduler(
