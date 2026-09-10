@@ -65,6 +65,21 @@ Already complete or substantially complete:
    - completed planner invocations and post-materialization crashes recover without duplicate inference, children, or outbox rows
    - `block` and `checkpoint` map to existing canonical states without creating children
 
+7. **Acceptance / candidate-freeze stage — Complete for the current scheduler slice**
+   - pass-reviewed work is frozen into immutable pre-commit evidence
+   - live worktree/base/diff and validation/review artifact identities are rechecked before acceptance
+   - acceptance remains independently replayable and creates no Git commit
+
+8. **Git integration / commit stage — Complete for the current scheduler slice**
+   - only immutable accepted candidates are eligible
+   - commit launch intent is persisted before Git mutation
+   - commit identity is checked against exact base, branch, authorized paths, message, and accepted diff
+   - non-cache untracked content fails closed because its bytes are not bound by the accepted fingerprint
+   - a post-commit restart recovers the exact child commit without creating a second commit
+   - tranche integration-head advancement uses the existing compare-and-swap ref and is independently recoverable
+   - append-only commit evidence is persisted before any later completion projection
+   - the ticket remains `accepted`; completion is a separate later stage
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage — Complete
@@ -154,7 +169,7 @@ Completion condition: there is one durable, immutable accepted-candidate identit
 
 **Current status:** Complete for this scheduler milestone. A durable pass-routing decision becomes independently acceptance-eligible; acceptance re-checks the live worktree/root/base and exact implementation diff, validates the frozen review candidate plus implementation/validation/review artifacts and hashes, persists an append-only `accepted_candidates` record, and transitions `local_review → accepted` atomically with scheduler effect completion. No Git commit is created in this stage. Restart after effect completion finalizes without re-running the acceptance inspection, while candidate or artifact drift fails closed.
 
-## 8. Git integration / commit stage
+## 8. Git integration / commit stage — Complete
 
 Move accepted work into the durable Git-integration lifecycle exactly once.
 
@@ -169,6 +184,8 @@ Required slices:
 - Never create a second commit for the same accepted candidate on replay.
 
 Completion condition: an accepted candidate produces exactly one durable commit identity, or stops for reconciliation when exact recovery cannot be proven.
+
+**Current status:** Complete for this scheduler milestone. The stage claims only immutable accepted candidates, persists an immutable commit intent before Git mutation, re-checks repository/worktree/base/branch/diff/authorized-path identity, creates exactly one isolated child commit through `GitWorktreeAdapter.accept`, and records append-only `git_commit_evidence` before completion projection. Replays recover an exact single child commit when the process dies after `git commit`, recover an already-advanced tranche integration ref after CAS, and refuse ambiguous commits, missing launch intent, candidate drift, conflicting tranche heads, or untracked bytes that were not part of the accepted fingerprint. The ticket remains `accepted`, and no `done` transition or completion projection occurs in this stage.
 
 ## 9. Completion / Hermes projection stage
 

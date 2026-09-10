@@ -144,6 +144,40 @@ class InvocationLifecycleTests(unittest.TestCase):
                 return result
         self.fail(f"scheduler did not reach stage {stage!r}")
 
+    def prepare_scheduler_accepted(self, *, attach_tranche: bool = False) -> tuple[LocalFirstController, str, SequencedLifecycleModel]:
+        model = SequencedLifecycleModel(["ok"])
+        ctl, ticket = self.controller(model)
+        if attach_tranche:
+            base = self.git("rev-parse", "HEAD").stdout.strip()
+            self.ledger.connection.execute("INSERT INTO features(id,title,status,created_at,updated_at) VALUES ('fixture-feature','fixture','active',0,0)")
+            self.ledger.connection.execute("INSERT INTO tranches(id,feature_id,ordinal,status,base_sha) VALUES ('fixture-tranche','fixture-feature',0,'active',?)", (base,))
+            self.ledger.connection.execute("UPDATE tickets SET feature_id='fixture-feature',tranche_id='fixture-tranche' WHERE id=?", (ticket,))
+            self.git("update-ref", "refs/local-first/tranches/fixture-tranche/integration-head", base)
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="scheduler",
+            lease_seconds=30,
+            clock=lambda: 100,
+            implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo),
+            validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo),
+            review_runner=lambda value: ctl.execute_fresh_review_only(value, repository=self.repo),
+            review_execution_policy_hash=ctl.review_execution_policy_hash(),
+            acceptance_runner=lambda value: ctl.inspect_acceptance_candidate_only(value, repository=self.repo),
+        )
+        self.assertEqual(scheduler.process_next().stage, "implementation")
+        self.assertEqual(scheduler.process_next().stage, "validation")
+        self.run_until_stage(scheduler, "review")
+        self.run_until_stage(scheduler, "repair_routing")
+        self.run_until_stage(scheduler, "acceptance")
+        for _ in range(6):
+            result = scheduler.process_next()
+            if result.stage is None:
+                break
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], CanonicalState.ACCEPTED.value)
+        self.assertIsNotNone(self.ledger.accepted_candidate(ticket))
+        return ctl, ticket, model
+
     def triage_parent(self) -> tuple[LocalFirstController, str]:
         ctl, ticket = self.controller(LifecycleModel())
         # Establish the already-durable repair-routing precondition directly;
@@ -1029,6 +1063,168 @@ class InvocationLifecycleTests(unittest.TestCase):
         self.assertEqual(self.ledger.scheduler_claim(claim_id)["status"], "completed")
         transitions = [event for event in self.ledger.events_for(ticket) if event["event_type"] == "state_transition" and event["to_state"] == "accepted"]
         self.assertEqual(len(transitions), 1)
+
+    def test_scheduler_git_integration_commits_exact_candidate_without_completion(self) -> None:
+        ctl, ticket, _ = self.prepare_scheduler_accepted()
+        self.assertEqual(preview_next(self.ledger, now=100).next_stage, "git_integration")
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="git",
+            lease_seconds=30,
+            clock=lambda: 100,
+            git_integration_runner=lambda value: ctl.execute_git_integration_only(value, repository=self.repo),
+        )
+        result = scheduler.process_next()
+        self.assertEqual((result.stage, result.status, result.ticket_id), ("git_integration", "completed", ticket))
+        evidence = self.ledger.git_commit_evidence(ticket)
+        intent = self.ledger.git_commit_intent(ticket)
+        self.assertIsNotNone(evidence)
+        self.assertEqual(intent["status"], "completed")
+        self.assertEqual(intent["commit_sha"], evidence["commit_sha"])
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (ticket,)).fetchone()
+        worktree = Path(str(attempt["worktree_path"]))
+        self.assertEqual(attempt["accepted_commit_sha"], evidence["commit_sha"])
+        self.assertEqual(subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(), evidence["commit_sha"])
+        self.assertEqual(subprocess.run(("git", "rev-parse", "HEAD^"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(), evidence["base_sha"])
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), evidence["base_sha"])
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "accepted")
+        self.assertIsNone(self.ledger.accepted_commit(ticket))
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM accepted_evidence WHERE ticket_id=?", (ticket,)).fetchone()[0], 0)
+        self.assertFalse(any(event["to_state"] == "done" for event in self.ledger.events_for(ticket)))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.ledger.connection.execute("UPDATE git_commit_evidence SET commit_sha='bad' WHERE ticket_id=?", (ticket,))
+
+    def test_scheduler_git_integration_fails_closed_on_candidate_drift_and_untracked_content(self) -> None:
+        ctl, ticket, _ = self.prepare_scheduler_accepted()
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (ticket,)).fetchone()
+        worktree = Path(str(attempt["worktree_path"]))
+        (worktree / "app.py").write_text("def value():\n    return 'drifted'\n", encoding="utf-8")
+        scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="git", lease_seconds=30, clock=lambda: 100,
+            git_integration_runner=lambda value: ctl.execute_git_integration_only(value, repository=self.repo),
+        )
+        with self.assertRaisesRegex(RuntimeError, "accepted candidate diff drift"):
+            scheduler.process_next()
+        self.assertIsNone(self.ledger.git_commit_intent(ticket))
+        self.assertIsNone(self.ledger.git_commit_evidence(ticket))
+        self.assertEqual(subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(), attempt["base_sha"])
+
+        # Restore the accepted tracked diff, then add content that the candidate fingerprint never bound.
+        (worktree / "app.py").write_text("def value():\n    return 'ok'\n", encoding="utf-8")
+        (worktree / "extra.py").write_text("x = 1\n", encoding="utf-8")
+        replay = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="git-replay", lease_seconds=30, clock=lambda: 131,
+            git_integration_runner=lambda value: ctl.execute_git_integration_only(value, repository=self.repo),
+        )
+        with self.assertRaisesRegex(RuntimeError, "accepted fingerprint does not bind untracked content"):
+            replay.process_next()
+        self.assertIsNone(self.ledger.git_commit_intent(ticket))
+        self.assertIsNone(self.ledger.git_commit_evidence(ticket))
+
+    def test_scheduler_git_integration_recovers_commit_created_before_ledger_update_without_second_commit(self) -> None:
+        ctl, ticket, _ = self.prepare_scheduler_accepted()
+        crashing = LocalFirstController(
+            self.ledger,
+            Board(),
+            self.config,
+            local_model=LifecycleModel(),
+            fault_injector=lambda stage: (_ for _ in ()).throw(RuntimeError("simulated controller death")) if stage == "git_commit_created" else None,
+        )
+        first = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="git-a", lease_seconds=30, clock=lambda: 100,
+            git_integration_runner=lambda value: crashing.execute_git_integration_only(value, repository=self.repo),
+        )
+        with self.assertRaisesRegex(RuntimeError, "simulated controller death"):
+            first.process_next()
+        intent = self.ledger.git_commit_intent(ticket)
+        self.assertEqual(intent["status"], "started")
+        self.assertIsNone(self.ledger.git_commit_evidence(ticket))
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (ticket,)).fetchone()
+        worktree = Path(str(attempt["worktree_path"]))
+        commit_sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip()
+        self.assertNotEqual(commit_sha, attempt["base_sha"])
+        self.assertEqual(subprocess.run(("git", "rev-list", "--count", f"{attempt['base_sha']}..HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(), "1")
+
+        resumed_ctl = LocalFirstController(self.ledger, Board(), self.config, local_model=LifecycleModel())
+        resumed = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="git-b", lease_seconds=30, clock=lambda: 131,
+            git_integration_runner=lambda value: resumed_ctl.execute_git_integration_only(value, repository=self.repo),
+        )
+        result = resumed.process_next()
+        self.assertEqual(result.stage, "git_integration")
+        self.assertEqual(self.ledger.git_commit_evidence(ticket)["commit_sha"], commit_sha)
+        self.assertEqual(self.ledger.git_commit_intent(ticket)["status"], "completed")
+        self.assertEqual(subprocess.run(("git", "rev-list", "--count", f"{attempt['base_sha']}..HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(), "1")
+
+    def test_scheduler_git_integration_recovers_after_tranche_head_advanced(self) -> None:
+        ctl, ticket, _ = self.prepare_scheduler_accepted(attach_tranche=True)
+        accepted = self.ledger.accepted_candidate(ticket)
+        ref = "refs/local-first/tranches/fixture-tranche/integration-head"
+        self.assertEqual(self.git("rev-parse", ref).stdout.strip(), accepted["base_sha"])
+        crashing = LocalFirstController(
+            self.ledger,
+            Board(),
+            self.config,
+            local_model=LifecycleModel(),
+            fault_injector=lambda stage: (_ for _ in ()).throw(RuntimeError("simulated controller death")) if stage == "git_integration_head_advanced" else None,
+        )
+        first = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="git-a", lease_seconds=30, clock=lambda: 100,
+            git_integration_runner=lambda value: crashing.execute_git_integration_only(value, repository=self.repo),
+        )
+        with self.assertRaisesRegex(RuntimeError, "simulated controller death"):
+            first.process_next()
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (ticket,)).fetchone()
+        worktree = Path(str(attempt["worktree_path"]))
+        commit_sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip()
+        self.assertEqual(self.git("rev-parse", ref).stdout.strip(), commit_sha)
+        self.assertIsNone(self.ledger.git_commit_evidence(ticket))
+
+        resumed_ctl = LocalFirstController(self.ledger, Board(), self.config, local_model=LifecycleModel())
+        resumed = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="git-b", lease_seconds=30, clock=lambda: 131,
+            git_integration_runner=lambda value: resumed_ctl.execute_git_integration_only(value, repository=self.repo),
+        )
+        self.assertEqual(resumed.process_next().stage, "git_integration")
+        evidence = self.ledger.git_commit_evidence(ticket)
+        self.assertEqual((evidence["integration_head_before"], evidence["integration_head_after"]), (accepted["base_sha"], commit_sha))
+        self.assertEqual(self.git("rev-parse", ref).stdout.strip(), commit_sha)
+        self.assertEqual(subprocess.run(("git", "rev-list", "--count", f"{accepted['base_sha']}..HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(), "1")
+
+    def test_scheduler_git_integration_finalizes_after_effect_without_rerunning_git(self) -> None:
+        ctl, ticket, _ = self.prepare_scheduler_accepted()
+        claim = self.ledger.claim_next_scheduler_git_integration("crashed", lease_seconds=1, now=101)
+        assert claim is not None
+        claim_id = str(claim["claim_id"])
+        self.ledger.begin_scheduler_claim_effect(claim_id, "crashed", now=101)
+        git_result = ctl.execute_git_integration_only(ticket, repository=self.repo)
+        applied = self.ledger.apply_scheduler_git_integration_effect(claim_id, "crashed", git_result, now=101)
+        self.assertIsNotNone(applied["side_effect_completed_at"])
+        self.assertIsNone(applied["finalized_at"])
+        calls: list[str] = []
+        resumed = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="git-recovery", lease_seconds=30, clock=lambda: 103,
+            git_integration_runner=lambda value: calls.append(value) or (_ for _ in ()).throw(AssertionError("Git integration must not rerun")),
+        )
+        result = resumed.process_next()
+        self.assertEqual((result.stage, result.status), ("git_integration", "completed"))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.ledger.scheduler_claim(claim_id)["status"], "completed")
+
+    def test_scheduler_git_integration_refuses_commit_without_durable_intent(self) -> None:
+        _, ticket, _ = self.prepare_scheduler_accepted()
+        claim = self.ledger.claim_next_scheduler_git_integration("operator", lease_seconds=30, now=100)
+        assert claim is not None
+        identity = json.loads(str(claim["candidate_identity_json"]))
+        worktree = Path(str(identity["worktree_path"]))
+        subprocess.run(("git", "add", "-A"), cwd=worktree, check=True, capture_output=True, text=True)
+        subprocess.run(("git", "commit", "-m", str(identity["commit_message"])), cwd=worktree, check=True, capture_output=True, text=True)
+        ctl = LocalFirstController(self.ledger, Board(), self.config, local_model=LifecycleModel())
+        with self.assertRaisesRegex(RuntimeError, "commit exists without durable launch intent"):
+            ctl.execute_git_integration_only(ticket, repository=self.repo)
+        self.assertIsNone(self.ledger.git_commit_intent(ticket))
+        self.assertIsNone(self.ledger.git_commit_evidence(ticket))
 
     def test_scheduler_repair_routing_finalizes_after_restart_without_duplicate_transition(self) -> None:
         model = SequencedLifecycleModel(["still-bad"]); ctl, ticket = self.controller(model)

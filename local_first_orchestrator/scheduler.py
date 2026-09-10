@@ -169,6 +169,23 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     if acceptance is not None:
         return ProcessNextPreview(next_stage="acceptance", ticket_id=str(acceptance["id"]), would_execute=True)
 
+    git_replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage LIKE 'git_integration:%' AND status='claimed' "
+        "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+    ).fetchone()
+    if git_replay is not None:
+        return ProcessNextPreview(next_stage="git_integration", ticket_id=str(git_replay["ticket_id"]), would_execute=True)
+    git_candidate = ledger.connection.execute("""
+        SELECT t.id FROM tickets t
+        JOIN accepted_candidates ac ON ac.ticket_id=t.id
+        WHERE t.state='accepted'
+          AND NOT EXISTS (SELECT 1 FROM git_commit_evidence ge WHERE ge.ticket_id=t.id)
+          AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('git_integration:' || ac.attempt_number))
+        ORDER BY t.created_at,t.id LIMIT 1
+    """).fetchone()
+    if git_candidate is not None:
+        return ProcessNextPreview(next_stage="git_integration", ticket_id=str(git_candidate["id"]), would_execute=True)
+
     implementation_replay = ledger.connection.execute(
         "SELECT ticket_id FROM scheduler_stage_claims WHERE (stage='implementation' OR stage LIKE 'implementation:%') AND status='claimed' "
         "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
@@ -249,6 +266,7 @@ class ProcessNextScheduler:
         triage_runner: Callable[[str], dict[str, Any]] | None = None,
         triage_execution_policy_hash: str | None = None,
         acceptance_runner: Callable[[str], dict[str, Any]] | None = None,
+        git_integration_runner: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         if not worker_id or lease_seconds < 1:
             raise ValueError("process-next requires a worker id and positive lease")
@@ -269,6 +287,7 @@ class ProcessNextScheduler:
         self.triage_runner = triage_runner
         self.triage_execution_policy_hash = triage_execution_policy_hash
         self.acceptance_runner = acceptance_runner
+        self.git_integration_runner = git_integration_runner
         if self.review_runner is not None and not self.review_execution_policy_hash:
             raise ValueError("process-next review runner requires a review execution policy hash")
         if self.triage_runner is not None and not self.triage_execution_policy_hash:
@@ -460,6 +479,29 @@ class ProcessNextScheduler:
                     claim_id, execution_owner, acceptance_result, now=now
                 )
                 return ProcessNextResult("completed", "acceptance", ticket_id, claim_id)
+
+        if self.git_integration_runner is not None:
+            git_claim = self.ledger.claim_next_scheduler_git_integration(
+                execution_owner, lease_seconds=self.lease_seconds, now=now
+            )
+            if git_claim is not None:
+                claim_id = str(git_claim["claim_id"])
+                ticket_id = str(git_claim["ticket_id"])
+                current = self.ledger.scheduler_claim(claim_id)
+                if current.get("side_effect_completed_at") is not None and current.get("result_json"):
+                    git_result = json.loads(str(current["result_json"]))
+                else:
+                    if current.get("side_effect_started_at") is None:
+                        self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+                    git_result = self.git_integration_runner(ticket_id)
+                    current = self.ledger.apply_scheduler_git_integration_effect(
+                        claim_id, execution_owner, git_result, now=now
+                    )
+                    git_result = json.loads(str(current["result_json"]))
+                self.ledger.complete_scheduler_claim(
+                    claim_id, execution_owner, git_result, now=now
+                )
+                return ProcessNextResult("completed", "git_integration", ticket_id, claim_id)
 
         if self.implementation_runner is not None:
             implementation_claim = self.ledger.claim_next_scheduler_implementation(

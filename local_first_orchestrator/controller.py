@@ -1293,6 +1293,153 @@ class LocalFirstController:
             raise RuntimeError("acceptance_reconciliation_required: worktree repository/base drift")
         return {"ticket_id": ticket_id, "attempt_number": attempt_number, "current_diff_hash": diff_hash}
 
+    def execute_git_integration_only(self, ticket_id: str, *, repository: Path) -> dict[str, object]:
+        """Create/recover exactly one accepted commit and advance only the controller integration ref."""
+        claim = self.ledger.connection.execute(
+            "SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage LIKE 'git_integration:%' AND status='claimed' ORDER BY created_at DESC LIMIT 1",
+            (ticket_id,),
+        ).fetchone()
+        if claim is None or not claim["candidate_identity_json"]:
+            raise RuntimeError("git_integration_reconciliation_required: scheduler claim missing")
+        try:
+            identity = json.loads(str(claim["candidate_identity_json"]))
+            attempt_number = int(identity["attempt_number"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("git_integration_reconciliation_required: claim identity malformed") from exc
+        ticket_row = self.ledger.get_ticket(ticket_id)
+        accepted = self.ledger.accepted_candidate(ticket_id)
+        if ticket_row["state"] != CanonicalState.ACCEPTED.value or accepted is None:
+            raise RuntimeError("git_integration_reconciliation_required: accepted candidate authority missing")
+        expected = {
+            "ticket_id": ticket_id,
+            "attempt_number": int(accepted["attempt_number"]),
+            "accepted_evidence_hash": str(accepted["evidence_hash"]),
+            "candidate_fingerprint": str(accepted["candidate_fingerprint"]),
+            "base_sha": str(accepted["base_sha"]),
+            "worktree_path": str(accepted["worktree_path"]),
+        }
+        if any(identity.get(key) != value for key, value in expected.items()):
+            raise RuntimeError("git_integration_reconciliation_required: accepted candidate identity drift")
+        attempt = self.ledger.connection.execute(
+            "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)
+        ).fetchone()
+        latest = self.ledger.connection.execute(
+            "SELECT MAX(attempt_number) AS latest FROM attempts WHERE ticket_id=?", (ticket_id,)
+        ).fetchone()["latest"]
+        if attempt is None or latest is None or int(latest) != attempt_number or str(attempt["branch"] or "") != str(identity.get("branch") or ""):
+            raise RuntimeError("git_integration_reconciliation_required: attempt identity drift")
+        binding = self.ledger.runtime_binding(ticket_id)
+        repo = Path(repository).resolve(strict=True)
+        configured_repo, worktree_root, _ = self.config.validate_execution_roots()
+        if configured_repo != repo or str(binding["repository_path"]) != str(repo):
+            raise RuntimeError("git_integration_reconciliation_required: repository binding drift")
+        worktree = Path(str(identity["worktree_path"])).resolve(strict=True)
+        try:
+            worktree.relative_to(worktree_root.resolve())
+        except ValueError as exc:
+            raise RuntimeError("git_integration_reconciliation_required: worktree outside configured root") from exc
+        base = str(identity["base_sha"])
+        candidate_fingerprint = str(identity["candidate_fingerprint"])
+        commit_message = str(identity["commit_message"])
+        tranche_id = identity.get("tranche_id")
+        if tranche_id != (None if ticket_row["tranche_id"] is None else str(ticket_row["tranche_id"])):
+            raise RuntimeError("git_integration_reconciliation_required: tranche identity drift")
+        adapter = GitWorktreeAdapter(repo, worktree_root)
+        ticket = ticket_from_ledger(ticket_row)
+        authorized_files = set(ticket.allowed_files) | set(ticket.create_files) | set(ticket.new_test_files)
+        if not authorized_files:
+            raise RuntimeError("git_integration_reconciliation_required: accepted candidate has no authorized files")
+
+        def git(*args: str) -> subprocess.CompletedProcess[str]:
+            try:
+                return subprocess.run(("git", *args), cwd=worktree, text=True, capture_output=True, check=True, timeout=30)
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RuntimeError("git_integration_reconciliation_required: git inspection failed") from exc
+
+        live_root = git("rev-parse", "--show-toplevel").stdout.strip()
+        live_branch = git("branch", "--show-current").stdout.strip()
+        live_head = git("rev-parse", "HEAD").stdout.strip()
+        if live_root != str(worktree) or live_branch != str(identity["branch"]):
+            raise RuntimeError("git_integration_reconciliation_required: worktree root/branch drift")
+        ancestor = subprocess.run(
+            ("git", "merge-base", "--is-ancestor", str(binding["starting_sha"]), base),
+            cwd=repo, text=True, capture_output=True, check=False, timeout=30,
+        )
+        if ancestor.returncode != 0:
+            raise RuntimeError("git_integration_reconciliation_required: accepted base is outside repository provenance")
+        intent = self.ledger.git_commit_intent(ticket_id)
+        if intent is None and live_head != base:
+            raise RuntimeError("git_integration_reconciliation_required: commit exists without durable launch intent")
+
+        def status_paths() -> list[str]:
+            lines = git("status", "--porcelain=v1").stdout.splitlines()
+            return [line[3:].strip() for line in lines if "__pycache__" not in line]
+
+        if live_head == base:
+            untracked = [
+                line[3:].strip()
+                for line in git("status", "--porcelain=v1").stdout.splitlines()
+                if line.startswith("?? ") and "__pycache__" not in line
+            ]
+            if untracked:
+                raise RuntimeError("git_integration_reconciliation_required: accepted fingerprint does not bind untracked content")
+            paths = status_paths()
+            if not paths or any(path not in authorized_files for path in paths):
+                raise RuntimeError("git_integration_reconciliation_required: candidate status contains unauthorized or missing changes")
+            if adapter.diff_hash(worktree) != candidate_fingerprint:
+                raise RuntimeError("git_integration_reconciliation_required: accepted candidate diff drift")
+            current = adapter.existing_execution_base(None if tranche_id is None else str(tranche_id), base)
+            if current != base:
+                raise RuntimeError("git_integration_reconciliation_required: integration head moved before commit")
+            intent = self.ledger.start_git_commit_intent(ticket_id, identity)
+            if intent["status"] == "completed":
+                raise RuntimeError("git_integration_reconciliation_required: completed intent has uncommitted worktree")
+            for cache in sorted(worktree.rglob("__pycache__"), reverse=True):
+                if cache.is_dir():
+                    shutil.rmtree(cache)
+            attempt_worktree = AttemptWorktree(ticket_id, attempt_number, base, str(identity["branch"]), worktree, candidate_fingerprint)
+            commit_sha = adapter.accept(attempt_worktree, commit_message)
+            self._crash("git_commit_created")
+        else:
+            if intent is None:
+                raise RuntimeError("git_integration_reconciliation_required: missing git commit intent")
+            parent = git("rev-parse", "HEAD^").stdout.strip()
+            committed_diff = git("diff", "--binary", "--no-ext-diff", base, "HEAD").stdout
+            names = git("diff", "--name-only", base, "HEAD").stdout.splitlines()
+            clean = git("status", "--porcelain=v1").stdout.strip() == ""
+            actual_message = git("log", "-1", "--format=%B").stdout.strip()
+            if parent != base or hashlib.sha256(committed_diff.encode()).hexdigest() != candidate_fingerprint or not names or any(name not in authorized_files for name in names) or not clean or actual_message != commit_message:
+                raise RuntimeError("git_integration_reconciliation_required: post-commit state is ambiguous")
+            commit_sha = live_head
+
+        final_parent = git("rev-parse", f"{commit_sha}^").stdout.strip()
+        final_diff = git("diff", "--binary", "--no-ext-diff", base, commit_sha).stdout
+        final_names = git("diff", "--name-only", base, commit_sha).stdout.splitlines()
+        final_message = git("log", "-1", "--format=%B", commit_sha).stdout.strip()
+        if final_parent != base or hashlib.sha256(final_diff.encode()).hexdigest() != candidate_fingerprint or not final_names or any(name not in authorized_files for name in final_names) or final_message != commit_message or git("status", "--porcelain=v1").stdout.strip():
+            raise RuntimeError("git_integration_reconciliation_required: committed candidate identity drift")
+
+        if tranche_id is not None:
+            current = adapter.existing_execution_base(str(tranche_id), base)
+            if current == base:
+                adapter.advance_integration_head(str(tranche_id), base, commit_sha)
+                self._crash("git_integration_head_advanced")
+            elif current != commit_sha:
+                raise RuntimeError("git_integration_reconciliation_required: integration head conflicts with accepted commit")
+            after = adapter.existing_execution_base(str(tranche_id), base)
+            if after != commit_sha:
+                raise RuntimeError("git_integration_reconciliation_required: integration head did not reach accepted commit")
+        else:
+            after = commit_sha
+        return {
+            "ticket_id": ticket_id,
+            "attempt_number": attempt_number,
+            "candidate_identity": identity,
+            "commit_sha": commit_sha,
+            "integration_head_before": base,
+            "integration_head_after": after,
+        }
+
     def review_historical_candidate(self, ticket_id: str, attempt_number: int, *, repository: Path, owner: str="local-first-reviewer") -> dict[str, object]:
         """Hand an R2d candidate to the ordinary fresh review machinery only."""
         candidate = self.ledger.review_candidate(ticket_id, attempt_number)

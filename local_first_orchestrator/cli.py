@@ -331,6 +331,9 @@ def run_command(args: argparse.Namespace) -> int:
                 acceptance_runner=lambda ticket_id: ctl.inspect_acceptance_candidate_only(
                     ticket_id, repository=registered.canonical_repository
                 ),
+                git_integration_runner=lambda ticket_id: ctl.execute_git_integration_only(
+                    ticket_id, repository=registered.canonical_repository
+                ),
             ).process_next()
             print(json.dumps(asdict(result),sort_keys=True))
         elif args.command in {"implementation-only", "implement-only"}:

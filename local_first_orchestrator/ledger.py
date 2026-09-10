@@ -374,6 +374,41 @@ CREATE TRIGGER IF NOT EXISTS accepted_candidates_immutable_update
 BEFORE UPDATE ON accepted_candidates BEGIN SELECT RAISE(ABORT, 'accepted candidates are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS accepted_candidates_immutable_delete
 BEFORE DELETE ON accepted_candidates BEGIN SELECT RAISE(ABORT, 'accepted candidates are append-only'); END;
+CREATE TABLE IF NOT EXISTS git_commit_intents (
+    ticket_id TEXT PRIMARY KEY REFERENCES tickets(id),
+    attempt_number INTEGER NOT NULL,
+    accepted_evidence_hash TEXT NOT NULL,
+    candidate_fingerprint TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    worktree_path TEXT NOT NULL,
+    commit_message TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('started','completed')),
+    commit_sha TEXT,
+    created_at INTEGER NOT NULL,
+    completed_at INTEGER
+);
+CREATE TRIGGER IF NOT EXISTS git_commit_intents_immutable_identity
+BEFORE UPDATE OF attempt_number,accepted_evidence_hash,candidate_fingerprint,base_sha,worktree_path,commit_message ON git_commit_intents
+BEGIN SELECT RAISE(ABORT, 'git commit intent identity is immutable'); END;
+CREATE TABLE IF NOT EXISTS git_commit_evidence (
+    ticket_id TEXT PRIMARY KEY REFERENCES tickets(id),
+    attempt_number INTEGER NOT NULL,
+    accepted_evidence_hash TEXT NOT NULL,
+    candidate_fingerprint TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    worktree_path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    commit_message TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    tranche_id TEXT,
+    integration_head_before TEXT NOT NULL,
+    integration_head_after TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS git_commit_evidence_immutable_update
+BEFORE UPDATE ON git_commit_evidence BEGIN SELECT RAISE(ABORT, 'git commit evidence is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS git_commit_evidence_immutable_delete
+BEFORE DELETE ON git_commit_evidence BEGIN SELECT RAISE(ABORT, 'git commit evidence is append-only'); END;
 CREATE TABLE IF NOT EXISTS tranche_completion_evidence (
     tranche_id TEXT PRIMARY KEY REFERENCES tranches(id), root_planning_sha TEXT NOT NULL,
     final_integration_sha TEXT NOT NULL, accepted_ticket_ids_json TEXT NOT NULL,
@@ -1780,6 +1815,295 @@ class Ledger:
         row = self.connection.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket_id,)).fetchone()
         return dict(row) if row else None
 
+    def git_commit_intent(self, ticket_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM git_commit_intents WHERE ticket_id=?", (ticket_id,)).fetchone()
+        return dict(row) if row else None
+
+    def git_commit_evidence(self, ticket_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM git_commit_evidence WHERE ticket_id=?", (ticket_id,)).fetchone()
+        return dict(row) if row else None
+
+
+    def claim_next_scheduler_git_integration(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+        """Claim one immutable accepted candidate for commit/integration only."""
+        if not owner or lease_seconds < 1:
+            raise ValueError("git integration scheduler claim requires owner and positive lease")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
+                return None
+            replay = conn.execute(
+                "SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'git_integration:%' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
+                (now,),
+            ).fetchone()
+            if replay is not None:
+                ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (replay["ticket_id"],)).fetchone()
+                accepted = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (replay["ticket_id"],)).fetchone()
+                attempt = None if accepted is None else conn.execute(
+                    "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?",
+                    (replay["ticket_id"], accepted["attempt_number"]),
+                ).fetchone()
+                if ticket is None or accepted is None or attempt is None or ticket["state"] != CanonicalState.ACCEPTED.value:
+                    raise RuntimeError("git_integration_reconciliation_required: accepted candidate authority is missing")
+                try:
+                    identity = json.loads(str(replay["candidate_identity_json"] or ""))
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("git_integration_reconciliation_required: claim identity malformed") from exc
+                expected = {
+                    "ticket_id": str(ticket["id"]),
+                    "attempt_number": int(accepted["attempt_number"]),
+                    "accepted_evidence_hash": str(accepted["evidence_hash"]),
+                    "candidate_fingerprint": str(accepted["candidate_fingerprint"]),
+                    "base_sha": str(accepted["base_sha"]),
+                    "worktree_path": str(accepted["worktree_path"]),
+                    "branch": str(attempt["branch"] or ""),
+                    "tranche_id": None if ticket["tranche_id"] is None else str(ticket["tranche_id"]),
+                    "commit_message": f"local-first: {ticket['title']}",
+                }
+                if identity != expected:
+                    raise RuntimeError("git_integration_reconciliation_required: claim identity drift")
+                changed = conn.execute(
+                    "UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?",
+                    (owner, now + lease_seconds, now, replay["claim_id"], now),
+                )
+                if changed.rowcount != 1:
+                    return None
+                conn.execute(
+                    "UPDATE tickets SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=?",
+                    (owner, now + lease_seconds, now, replay["ticket_id"]),
+                )
+                self._append_event(
+                    conn,
+                    entity_type="ticket",
+                    entity_id=str(replay["ticket_id"]),
+                    event_type="scheduler_stage_reclaimed",
+                    actor_id=owner,
+                    payload={"claim_id": replay["claim_id"], "stage": "git_integration", "lease_expires_at": now + lease_seconds},
+                )
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
+
+            row = conn.execute("""
+                SELECT t.id,t.title,t.tranche_id,ac.attempt_number,ac.evidence_hash,ac.candidate_fingerprint,
+                       ac.base_sha,ac.worktree_path,a.branch
+                FROM tickets t
+                JOIN accepted_candidates ac ON ac.ticket_id=t.id
+                JOIN attempts a ON a.ticket_id=t.id AND a.attempt_number=ac.attempt_number
+                WHERE t.state='accepted'
+                  AND NOT EXISTS (SELECT 1 FROM git_commit_evidence ge WHERE ge.ticket_id=t.id)
+                  AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('git_integration:' || ac.attempt_number))
+                ORDER BY t.created_at,t.id LIMIT 1
+            """).fetchone()
+            if row is None:
+                return None
+            identity = {
+                "ticket_id": str(row["id"]),
+                "attempt_number": int(row["attempt_number"]),
+                "accepted_evidence_hash": str(row["evidence_hash"]),
+                "candidate_fingerprint": str(row["candidate_fingerprint"]),
+                "base_sha": str(row["base_sha"]),
+                "worktree_path": str(row["worktree_path"]),
+                "branch": str(row["branch"] or ""),
+                "tranche_id": None if row["tranche_id"] is None else str(row["tranche_id"]),
+                "commit_message": f"local-first: {row['title']}",
+            }
+            encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+            stage = f"git_integration:{identity['attempt_number']}"
+            claim_id = hashlib.sha256((stage + ":" + encoded).encode()).hexdigest()[:32]
+            changed = conn.execute(
+                "UPDATE tickets SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=? AND state='accepted' AND (lease_expires_at IS NULL OR lease_expires_at<=?)",
+                (owner, now + lease_seconds, now, row["id"], now),
+            )
+            if changed.rowcount != 1:
+                return None
+            conn.execute(
+                "INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,created_at,updated_at) VALUES (?,?,?,'claimed',?,?,1,?,?,?)",
+                (claim_id, row["id"], stage, owner, now + lease_seconds, encoded, now, now),
+            )
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=str(row["id"]),
+                event_type="scheduler_stage_claimed",
+                actor_id=owner,
+                payload={"claim_id": claim_id, "stage": "git_integration", "candidate_identity": identity},
+            )
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
+    def start_git_commit_intent(self, ticket_id: str, candidate_identity: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        """Persist immutable commit launch intent before Git can be mutated."""
+        now = self._now() if now is None else now
+        required = ("attempt_number", "accepted_evidence_hash", "candidate_fingerprint", "base_sha", "worktree_path", "commit_message")
+        if candidate_identity.get("ticket_id") != ticket_id or any(not candidate_identity.get(key) for key in required):
+            raise ValueError("invalid git commit intent identity")
+        with self._transaction() as conn:
+            accepted = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if accepted is None:
+                raise RuntimeError("git_integration_reconciliation_required: accepted candidate is missing")
+            expected = (
+                int(accepted["attempt_number"]),
+                str(accepted["evidence_hash"]),
+                str(accepted["candidate_fingerprint"]),
+                str(accepted["base_sha"]),
+                str(accepted["worktree_path"]),
+            )
+            incoming = (
+                int(candidate_identity["attempt_number"]),
+                str(candidate_identity["accepted_evidence_hash"]),
+                str(candidate_identity["candidate_fingerprint"]),
+                str(candidate_identity["base_sha"]),
+                str(candidate_identity["worktree_path"]),
+            )
+            if incoming != expected:
+                raise RuntimeError("git_integration_reconciliation_required: accepted candidate intent identity drift")
+            values = (*incoming, str(candidate_identity["commit_message"]))
+            existing = conn.execute("SELECT * FROM git_commit_intents WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if existing is not None:
+                existing_values = tuple(existing[key] for key in ("attempt_number", "accepted_evidence_hash", "candidate_fingerprint", "base_sha", "worktree_path", "commit_message"))
+                if existing_values != values:
+                    raise RuntimeError("git_integration_reconciliation_required: conflicting git commit intent")
+                return dict(existing)
+            conn.execute(
+                "INSERT INTO git_commit_intents(ticket_id,attempt_number,accepted_evidence_hash,candidate_fingerprint,base_sha,worktree_path,commit_message,status,created_at) VALUES (?,?,?,?,?,?,?,'started',?)",
+                (ticket_id, *values, now),
+            )
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=ticket_id,
+                event_type="git_commit_intent_started",
+                actor_id="controller",
+                payload={
+                    "attempt_number": values[0],
+                    "accepted_evidence_hash": values[1],
+                    "candidate_fingerprint": values[2],
+                    "base_sha": values[3],
+                    "worktree_path": values[4],
+                    "commit_message": values[5],
+                },
+            )
+            return dict(conn.execute("SELECT * FROM git_commit_intents WHERE ticket_id=?", (ticket_id,)).fetchone())
+
+    def apply_scheduler_git_integration_effect(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        """Atomically persist exact commit/integration evidence and finish the scheduler effect."""
+        now = self._now() if now is None else now
+        encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if claim is None or not str(claim["stage"]).startswith("git_integration:"):
+                raise ValueError("scheduler claim is not git integration")
+            if claim["side_effect_started_at"] is None:
+                raise RuntimeError("scheduler claim effect was not durably started")
+            if claim["lease_owner"] != owner or claim["lease_expires_at"] is None or int(claim["lease_expires_at"]) <= now:
+                raise PermissionError("scheduler claim lease is not owned")
+            if claim["side_effect_completed_at"] is not None:
+                if claim["result_json"] != encoded:
+                    raise RuntimeError("git integration completed effect result conflicts")
+                return dict(claim)
+            try:
+                identity = json.loads(str(claim["candidate_identity_json"] or ""))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("git_integration_reconciliation_required: claim identity malformed") from exc
+            if result.get("candidate_identity") != identity:
+                raise RuntimeError("git_integration_reconciliation_required: result candidate identity drift")
+            ticket_id = str(claim["ticket_id"])
+            commit_sha = str(result.get("commit_sha") or "")
+            before = str(result.get("integration_head_before") or "")
+            after = str(result.get("integration_head_after") or "")
+            if not commit_sha or not before or after != commit_sha:
+                raise RuntimeError("git_integration_reconciliation_required: incomplete commit/integration result")
+            intent = conn.execute("SELECT * FROM git_commit_intents WHERE ticket_id=?", (ticket_id,)).fetchone()
+            accepted = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket_id,)).fetchone()
+            attempt = conn.execute(
+                "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?",
+                (ticket_id, int(identity["attempt_number"])),
+            ).fetchone()
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if intent is None or accepted is None or attempt is None or ticket is None or ticket["state"] != CanonicalState.ACCEPTED.value:
+                raise RuntimeError("git_integration_reconciliation_required: commit authority is incomplete")
+            intent_identity = tuple(intent[key] for key in ("attempt_number", "accepted_evidence_hash", "candidate_fingerprint", "base_sha", "worktree_path", "commit_message"))
+            claim_identity = (
+                int(identity["attempt_number"]),
+                str(identity["accepted_evidence_hash"]),
+                str(identity["candidate_fingerprint"]),
+                str(identity["base_sha"]),
+                str(identity["worktree_path"]),
+                str(identity["commit_message"]),
+            )
+            if intent_identity != claim_identity:
+                raise RuntimeError("git_integration_reconciliation_required: commit intent identity drift")
+            accepted_identity = (
+                int(accepted["attempt_number"]),
+                str(accepted["evidence_hash"]),
+                str(accepted["candidate_fingerprint"]),
+                str(accepted["base_sha"]),
+                str(accepted["worktree_path"]),
+            )
+            expected_accepted_identity = (
+                int(identity["attempt_number"]),
+                str(identity["accepted_evidence_hash"]),
+                str(identity["candidate_fingerprint"]),
+                str(identity["base_sha"]),
+                str(identity["worktree_path"]),
+            )
+            ticket_tranche = None if ticket["tranche_id"] is None else str(ticket["tranche_id"])
+            if accepted_identity != expected_accepted_identity or str(attempt["branch"] or "") != str(identity["branch"]) or ticket_tranche != identity.get("tranche_id"):
+                raise RuntimeError("git_integration_reconciliation_required: accepted/attempt/tranche identity drift")
+            evidence_values = (
+                ticket_id,
+                int(identity["attempt_number"]),
+                str(identity["accepted_evidence_hash"]),
+                str(identity["candidate_fingerprint"]),
+                str(identity["base_sha"]),
+                str(identity["worktree_path"]),
+                str(identity["branch"]),
+                str(identity["commit_message"]),
+                commit_sha,
+                None if identity.get("tranche_id") is None else str(identity["tranche_id"]),
+                before,
+                after,
+            )
+            evidence_keys = (
+                "ticket_id", "attempt_number", "accepted_evidence_hash", "candidate_fingerprint", "base_sha",
+                "worktree_path", "branch", "commit_message", "commit_sha", "tranche_id",
+                "integration_head_before", "integration_head_after",
+            )
+            existing = conn.execute("SELECT * FROM git_commit_evidence WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if existing is not None:
+                if tuple(existing[key] for key in evidence_keys) != evidence_values:
+                    raise RuntimeError("git_integration_reconciliation_required: conflicting git commit evidence")
+            else:
+                conn.execute(
+                    "INSERT INTO git_commit_evidence(ticket_id,attempt_number,accepted_evidence_hash,candidate_fingerprint,base_sha,worktree_path,branch,commit_message,commit_sha,tranche_id,integration_head_before,integration_head_after,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (*evidence_values, now),
+                )
+            if attempt["accepted_commit_sha"] not in (None, commit_sha):
+                raise RuntimeError("git_integration_reconciliation_required: attempt commit identity conflicts")
+            conn.execute(
+                "UPDATE attempts SET accepted_commit_sha=? WHERE ticket_id=? AND attempt_number=? AND (accepted_commit_sha IS NULL OR accepted_commit_sha=?)",
+                (commit_sha, ticket_id, int(identity["attempt_number"]), commit_sha),
+            )
+            if intent["status"] == "completed" and intent["commit_sha"] != commit_sha:
+                raise RuntimeError("git_integration_reconciliation_required: completed intent commit conflicts")
+            conn.execute(
+                "UPDATE git_commit_intents SET status='completed',commit_sha=?,completed_at=COALESCE(completed_at,?) WHERE ticket_id=?",
+                (commit_sha, now, ticket_id),
+            )
+            changed = conn.execute(
+                "UPDATE scheduler_stage_claims SET side_effect_completed_at=?,result_json=?,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_owner=? AND lease_expires_at>? AND side_effect_completed_at IS NULL",
+                (now, encoded, now, claim_id, owner, now),
+            )
+            if changed.rowcount != 1:
+                raise PermissionError("scheduler claim lease is not owned")
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=ticket_id,
+                event_type="scheduler_stage_effect_completed",
+                actor_id=owner,
+                payload={"claim_id": claim_id, "stage": "git_integration", "result": result},
+            )
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
     def claim_next_scheduler_repair_routing(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
         """Claim one failed validation or completed review for routing only."""
         if not owner or lease_seconds < 1:
@@ -2488,7 +2812,7 @@ class Ledger:
             if changed.rowcount != 1:
                 raise PermissionError("scheduler claim lease is not owned")
             self._append_event(conn, entity_type="ticket", entity_id=str(row["ticket_id"]), event_type="scheduler_stage_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": row["stage"], "result": result})
-            if row["stage"] == "implementation" or str(row["stage"]).startswith("implementation:") or str(row["stage"]).startswith("validation:") or str(row["stage"]).startswith("review:") or str(row["stage"]).startswith("repair_routing:") or str(row["stage"]).startswith("triage:") or str(row["stage"]).startswith("acceptance:"):
+            if row["stage"] == "implementation" or str(row["stage"]).startswith("implementation:") or str(row["stage"]).startswith("validation:") or str(row["stage"]).startswith("review:") or str(row["stage"]).startswith("repair_routing:") or str(row["stage"]).startswith("triage:") or str(row["stage"]).startswith("acceptance:") or str(row["stage"]).startswith("git_integration:"):
                 conn.execute(
                     "UPDATE tickets SET lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND lease_owner=?",
                     (now, row["ticket_id"], owner),
