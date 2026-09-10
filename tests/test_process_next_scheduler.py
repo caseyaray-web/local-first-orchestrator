@@ -103,25 +103,55 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         self.assertEqual(claim["ticket_id"], ready)
         self.assertEqual(self.ledger.get_ticket(malformed)["state"], "draft")
 
-    def test_expired_claim_replays_same_stage_after_restart_without_duplicate_transition(self) -> None:
+    def test_expired_claim_replays_completed_effect_without_duplicate_transition(self) -> None:
         ticket = self.ticket("ready")
         first = self.ledger.claim_next_scheduler_readiness("worker-a", lease_seconds=1, now=100)
         self.assertEqual(first["ticket_id"], ticket)
-        self.assertEqual(self.ledger.admit_ticket_if_ready(ticket).status, "ready")
+        self.ledger.begin_scheduler_claim_effect(first["claim_id"], "worker-a", now=100)
+        applied = self.ledger.apply_scheduler_readiness_effect(first["claim_id"], "worker-a", now=100)
+        self.assertIsNotNone(applied["side_effect_completed_at"])
+        self.assertIsNone(applied["finalized_at"])
         self.ledger.close()
 
         self.ledger = Ledger(self.database)
         self.ledger.migrate()
         replay = self.ledger.claim_next_scheduler_readiness("worker-b", lease_seconds=10, now=102)
         self.assertEqual(replay["claim_id"], first["claim_id"])
-        self.assertEqual(self.ledger.admit_ticket_if_ready(ticket).status, "ready")
-        self.ledger.complete_scheduler_claim(first["claim_id"], "worker-b", {"status": "ready"}, now=102)
+        reapplied = self.ledger.apply_scheduler_readiness_effect(first["claim_id"], "worker-b", now=102)
+        result = json.loads(reapplied["result_json"])
+        self.ledger.complete_scheduler_claim(first["claim_id"], "worker-b", result, now=102)
 
         transitions = [event for event in self.ledger.events_for(ticket) if event["event_type"] == "state_transition"]
         self.assertEqual(len(transitions), 1)
         row = self.ledger.scheduler_claim(first["claim_id"])
         self.assertEqual(row["status"], "completed")
+        self.assertIsNotNone(row["side_effect_started_at"])
+        self.assertIsNotNone(row["side_effect_completed_at"])
+        self.assertIsNotNone(row["finalized_at"])
         self.assertEqual(row["attempt_count"], 2)
+
+    def test_readiness_effect_failure_rolls_back_transition_but_preserves_started_marker(self) -> None:
+        ticket = self.ticket("atomic")
+        claim = self.ledger.claim_next_scheduler_readiness("worker-a", lease_seconds=1, now=100)
+        self.ledger.begin_scheduler_claim_effect(claim["claim_id"], "worker-a", now=100)
+        self.ledger.failure_injector = lambda point: (_ for _ in ()).throw(RuntimeError(point)) if point == "after_event_creation" else None
+
+        with self.assertRaisesRegex(RuntimeError, "after_event_creation"):
+            self.ledger.apply_scheduler_readiness_effect(claim["claim_id"], "worker-a", now=100)
+
+        row = self.ledger.scheduler_claim(claim["claim_id"])
+        self.assertIsNotNone(row["side_effect_started_at"])
+        self.assertIsNone(row["side_effect_completed_at"])
+        self.assertIsNone(row["finalized_at"])
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "draft")
+        self.assertFalse([e for e in self.ledger.events_for(ticket) if e["event_type"] == "state_transition"])
+
+        self.ledger.failure_injector = None
+        replay = self.ledger.claim_next_scheduler_readiness("worker-b", lease_seconds=10, now=102)
+        applied = self.ledger.apply_scheduler_readiness_effect(replay["claim_id"], "worker-b", now=102)
+        result = json.loads(applied["result_json"])
+        self.ledger.complete_scheduler_claim(replay["claim_id"], "worker-b", result, now=102)
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "ready_local")
 
     def test_process_next_runs_exactly_one_durable_stage_per_tick(self) -> None:
         ticket = self.ticket("ready")

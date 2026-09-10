@@ -96,6 +96,9 @@ CREATE TABLE IF NOT EXISTS scheduler_stage_claims (
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
     result_json TEXT,
     last_error TEXT,
+    side_effect_started_at INTEGER,
+    side_effect_completed_at INTEGER,
+    finalized_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE(ticket_id, stage)
@@ -793,6 +796,14 @@ class Ledger:
         for name, definition in {"payload_json": "TEXT NOT NULL DEFAULT '{}'", "operation": "TEXT NOT NULL DEFAULT 'set_state'", "external_task_id": "TEXT", "lease_owner": "TEXT", "lease_expires_at": "INTEGER", "next_attempt_at": "INTEGER", "attempt_count": "INTEGER NOT NULL DEFAULT 0", "last_error": "TEXT", "terminal_error": "TEXT", "superseded_at": "INTEGER", "superseded_by_event_id": "INTEGER", "supersession_reason": "TEXT"}.items():
             if name not in projection_columns:
                 self.connection.execute(f"ALTER TABLE board_projection_outbox ADD COLUMN {name} {definition}")
+        scheduler_claim_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(scheduler_stage_claims)")}
+        for name, definition in {
+            "side_effect_started_at": "INTEGER",
+            "side_effect_completed_at": "INTEGER",
+            "finalized_at": "INTEGER",
+        }.items():
+            if name not in scheduler_claim_columns:
+                self.connection.execute(f"ALTER TABLE scheduler_stage_claims ADD COLUMN {name} {definition}")
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_state_projection_claimable ON board_projection_outbox(operation, acknowledged_at, superseded_at, next_attempt_at, lease_expires_at, queued_at)")
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)",
@@ -1467,6 +1478,141 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_claimed", actor_id=owner, payload={"claim_id": claim_id, "stage": "dependency_readiness", "lease_expires_at": now + lease_seconds})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
+    def begin_scheduler_claim_effect(self, claim_id: str, owner: str, *, now: int | None = None) -> dict[str, Any]:
+        """Durably mark a claimed stage as started before any stage side effect."""
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if row is None:
+                raise KeyError(claim_id)
+            if row["status"] == "completed":
+                return dict(row)
+            if row["side_effect_completed_at"] is not None:
+                return dict(row)
+            if row["side_effect_started_at"] is not None:
+                return dict(row)
+            changed = conn.execute(
+                "UPDATE scheduler_stage_claims SET side_effect_started_at=?,updated_at=? "
+                "WHERE claim_id=? AND status='claimed' AND lease_owner=? AND lease_expires_at>? AND side_effect_started_at IS NULL",
+                (now, now, claim_id, owner, now),
+            )
+            if changed.rowcount != 1:
+                raise PermissionError("scheduler claim lease is not owned")
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=str(row["ticket_id"]),
+                event_type="scheduler_stage_effect_started",
+                actor_id=owner,
+                payload={"claim_id": claim_id, "stage": row["stage"]},
+            )
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
+    def apply_scheduler_readiness_effect(self, claim_id: str, owner: str, *, now: int | None = None) -> dict[str, Any]:
+        """Apply readiness and its durable completion marker atomically.
+
+        The prior begin marker lives in a separate transaction.  Therefore a
+        crash before this transaction leaves an explicit started/unknown claim;
+        a crash after commit always leaves both the ticket transition/outbox and
+        side_effect_completed_at visible together.
+        """
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if claim is None:
+                raise KeyError(claim_id)
+            if claim["stage"] != "dependency_readiness":
+                raise ValueError("scheduler claim is not dependency readiness")
+            if claim["status"] == "completed" or claim["side_effect_completed_at"] is not None:
+                return dict(claim)
+            if claim["side_effect_started_at"] is None:
+                raise RuntimeError("scheduler claim effect was not durably started")
+            if claim["lease_owner"] != owner or claim["lease_expires_at"] is None or int(claim["lease_expires_at"]) <= now:
+                raise PermissionError("scheduler claim lease is not owned")
+
+            ticket_id = str(claim["ticket_id"])
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None:
+                raise KeyError(ticket_id)
+            if ticket["state"] == CanonicalState.READY_LOCAL.value:
+                result = {"status": "ready", "unresolved_dependency_ids": []}
+            else:
+                if ticket["state"] != CanonicalState.DRAFT.value:
+                    raise RuntimeError(f"claimed readiness stage became ineligible: wrong_state")
+                binding = conn.execute("SELECT repository_path,starting_sha FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
+                if binding is None or not binding["repository_path"] or not binding["starting_sha"]:
+                    raise RuntimeError("claimed readiness stage became ineligible: invalid_runtime_binding")
+                try:
+                    from .controller import ticket_from_ledger
+                    validate_ticket(ticket_from_ledger(dict(ticket)))
+                    dependencies = tuple(sorted(set(json.loads(ticket["dependencies_json"]))))
+                except Exception as exc:
+                    raise RuntimeError("claimed readiness stage became ineligible: invalid_ticket") from exc
+                if ticket_id in dependencies:
+                    raise RuntimeError("claimed readiness stage became ineligible: invalid_ticket")
+                unresolved: list[str] = []
+                for dependency in dependencies:
+                    dep = conn.execute("SELECT state FROM tickets WHERE id=?", (dependency,)).fetchone()
+                    if dep is None:
+                        unresolved.append(dependency)
+                        continue
+                    if dep["state"] == CanonicalState.ACCEPTED.value:
+                        continue
+                    accepted = conn.execute("SELECT 1 FROM accepted_evidence WHERE ticket_id=? LIMIT 1", (dependency,)).fetchone()
+                    if dep["state"] == CanonicalState.DONE.value and accepted is not None:
+                        continue
+                    unresolved.append(dependency)
+                if unresolved:
+                    raise RuntimeError("claimed readiness stage became ineligible: waiting_on_dependencies")
+
+                target = CanonicalState.READY_LOCAL
+                current = CanonicalState(ticket["state"])
+                validate_transition(current, target)
+                changed = conn.execute(
+                    "UPDATE tickets SET state=?,updated_at=? WHERE id=? AND state=?",
+                    (target.value, now, ticket_id, current.value),
+                )
+                if changed.rowcount != 1:
+                    raise RuntimeError("ticket changed concurrently")
+                event_id = self._append_event(
+                    conn,
+                    entity_type="ticket",
+                    entity_id=ticket_id,
+                    event_type="state_transition",
+                    actor_id="readiness",
+                    from_state=current.value,
+                    to_state=target.value,
+                    payload={"reason": "dependencies_satisfied"},
+                )
+                self._inject_failure("after_event_creation")
+                if target.value in self._PROJECTABLE_STATES:
+                    self._enqueue_projection_bundle_in_transaction(
+                        conn,
+                        ticket_id=ticket_id,
+                        event_id=event_id,
+                        evidence=f"state={target.value}",
+                        state_payload={"reason": "dependencies_satisfied"},
+                    )
+                result = {"status": "ready", "unresolved_dependency_ids": []}
+
+            encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+            changed = conn.execute(
+                "UPDATE scheduler_stage_claims SET side_effect_completed_at=?,result_json=?,updated_at=? "
+                "WHERE claim_id=? AND status='claimed' AND lease_owner=? AND lease_expires_at>? AND side_effect_completed_at IS NULL",
+                (now, encoded, now, claim_id, owner, now),
+            )
+            if changed.rowcount != 1:
+                raise PermissionError("scheduler claim lease is not owned")
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=ticket_id,
+                event_type="scheduler_stage_effect_completed",
+                actor_id=owner,
+                payload={"claim_id": claim_id, "stage": "dependency_readiness", "result": result},
+            )
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
     def complete_scheduler_claim(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
         now = self._now() if now is None else now
         encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
@@ -1478,10 +1624,14 @@ class Ledger:
                 if row["result_json"] != encoded:
                     raise RuntimeError("scheduler claim result conflicts")
                 return dict(row)
+            if row["side_effect_completed_at"] is None:
+                raise RuntimeError("scheduler claim side effect is not durably completed")
+            if row["result_json"] is not None and row["result_json"] != encoded:
+                raise RuntimeError("scheduler claim result conflicts")
             changed = conn.execute(
-                "UPDATE scheduler_stage_claims SET status='completed',lease_owner=NULL,lease_expires_at=NULL,result_json=?,updated_at=? "
-                "WHERE claim_id=? AND status='claimed' AND lease_owner=? AND lease_expires_at>?",
-                (encoded, now, claim_id, owner, now),
+                "UPDATE scheduler_stage_claims SET status='completed',lease_owner=NULL,lease_expires_at=NULL,result_json=?,finalized_at=?,updated_at=? "
+                "WHERE claim_id=? AND status='claimed' AND lease_owner=? AND lease_expires_at>? AND side_effect_completed_at IS NOT NULL",
+                (encoded, now, now, claim_id, owner, now),
             )
             if changed.rowcount != 1:
                 raise PermissionError("scheduler claim lease is not owned")

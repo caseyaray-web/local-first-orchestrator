@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 import sqlite3
 from dataclasses import dataclass
@@ -184,19 +185,22 @@ class ProcessNextScheduler:
         )
         if claim is None:
             return ProcessNextResult("no_work")
-        readiness = self.ledger.admit_ticket_if_ready(str(claim["ticket_id"]))
+        claim_id = str(claim["claim_id"])
+        ticket_id = str(claim["ticket_id"])
+        self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+        applied = self.ledger.apply_scheduler_readiness_effect(claim_id, execution_owner, now=now)
         result = {
-            "status": readiness.status,
-            "unresolved_dependency_ids": list(readiness.unresolved_dependency_ids),
+            "status": "ready",
+            "unresolved_dependency_ids": [],
         }
-        if readiness.status != "ready":
-            raise RuntimeError(f"claimed readiness stage became ineligible: {readiness.status}")
+        if applied.get("result_json"):
+            result = json.loads(str(applied["result_json"]))
         self.ledger.complete_scheduler_claim(
-            str(claim["claim_id"]), execution_owner, result, now=now
+            claim_id, execution_owner, result, now=now
         )
         return ProcessNextResult(
             "completed",
             "dependency_readiness",
-            str(claim["ticket_id"]),
-            str(claim["claim_id"]),
+            ticket_id,
+            claim_id,
         )
