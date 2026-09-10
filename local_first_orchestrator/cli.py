@@ -316,6 +316,7 @@ def run_command(args: argparse.Namespace) -> int:
                 review_runner=lambda ticket_id: ctl.execute_fresh_review_only(
                     ticket_id, repository=registered.canonical_repository
                 ),
+                review_execution_policy_hash=ctl.review_execution_policy_hash(),
             ).process_next()
             print(json.dumps(asdict(result),sort_keys=True))
         elif args.command in {"implementation-only", "implement-only"}:

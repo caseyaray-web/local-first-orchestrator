@@ -179,6 +179,7 @@ class ProcessNextScheduler:
         implementation_runner: Callable[[str], dict[str, Any]] | None = None,
         validation_runner: Callable[[str], dict[str, Any]] | None = None,
         review_runner: Callable[[str], dict[str, Any]] | None = None,
+        review_execution_policy_hash: str | None = None,
     ) -> None:
         if not worker_id or lease_seconds < 1:
             raise ValueError("process-next requires a worker id and positive lease")
@@ -195,6 +196,9 @@ class ProcessNextScheduler:
         self.implementation_runner = implementation_runner
         self.validation_runner = validation_runner
         self.review_runner = review_runner
+        self.review_execution_policy_hash = review_execution_policy_hash
+        if self.review_runner is not None and not self.review_execution_policy_hash:
+            raise ValueError("process-next review runner requires a review execution policy hash")
 
     def process_next(self) -> ProcessNextResult:
         now = int(self.clock())
@@ -271,7 +275,10 @@ class ProcessNextScheduler:
 
         if self.review_runner is not None:
             review_claim = self.ledger.claim_next_scheduler_review(
-                execution_owner, lease_seconds=self.lease_seconds, now=now
+                execution_owner,
+                lease_seconds=self.lease_seconds,
+                review_execution_policy_hash=str(self.review_execution_policy_hash),
+                now=now,
             )
             if review_claim is not None:
                 claim_id = str(review_claim["claim_id"])
@@ -281,8 +288,17 @@ class ProcessNextScheduler:
                     review_result = json.loads(str(current["result_json"]))
                 else:
                     if current.get("side_effect_started_at") is not None:
-                        raise RuntimeError("review_reconciliation_required: started review outcome is unknown")
-                    self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+                        try:
+                            identity = json.loads(str(current.get("candidate_identity_json") or ""))
+                            attempt_number = int(identity["attempt_number"])
+                        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                            raise RuntimeError("review_reconciliation_required: review claim identity is malformed") from exc
+                        review_stage = self.ledger.model_stage(ticket_id, attempt_number, "review")
+                        invocations = self.ledger.review_invocations(ticket_id, attempt_number)
+                        if review_stage is None and invocations and str(invocations[-1]["status"]) != "completed":
+                            raise RuntimeError("review_reconciliation_required: started review outcome is unknown")
+                    else:
+                        self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
                     review_result = self.review_runner(ticket_id)
                     self.ledger.complete_scheduler_review_effect(
                         claim_id, execution_owner, review_result, now=now

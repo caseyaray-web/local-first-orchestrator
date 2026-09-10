@@ -52,8 +52,11 @@ class LifecycleModel:
                 raise RuntimeError("launch failed")
             (workdir / "app.py").write_text("def value():\n    return 'ok'\n", encoding="utf-8")
         artifact = artifact_dir / f"{purpose}-result.json"
-        artifact.write_text("{}", encoding="utf-8")
         payload = {} if purpose == "implementation" else {"verdict":"pass","criterion_results":[{"criterion_id":"AC-1","status":"pass","evidence":"ok"}],"findings":[],"suggestions":[]}
+        if purpose == "review":
+            artifact.write_text(json.dumps({"provider":self.provider,"model":self.model,"payload":payload},sort_keys=True), encoding="utf-8")
+        else:
+            artifact.write_text("{}", encoding="utf-8")
         return type("Result", (), {"payload": payload, "artifact_path": artifact})()
 
 
@@ -188,6 +191,7 @@ class InvocationLifecycleTests(unittest.TestCase):
         scheduler = ProcessNextScheduler(
             self.ledger, Board(), worker_id="scheduler-review", lease_seconds=30, clock=lambda: 102,
             review_runner=lambda ticket_id: ctl.execute_fresh_review_only(ticket_id, repository=self.repo),
+            review_execution_policy_hash=ctl.review_execution_policy_hash(),
         )
         results = [scheduler.process_next() for _ in range(3)]
         result = next(item for item in results if item.stage == "review")
@@ -201,6 +205,10 @@ class InvocationLifecycleTests(unittest.TestCase):
         self.assertIsNone(self.ledger.accepted_commit(ticket))
         review_call = self.ledger.review_invocations(ticket, 1)[0]
         self.assertEqual(review_call["worktree_path"], "packet-only")
+        review_artifact = json.loads(Path(str(review_call["model_artifact"])).read_text(encoding="utf-8"))
+        self.assertEqual(set(review_artifact), {"provider", "model", "payload"})
+        self.assertEqual(review_artifact["provider"], model.provider)
+        self.assertEqual(review_artifact["model"], model.model)
         claim = self.ledger.scheduler_claim(str(result.claim_id))
         self.assertEqual(claim["status"], "completed")
         self.assertIsNotNone(claim["side_effect_completed_at"])
@@ -210,14 +218,14 @@ class InvocationLifecycleTests(unittest.TestCase):
         model = LifecycleModel(); ctl, ticket = self.controller(model)
         ProcessNextScheduler(self.ledger, Board(), worker_id="implementation", lease_seconds=30, clock=lambda: 100, implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo)).process_next()
         ProcessNextScheduler(self.ledger, Board(), worker_id="validation", lease_seconds=30, clock=lambda: 101, validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo)).process_next()
-        claim = self.ledger.claim_next_scheduler_review("crashed", lease_seconds=1, now=102)
+        claim = self.ledger.claim_next_scheduler_review("crashed", lease_seconds=1, review_execution_policy_hash=ctl.review_execution_policy_hash(), now=102)
         assert claim is not None
         claim_id = str(claim["claim_id"])
         self.ledger.begin_scheduler_claim_effect(claim_id, "crashed", now=102)
         persisted = ctl.execute_fresh_review_only(ticket, repository=self.repo)
         self.ledger.complete_scheduler_review_effect(claim_id, "crashed", persisted, now=102)
         calls: list[str] = []
-        resumed = ProcessNextScheduler(self.ledger, Board(), worker_id="recovery", lease_seconds=30, clock=lambda: 104, review_runner=lambda value: calls.append(value) or (_ for _ in ()).throw(AssertionError("reviewer must not be reinvoked")))
+        resumed = ProcessNextScheduler(self.ledger, Board(), worker_id="recovery", lease_seconds=30, clock=lambda: 104, review_runner=lambda value: calls.append(value) or (_ for _ in ()).throw(AssertionError("reviewer must not be reinvoked")), review_execution_policy_hash=ctl.review_execution_policy_hash())
 
         results = [resumed.process_next() for _ in range(3)]
 
@@ -230,23 +238,66 @@ class InvocationLifecycleTests(unittest.TestCase):
         model = LifecycleModel(); ctl, ticket = self.controller(model)
         ProcessNextScheduler(self.ledger, Board(), worker_id="implementation", lease_seconds=30, clock=lambda: 100, implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo)).process_next()
         ProcessNextScheduler(self.ledger, Board(), worker_id="validation", lease_seconds=30, clock=lambda: 101, validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo)).process_next()
-        claim = self.ledger.claim_next_scheduler_review("crashed", lease_seconds=1, now=102)
-        assert claim is not None
-        self.ledger.begin_scheduler_claim_effect(str(claim["claim_id"]), "crashed", now=102)
-        calls: list[str] = []
-        resumed = ProcessNextScheduler(self.ledger, Board(), worker_id="recovery", lease_seconds=30, clock=lambda: 104, review_runner=lambda value: calls.append(value) or ctl.execute_fresh_review_only(value, repository=self.repo))
+        crashing = LocalFirstController(self.ledger, Board(), self.config, local_model=model, fault_injector=lambda stage: (_ for _ in ()).throw(RuntimeError("simulated controller death")) if stage == "review_invocation_started" else None)
+        first = ProcessNextScheduler(self.ledger, Board(), worker_id="crashed", lease_seconds=30, clock=lambda: 102, review_runner=lambda value: crashing.execute_fresh_review_only(value, repository=self.repo), review_execution_policy_hash=crashing.review_execution_policy_hash())
+        with self.assertRaisesRegex(RuntimeError, "simulated controller death"):
+            for _ in range(3): first.process_next()
+        self.assertEqual(model.calls, 1)
+        review_call = self.ledger.review_invocations(ticket, 1)[0]
+        self.assertEqual(review_call["status"], "started")
 
+        calls: list[str] = []
+        resumed = ProcessNextScheduler(self.ledger, Board(), worker_id="recovery", lease_seconds=30, clock=lambda: 133, review_runner=lambda value: calls.append(value) or ctl.execute_fresh_review_only(value, repository=self.repo), review_execution_policy_hash=ctl.review_execution_policy_hash())
         with self.assertRaisesRegex(RuntimeError, "review_reconciliation_required"):
             for _ in range(3): resumed.process_next()
-
         self.assertEqual(calls, [])
-        self.assertIsNone(self.ledger.scheduler_claim(str(claim["claim_id"]))["side_effect_completed_at"])
+        claim = self.ledger.connection.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage LIKE 'review:%'", (ticket,)).fetchone()
+        self.assertIsNotNone(claim["side_effect_started_at"])
+        self.assertIsNone(claim["side_effect_completed_at"])
+
+    def test_scheduler_review_recovers_completed_invocation_before_model_stage_without_reinvocation(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        ProcessNextScheduler(self.ledger, Board(), worker_id="implementation", lease_seconds=30, clock=lambda: 100, implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo)).process_next()
+        ProcessNextScheduler(self.ledger, Board(), worker_id="validation", lease_seconds=30, clock=lambda: 101, validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo)).process_next()
+        crashing = LocalFirstController(self.ledger, Board(), self.config, local_model=model, fault_injector=lambda stage: (_ for _ in ()).throw(RuntimeError("simulated controller death")) if stage == "review_invocation_completed" else None)
+        first = ProcessNextScheduler(self.ledger, Board(), worker_id="crashed", lease_seconds=30, clock=lambda: 102, review_runner=lambda value: crashing.execute_fresh_review_only(value, repository=self.repo), review_execution_policy_hash=crashing.review_execution_policy_hash())
+        with self.assertRaisesRegex(RuntimeError, "simulated controller death"):
+            for _ in range(3): first.process_next()
+        self.assertEqual(model.calls, 2)
+        review_call = self.ledger.review_invocations(ticket, 1)[0]
+        self.assertEqual(review_call["status"], "completed")
+        artifact_before = Path(str(review_call["model_artifact"])).read_bytes()
+        self.assertIsNone(self.ledger.model_stage(ticket, 1, "review"))
+
+        resumed_ctl = LocalFirstController(self.ledger, Board(), self.config, local_model=model)
+        resumed = ProcessNextScheduler(self.ledger, Board(), worker_id="recovery", lease_seconds=30, clock=lambda: 133, review_runner=lambda value: resumed_ctl.execute_fresh_review_only(value, repository=self.repo), review_execution_policy_hash=resumed_ctl.review_execution_policy_hash())
+        results = [resumed.process_next() for _ in range(3)]
+        final = next(item for item in results if item.stage == "review")
+        self.assertEqual(final.status, "completed")
+        self.assertEqual(model.calls, 2)
+        self.assertIsNotNone(self.ledger.model_stage(ticket, 1, "review"))
+        self.assertEqual(Path(str(review_call["model_artifact"])).read_bytes(), artifact_before)
+
+    def test_scheduler_review_reclaim_fails_closed_on_execution_policy_drift(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        ProcessNextScheduler(self.ledger, Board(), worker_id="implementation", lease_seconds=30, clock=lambda: 100, implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo)).process_next()
+        ProcessNextScheduler(self.ledger, Board(), worker_id="validation", lease_seconds=30, clock=lambda: 101, validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo)).process_next()
+        original_policy_hash = ctl.review_execution_policy_hash()
+        claim = self.ledger.claim_next_scheduler_review("crashed", lease_seconds=1, review_execution_policy_hash=original_policy_hash, now=102)
+        assert claim is not None
+        original_identity = json.loads(str(claim["candidate_identity_json"]))
+        model.model = "fixture-model-v2"
+        drifted_ctl = LocalFirstController(self.ledger, Board(), self.config, local_model=model)
+        self.assertNotEqual(original_policy_hash, drifted_ctl.review_execution_policy_hash())
+        with self.assertRaisesRegex(RuntimeError, "review execution policy drift"):
+            self.ledger.claim_next_scheduler_review("recovery", lease_seconds=30, review_execution_policy_hash=drifted_ctl.review_execution_policy_hash(), now=104)
+        self.assertEqual(json.loads(str(self.ledger.scheduler_claim(str(claim["claim_id"]))["candidate_identity_json"])), original_identity)
 
     def test_scheduler_review_fails_closed_when_candidate_identity_drifts(self) -> None:
         model = LifecycleModel(); ctl, ticket = self.controller(model)
         ProcessNextScheduler(self.ledger, Board(), worker_id="implementation", lease_seconds=30, clock=lambda: 100, implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo)).process_next()
         ProcessNextScheduler(self.ledger, Board(), worker_id="validation", lease_seconds=30, clock=lambda: 101, validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo)).process_next()
-        claim = self.ledger.claim_next_scheduler_review("reviewer", lease_seconds=30, now=102)
+        claim = self.ledger.claim_next_scheduler_review("reviewer", lease_seconds=30, review_execution_policy_hash=ctl.review_execution_policy_hash(), now=102)
         assert claim is not None
         self.ledger.begin_scheduler_claim_effect(str(claim["claim_id"]), "reviewer", now=102)
         self.ledger.connection.execute("UPDATE review_candidates SET runtime_identity_json='{}' WHERE ticket_id=? AND attempt_number=1", (ticket,))

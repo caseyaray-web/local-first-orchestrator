@@ -27,6 +27,21 @@ Already complete or substantially complete:
    - replays a persisted model stage without model reinvocation
    - stops before deterministic validation
 
+3. **Deterministic validation stage — Complete for the current scheduler slice**
+   - validation is independently claimable after implementation
+   - candidate identity is bound to the exact implementation attempt/diff/worktree
+   - deterministic validation evidence is persisted durably
+   - crash/replay behavior is covered without crossing into review in the same tick
+
+4. **Fresh review stage — Complete for the current scheduler slice**
+   - review is independently claimable only after passing validation
+   - review uses a fresh packet-only context
+   - review claims bind both candidate identity and configured review execution policy
+   - completed review invocations can be recovered before model-stage persistence without reinvocation
+   - unknown started invocations fail closed
+   - adapter-authored review artifacts are preserved intact
+   - repair/acceptance remain separate later stages
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage
@@ -46,7 +61,7 @@ Required slices:
 
 Completion condition: a persisted implementation candidate can be picked up by a later `process-next`, validated against its exact attempt/diff/worktree and trusted verification policy, survive crash/restart without duplicate or ambiguous evidence, and end in a durable state from which review or repair can proceed.
 
-## 4. Fresh review stage
+## 4. Fresh review stage — Complete
 
 Make fresh review independently claimable and restart-safe.
 
@@ -62,6 +77,8 @@ Required slices:
 - Do not invoke repair in the same scheduler tick.
 
 Completion condition: a validated candidate receives one fresh independent review, whose exact structured result is durably bound to that candidate and can be recovered without duplicate review calls.
+
+**Current status:** Complete for this scheduler milestone. Review claims now bind candidate identity plus provider/model/timeout/schema execution identity; adapter-authored artifacts are preserved; completed invocations interrupted before model-stage persistence are recoverable without reinvocation; ambiguous started invocations still fail closed.
 
 ## 5. Repair-routing stage
 

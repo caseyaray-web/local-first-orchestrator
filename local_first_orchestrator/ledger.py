@@ -1533,6 +1533,16 @@ class Ledger:
         }
         return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
+    def review_policy_hash(self, ticket: Any, execution_policy_hash: str) -> str:
+        """Bind review claims to ticket policy plus configured review execution identity."""
+        if not execution_policy_hash:
+            raise ValueError("review execution policy hash is required")
+        policy = {
+            "ticket_policy_hash": self._validation_policy_hash(ticket),
+            "review_execution_policy_hash": execution_policy_hash,
+        }
+        return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
     def claim_next_scheduler_validation(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
         """Claim one exact implementation candidate for deterministic validation."""
         if not owner or lease_seconds < 1:
@@ -1647,7 +1657,7 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=str(claim["ticket_id"]), event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": "validation", "result": result})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
-    def claim_next_scheduler_review(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+    def claim_next_scheduler_review(self, owner: str, *, lease_seconds: int, review_execution_policy_hash: str, now: int | None = None) -> dict[str, Any] | None:
         """Claim one exact passing validation candidate for packet-only review."""
         if not owner or lease_seconds < 1:
             raise ValueError("scheduler claim requires an owner and positive lease")
@@ -1657,6 +1667,13 @@ class Ledger:
                 return None
             replay = conn.execute("SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'review:%' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,)).fetchone()
             if replay is not None:
+                try:
+                    replay_identity = json.loads(str(replay["candidate_identity_json"] or ""))
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("review_reconciliation_required: review claim identity is malformed") from exc
+                replay_ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (replay["ticket_id"],)).fetchone()
+                if replay_ticket is None or replay_identity.get("review_policy_hash") != self.review_policy_hash(replay_ticket, review_execution_policy_hash):
+                    raise RuntimeError("review_reconciliation_required: review execution policy drift")
                 if conn.execute("UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?", (owner, now + lease_seconds, now, replay["claim_id"], now)).rowcount != 1:
                     return None
                 conn.execute("UPDATE tickets SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=?", (owner, now + lease_seconds, now, replay["ticket_id"]))
@@ -1685,7 +1702,7 @@ class Ledger:
             if str(validation["candidate_identity"].get("implementation_diff_hash")) != str(row["diff_hash"]):
                 raise RuntimeError("review_reconciliation_required: validated candidate drift")
             ticket_id = str(row["id"])
-            policy = self._validation_policy_hash(row)
+            policy = self.review_policy_hash(row, review_execution_policy_hash)
             identity = {"ticket_id": ticket_id, "attempt_number": attempt_number, "implementation_diff_hash": str(row["diff_hash"]), "validation_artifact": str(row["artifact_path"]), "validation_artifact_sha256": str(row["artifact_sha256"]), "validation_evidence_hash": hashlib.sha256(str(validation.get("compact_evidence", "")).encode()).hexdigest(), "review_policy_hash": policy}
             candidate = conn.execute("SELECT * FROM review_candidates WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
             encoded_identity = json.dumps(identity, sort_keys=True, separators=(",", ":"))
