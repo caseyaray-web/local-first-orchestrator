@@ -52,6 +52,19 @@ Already complete or substantially complete:
    - pass review is recorded without accepting the candidate in the routing tick
    - repair-routing effect completion and state transition are atomic and restart-finalizable
 
+6. **Bounded triage/decomposition stage — Complete for the current scheduler slice**
+   - only durable repair-routing decisions whose action is `triage` are eligible
+   - triage uses the configured local decomposition route in planning-only `safe` mode
+   - claim identity binds parent depth, unresolved criteria, failure evidence, ticket policy, and triage execution policy
+   - valid triage proposals are persisted before child materialization/projection
+   - existing child-count, depth, scope, criterion, readiness, and duplicate rules remain authoritative
+   - ledger-assigned child IDs replace model-proposed IDs for durable identity
+   - scheduler-created children inherit repository/runtime provenance and explicit criterion linkage
+   - child materialization and create-card outbox enqueue are atomic
+   - pending child-card projection prevents implementation from claiming the child
+   - completed planner invocations and post-materialization crashes recover without duplicate inference, children, or outbox rows
+   - `block` and `checkpoint` map to existing canonical states without creating children
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage
@@ -108,7 +121,7 @@ Completion condition: failures cannot create uncontrolled retry loops, and every
 
 **Current status:** Complete for this scheduler milestone. Repair routing is a ledger-derived stage with no model call of its own. It atomically records the decision and state transition, preserves same-ticket attempt continuity for repair, routes repeated/exhausted failures to triage, and leaves pass review candidates for the separate acceptance milestone.
 
-## 6. Bounded triage/decomposition stage
+## 6. Bounded triage/decomposition stage — Complete
 
 Bring the existing triage policy machinery under scheduler control.
 
@@ -122,6 +135,8 @@ Required slices:
 - Preserve parent state and criterion linkage exactly.
 
 Completion condition: triage creates at most the permitted bounded child set, exactly once, with every child mapped to unresolved acceptance criteria and recoverable projection state.
+
+**Current status:** Complete for this scheduler milestone. Triage is independently claimable only from a durable repair-routing decision, runs through a planning-only decomposition route, persists and recovers model provenance, materializes bounded children using ledger-assigned identities, atomically enqueues their retry-safe Hermes projections, preserves repository and criterion provenance, and blocks child implementation until external card creation is acknowledged. Restart coverage includes completed-invocation recovery and the post-materialization/pre-finalization boundary without duplicate inference or child creation.
 
 ## 7. Acceptance / candidate-freeze stage
 

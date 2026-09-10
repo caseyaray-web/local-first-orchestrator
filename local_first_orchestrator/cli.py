@@ -19,6 +19,7 @@ from .local_qwen import LOCAL_QWEN_MODEL, LOCAL_QWEN_PROVIDER, LocalQwenAdapter
 from .operator_config import ModelRegistration, OperatorConfig, default_execution_roots, load_operator_config, save_operator_config
 from .scheduler import ProcessNextScheduler, preview_database
 from .ticket import MicroTicket, PatchBudget, VerificationProfile
+from .triage import LocalTriagePlanner
 
 
 def _correction_service(ledger: Ledger, args: argparse.Namespace) -> CorrectionService:
@@ -302,6 +303,14 @@ def run_command(args: argparse.Namespace) -> int:
             if not args.allow_board_writes: raise PermissionError("process-next --execute requires --allow-board-writes")
             if not args.hermes_executable or not args.board: raise ValueError("process-next execution requires --hermes-executable and --board")
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=True)
+            triage_route = dict(registered.decomposition).get("local")
+            triage_planner = None if triage_route is None else LocalTriagePlanner(
+                executable=args.hermes_executable,
+                provider=triage_route.provider,
+                model=triage_route.model,
+                profile=triage_route.profile,
+                timeout_seconds=ctl.config.review_timeout_seconds,
+            )
             result=ProcessNextScheduler(
                 ledger,
                 ctl.board,
@@ -317,6 +326,8 @@ def run_command(args: argparse.Namespace) -> int:
                     ticket_id, repository=registered.canonical_repository
                 ),
                 review_execution_policy_hash=ctl.review_execution_policy_hash(),
+                triage_runner=None if triage_planner is None else lambda ticket_id: ctl.execute_triage_only(ticket_id, planner=triage_planner),
+                triage_execution_policy_hash=None if triage_planner is None else triage_planner.execution_policy_hash(),
             ).process_next()
             print(json.dumps(asdict(result),sort_keys=True))
         elif args.command in {"implementation-only", "implement-only"}:

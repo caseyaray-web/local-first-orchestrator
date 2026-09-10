@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal, Protocol
 
 from .decomposition import generated_projection_key
+from .triage import triage_projection_key
 from .ledger import Ledger
 
 
@@ -78,6 +79,13 @@ def _contract_from_body(body: str) -> dict[str, Any]:
 
 
 def _expected_contract_identity(payload: dict[str, str], identity: dict[str, str]) -> dict[str, str]:
+    if identity.get("kind") == "triage_microticket":
+        return {
+            "kind": "triage_microticket",
+            "orchestrator_ticket_id": payload["orchestrator_ticket_id"],
+            "parent_ticket_id": payload["parent_ticket_id"],
+            "projection_key": payload["projection_key"],
+        }
     return {
         "kind": "microticket",
         "orchestrator_ticket_id": payload["orchestrator_ticket_id"],
@@ -103,16 +111,24 @@ def _canonical_payload(row: dict[str, Any], identity: dict[str, str]) -> dict[st
         raise DeterministicProjectionError("malformed generated projection payload") from exc
     if not isinstance(raw, dict):
         raise DeterministicProjectionError("generated projection payload must be an object")
-    required = ("title", "body", "orchestrator_ticket_id", "feature_id", "tranche_id", "projection_key")
+    required = (
+        ("title", "body", "orchestrator_ticket_id", "parent_ticket_id", "projection_key")
+        if identity.get("kind") == "triage_microticket"
+        else ("title", "body", "orchestrator_ticket_id", "feature_id", "tranche_id", "projection_key")
+    )
     if any(not isinstance(raw.get(name), str) or not raw[name] for name in required):
         raise DeterministicProjectionError("generated projection payload is incomplete")
-    expected_key = generated_projection_key(identity["ticket_id"])
+    expected_key = triage_projection_key(identity["ticket_id"]) if identity.get("kind") == "triage_microticket" else generated_projection_key(identity["ticket_id"])
     if row["ticket_id"] != identity["ticket_id"] or raw["orchestrator_ticket_id"] != identity["ticket_id"]:
         raise DeterministicProjectionError("generated projection ticket identity mismatch")
-    if raw["feature_id"] != identity["feature_id"]:
-        raise DeterministicProjectionError("generated projection feature identity mismatch")
-    if raw["tranche_id"] != identity["tranche_id"]:
-        raise DeterministicProjectionError("generated projection tranche identity mismatch")
+    if identity.get("kind") == "triage_microticket":
+        if raw["parent_ticket_id"] != identity["parent_ticket_id"]:
+            raise DeterministicProjectionError("triage projection parent identity mismatch")
+    else:
+        if raw["feature_id"] != identity["feature_id"]:
+            raise DeterministicProjectionError("generated projection feature identity mismatch")
+        if raw["tranche_id"] != identity["tranche_id"]:
+            raise DeterministicProjectionError("generated projection tranche identity mismatch")
     if (raw["projection_key"], row["idempotency_key"], expected_key) != (expected_key, expected_key, expected_key):
         raise DeterministicProjectionError("generated projection key mismatch")
     _verify_contract_identity(_contract_from_body(raw["body"]), {name: raw[name] for name in required}, identity)
@@ -160,7 +176,13 @@ class GeneratedProjectionWorker:
         if row is None:
             return GeneratedProjectionDeliveryResult("no_work")
         try:
-            identity = self.ledger.generated_projection_identity(str(row["ticket_id"]), int(row["event_id"]))
+            event = self.ledger.connection.execute("SELECT event_type FROM events WHERE id=?", (int(row["event_id"]),)).fetchone()
+            if event is None:
+                raise KeyError("generated projection event missing")
+            if event["event_type"] == "triage_child_created":
+                identity = self.ledger.triage_projection_identity(str(row["ticket_id"]), int(row["event_id"]))
+            else:
+                identity = self.ledger.generated_projection_identity(str(row["ticket_id"]), int(row["event_id"]))
             payload = _canonical_payload(row, identity)
         except (DeterministicProjectionError, KeyError, ValueError) as exc:
             return self._terminal(row, DeterministicProjectionError(str(exc)), int(self.clock()))

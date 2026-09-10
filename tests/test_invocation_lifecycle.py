@@ -6,12 +6,15 @@ import unittest
 from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
+from local_first_orchestrator.generated_projection import GeneratedProjectionWorker
 from local_first_orchestrator.hermes_board import ExternalTicket
 from local_first_orchestrator.ledger import Ledger, _stable_scheduler_failure_fingerprint
 from local_first_orchestrator.scheduler import ProcessNextScheduler, preview_next
 from local_first_orchestrator.states import CanonicalState
+from local_first_orchestrator.triage import LocalTriagePlanner
 
 
 def contract(*, new_test_files: list[str] | None = None) -> dict[str, object]:
@@ -35,6 +38,21 @@ class Board:
     def set_state(self, ticket_id: str, state: object, *, idempotency_key: str) -> None: pass
     def find_comment_marker(self, ticket_id: str, marker: str) -> str: return "not_found"
     def deliver_comment(self, ticket_id: str, comment: str, *, idempotency_key: str) -> None: pass
+
+
+class ProjectionBoard(Board):
+    def __init__(self) -> None:
+        self.created: list[tuple[str, str, str]] = []
+        self._body_by_id: dict[str, str] = {}
+
+    def create_microticket(self, title: str, body: str, *, idempotency_key: str) -> str:
+        task_id = f"external-{len(self.created) + 1}"
+        self.created.append((title, body, idempotency_key))
+        self._body_by_id[task_id] = body
+        return task_id
+
+    def get_task(self, task_id: str):
+        return SimpleNamespace(id=task_id, body=self._body_by_id[task_id])
 
 
 class LifecycleModel:
@@ -124,6 +142,203 @@ class InvocationLifecycleTests(unittest.TestCase):
             if result.stage == stage:
                 return result
         self.fail(f"scheduler did not reach stage {stage!r}")
+
+    def triage_parent(self) -> tuple[LocalFirstController, str]:
+        ctl, ticket = self.controller(LifecycleModel())
+        # Establish the already-durable repair-routing precondition directly;
+        # this fixture is testing the next scheduler stage, not board projection.
+        self.ledger.connection.execute("UPDATE tickets SET state=?,lease_owner=NULL,lease_expires_at=NULL WHERE id=?", (CanonicalState.NEEDS_TRIAGE.value, ticket))
+        self.ledger.connection.execute("DELETE FROM board_projection_outbox WHERE ticket_id=?", (ticket,))
+        self.ledger.record_runtime_stage(
+            ticket,
+            "repair-routing-1",
+            json.dumps({"ticket_id": ticket, "attempt_number": 1, "action": "triage", "failure_evidence": "ticket is too broad"}, sort_keys=True, separators=(",", ":")),
+            attempt_number=1,
+        )
+        return ctl, ticket
+
+    def triage_planner(self, payload: dict[str, object], calls: list[tuple[str, ...]] | None = None) -> LocalTriagePlanner:
+        def runner(argv, **kwargs):
+            if calls is not None:
+                calls.append(tuple(argv))
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
+        return LocalTriagePlanner(runner=runner, provider="triage-provider", model="triage-model", profile="triage-profile", timeout_seconds=23)
+
+    def triage_child_payload(self) -> dict[str, object]:
+        child = contract()
+        child["ticket_id"] = "model-child-id"
+        child["dependencies"] = []
+        return {
+            "classification": "oversized_ticket",
+            "root_cause_evidence": "The ticket contains two separable concerns.",
+            "recommended_action": "decompose",
+            "children": [{"id": "suggested-child", "resolves_criteria": ["AC-1"], "ticket": child}],
+        }
+
+    def test_scheduler_triage_decomposes_once_and_queues_authoritative_child_projection(self) -> None:
+        ctl, ticket = self.triage_parent()
+        calls: list[tuple[str, ...]] = []
+        planner = self.triage_planner(self.triage_child_payload(), calls)
+        preview = preview_next(self.ledger, now=100)
+        self.assertEqual((preview.next_stage, preview.ticket_id), ("triage", ticket))
+
+        scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="triage", lease_seconds=30, clock=lambda: 100,
+            triage_runner=lambda value: ctl.execute_triage_only(value, planner=planner),
+            triage_execution_policy_hash=planner.execution_policy_hash(),
+        )
+        result = scheduler.process_next()
+        self.assertEqual((result.stage, result.status), ("triage", "completed"))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("safe", calls[0])
+        children = self.ledger.connection.execute("SELECT * FROM tickets WHERE parent_ticket_id=?", (ticket,)).fetchall()
+        self.assertEqual(len(children), 1)
+        child_id = str(children[0]["id"])
+        self.assertNotEqual(child_id, "model-child-id")
+        self.assertEqual(children[0]["state"], "ready_local")
+        binding = self.ledger.runtime_binding(child_id)
+        parent_binding = self.ledger.runtime_binding(ticket)
+        self.assertEqual((binding["repository_path"], binding["starting_sha"], binding["canonical_sha"], binding["ownership_verified"]), (parent_binding["repository_path"], parent_binding["starting_sha"], parent_binding["canonical_sha"], parent_binding["ownership_verified"]))
+        self.assertEqual(self.ledger.connection.execute("SELECT criterion_id FROM ticket_criteria WHERE ticket_id=?", (child_id,)).fetchone()[0], "AC-1")
+        outbox = self.ledger.connection.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket'", (child_id,)).fetchone()
+        self.assertIsNotNone(outbox)
+        payload = json.loads(str(outbox["payload_json"]))
+        contract_body = json.loads(payload["body"].split("```local-first-contract\n", 1)[1].split("\n```", 1)[0])
+        self.assertEqual(contract_body["orchestrator_ticket_id"], child_id)
+        self.assertEqual(contract_body["parent_ticket_id"], ticket)
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "needs_triage")
+        # Even a delayed projection retry gates implementation eligibility.
+        self.ledger.connection.execute("UPDATE board_projection_outbox SET next_attempt_at=200 WHERE ticket_id=? AND operation='create_microticket'", (child_id,))
+        self.assertNotEqual(preview_next(self.ledger, now=100).next_stage, "implementation")
+
+    def test_scheduler_triage_child_projection_uses_existing_retry_safe_worker(self) -> None:
+        ctl, ticket = self.triage_parent()
+        planner = self.triage_planner(self.triage_child_payload())
+        scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="triage", lease_seconds=30, clock=lambda: 100,
+            triage_runner=lambda value: ctl.execute_triage_only(value, planner=planner),
+            triage_execution_policy_hash=planner.execution_policy_hash(),
+        )
+        self.assertEqual(scheduler.process_next().stage, "triage")
+        child_id = str(self.ledger.connection.execute("SELECT id FROM tickets WHERE parent_ticket_id=?", (ticket,)).fetchone()[0])
+        board = ProjectionBoard()
+        delivered = GeneratedProjectionWorker(self.ledger, board, worker_id="projection", clock=lambda: 101).deliver_one()
+        self.assertEqual((delivered.status, delivered.ticket_id), ("delivered", child_id))
+        self.assertEqual(len(board.created), 1)
+        _, body, key = board.created[0]
+        projected = json.loads(body.split("```local-first-contract\n", 1)[1].split("\n```", 1)[0])
+        self.assertEqual(projected["kind"], "triage_microticket")
+        self.assertEqual(projected["orchestrator_ticket_id"], child_id)
+        self.assertEqual(projected["parent_ticket_id"], ticket)
+        self.assertEqual(projected["projection_key"], key)
+        outbox = self.ledger.connection.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket'", (child_id,)).fetchone()
+        self.assertIsNotNone(outbox["acknowledged_at"])
+
+    def test_scheduler_triage_block_and_checkpoint_do_not_create_children(self) -> None:
+        for action, expected_state in (("block", "blocked"), ("checkpoint", "needs_checkpoint")):
+            with self.subTest(action=action):
+                self.tearDown(); self.setUp()
+                ctl, ticket = self.triage_parent()
+                planner = self.triage_planner({"classification":"architecture_gap","root_cause_evidence":"A higher-level decision is required.","recommended_action":action,"children":[]})
+                scheduler = ProcessNextScheduler(
+                    self.ledger, Board(), worker_id="triage", lease_seconds=30, clock=lambda: 100,
+                    triage_runner=lambda value, ctl=ctl, planner=planner: ctl.execute_triage_only(value, planner=planner),
+                    triage_execution_policy_hash=planner.execution_policy_hash(),
+                )
+                result = scheduler.process_next()
+                self.assertEqual(result.stage, "triage")
+                self.assertEqual(self.ledger.get_ticket(ticket)["state"], expected_state)
+                self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM tickets WHERE parent_ticket_id=?", (ticket,)).fetchone()[0], 0)
+
+    def test_scheduler_triage_recovers_completed_invocation_without_reinvocation_or_duplicate_children(self) -> None:
+        ctl, ticket = self.triage_parent()
+        calls: list[tuple[str, ...]] = []
+        planner = self.triage_planner(self.triage_child_payload(), calls)
+        crashing = LocalFirstController(self.ledger, Board(), self.config, local_model=LifecycleModel(), fault_injector=lambda stage: (_ for _ in ()).throw(RuntimeError("simulated controller death")) if stage == "triage_invocation_completed" else None)
+        first = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="triage-a", lease_seconds=30, clock=lambda: 100,
+            triage_runner=lambda value: crashing.execute_triage_only(value, planner=planner),
+            triage_execution_policy_hash=planner.execution_policy_hash(),
+        )
+        with self.assertRaisesRegex(RuntimeError, "simulated controller death"):
+            first.process_next()
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(self.ledger.model_stage(ticket, 1, "triage"))
+        invocation = self.ledger.connection.execute("SELECT * FROM model_invocations WHERE ticket_id=? AND stage='triage'", (ticket,)).fetchone()
+        self.assertEqual(invocation["status"], "completed")
+
+        resumed_ctl = LocalFirstController(self.ledger, Board(), self.config, local_model=LifecycleModel())
+        second = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="triage-b", lease_seconds=30, clock=lambda: 131,
+            triage_runner=lambda value: resumed_ctl.execute_triage_only(value, planner=planner),
+            triage_execution_policy_hash=planner.execution_policy_hash(),
+        )
+        result = second.process_next()
+        self.assertEqual(result.stage, "triage")
+        self.assertEqual(len(calls), 1)
+        self.assertIsNotNone(self.ledger.model_stage(ticket, 1, "triage"))
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM tickets WHERE parent_ticket_id=?", (ticket,)).fetchone()[0], 1)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM board_projection_outbox WHERE operation='create_microticket'", ()).fetchone()[0], 1)
+
+    def test_scheduler_triage_restart_after_child_materialization_does_not_duplicate_children_or_outbox(self) -> None:
+        ctl, ticket = self.triage_parent()
+        calls: list[tuple[str, ...]] = []
+        planner = self.triage_planner(self.triage_child_payload(), calls)
+        crashing = LocalFirstController(self.ledger, Board(), self.config, local_model=LifecycleModel(), fault_injector=lambda stage: (_ for _ in ()).throw(RuntimeError("simulated controller death")) if stage == "triage_action_applied" else None)
+        first = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="triage-a", lease_seconds=30, clock=lambda: 100,
+            triage_runner=lambda value: crashing.execute_triage_only(value, planner=planner),
+            triage_execution_policy_hash=planner.execution_policy_hash(),
+        )
+        with self.assertRaisesRegex(RuntimeError, "simulated controller death"):
+            first.process_next()
+        self.assertEqual(len(calls), 1)
+        child_before = str(self.ledger.connection.execute("SELECT id FROM tickets WHERE parent_ticket_id=?", (ticket,)).fetchone()[0])
+        self.assertIsNone(self.ledger.runtime_stage(ticket, "triage-applied-1"))
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM board_projection_outbox WHERE operation='create_microticket'", ()).fetchone()[0], 1)
+
+        resumed_ctl = LocalFirstController(self.ledger, Board(), self.config, local_model=LifecycleModel())
+        projection_board = ProjectionBoard()
+        second = ProcessNextScheduler(
+            self.ledger, projection_board, worker_id="triage-b", lease_seconds=30, clock=lambda: 131,
+            triage_runner=lambda value: resumed_ctl.execute_triage_only(value, planner=planner),
+            triage_execution_policy_hash=planner.execution_policy_hash(),
+        )
+        projection = second.process_next()
+        self.assertEqual(projection.stage, "generated_projection")
+        self.assertEqual(len(projection_board.created), 1)
+        result = second.process_next()
+        self.assertEqual(result.stage, "triage")
+        self.assertEqual(len(calls), 1)
+        children = self.ledger.connection.execute("SELECT id FROM tickets WHERE parent_ticket_id=?", (ticket,)).fetchall()
+        self.assertEqual([str(row[0]) for row in children], [child_before])
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM board_projection_outbox WHERE operation='create_microticket'", ()).fetchone()[0], 1)
+
+    def test_scheduler_triage_refuses_unknown_started_invocation_and_policy_drift(self) -> None:
+        ctl, ticket = self.triage_parent()
+        planner = self.triage_planner(self.triage_child_payload())
+        crashing = LocalFirstController(self.ledger, Board(), self.config, local_model=LifecycleModel(), fault_injector=lambda stage: (_ for _ in ()).throw(RuntimeError("simulated controller death")) if stage == "triage_invocation_started" else None)
+        first = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="triage-a", lease_seconds=30, clock=lambda: 100,
+            triage_runner=lambda value: crashing.execute_triage_only(value, planner=planner),
+            triage_execution_policy_hash=planner.execution_policy_hash(),
+        )
+        with self.assertRaisesRegex(RuntimeError, "simulated controller death"):
+            first.process_next()
+        invocation = self.ledger.connection.execute("SELECT * FROM model_invocations WHERE ticket_id=? AND stage='triage'", (ticket,)).fetchone()
+        self.assertEqual(invocation["status"], "started")
+        drifted = self.triage_planner(self.triage_child_payload())
+        drifted.model = "different-model"
+        with self.assertRaisesRegex(RuntimeError, "claim identity drift"):
+            self.ledger.claim_next_scheduler_triage("other", lease_seconds=30, triage_execution_policy_hash=drifted.execution_policy_hash(), now=131)
+
+        resumed = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="triage-b", lease_seconds=30, clock=lambda: 131,
+            triage_runner=lambda value: ctl.execute_triage_only(value, planner=planner),
+            triage_execution_policy_hash=planner.execution_policy_hash(),
+        )
+        with self.assertRaisesRegex(RuntimeError, "triage_reconciliation_required"):
+            resumed.process_next()
     def test_completed_persists_start_before_call_and_links_output_artifact(self) -> None:
         model = LifecycleModel(); ctl, ticket = self.controller(model); self.assertTrue(ctl.execute(ticket, repository=self.repo, allow_board_writes=True))
         row = self.invocation(ticket); self.assertEqual(row["status"], "completed"); self.assertEqual(row["timeout_seconds"], 17); self.assertTrue(Path(str(row["model_artifact"])).is_file())

@@ -1435,6 +1435,160 @@ class Ledger:
             raise KeyError(claim_id)
         return dict(row)
 
+    def _triage_claim_identity(self, row: sqlite3.Row | dict[str, Any], *, attempt_number: int, failure_evidence: str, triage_execution_policy_hash: str) -> dict[str, Any]:
+        if not triage_execution_policy_hash:
+            raise ValueError("triage execution policy hash is required")
+        accepted = self.connection.execute(
+            "SELECT criterion_id FROM criterion_statuses WHERE ticket_id=? AND status='accepted' ORDER BY criterion_id",
+            (row["id"],),
+        ).fetchall()
+        criteria = set(json.loads(row["criterion_ids_json"]))
+        unresolved = sorted(criteria - {str(item["criterion_id"]) for item in accepted})
+        ticket_policy_hash = self._validation_policy_hash(row)
+        return {
+            "ticket_id": str(row["id"]),
+            "attempt_number": int(attempt_number),
+            "parent_depth": int(row["depth"]),
+            "unresolved_criteria": unresolved,
+            "failure_evidence_hash": hashlib.sha256(failure_evidence.encode()).hexdigest(),
+            "ticket_policy_hash": ticket_policy_hash,
+            "triage_execution_policy_hash": triage_execution_policy_hash,
+        }
+
+    def claim_next_scheduler_triage(self, owner: str, *, lease_seconds: int, triage_execution_policy_hash: str, now: int | None = None) -> dict[str, Any] | None:
+        """Claim one policy-routed needs-triage ticket for planning-only triage."""
+        if not owner or lease_seconds < 1 or not triage_execution_policy_hash:
+            raise ValueError("triage scheduler claim requires owner, lease, and execution policy")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
+                return None
+            replay = conn.execute(
+                "SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'triage:%' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
+                (now,),
+            ).fetchone()
+            if replay is not None:
+                ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (replay["ticket_id"],)).fetchone()
+                if ticket is None:
+                    raise RuntimeError("triage_reconciliation_required: ticket missing")
+                try:
+                    identity = json.loads(str(replay["candidate_identity_json"] or ""))
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("triage_reconciliation_required: claim identity malformed") from exc
+                routing = conn.execute(
+                    "SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage=?",
+                    (replay["ticket_id"], f"repair-routing-{int(identity['attempt_number'])}"),
+                ).fetchone()
+                if routing is None:
+                    raise RuntimeError("triage_reconciliation_required: routing evidence missing")
+                try:
+                    routing_detail = json.loads(str(routing["detail"]))
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("triage_reconciliation_required: routing evidence malformed") from exc
+                if routing_detail.get("action") != "triage":
+                    raise RuntimeError("triage_reconciliation_required: ticket is no longer triage-routable")
+                expected = self._triage_claim_identity(
+                    ticket,
+                    attempt_number=int(identity["attempt_number"]),
+                    failure_evidence=str(routing_detail.get("failure_evidence") or ""),
+                    triage_execution_policy_hash=triage_execution_policy_hash,
+                )
+                if identity != expected:
+                    raise RuntimeError("triage_reconciliation_required: claim identity drift")
+                changed = conn.execute(
+                    "UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?",
+                    (owner, now + lease_seconds, now, replay["claim_id"], now),
+                )
+                if changed.rowcount != 1:
+                    return None
+                conn.execute("UPDATE tickets SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=?", (owner, now + lease_seconds, now, replay["ticket_id"]))
+                self._append_event(conn, entity_type="ticket", entity_id=str(replay["ticket_id"]), event_type="scheduler_stage_reclaimed", actor_id=owner, payload={"claim_id": replay["claim_id"], "stage": "triage", "lease_expires_at": now + lease_seconds})
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
+
+            row = conn.execute("""
+                SELECT t.*, r.detail AS routing_detail, r.attempt_number AS routing_attempt
+                FROM tickets t
+                JOIN runtime_stages r ON r.ticket_id=t.id AND r.stage=('repair-routing-' || r.attempt_number)
+                WHERE t.state=?
+                  AND json_valid(r.detail)=1
+                  AND json_extract(r.detail,'$.action')='triage'
+                  AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('triage:' || r.attempt_number))
+                ORDER BY t.created_at,t.id,r.attempt_number DESC LIMIT 1
+            """, (CanonicalState.NEEDS_TRIAGE.value,)).fetchone()
+            if row is None:
+                return None
+            attempt_number = int(row["routing_attempt"])
+            routing_detail = json.loads(str(row["routing_detail"]))
+            identity = self._triage_claim_identity(
+                row,
+                attempt_number=attempt_number,
+                failure_evidence=str(routing_detail.get("failure_evidence") or ""),
+                triage_execution_policy_hash=triage_execution_policy_hash,
+            )
+            encoded_identity = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+            stage = f"triage:{attempt_number}"
+            claim_id = hashlib.sha256((stage + ":" + encoded_identity).encode()).hexdigest()[:32]
+            changed = conn.execute(
+                "UPDATE tickets SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=? AND state=? AND (lease_expires_at IS NULL OR lease_expires_at<=?)",
+                (owner, now + lease_seconds, now, row["id"], CanonicalState.NEEDS_TRIAGE.value, now),
+            )
+            if changed.rowcount != 1:
+                return None
+            conn.execute(
+                "INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,created_at,updated_at) VALUES (?,?,?,'claimed',?,?,1,?,?,?)",
+                (claim_id, row["id"], stage, owner, now + lease_seconds, encoded_identity, now, now),
+            )
+            self._append_event(conn, entity_type="ticket", entity_id=str(row["id"]), event_type="scheduler_stage_claimed", actor_id=owner, payload={"claim_id": claim_id, "stage": "triage", "candidate_identity": identity})
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
+    def complete_scheduler_triage_effect(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        now = self._now() if now is None else now
+        encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if claim is None or not str(claim["stage"]).startswith("triage:"):
+                raise ValueError("scheduler claim is not triage")
+            if claim["side_effect_started_at"] is None:
+                raise RuntimeError("scheduler claim effect was not durably started")
+            if claim["lease_owner"] != owner or claim["lease_expires_at"] is None or int(claim["lease_expires_at"]) <= now:
+                raise PermissionError("scheduler claim lease is not owned")
+            identity = json.loads(str(claim["candidate_identity_json"] or ""))
+            if result.get("candidate_identity") != identity:
+                raise RuntimeError("triage result candidate identity does not match scheduler claim")
+            attempt_number = int(identity["attempt_number"])
+            model_stage = conn.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='triage'", (claim["ticket_id"], attempt_number)).fetchone()
+            applied = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (claim["ticket_id"], f"triage-applied-{attempt_number}")).fetchone()
+            if model_stage is None or applied is None:
+                raise RuntimeError("triage_reconciliation_required: triage output/application is not durably recorded")
+            identity_hash = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            if str(model_stage["diff_hash"]) != identity_hash:
+                raise RuntimeError("triage_reconciliation_required: triage model stage identity drift")
+            artifact = Path(str(model_stage["response_artifact"] or ""))
+            if not artifact.is_file() or str(result.get("triage_artifact") or "") != str(artifact):
+                raise RuntimeError("triage_reconciliation_required: triage artifact is missing or conflicts")
+            try:
+                envelope = json.loads(artifact.read_text(encoding="utf-8"))
+                raw_payload = envelope["payload"]
+            except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("triage_reconciliation_required: triage artifact is invalid") from exc
+            proposal_hash = hashlib.sha256(json.dumps(raw_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            if proposal_hash != str(result.get("proposal_hash") or ""):
+                raise RuntimeError("triage_reconciliation_required: triage proposal hash conflicts")
+            if str(applied["detail"]) != encoded:
+                raise RuntimeError("triage_reconciliation_required: applied triage result conflicts")
+            if claim["side_effect_completed_at"] is not None:
+                if claim["result_json"] != encoded:
+                    raise RuntimeError("triage completed effect result conflicts")
+                return dict(claim)
+            changed = conn.execute(
+                "UPDATE scheduler_stage_claims SET side_effect_completed_at=?,result_json=?,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_owner=? AND lease_expires_at>? AND side_effect_completed_at IS NULL",
+                (now, encoded, now, claim_id, owner, now),
+            )
+            if changed.rowcount != 1:
+                raise PermissionError("scheduler claim lease is not owned")
+            self._append_event(conn, entity_type="ticket", entity_id=str(claim["ticket_id"]), event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": "triage", "result": result})
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
     def claim_next_scheduler_repair_routing(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
         """Claim one failed validation or completed review for routing only."""
         if not owner or lease_seconds < 1:
@@ -1633,6 +1787,7 @@ class Ledger:
                 "SELECT t.id,t.state FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id "
                 "WHERE t.state IN (?,?) AND (t.lease_expires_at IS NULL OR t.lease_expires_at<=?) "
                 "AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND (c.stage='implementation' OR c.stage LIKE 'implementation:%') AND c.status='claimed') "
+                "AND NOT EXISTS (SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=t.id AND b.operation='create_microticket' AND b.acknowledged_at IS NULL) "
                 "ORDER BY t.created_at,t.id LIMIT 1",
                 (CanonicalState.READY_LOCAL.value, CanonicalState.REPAIRING.value, now),
             ).fetchone()
@@ -2142,7 +2297,7 @@ class Ledger:
             if changed.rowcount != 1:
                 raise PermissionError("scheduler claim lease is not owned")
             self._append_event(conn, entity_type="ticket", entity_id=str(row["ticket_id"]), event_type="scheduler_stage_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": row["stage"], "result": result})
-            if row["stage"] == "implementation" or str(row["stage"]).startswith("implementation:") or str(row["stage"]).startswith("validation:") or str(row["stage"]).startswith("review:") or str(row["stage"]).startswith("repair_routing:"):
+            if row["stage"] == "implementation" or str(row["stage"]).startswith("implementation:") or str(row["stage"]).startswith("validation:") or str(row["stage"]).startswith("review:") or str(row["stage"]).startswith("repair_routing:") or str(row["stage"]).startswith("triage:"):
                 conn.execute(
                     "UPDATE tickets SET lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND lease_owner=?",
                     (now, row["ticket_id"], owner),
@@ -2627,11 +2782,11 @@ class Ledger:
         )
         return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
-    def create_triaged_children(self, parent_ticket_id: str, children: list[tuple[str, MicroTicket, str]], *, classification: str, root_cause_evidence: str) -> list[str]:
+    def create_triaged_children(self, parent_ticket_id: str, children: list[tuple[str, MicroTicket, str]], *, classification: str, root_cause_evidence: str, project_children: bool = False) -> list[str]:
         """Atomically create controller-owned children; no board/model I/O occurs here."""
         now = self._now()
         with self._transaction() as conn:
-            parent = conn.execute("SELECT state, depth FROM tickets WHERE id = ?", (parent_ticket_id,)).fetchone()
+            parent = conn.execute("SELECT state, depth, feature_id, tranche_id FROM tickets WHERE id = ?", (parent_ticket_id,)).fetchone()
             if parent is None:
                 raise KeyError(parent_ticket_id)
             if parent["state"] != CanonicalState.NEEDS_TRIAGE.value:
@@ -2653,6 +2808,26 @@ class Ledger:
                 if incoming_fingerprints != existing_fingerprints or len(children) != len(existing_rows):
                     raise ValueError("triage decomposition already exists with different children")
                 by_fingerprint = {str(row["fingerprint"]): str(row["child_ticket_id"]) for row in existing_rows}
+                if project_children:
+                    parent_binding = conn.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (parent_ticket_id,)).fetchone()
+                    if parent_binding is None:
+                        raise ValueError("triage parent runtime binding is missing")
+                    for child_id in by_fingerprint.values():
+                        child_binding = conn.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (child_id,)).fetchone()
+                        if child_binding is None or any(
+                            child_binding[name] != parent_binding[name]
+                            for name in ("repository_path", "starting_sha", "canonical_sha", "ownership_verified")
+                        ):
+                            raise ValueError("triage decomposition exists without matching scheduler runtime provenance")
+                        event = conn.execute(
+                            "SELECT id FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='triage_child_created' ORDER BY id DESC LIMIT 1",
+                            (child_id,),
+                        ).fetchone()
+                        if event is None or conn.execute(
+                            "SELECT 1 FROM board_projection_outbox WHERE ticket_id=? AND event_id=? AND operation='create_microticket'",
+                            (child_id, event["id"]),
+                        ).fetchone() is None:
+                            raise ValueError("triage decomposition exists without scheduler projection provenance")
                 return [by_fingerprint[fingerprint] for _, _, fingerprint in children]
             parent_criteria = set(json.loads(self.get_ticket(parent_ticket_id)["criterion_ids_json"]))
             accepted_rows = conn.execute(
@@ -2661,6 +2836,7 @@ class Ledger:
             ).fetchall()
             unresolved = parent_criteria - {str(row["criterion_id"]) for row in accepted_rows}
             created: list[str] = []
+            from .triage import triage_child_payload
             for title, child_ticket, fingerprint in children:
                 try:
                     validate_ticket(child_ticket)
@@ -2671,17 +2847,48 @@ class Ledger:
                 contract = child_ticket.contract()
                 child_id = uuid.uuid4().hex
                 conn.execute(
-                    "INSERT INTO tickets(id, parent_ticket_id, depth, title, objective, criterion_ids_json, primary_symbol, allowed_files_json, new_test_files_json, forbidden_changes_json, patch_budget_json, verification_json, risk, review_required, max_attempts, dependencies_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (child_id, parent_ticket_id, int(parent["depth"]) + 1, title, contract.get("objective"), json.dumps(contract.get("criterion_ids", [])), contract.get("primary_symbol"), json.dumps(contract.get("allowed_files", [])), json.dumps(contract.get("new_test_files", [])), json.dumps(contract.get("forbidden_changes", [])), json.dumps(contract.get("patch_budget", {})), json.dumps(contract.get("verification", {})), contract.get("risk"), int(contract.get("review_required", True)), contract.get("max_attempts", 2), json.dumps(contract.get("dependencies", [])), CanonicalState.READY_LOCAL.value, now, now),
+                    "INSERT INTO tickets(id, feature_id, tranche_id, parent_ticket_id, depth, title, objective, criterion_ids_json, primary_symbol, allowed_files_json, new_test_files_json, forbidden_changes_json, patch_budget_json, verification_json, risk, review_required, max_attempts, dependencies_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (child_id, parent["feature_id"], parent["tranche_id"], parent_ticket_id, int(parent["depth"]) + 1, title, contract.get("objective"), json.dumps(contract.get("criterion_ids", [])), contract.get("primary_symbol"), json.dumps(contract.get("allowed_files", [])), json.dumps(contract.get("new_test_files", [])), json.dumps(contract.get("forbidden_changes", [])), json.dumps(contract.get("patch_budget", {})), json.dumps(contract.get("verification", {})), contract.get("risk"), int(contract.get("review_required", True)), contract.get("max_attempts", 2), json.dumps(contract.get("dependencies", [])), CanonicalState.READY_LOCAL.value, now, now),
                 )
+                binding = conn.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (parent_ticket_id,)).fetchone()
+                if project_children:
+                    if binding is None:
+                        raise ValueError("triage parent runtime binding is missing")
+                    conn.execute(
+                        "INSERT INTO runtime_bindings(ticket_id,repository_path,starting_sha,canonical_sha,ownership_verified,created_at) VALUES (?,?,?,?,?,?)",
+                        (child_id, binding["repository_path"], binding["starting_sha"], binding["canonical_sha"], binding["ownership_verified"], now),
+                    )
+                for criterion_id in child_ticket.criterion_ids:
+                    conn.execute("INSERT INTO ticket_criteria(ticket_id,criterion_id) VALUES (?,?)", (child_id, criterion_id))
                 conn.execute(
                     "INSERT INTO triage_children(parent_ticket_id, child_ticket_id, fingerprint, created_at) VALUES (?, ?, ?, ?)",
                     (parent_ticket_id, child_id, fingerprint, now),
                 )
-                self._append_event(conn, entity_type="ticket", entity_id=child_id, event_type="triage_child_created", actor_id="controller", to_state=CanonicalState.READY_LOCAL.value, payload={"parent_ticket_id": parent_ticket_id, "fingerprint": fingerprint, "resolves_criteria": list(child_ticket.criterion_ids)})
+                event_id = self._append_event(conn, entity_type="ticket", entity_id=child_id, event_type="triage_child_created", actor_id="controller", to_state=CanonicalState.READY_LOCAL.value, payload={"parent_ticket_id": parent_ticket_id, "fingerprint": fingerprint, "resolves_criteria": list(child_ticket.criterion_ids)})
+                if project_children:
+                    payload = triage_child_payload(parent_ticket_id, child_id, title, child_ticket)
+                    self._enqueue_generated_create_projection_in_transaction(
+                        conn,
+                        ticket_id=child_id,
+                        event_id=event_id,
+                        payload=payload,
+                        idempotency_key=payload["projection_key"],
+                    )
                 created.append(child_id)
             self._append_event(conn, entity_type="ticket", entity_id=parent_ticket_id, event_type="triage_children_created", actor_id="controller", payload={"classification": classification, "root_cause_evidence": root_cause_evidence, "child_ids": created})
             return created
+
+    def triage_projection_identity(self, ticket_id: str, event_id: int) -> dict[str, str]:
+        row = self.connection.execute(
+            "SELECT t.id AS ticket_id,t.parent_ticket_id,e.entity_type,e.entity_id,e.event_type "
+            "FROM tickets t JOIN events e ON e.id=? WHERE t.id=?",
+            (event_id, ticket_id),
+        ).fetchone()
+        if row is None or (row["entity_type"], row["entity_id"], row["event_type"]) != ("ticket", ticket_id, "triage_child_created"):
+            raise KeyError("authoritative triage projection identity missing")
+        if not isinstance(row["parent_ticket_id"], str) or not row["parent_ticket_id"]:
+            raise ValueError("authoritative triage projection parent identity missing")
+        return {"kind": "triage_microticket", "ticket_id": str(row["ticket_id"]), "parent_ticket_id": str(row["parent_ticket_id"])}
 
     def pause(self, actor_id: str, *, reason: str) -> None:
         self._set_pause(True, actor_id, reason)
@@ -2801,8 +3008,8 @@ class Ledger:
         if ticket is None:
             raise KeyError(ticket_id)
         event = conn.execute("SELECT entity_type, entity_id, event_type FROM events WHERE id=?", (event_id,)).fetchone()
-        if event is None or (event["entity_type"], event["entity_id"], event["event_type"]) != ("ticket", ticket_id, "generated_microticket_created"):
-            raise ValueError("event is not a generated microticket creation")
+        if event is None or event["entity_type"] != "ticket" or event["entity_id"] != ticket_id or event["event_type"] not in {"generated_microticket_created", "triage_child_created"}:
+            raise ValueError("event is not an authorized microticket creation")
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         existing_key = conn.execute("SELECT * FROM board_projection_outbox WHERE idempotency_key=?", (idempotency_key,)).fetchone()
         if existing_key is not None and (existing_key["ticket_id"], int(existing_key["event_id"])) != (ticket_id, event_id):

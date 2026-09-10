@@ -130,6 +130,24 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     if repair is not None:
         return ProcessNextPreview(next_stage="repair_routing", ticket_id=str(repair["id"]), would_execute=True)
 
+    triage_replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage LIKE 'triage:%' AND status='claimed' "
+        "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+    ).fetchone()
+    if triage_replay is not None:
+        return ProcessNextPreview(next_stage="triage", ticket_id=str(triage_replay["ticket_id"]), would_execute=True)
+    triage = ledger.connection.execute("""
+        SELECT t.id FROM tickets t
+        JOIN runtime_stages r ON r.ticket_id=t.id AND r.stage=('repair-routing-' || r.attempt_number)
+        WHERE t.state='needs_triage'
+          AND json_valid(r.detail)=1
+          AND json_extract(r.detail,'$.action')='triage'
+          AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('triage:' || r.attempt_number))
+        ORDER BY t.created_at,t.id,r.attempt_number DESC LIMIT 1
+    """).fetchone()
+    if triage is not None:
+        return ProcessNextPreview(next_stage="triage", ticket_id=str(triage["id"]), would_execute=True)
+
     implementation_replay = ledger.connection.execute(
         "SELECT ticket_id FROM scheduler_stage_claims WHERE (stage='implementation' OR stage LIKE 'implementation:%') AND status='claimed' "
         "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
@@ -140,6 +158,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
         "SELECT t.id FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id "
         "WHERE t.state IN (?,?) AND (t.lease_expires_at IS NULL OR t.lease_expires_at<=?) "
         "AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND (c.stage='implementation' OR c.stage LIKE 'implementation:%') AND c.status='claimed') "
+        "AND NOT EXISTS (SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=t.id AND b.operation='create_microticket' AND b.acknowledged_at IS NULL) "
         "ORDER BY t.created_at,t.id LIMIT 1",
         ("ready_local", "repairing", now),
     ).fetchone()
@@ -206,6 +225,8 @@ class ProcessNextScheduler:
         validation_runner: Callable[[str], dict[str, Any]] | None = None,
         review_runner: Callable[[str], dict[str, Any]] | None = None,
         review_execution_policy_hash: str | None = None,
+        triage_runner: Callable[[str], dict[str, Any]] | None = None,
+        triage_execution_policy_hash: str | None = None,
     ) -> None:
         if not worker_id or lease_seconds < 1:
             raise ValueError("process-next requires a worker id and positive lease")
@@ -223,8 +244,12 @@ class ProcessNextScheduler:
         self.validation_runner = validation_runner
         self.review_runner = review_runner
         self.review_execution_policy_hash = review_execution_policy_hash
+        self.triage_runner = triage_runner
+        self.triage_execution_policy_hash = triage_execution_policy_hash
         if self.review_runner is not None and not self.review_execution_policy_hash:
             raise ValueError("process-next review runner requires a review execution policy hash")
+        if self.triage_runner is not None and not self.triage_execution_policy_hash:
+            raise ValueError("process-next triage runner requires a triage execution policy hash")
 
     def process_next(self) -> ProcessNextResult:
         now = int(self.clock())
@@ -348,6 +373,44 @@ class ProcessNextScheduler:
             result = json.loads(str(current["result_json"]))
             self.ledger.complete_scheduler_claim(claim_id, execution_owner, result, now=now)
             return ProcessNextResult("completed", "repair_routing", ticket_id, claim_id)
+
+        if self.triage_runner is not None:
+            triage_claim = self.ledger.claim_next_scheduler_triage(
+                execution_owner,
+                lease_seconds=self.lease_seconds,
+                triage_execution_policy_hash=str(self.triage_execution_policy_hash),
+                now=now,
+            )
+            if triage_claim is not None:
+                claim_id = str(triage_claim["claim_id"])
+                ticket_id = str(triage_claim["ticket_id"])
+                current = self.ledger.scheduler_claim(claim_id)
+                if current.get("side_effect_completed_at") is not None and current.get("result_json"):
+                    triage_result = json.loads(str(current["result_json"]))
+                else:
+                    if current.get("side_effect_started_at") is not None:
+                        try:
+                            identity = json.loads(str(current.get("candidate_identity_json") or ""))
+                            attempt_number = int(identity["attempt_number"])
+                        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                            raise RuntimeError("triage_reconciliation_required: triage claim identity is malformed") from exc
+                        model_stage = self.ledger.model_stage(ticket_id, attempt_number, "triage")
+                        invocations = self.ledger.connection.execute(
+                            "SELECT * FROM model_invocations WHERE ticket_id=? AND attempt_number=? AND stage='triage' ORDER BY started_at,invocation_id",
+                            (ticket_id, attempt_number),
+                        ).fetchall()
+                        if model_stage is None and invocations and str(invocations[-1]["status"]) != "completed":
+                            raise RuntimeError("triage_reconciliation_required: started triage outcome is unknown")
+                    else:
+                        self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+                    triage_result = self.triage_runner(ticket_id)
+                    self.ledger.complete_scheduler_triage_effect(
+                        claim_id, execution_owner, triage_result, now=now
+                    )
+                self.ledger.complete_scheduler_claim(
+                    claim_id, execution_owner, triage_result, now=now
+                )
+                return ProcessNextResult("completed", "triage", ticket_id, claim_id)
 
         if self.implementation_runner is not None:
             implementation_claim = self.ledger.claim_next_scheduler_implementation(

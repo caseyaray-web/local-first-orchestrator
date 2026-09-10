@@ -24,6 +24,7 @@ from .repository_snapshot import snapshot as repository_snapshot
 from .corrections import CorrectionService
 from .states import CanonicalState
 from .ticket import MicroTicket, PatchBudget, VerificationProfile
+from .triage import LocalTriagePlanner, TriageCoordinator, TriageError, normalize_triage
 from .validation import DeterministicValidator
 
 
@@ -1074,6 +1075,187 @@ class LocalFirstController:
         self.ledger.record_model_stage(ticket_id,attempt_number,"review",purpose="review",adapter=type(self.local_model).__name__,request_hash=packet_hash,response_artifact=str(review_path),worktree_path="",base_sha=str(validation["candidate_identity"]["base_sha"]),diff_hash=str(identity["implementation_diff_hash"]))
         self._crash("review_completed")
         return result_payload(review, review_path, replayed=False)
+
+    def execute_triage_only(self, ticket_id: str, *, planner: LocalTriagePlanner) -> dict[str, object]:
+        """Run/recover one planning-only triage proposal and apply its bounded action."""
+        claim_row = self.ledger.connection.execute(
+            "SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage LIKE 'triage:%' AND status='claimed' ORDER BY created_at DESC LIMIT 1",
+            (ticket_id,),
+        ).fetchone()
+        if claim_row is None or not claim_row["candidate_identity_json"]:
+            raise RuntimeError("triage_reconciliation_required: identity-bound scheduler claim is missing")
+        try:
+            identity = json.loads(str(claim_row["candidate_identity_json"]))
+            attempt_number = int(identity["attempt_number"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("triage_reconciliation_required: claim identity is malformed") from exc
+        if identity.get("triage_execution_policy_hash") != planner.execution_policy_hash():
+            raise RuntimeError("triage_reconciliation_required: triage execution policy drift")
+
+        parent_row = self.ledger.get_ticket(ticket_id)
+        parent = ticket_from_ledger(parent_row)
+        routing = self.ledger.runtime_stage(ticket_id, f"repair-routing-{attempt_number}")
+        if routing is None:
+            raise RuntimeError("triage_reconciliation_required: repair-routing evidence is missing")
+        try:
+            routing_detail = json.loads(str(routing["detail"]))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("triage_reconciliation_required: repair-routing evidence is malformed") from exc
+        failure_evidence = str(routing_detail.get("failure_evidence") or "")
+        if routing_detail.get("action") != "triage" or hashlib.sha256(failure_evidence.encode()).hexdigest() != identity.get("failure_evidence_hash"):
+            raise RuntimeError("triage_reconciliation_required: repair-routing evidence drift")
+        unresolved = set(self.ledger.unresolved_criteria(ticket_id))
+        if sorted(unresolved) != identity.get("unresolved_criteria") or int(parent_row["depth"]) != int(identity["parent_depth"]):
+            raise RuntimeError("triage_reconciliation_required: parent triage identity drift")
+
+        applied_stage = self.ledger.runtime_stage(ticket_id, f"triage-applied-{attempt_number}")
+        if applied_stage is not None:
+            try:
+                applied = json.loads(str(applied_stage["detail"]))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("triage_reconciliation_required: applied triage record is malformed") from exc
+            if applied.get("candidate_identity") != identity:
+                raise RuntimeError("triage_reconciliation_required: applied triage identity drift")
+            return applied
+
+        def proposal_from_artifact(path: Path):
+            try:
+                envelope = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError("triage_reconciliation_required: triage artifact is invalid") from exc
+            if not isinstance(envelope, dict) or set(envelope) != {"provider", "model", "payload"}:
+                raise RuntimeError("triage_reconciliation_required: triage artifact envelope is invalid")
+            if envelope["provider"] != planner.provider or envelope["model"] != planner.model:
+                raise RuntimeError("triage_reconciliation_required: triage artifact execution identity drift")
+            try:
+                proposal = normalize_triage(envelope["payload"], parent, parent_depth=int(parent_row["depth"]), unresolved_criteria=unresolved)
+            except TriageError as exc:
+                raise RuntimeError("triage_reconciliation_required: persisted triage proposal is invalid") from exc
+            return proposal, envelope["payload"]
+
+        stage = self.ledger.model_stage(ticket_id, attempt_number, "triage")
+        proposal = None
+        raw_payload: dict[str, object] | None = None
+        artifact_path: Path | None = None
+        if stage is not None:
+            artifact_path = Path(str(stage["response_artifact"]))
+            proposal, raw_payload = proposal_from_artifact(artifact_path)
+        else:
+            invocations = self.ledger.connection.execute(
+                "SELECT * FROM model_invocations WHERE ticket_id=? AND attempt_number=? AND stage='triage' ORDER BY started_at,invocation_id",
+                (ticket_id, attempt_number),
+            ).fetchall()
+            if invocations:
+                prior = dict(invocations[-1])
+                if prior["status"] == "completed":
+                    artifact_value = prior.get("model_artifact")
+                    if not artifact_value:
+                        raise RuntimeError("triage_reconciliation_required: completed triage invocation is missing its artifact")
+                    artifact_path = Path(str(artifact_value))
+                    proposal, raw_payload = proposal_from_artifact(artifact_path)
+                    recorded = self.ledger.record_model_stage(
+                        ticket_id,
+                        attempt_number,
+                        "triage",
+                        purpose="triage",
+                        adapter=type(planner).__name__,
+                        request_hash=str(prior["packet_hash"]),
+                        response_artifact=str(artifact_path),
+                        worktree_path="packet-only",
+                        base_sha=str(self.ledger.runtime_binding(ticket_id)["starting_sha"]),
+                        diff_hash=hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                    )
+                    if not recorded and self.ledger.model_stage(ticket_id, attempt_number, "triage") is None:
+                        raise RuntimeError("triage_reconciliation_required: completed triage invocation could not be recovered")
+                else:
+                    raise RuntimeError("triage_reconciliation_required: prior triage invocation requires reconciliation")
+
+        if proposal is None or raw_payload is None or artifact_path is None:
+            artifact_root = self.config.validate_execution_roots()[2] / ticket_id / str(attempt_number)
+            packet = planner.packet(parent, parent_depth=int(parent_row["depth"]), unresolved_criteria=unresolved, failure_evidence=failure_evidence)
+            packet_hash = hashlib.sha256(packet.encode()).hexdigest()
+            invocation_id = uuid.uuid4().hex
+            self.ledger.start_model_invocation(
+                invocation_id=invocation_id,
+                ticket_id=ticket_id,
+                attempt_number=attempt_number,
+                stage="triage",
+                provider=planner.provider,
+                model=planner.model,
+                packet_hash=packet_hash,
+                worktree_path="packet-only",
+                timeout_seconds=planner.timeout_seconds,
+            )
+            self._crash("triage_invocation_started")
+            started = time.monotonic()
+            try:
+                planned = planner.propose(
+                    parent,
+                    parent_depth=int(parent_row["depth"]),
+                    unresolved_criteria=unresolved,
+                    failure_evidence=failure_evidence,
+                    artifact_dir=artifact_root,
+                    packet=packet,
+                )
+            except subprocess.TimeoutExpired as exc:
+                self.ledger.finish_model_invocation(invocation_id, status="timeout", duration_seconds=time.monotonic() - started, error={"type":"TimeoutExpired","timeout_seconds":planner.timeout_seconds,"process":str(exc)[:1000]})
+                raise
+            except TriageError as exc:
+                self.ledger.finish_model_invocation(invocation_id, status="malformed_output", duration_seconds=time.monotonic() - started, error={"type":type(exc).__name__,"message":str(exc)[:1000]})
+                raise
+            except Exception as exc:
+                self.ledger.finish_model_invocation(invocation_id, status="process_error", duration_seconds=time.monotonic() - started, error={"type":type(exc).__name__,"message":str(exc)[:1000]})
+                raise
+            proposal, raw_payload, artifact_path = planned.proposal, planned.raw_payload, planned.artifact_path
+            self.ledger.finish_model_invocation(invocation_id, status="completed", duration_seconds=time.monotonic() - started, model_artifact=str(artifact_path))
+            self._crash("triage_invocation_completed")
+            self.ledger.record_model_stage(
+                ticket_id,
+                attempt_number,
+                "triage",
+                purpose="triage",
+                adapter=type(planner).__name__,
+                request_hash=packet_hash,
+                response_artifact=str(artifact_path),
+                worktree_path="packet-only",
+                base_sha=str(self.ledger.runtime_binding(ticket_id)["starting_sha"]),
+                diff_hash=hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            )
+            self._crash("triage_model_stage_completed")
+
+        assert proposal is not None and raw_payload is not None and artifact_path is not None
+        child_ids: list[str] = []
+        target_state: str | None = None
+        if proposal.recommended_action == "decompose":
+            child_ids = TriageCoordinator(self.ledger).apply(ticket_id, proposal, project_children=True)
+        elif proposal.recommended_action == "block":
+            if self.ledger.get_ticket(ticket_id)["state"] == CanonicalState.NEEDS_TRIAGE.value:
+                self.ledger.transition(ticket_id, CanonicalState.BLOCKED, actor_id="triage", payload={"classification":proposal.classification,"root_cause_evidence":proposal.root_cause_evidence})
+            elif self.ledger.get_ticket(ticket_id)["state"] != CanonicalState.BLOCKED.value:
+                raise RuntimeError("triage_reconciliation_required: block outcome state conflicts")
+            target_state = CanonicalState.BLOCKED.value
+        elif proposal.recommended_action == "checkpoint":
+            if self.ledger.get_ticket(ticket_id)["state"] == CanonicalState.NEEDS_TRIAGE.value:
+                self.ledger.transition(ticket_id, CanonicalState.NEEDS_CHECKPOINT, actor_id="triage", payload={"classification":proposal.classification,"root_cause_evidence":proposal.root_cause_evidence})
+            elif self.ledger.get_ticket(ticket_id)["state"] != CanonicalState.NEEDS_CHECKPOINT.value:
+                raise RuntimeError("triage_reconciliation_required: checkpoint outcome state conflicts")
+            target_state = CanonicalState.NEEDS_CHECKPOINT.value
+
+        self._crash("triage_action_applied")
+        result: dict[str, object] = {
+            "ticket_id": ticket_id,
+            "attempt_number": attempt_number,
+            "candidate_identity": identity,
+            "classification": proposal.classification,
+            "root_cause_evidence": proposal.root_cause_evidence,
+            "recommended_action": proposal.recommended_action,
+            "child_ids": child_ids,
+            "target_state": target_state,
+            "triage_artifact": str(artifact_path),
+            "proposal_hash": hashlib.sha256(json.dumps(raw_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+        }
+        self.ledger.record_runtime_stage(ticket_id, f"triage-applied-{attempt_number}", json.dumps(result, sort_keys=True, separators=(",", ":")), attempt_number=attempt_number)
+        return result
 
     def review_historical_candidate(self, ticket_id: str, attempt_number: int, *, repository: Path, owner: str="local-first-reviewer") -> dict[str, object]:
         """Hand an R2d candidate to the ordinary fresh review machinery only."""

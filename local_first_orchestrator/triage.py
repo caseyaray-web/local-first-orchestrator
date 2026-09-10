@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .ledger import Ledger
@@ -20,6 +22,34 @@ _CLASSIFICATIONS = _CLASSIFICATIONS_WITH_CHILDREN | {
     "missing_context", "architecture_gap", "environment_failure", "invalid_ticket_contract",
     "credential_or_service_failure", "flaky_test", "merge_conflict", "model_failure", "non_convergent_defect",
 }
+
+_LOCAL_FIRST_MARKER = "<!-- local-first-orchestrator -->"
+_LOCAL_FIRST_CONTRACT = "local-first-contract"
+
+
+def triage_projection_key(ticket_id: str) -> str:
+    return f"board-create:triage:v1:{ticket_id}"
+
+
+def triage_child_payload(parent_ticket_id: str, orchestrator_ticket_id: str, title: str, ticket: MicroTicket) -> dict[str, str]:
+    """Serialize a triage-generated child using the ledger-assigned child identity."""
+    projection_key = triage_projection_key(orchestrator_ticket_id)
+    contract = {
+        "kind": "triage_microticket",
+        "orchestrator_ticket_id": orchestrator_ticket_id,
+        "parent_ticket_id": parent_ticket_id,
+        "projection_key": projection_key,
+        **ticket.contract(),
+    }
+    encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"))
+    body = f"{_LOCAL_FIRST_MARKER}\n```{_LOCAL_FIRST_CONTRACT}\n{encoded}\n```"
+    return {
+        "title": title,
+        "body": body,
+        "orchestrator_ticket_id": orchestrator_ticket_id,
+        "parent_ticket_id": parent_ticket_id,
+        "projection_key": projection_key,
+    }
 
 
 @dataclass(frozen=True)
@@ -112,12 +142,94 @@ def normalize_triage(payload: object, parent: MicroTicket, *, parent_depth: int,
     return TriageResult(classification, evidence, action, tuple(children))
 
 
+@dataclass(frozen=True)
+class TriagePlanResult:
+    proposal: TriageResult
+    raw_payload: dict[str, object]
+    artifact_path: Path
+    packet_hash: str
+    provider: str
+    model: str
+
+
+class LocalTriagePlanner:
+    """Planning-only triage inference through the configured decomposition route."""
+
+    def __init__(self, *, runner=subprocess.run, executable: str = "hermes", provider: str, model: str, profile: str = "unresolved", timeout_seconds: int = 300) -> None:
+        if not provider or not model or not isinstance(timeout_seconds, int) or timeout_seconds < 1:
+            raise ValueError("invalid triage planner configuration")
+        self.runner, self.executable = runner, executable
+        self.provider, self.model, self.profile = provider, model, profile
+        self.timeout_seconds = timeout_seconds
+
+    def execution_policy_hash(self) -> str:
+        policy = {
+            "provider": self.provider,
+            "model": self.model,
+            "profile": self.profile,
+            "timeout_seconds": self.timeout_seconds,
+            "mode": "safe-planning-only",
+            "schema": "triage-v1",
+        }
+        return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def packet(self, parent: MicroTicket, *, parent_depth: int, unresolved_criteria: set[str], failure_evidence: str) -> str:
+        return json.dumps(
+            {
+                "task": "Classify why this Local First ticket failed and choose exactly one bounded triage action.",
+                "parent_ticket": parent.contract(),
+                "parent_depth": parent_depth,
+                "unresolved_criteria": sorted(unresolved_criteria),
+                "failure_evidence": failure_evidence,
+                "output_contract": {
+                    "classification": sorted(_CLASSIFICATIONS),
+                    "recommended_action": ["decompose", "block", "checkpoint"],
+                    "max_children": 3,
+                    "max_depth": 2,
+                    "rules": [
+                        "Return one JSON object only.",
+                        "Only oversized_ticket may decompose into children.",
+                        "Children must map only unresolved parent criteria and must be executable MicroTicket contracts.",
+                        "Do not edit files, run implementation commands, or broaden scope.",
+                    ],
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def propose(self, parent: MicroTicket, *, parent_depth: int, unresolved_criteria: set[str], failure_evidence: str, artifact_dir: Path, packet: str | None = None) -> TriagePlanResult:
+        packet = packet or self.packet(parent, parent_depth=parent_depth, unresolved_criteria=unresolved_criteria, failure_evidence=failure_evidence)
+        packet_hash = hashlib.sha256(packet.encode()).hexdigest()
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        completed = self.runner(
+            (self.executable, "chat", "--toolsets", "safe", "--provider", self.provider, "--model", self.model, "--query", packet, "--quiet"),
+            text=True,
+            capture_output=True,
+            timeout=self.timeout_seconds,
+            check=False,
+            cwd=str(artifact_dir),
+        )
+        if completed.returncode:
+            raise RuntimeError(f"triage planner exited {completed.returncode}: {completed.stderr.strip()}")
+        try:
+            raw = json.loads(completed.stdout or "")
+        except json.JSONDecodeError as exc:
+            raise TriageError("triage planner did not return JSON") from exc
+        if not isinstance(raw, dict):
+            raise TriageError("triage planner result must be an object")
+        proposal = normalize_triage(raw, parent, parent_depth=parent_depth, unresolved_criteria=unresolved_criteria)
+        artifact = artifact_dir / "triage-result.json"
+        artifact.write_text(json.dumps({"provider": self.provider, "model": self.model, "payload": raw}, sort_keys=True), encoding="utf-8")
+        return TriagePlanResult(proposal, raw, artifact, packet_hash, self.provider, self.model)
+
+
 class TriageCoordinator:
     """Bounded, ledger-only triage. Models propose; this controller mutates."""
     def __init__(self, ledger: Ledger) -> None:
         self.ledger = ledger
 
-    def apply(self, parent_ticket_id: str, result: TriageResult) -> list[str]:
+    def apply(self, parent_ticket_id: str, result: TriageResult, *, project_children: bool = False) -> list[str]:
         if result.recommended_action != "decompose" or result.classification not in _CLASSIFICATIONS_WITH_CHILDREN:
             raise TriageError("only validated decompositions can create children")
         parent = self.ledger.get_ticket(parent_ticket_id)
@@ -144,6 +256,7 @@ class TriageCoordinator:
             [(child.title, child.ticket, child.fingerprint) for child in result.children],
             classification=result.classification,
             root_cause_evidence=result.root_cause_evidence,
+            project_children=project_children,
         )
 
     def resolve_parent(self, parent_ticket_id: str) -> bool:
