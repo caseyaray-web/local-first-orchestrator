@@ -20,6 +20,16 @@ from .historical_revalidation import authorization_hash, authorization_identity,
 from .ticket import MicroTicket
 
 
+def _stable_scheduler_failure_fingerprint(ticket_id: str, stage: str, evidence: str) -> str:
+    """Hash stable failure identity while excluding volatile locations and timestamps."""
+    normalized = evidence.lower()
+    normalized = re.sub(r"\b(?:line|ln)\s*\d+\b", "", normalized)
+    normalized = re.sub(r"\b\d{4}-\d\d-\d\d(?:[t ]\d\d:\d\d:\d\d(?:\.\d+)?z?)?\b", "", normalized)
+    normalized = re.sub(r"(?:[a-z]:)?/(?:[^\s:]+/)+[^\s:]+", "<path>", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip(" :,-")
+    return hashlib.sha256("\x1f".join((ticket_id, stage, normalized)).encode()).hexdigest()
+
+
 def _is_json_int(value: object) -> bool:
     return type(value) is int
 
@@ -1425,6 +1435,172 @@ class Ledger:
             raise KeyError(claim_id)
         return dict(row)
 
+    def claim_next_scheduler_repair_routing(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+        """Claim one failed validation or completed review for routing only."""
+        if not owner or lease_seconds < 1:
+            raise ValueError("scheduler claim requires an owner and positive lease")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
+                return None
+            replay = conn.execute("SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'repair_routing:%' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,)).fetchone()
+            if replay is not None:
+                if conn.execute("UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?", (owner, now + lease_seconds, now, replay["claim_id"], now)).rowcount != 1:
+                    return None
+                conn.execute("UPDATE tickets SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=?", (owner, now + lease_seconds, now, replay["ticket_id"]))
+                self._append_event(conn, entity_type="ticket", entity_id=str(replay["ticket_id"]), event_type="scheduler_stage_reclaimed", actor_id=owner, payload={"claim_id": replay["claim_id"], "stage": "repair_routing", "lease_expires_at": now + lease_seconds})
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
+            row = conn.execute("""
+                SELECT t.id, t.state,
+                       COALESCE((SELECT MAX(r.attempt_number) FROM runtime_stages r WHERE r.ticket_id=t.id AND r.stage LIKE 'validation-%'),
+                                (SELECT MAX(m.attempt_number) FROM model_stage_artifacts m WHERE m.ticket_id=t.id AND m.stage='review')) AS attempt_number
+                FROM tickets t
+                WHERE (
+                    t.state='verifying' AND EXISTS (
+                        SELECT 1 FROM runtime_stages r WHERE r.ticket_id=t.id AND r.stage=('validation-' || r.attempt_number)
+                        AND json_valid(r.detail)=1 AND json_extract(r.detail,'$.passed')=0
+                    )
+                ) OR (
+                    t.state='local_review' AND EXISTS (
+                        SELECT 1 FROM model_stage_artifacts m WHERE m.ticket_id=t.id AND m.stage='review'
+                    )
+                )
+                ORDER BY t.created_at,t.id LIMIT 1
+            """).fetchone()
+            if row is None or row["attempt_number"] is None:
+                return None
+            ticket_id = str(row["id"]); attempt_number = int(row["attempt_number"]); stage = f"repair_routing:{attempt_number}"
+            if conn.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, stage)).fetchone():
+                return None
+            claim_id = hashlib.sha256(f"{stage}:{ticket_id}".encode()).hexdigest()[:32]
+            conn.execute("INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,created_at,updated_at) VALUES (?,?,?,'claimed',?,?,1,?,?)", (claim_id,ticket_id,stage,owner,now+lease_seconds,now,now))
+            conn.execute("UPDATE tickets SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=?", (owner,now+lease_seconds,now,ticket_id))
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_claimed", actor_id=owner, payload={"claim_id":claim_id,"stage":"repair_routing","attempt_number":attempt_number})
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
+    def apply_scheduler_repair_routing_effect(self, claim_id: str, owner: str, *, now: int | None = None) -> dict[str, Any]:
+        """Derive and persist one repair/pass/triage decision atomically."""
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if claim is None or not str(claim["stage"]).startswith("repair_routing:"):
+                raise ValueError("scheduler claim is not repair routing")
+            if claim["side_effect_completed_at"] is not None:
+                return dict(claim)
+            if claim["side_effect_started_at"] is None:
+                raise RuntimeError("scheduler claim effect was not durably started")
+            if claim["lease_owner"] != owner or claim["lease_expires_at"] is None or int(claim["lease_expires_at"]) <= now:
+                raise PermissionError("scheduler claim lease is not owned")
+
+            ticket_id = str(claim["ticket_id"])
+            attempt_number = int(str(claim["stage"]).split(":", 1)[1])
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None:
+                raise KeyError(ticket_id)
+            state = str(ticket["state"])
+            max_attempts = int(ticket["max_attempts"])
+            result: dict[str, Any]
+
+            if state == CanonicalState.VERIFYING.value:
+                validation = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"validation-{attempt_number}")).fetchone()
+                if validation is None:
+                    raise RuntimeError("repair_routing_reconciliation_required: failed validation evidence is missing")
+                try:
+                    detail = json.loads(str(validation["detail"]))
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("repair_routing_reconciliation_required: validation evidence is malformed") from exc
+                if bool(detail.get("passed")):
+                    raise RuntimeError("repair_routing_reconciliation_required: passing validation is not repair-routable")
+                compact = str(detail.get("compact_evidence") or "")
+                if not compact:
+                    raise RuntimeError("repair_routing_reconciliation_required: validation failure evidence is empty")
+                fingerprint = _stable_scheduler_failure_fingerprint(ticket_id, "validation", compact)
+                repeated = False
+                for prior in conn.execute("SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage LIKE 'validation-%' AND attempt_number<?", (ticket_id, attempt_number)):
+                    try:
+                        prior_detail = json.loads(str(prior["detail"]))
+                    except json.JSONDecodeError:
+                        continue
+                    if bool(prior_detail.get("passed")):
+                        continue
+                    prior_compact = str(prior_detail.get("compact_evidence") or "")
+                    prior_fingerprint = _stable_scheduler_failure_fingerprint(ticket_id, "validation", prior_compact)
+                    repeated = repeated or prior_fingerprint == fingerprint
+                action = "triage" if repeated or attempt_number >= max_attempts else "repair"
+                result = {"ticket_id":ticket_id,"attempt_number":attempt_number,"source":"validation","action":action,"failure_fingerprint":fingerprint,"repeated_fingerprint":repeated,"failure_evidence":compact}
+            elif state == CanonicalState.LOCAL_REVIEW.value:
+                review_claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=? AND side_effect_completed_at IS NOT NULL AND result_json IS NOT NULL", (ticket_id, f"review:{attempt_number}")).fetchone()
+                if review_claim is None:
+                    raise RuntimeError("repair_routing_reconciliation_required: completed review result is missing")
+                try:
+                    review_result = json.loads(str(review_claim["result_json"]))
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("repair_routing_reconciliation_required: review result is malformed") from exc
+                verdict = str(review_result.get("review_verdict") or "")
+                findings = review_result.get("findings") or []
+                criterion_results = review_result.get("criterion_results") or []
+                suggestions = review_result.get("suggestions") or []
+                review_raw = review_result.get("review_raw") or {}
+                if verdict not in {"pass","repair","escalate"} or not isinstance(findings, list) or not isinstance(criterion_results, list):
+                    raise RuntimeError("repair_routing_reconciliation_required: normalized review result is incomplete")
+                repeated = any(
+                    isinstance(finding, dict) and finding.get("fingerprint") and conn.execute("SELECT 1 FROM review_findings WHERE ticket_id=? AND fingerprint=? LIMIT 1", (ticket_id, finding["fingerprint"])).fetchone() is not None
+                    for finding in findings
+                )
+                if verdict == "pass" or (verdict == "repair" and not findings):
+                    action = "pass"
+                elif verdict == "escalate" or repeated or attempt_number >= max_attempts:
+                    action = "triage"
+                else:
+                    action = "repair"
+                result = {"ticket_id":ticket_id,"attempt_number":attempt_number,"source":"review","action":action,"review_verdict":verdict,"repeated_fingerprint":repeated,"failure_fingerprint":next((str(item.get("fingerprint")) for item in findings if isinstance(item, dict) and item.get("fingerprint")), None),"failure_evidence":"; ".join(str(item.get("evidence") or "") for item in findings if isinstance(item, dict) and item.get("evidence")),"suggestions":suggestions}
+                conn.execute("INSERT OR REPLACE INTO review_results(ticket_id,attempt_number,verdict,payload_json,created_at) VALUES (?,?,?,?,?)", (ticket_id,attempt_number,verdict,json.dumps(review_raw,sort_keys=True),now))
+                for finding in findings:
+                    if not isinstance(finding, dict) or not finding.get("fingerprint"):
+                        continue
+                    conn.execute("INSERT INTO review_findings(ticket_id,attempt_number,fingerprint,payload_json,created_at) VALUES (?,?,?,?,?)", (ticket_id,attempt_number,str(finding["fingerprint"]),json.dumps(finding,sort_keys=True),now))
+                for criterion in criterion_results:
+                    if isinstance(criterion, dict) and criterion.get("criterion_id") and criterion.get("status") == "fail":
+                        conn.execute("INSERT INTO criterion_statuses(ticket_id,criterion_id,status,evidence,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(ticket_id,criterion_id) DO UPDATE SET status=excluded.status,evidence=excluded.evidence,updated_at=excluded.updated_at", (ticket_id,str(criterion["criterion_id"]),"open",str(criterion.get("evidence") or "review failure"),now))
+            else:
+                raise RuntimeError("repair_routing_reconciliation_required: ticket state is not routable")
+
+            encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+            stage_name = f"repair-routing-{attempt_number}"
+            existing_stage = conn.execute("SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, stage_name)).fetchone()
+            if existing_stage is not None and str(existing_stage["detail"]) != encoded:
+                raise RuntimeError("repair_routing_reconciliation_required: durable routing decision conflicts")
+            conn.execute("INSERT OR IGNORE INTO runtime_stages(ticket_id,stage,detail,attempt_number,created_at) VALUES (?,?,?,?,?)", (ticket_id,stage_name,encoded,attempt_number,now))
+
+            target = CanonicalState.REPAIRING if result["action"] == "repair" else CanonicalState.NEEDS_TRIAGE if result["action"] == "triage" else None
+            if target is not None:
+                current = CanonicalState(state)
+                validate_transition(current, target)
+                changed = conn.execute("UPDATE tickets SET state=?,updated_at=? WHERE id=? AND state=?", (target.value,now,ticket_id,current.value))
+                if changed.rowcount != 1:
+                    raise RuntimeError("ticket changed concurrently")
+                event_id = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="state_transition", actor_id="repair_router", from_state=current.value, to_state=target.value, payload=result)
+                if target.value in self._PROJECTABLE_STATES:
+                    self._enqueue_projection_bundle_in_transaction(conn, ticket_id=ticket_id, event_id=event_id, evidence=f"repair routing={result['action']}", state_payload=result)
+                if target == CanonicalState.REPAIRING:
+                    implementation = conn.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='implementation'", (ticket_id,attempt_number)).fetchone()
+                    attempt = conn.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id,attempt_number)).fetchone()
+                    if implementation is None or attempt is None or not attempt["worktree_path"]:
+                        raise RuntimeError("repair_routing_reconciliation_required: repair candidate provenance is incomplete")
+                    next_attempt = attempt_number + 1
+                    if next_attempt > max_attempts:
+                        raise RuntimeError("repair_routing_reconciliation_required: repair exceeds max attempts")
+                    conn.execute("INSERT OR IGNORE INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,created_at) VALUES (?,?,?,?,?,?,?)", (ticket_id,next_attempt,attempt["base_sha"],attempt["branch"],attempt["worktree_path"],implementation["diff_hash"],now))
+                    conn.execute("UPDATE attempts SET outcome='repair_requested',failure_fingerprint=? WHERE ticket_id=? AND attempt_number=?", (result.get("failure_fingerprint"),ticket_id,attempt_number))
+                    result["next_attempt_number"] = next_attempt
+                    encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+                    conn.execute("UPDATE runtime_stages SET detail=? WHERE ticket_id=? AND stage=?", (encoded,ticket_id,stage_name))
+
+            if conn.execute("UPDATE scheduler_stage_claims SET side_effect_completed_at=?,result_json=?,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_owner=? AND lease_expires_at>? AND side_effect_completed_at IS NULL", (now,encoded,now,claim_id,owner,now)).rowcount != 1:
+                raise PermissionError("scheduler claim lease is not owned")
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id":claim_id,"stage":"repair_routing","result":result})
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
     def claim_next_scheduler_implementation(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
         """Claim one ready-local implementation stage, including expired replay."""
         if not owner or lease_seconds < 1:
@@ -1435,7 +1611,7 @@ class Ledger:
             if paused is None or paused["paused"]:
                 return None
             replay = conn.execute(
-                "SELECT * FROM scheduler_stage_claims WHERE stage='implementation' AND status='claimed' "
+                "SELECT * FROM scheduler_stage_claims WHERE (stage='implementation' OR stage LIKE 'implementation:%') AND status='claimed' "
                 "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
             ).fetchone()
             if replay is not None:
@@ -1454,29 +1630,37 @@ class Ledger:
                 return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
 
             candidate = conn.execute(
-                "SELECT t.id FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id "
-                "WHERE t.state=? AND (t.lease_expires_at IS NULL OR t.lease_expires_at<=?) "
-                "AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage='implementation' AND c.status='claimed') "
+                "SELECT t.id,t.state FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id "
+                "WHERE t.state IN (?,?) AND (t.lease_expires_at IS NULL OR t.lease_expires_at<=?) "
+                "AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND (c.stage='implementation' OR c.stage LIKE 'implementation:%') AND c.status='claimed') "
                 "ORDER BY t.created_at,t.id LIMIT 1",
-                (CanonicalState.READY_LOCAL.value, now),
+                (CanonicalState.READY_LOCAL.value, CanonicalState.REPAIRING.value, now),
             ).fetchone()
             if candidate is None:
                 return None
             ticket_id = str(candidate["id"])
-            ordinal = int(conn.execute("SELECT COUNT(*) AS n FROM scheduler_stage_claims WHERE ticket_id=? AND stage='implementation'", (ticket_id,)).fetchone()["n"]) + 1
-            claim_id = hashlib.sha256(f"implementation:{ticket_id}:{ordinal}".encode()).hexdigest()[:32]
+            source_state = CanonicalState(str(candidate["state"]))
+            prior_claims = int(conn.execute("SELECT COUNT(*) AS n FROM scheduler_stage_claims WHERE ticket_id=? AND (stage='implementation' OR stage LIKE 'implementation:%')", (ticket_id,)).fetchone()["n"])
+            if prior_claims == 0:
+                stage_name = "implementation"
+            else:
+                latest_attempt = conn.execute("SELECT MAX(attempt_number) AS n FROM attempts WHERE ticket_id=?", (ticket_id,)).fetchone()["n"]
+                if latest_attempt is None:
+                    raise RuntimeError("repair implementation requires a durable attempt identity")
+                stage_name = f"implementation:{int(latest_attempt)}"
+            claim_id = hashlib.sha256(f"{stage_name}:{ticket_id}".encode()).hexdigest()[:32]
             changed = conn.execute(
                 "UPDATE tickets SET state=?,lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=? AND state=? AND (lease_expires_at IS NULL OR lease_expires_at<=?)",
-                (CanonicalState.IMPLEMENTING.value, owner, now + lease_seconds, now, ticket_id, CanonicalState.READY_LOCAL.value, now),
+                (CanonicalState.IMPLEMENTING.value, owner, now + lease_seconds, now, ticket_id, source_state.value, now),
             )
             if changed.rowcount != 1:
                 return None
             conn.execute(
                 "INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,created_at,updated_at) VALUES (?,?,?,'claimed',?,?,1,?,?)",
-                (claim_id, ticket_id, "implementation", owner, now + lease_seconds, now, now),
+                (claim_id, ticket_id, stage_name, owner, now + lease_seconds, now, now),
             )
-            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="lease_claimed", actor_id=owner, from_state=CanonicalState.READY_LOCAL.value, to_state=CanonicalState.IMPLEMENTING.value, payload={"lease_expires_at": now + lease_seconds, "scheduler_claim_id": claim_id})
-            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_claimed", actor_id=owner, payload={"claim_id": claim_id, "stage": "implementation", "lease_expires_at": now + lease_seconds})
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="lease_claimed", actor_id=owner, from_state=source_state.value, to_state=CanonicalState.IMPLEMENTING.value, payload={"lease_expires_at": now + lease_seconds, "scheduler_claim_id": claim_id})
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_claimed", actor_id=owner, payload={"claim_id": claim_id, "stage": stage_name, "lease_expires_at": now + lease_seconds})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
     def complete_scheduler_implementation_effect(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
@@ -1487,7 +1671,7 @@ class Ledger:
             claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
             if claim is None:
                 raise KeyError(claim_id)
-            if claim["stage"] != "implementation":
+            if claim["stage"] != "implementation" and not str(claim["stage"]).startswith("implementation:"):
                 raise ValueError("scheduler claim is not implementation")
             if claim["side_effect_completed_at"] is not None:
                 return dict(claim)
@@ -1958,7 +2142,7 @@ class Ledger:
             if changed.rowcount != 1:
                 raise PermissionError("scheduler claim lease is not owned")
             self._append_event(conn, entity_type="ticket", entity_id=str(row["ticket_id"]), event_type="scheduler_stage_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": row["stage"], "result": result})
-            if row["stage"] == "implementation" or str(row["stage"]).startswith("validation:") or str(row["stage"]).startswith("review:"):
+            if row["stage"] == "implementation" or str(row["stage"]).startswith("implementation:") or str(row["stage"]).startswith("validation:") or str(row["stage"]).startswith("review:") or str(row["stage"]).startswith("repair_routing:"):
                 conn.execute(
                     "UPDATE tickets SET lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND lease_owner=?",
                     (now, row["ticket_id"], owner),

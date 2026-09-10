@@ -104,18 +104,44 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     if review is not None:
         return ProcessNextPreview(next_stage="review", ticket_id=str(review["id"]), would_execute=True)
 
+    repair_replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage LIKE 'repair_routing:%' AND status='claimed' "
+        "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+    ).fetchone()
+    if repair_replay is not None:
+        return ProcessNextPreview(next_stage="repair_routing", ticket_id=str(repair_replay["ticket_id"]), would_execute=True)
+    repair = ledger.connection.execute("""
+        SELECT t.id FROM tickets t
+        WHERE ((
+            t.state='verifying' AND EXISTS (
+                SELECT 1 FROM runtime_stages r WHERE r.ticket_id=t.id AND r.stage=('validation-' || r.attempt_number)
+                AND json_valid(r.detail)=1 AND json_extract(r.detail,'$.passed')=0
+            )
+        ) OR (
+            t.state='local_review' AND EXISTS (
+                SELECT 1 FROM model_stage_artifacts m WHERE m.ticket_id=t.id AND m.stage='review'
+            )
+        ))
+        AND NOT EXISTS (
+            SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage LIKE 'repair_routing:%'
+        )
+        ORDER BY t.created_at,t.id LIMIT 1
+    """).fetchone()
+    if repair is not None:
+        return ProcessNextPreview(next_stage="repair_routing", ticket_id=str(repair["id"]), would_execute=True)
+
     implementation_replay = ledger.connection.execute(
-        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage='implementation' AND status='claimed' "
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE (stage='implementation' OR stage LIKE 'implementation:%') AND status='claimed' "
         "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
     ).fetchone()
     if implementation_replay is not None:
         return ProcessNextPreview(next_stage="implementation", ticket_id=str(implementation_replay["ticket_id"]), would_execute=True)
     implementation = ledger.connection.execute(
         "SELECT t.id FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id "
-        "WHERE t.state=? AND (t.lease_expires_at IS NULL OR t.lease_expires_at<=?) "
-        "AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage='implementation' AND c.status='claimed') "
+        "WHERE t.state IN (?,?) AND (t.lease_expires_at IS NULL OR t.lease_expires_at<=?) "
+        "AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND (c.stage='implementation' OR c.stage LIKE 'implementation:%') AND c.status='claimed') "
         "ORDER BY t.created_at,t.id LIMIT 1",
-        ("ready_local", now),
+        ("ready_local", "repairing", now),
     ).fetchone()
     if implementation is not None:
         return ProcessNextPreview(next_stage="implementation", ticket_id=str(implementation["id"]), would_execute=True)
@@ -307,6 +333,21 @@ class ProcessNextScheduler:
                     claim_id, execution_owner, review_result, now=now
                 )
                 return ProcessNextResult("completed", "review", ticket_id, claim_id)
+
+        repair_claim = self.ledger.claim_next_scheduler_repair_routing(
+            execution_owner, lease_seconds=self.lease_seconds, now=now
+        )
+        if repair_claim is not None:
+            claim_id = str(repair_claim["claim_id"])
+            ticket_id = str(repair_claim["ticket_id"])
+            current = self.ledger.scheduler_claim(claim_id)
+            if current.get("side_effect_completed_at") is None:
+                if current.get("side_effect_started_at") is None:
+                    self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+                current = self.ledger.apply_scheduler_repair_routing_effect(claim_id, execution_owner, now=now)
+            result = json.loads(str(current["result_json"]))
+            self.ledger.complete_scheduler_claim(claim_id, execution_owner, result, now=now)
+            return ProcessNextResult("completed", "repair_routing", ticket_id, claim_id)
 
         if self.implementation_runner is not None:
             implementation_claim = self.ledger.claim_next_scheduler_implementation(

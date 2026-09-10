@@ -9,8 +9,8 @@ from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
 from local_first_orchestrator.hermes_board import ExternalTicket
-from local_first_orchestrator.ledger import Ledger
-from local_first_orchestrator.scheduler import ProcessNextScheduler
+from local_first_orchestrator.ledger import Ledger, _stable_scheduler_failure_fingerprint
+from local_first_orchestrator.scheduler import ProcessNextScheduler, preview_next
 from local_first_orchestrator.states import CanonicalState
 
 
@@ -71,6 +71,34 @@ class InvalidLifecycleModel(LifecycleModel):
         return type("Result", (), {"payload": {}, "artifact_path": artifact})()
 
 
+class SequencedLifecycleModel(LifecycleModel):
+    def __init__(self, implementation_values: list[str], review_payload: dict[str, object] | None = None) -> None:
+        super().__init__()
+        self.implementation_values = implementation_values
+        self.review_payload = review_payload
+        self.implementation_calls = 0
+        self.implementation_packets: list[str] = []
+
+    def invoke(self, purpose: str, packet: str, *, artifact_dir: Path, workdir: Path | None = None) -> object:
+        self.calls += 1
+        if purpose == "implementation":
+            assert workdir is not None
+            self.implementation_packets.append(packet)
+            index = min(self.implementation_calls, len(self.implementation_values) - 1)
+            value = self.implementation_values[index]
+            self.implementation_calls += 1
+            (workdir / "app.py").write_text(f"def value():\n    return {value!r}\n", encoding="utf-8")
+            payload: dict[str, object] = {}
+        else:
+            payload = self.review_payload or {"verdict":"pass","criterion_results":[{"criterion_id":"AC-1","status":"pass","evidence":"ok"}],"findings":[],"suggestions":[]}
+        artifact = artifact_dir / f"{purpose}-result.json"
+        if purpose == "review":
+            artifact.write_text(json.dumps({"provider":self.provider,"model":self.model,"payload":payload},sort_keys=True), encoding="utf-8")
+        else:
+            artifact.write_text("{}", encoding="utf-8")
+        return type("Result", (), {"payload": payload, "artifact_path": artifact})()
+
+
 class InvocationLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = TemporaryDirectory(); self.root = Path(self.temp.name); self.repo = self.root / "repo"; self.repo.mkdir()
@@ -90,6 +118,12 @@ class InvocationLifecycleTests(unittest.TestCase):
         return LocalFirstController(self.ledger, Board(), self.config, local_model=model, fault_injector=fault), ticket
     def invocation(self, ticket: str) -> dict[str, object]:
         row = self.ledger.connection.execute("SELECT * FROM model_invocations WHERE ticket_id=?", (ticket,)).fetchone(); assert row is not None; return dict(row)
+    def run_until_stage(self, scheduler: ProcessNextScheduler, stage: str, *, limit: int = 10):
+        for _ in range(limit):
+            result = scheduler.process_next()
+            if result.stage == stage:
+                return result
+        self.fail(f"scheduler did not reach stage {stage!r}")
     def test_completed_persists_start_before_call_and_links_output_artifact(self) -> None:
         model = LifecycleModel(); ctl, ticket = self.controller(model); self.assertTrue(ctl.execute(ticket, repository=self.repo, allow_board_writes=True))
         row = self.invocation(ticket); self.assertEqual(row["status"], "completed"); self.assertEqual(row["timeout_seconds"], 17); self.assertTrue(Path(str(row["model_artifact"])).is_file())
@@ -575,6 +609,152 @@ class InvocationLifecycleTests(unittest.TestCase):
         self.assertEqual(claim["status"], "claimed")
         self.assertIsNotNone(claim["side_effect_started_at"])
         self.assertIsNone(claim["side_effect_completed_at"])
+
+    def test_scheduler_validation_failure_fingerprint_ignores_volatile_locations_and_timestamps(self) -> None:
+        first = _stable_scheduler_failure_fingerprint(
+            "ticket",
+            "validation",
+            "FAILED /tmp/work-a/app.py line 41 at 2026-09-10T14:00:01Z: expected ok",
+        )
+        second = _stable_scheduler_failure_fingerprint(
+            "ticket",
+            "validation",
+            "failed /var/tmp/work-b/app.py line 987 at 2026-09-11T09:22:33Z: expected ok",
+        )
+        self.assertEqual(first, second)
+
+    def test_scheduler_validation_failure_routes_to_repair_and_next_attempt_uses_failure_evidence(self) -> None:
+        model = SequencedLifecycleModel(["still-bad", "ok"]); ctl, ticket = self.controller(model)
+        scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo),
+            validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo),
+        )
+        self.assertEqual(scheduler.process_next().stage, "implementation")
+        validation = scheduler.process_next()
+        self.assertEqual(validation.stage, "validation")
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "verifying")
+        preview = preview_next(self.ledger, now=100)
+        self.assertEqual((preview.next_stage, preview.ticket_id), ("repair_routing", ticket))
+
+        routed = scheduler.process_next()
+        self.assertEqual((routed.stage, routed.status), ("repair_routing", "completed"))
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "repairing")
+        decision = json.loads(str(self.ledger.runtime_stage(ticket, "repair-routing-1")["detail"]))
+        self.assertEqual((decision["action"], decision["next_attempt_number"]), ("repair", 2))
+        attempt1 = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (ticket,)).fetchone()
+        attempt2 = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=2", (ticket,)).fetchone()
+        self.assertEqual((attempt2["worktree_path"], attempt2["branch"]), (attempt1["worktree_path"], attempt1["branch"]))
+
+        repaired = scheduler.process_next()
+        self.assertEqual(repaired.stage, "implementation")
+        self.assertEqual(model.implementation_calls, 2)
+        self.assertIn("## failure_evidence: compact", model.implementation_packets[1])
+        self.assertIsNotNone(self.ledger.model_stage(ticket, 2, "implementation"))
+
+    def test_scheduler_repeated_validation_failure_routes_to_triage_once(self) -> None:
+        model = SequencedLifecycleModel(["still-bad", "still-bad"]); ctl, ticket = self.controller(model)
+        scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo),
+            validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo),
+        )
+        for expected in ("implementation", "validation", "repair_routing", "implementation", "validation", "repair_routing"):
+            self.assertEqual(scheduler.process_next().stage, expected)
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "needs_triage")
+        decision = json.loads(str(self.ledger.runtime_stage(ticket, "repair-routing-2")["detail"]))
+        self.assertEqual(decision["action"], "triage")
+        self.assertTrue(decision["repeated_fingerprint"])
+        triage_events = [event for event in self.ledger.events_for(ticket) if event["event_type"] == "state_transition" and event["to_state"] == "needs_triage"]
+        self.assertEqual(len(triage_events), 1)
+        self.assertIsNone(self.ledger.claim_next_scheduler_repair_routing("other", lease_seconds=30, now=100))
+
+    def test_scheduler_validation_failure_respects_max_attempts_without_repeat(self) -> None:
+        model = SequencedLifecycleModel(["still-bad"]); ctl, ticket = self.controller(model)
+        self.ledger.connection.execute("UPDATE tickets SET max_attempts=1 WHERE id=?", (ticket,))
+        scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo),
+            validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo),
+        )
+        self.assertEqual(scheduler.process_next().stage, "implementation")
+        self.assertEqual(scheduler.process_next().stage, "validation")
+        self.assertEqual(scheduler.process_next().stage, "repair_routing")
+        decision = json.loads(str(self.ledger.runtime_stage(ticket, "repair-routing-1")["detail"]))
+        self.assertEqual(decision["action"], "triage")
+        self.assertFalse(decision["repeated_fingerprint"])
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "needs_triage")
+
+    def test_scheduler_review_repair_routes_same_ticket_and_records_review_evidence(self) -> None:
+        review_payload = {
+            "verdict": "repair",
+            "criterion_results": [{"criterion_id":"AC-1","status":"fail","evidence":"value is wrong"}],
+            "findings": [{"severity":"blocking","criterion_id":"AC-1","file":"app.py","symbol":"value","evidence":"wrong value","minimal_repair":"return ok","verification":"run configured test","fingerprint_input":"wrong return value"}],
+            "suggestions": [],
+        }
+        model = SequencedLifecycleModel(["ok", "ok"], review_payload); ctl, ticket = self.controller(model)
+        scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo),
+            validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo),
+            review_runner=lambda value: ctl.execute_fresh_review_only(value, repository=self.repo),
+            review_execution_policy_hash=ctl.review_execution_policy_hash(),
+        )
+        self.assertEqual(scheduler.process_next().stage, "implementation")
+        self.assertEqual(scheduler.process_next().stage, "validation")
+        self.run_until_stage(scheduler, "review")
+        routed = self.run_until_stage(scheduler, "repair_routing")
+        self.assertEqual(routed.ticket_id, ticket)
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "repairing")
+        review_row = self.ledger.connection.execute("SELECT * FROM review_results WHERE ticket_id=? AND attempt_number=1", (ticket,)).fetchone()
+        self.assertEqual(review_row["verdict"], "repair")
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM review_findings WHERE ticket_id=? AND attempt_number=1", (ticket,)).fetchone()[0], 1)
+        decision = json.loads(str(self.ledger.runtime_stage(ticket, "repair-routing-1")["detail"]))
+        self.assertEqual(decision["action"], "repair")
+
+    def test_scheduler_pass_review_is_recorded_without_accepting_in_routing_tick(self) -> None:
+        model = SequencedLifecycleModel(["ok"]); ctl, ticket = self.controller(model)
+        scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo),
+            validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo),
+            review_runner=lambda value: ctl.execute_fresh_review_only(value, repository=self.repo),
+            review_execution_policy_hash=ctl.review_execution_policy_hash(),
+        )
+        self.assertEqual(scheduler.process_next().stage, "implementation")
+        self.assertEqual(scheduler.process_next().stage, "validation")
+        self.run_until_stage(scheduler, "review")
+        self.run_until_stage(scheduler, "repair_routing")
+        decision = json.loads(str(self.ledger.runtime_stage(ticket, "repair-routing-1")["detail"]))
+        self.assertEqual(decision["action"], "pass")
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "local_review")
+        self.assertEqual(self.ledger.connection.execute("SELECT verdict FROM review_results WHERE ticket_id=? AND attempt_number=1", (ticket,)).fetchone()[0], "pass")
+        self.assertIsNone(self.ledger.accepted_commit(ticket))
+
+    def test_scheduler_repair_routing_finalizes_after_restart_without_duplicate_transition(self) -> None:
+        model = SequencedLifecycleModel(["still-bad"]); ctl, ticket = self.controller(model)
+        scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo),
+            validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo),
+        )
+        self.assertEqual(scheduler.process_next().stage, "implementation")
+        self.assertEqual(scheduler.process_next().stage, "validation")
+        claim = self.ledger.claim_next_scheduler_repair_routing("crashed", lease_seconds=1, now=101)
+        assert claim is not None
+        claim_id = str(claim["claim_id"])
+        self.ledger.begin_scheduler_claim_effect(claim_id, "crashed", now=101)
+        applied = self.ledger.apply_scheduler_repair_routing_effect(claim_id, "crashed", now=101)
+        self.assertIsNotNone(applied["side_effect_completed_at"])
+        self.assertIsNone(applied["finalized_at"])
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "repairing")
+
+        resumed = ProcessNextScheduler(self.ledger, Board(), worker_id="recovery", lease_seconds=30, clock=lambda: 103)
+        final = resumed.process_next()
+        self.assertEqual((final.stage, final.status, final.ticket_id), ("repair_routing", "completed", ticket))
+        self.assertEqual(self.ledger.scheduler_claim(claim_id)["status"], "completed")
+        transitions = [event for event in self.ledger.events_for(ticket) if event["event_type"] == "state_transition" and event["to_state"] == "repairing"]
+        self.assertEqual(len(transitions), 1)
 
     def test_implementation_only_freezes_candidate_without_review_and_replays(self) -> None:
         model = LifecycleModel(); ctl, ticket = self.controller(model)

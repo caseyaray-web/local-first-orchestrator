@@ -42,6 +42,16 @@ Already complete or substantially complete:
    - adapter-authored review artifacts are preserved intact
    - repair/acceptance remain separate later stages
 
+5. **Repair-routing stage — Complete for the current scheduler slice**
+   - failed validation remains `verifying` until a later routing tick decides repair vs triage
+   - completed review output carries normalized verdict/findings/criteria into a later routing tick
+   - routing decisions are persisted before repair/triage work is exposed
+   - validation failures use stable fingerprints that ignore volatile paths, line numbers, and timestamps
+   - repeated fingerprints and `max_attempts` route to triage exactly once
+   - repair creates an attempt-scoped continuation on the same worktree/branch and carries failure evidence into the next implementation context
+   - pass review is recorded without accepting the candidate in the routing tick
+   - repair-routing effect completion and state transition are atomic and restart-finalizable
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage
@@ -80,7 +90,7 @@ Completion condition: a validated candidate receives one fresh independent revie
 
 **Current status:** Complete for this scheduler milestone. Review claims now bind candidate identity plus provider/model/timeout/schema execution identity; adapter-authored artifacts are preserved; completed invocations interrupted before model-stage persistence are recoverable without reinvocation; ambiguous started invocations still fail closed.
 
-## 5. Repair-routing stage
+## 5. Repair-routing stage — Complete
 
 Turn deterministic validation failures and blocking review findings into bounded same-ticket lifecycle decisions.
 
@@ -95,6 +105,8 @@ Required slices:
 - Persist the routing decision before exposing new work.
 
 Completion condition: failures cannot create uncontrolled retry loops, and every retry/triage decision is durable, bounded, and restart-safe.
+
+**Current status:** Complete for this scheduler milestone. Repair routing is a ledger-derived stage with no model call of its own. It atomically records the decision and state transition, preserves same-ticket attempt continuity for repair, routes repeated/exhausted failures to triage, and leaves pass review candidates for the separate acceptance milestone.
 
 ## 6. Bounded triage/decomposition stage
 

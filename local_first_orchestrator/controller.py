@@ -367,7 +367,24 @@ class LocalFirstController:
             self._assert_pre_inference_isolation(repository=repo, attempt=attempt, base_sha=base, ticket=ticket, canonical_sha=canonical_sha)
         artifacts_root = artifact_root / ticket_id / str(attempt_number)
         artifacts_root.mkdir(parents=True, exist_ok=True)
-        packet = ContextPacketBuilder().build_from_repository(ticket, attempt.path, repository_rules="Edit only allowed files. Return JSON only.")
+        failure_evidence = ""
+        repair_stage = self.ledger.connection.execute(
+            "SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage LIKE 'repair-routing-%' ORDER BY attempt_number DESC LIMIT 1",
+            (ticket_id,),
+        ).fetchone()
+        if repair_stage is not None:
+            try:
+                repair_detail = json.loads(str(repair_stage["detail"]))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("repair routing evidence is malformed") from exc
+            if repair_detail.get("action") == "repair" and int(repair_detail.get("next_attempt_number") or 0) == attempt_number:
+                failure_evidence = str(repair_detail.get("failure_evidence") or "")
+        packet = ContextPacketBuilder().build_from_repository(
+            ticket,
+            attempt.path,
+            repository_rules="Edit only allowed files. Return JSON only.",
+            failure_evidence=failure_evidence,
+        )
         ContextPacketBuilder().write_artifacts(packet, artifact_root=artifacts_root)
         request_hash = hashlib.sha256(packet.text.encode()).hexdigest()
         if hasattr(self.local_model, "implementation_timeout_seconds"):
@@ -520,9 +537,8 @@ class LocalFirstController:
                 raise RuntimeError("validation_reconciliation_required: validation artifact persistence conflicted")
             self.ledger.record_runtime_stage(ticket_id, "validation_completed", json.dumps(record, sort_keys=True), attempt_number=attempt_number, artifact_path=str(validation_path), artifact_sha256=validation_sha256, base_sha=expected["base_sha"])
         passed = bool(record.get("passed"))
-        target = CanonicalState.LOCAL_REVIEW if passed else CanonicalState.NEEDS_TRIAGE
-        if self.ledger.get_ticket(ticket_id)["state"] == CanonicalState.VERIFYING.value:
-            self.ledger.transition(ticket_id, target, payload={"validation": str(record["compact_evidence"]), "attempt_number": attempt_number})
+        if passed and self.ledger.get_ticket(ticket_id)["state"] == CanonicalState.VERIFYING.value:
+            self.ledger.transition(ticket_id, CanonicalState.LOCAL_REVIEW, payload={"validation": str(record["compact_evidence"]), "attempt_number": attempt_number})
         return {
             "ticket_id": ticket_id,
             "candidate_identity": identity,
@@ -972,11 +988,29 @@ class LocalFirstController:
         if not isinstance(selected_files, dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in selected_files.items()):
             raise RuntimeError("review_reconciliation_required: selected review files are malformed")
         packet = ReviewPacketBuilder().build(ticket, diff=diff, selected_files=selected_files, validation_evidence=str(validation["compact_evidence"]))
+        def result_payload(review_result: Any, response: Path, *, replayed: bool) -> dict[str, object]:
+            return {
+                "ticket_id": ticket_id,
+                "attempt_number": attempt_number,
+                "candidate_identity": identity,
+                "review_artifact": str(response),
+                "review_verdict": review_result.verdict,
+                "criterion_results": list(review_result.criterion_results),
+                "findings": [finding.__dict__ for finding in review_result.findings],
+                "suggestions": list(review_result.suggestions),
+                "review_raw": review_result.raw,
+                "replayed": replayed,
+            }
         existing = self.ledger.model_stage(ticket_id, attempt_number, "review")
         if existing is not None:
             response = Path(str(existing["response_artifact"]))
             if response.is_file() and str(existing["diff_hash"]) == str(identity["implementation_diff_hash"]):
-                return {"ticket_id":ticket_id,"attempt_number":attempt_number,"candidate_identity":identity,"review_artifact":str(response),"replayed":True}
+                try:
+                    envelope = json.loads(response.read_text(encoding="utf-8"))
+                    existing_review = normalize_review(envelope["payload"], ticket)
+                except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("review_reconciliation_required: persisted review artifact is invalid") from exc
+                return result_payload(existing_review, response, replayed=True)
             raise RuntimeError("review_reconciliation_required: persisted review stage conflicts")
         prior_invocations = self.ledger.review_invocations(ticket_id, attempt_number)
         if prior_invocations:
@@ -997,7 +1031,7 @@ class LocalFirstController:
                     model = str(getattr(self.local_model, "review_model", getattr(self.local_model, "model", type(self.local_model).__name__)))
                     if envelope["provider"] != provider or envelope["model"] != model or prior["provider"] != provider or prior["model"] != model:
                         raise ValueError("review execution identity drift")
-                    normalize_review(envelope["payload"], ticket)
+                    recovered_review = normalize_review(envelope["payload"], ticket)
                 except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
                     raise RuntimeError("review_reconciliation_required: completed review artifact is invalid") from exc
                 recorded = self.ledger.record_model_stage(
@@ -1014,7 +1048,7 @@ class LocalFirstController:
                 )
                 if not recorded and self.ledger.model_stage(ticket_id, attempt_number, "review") is None:
                     raise RuntimeError("review_reconciliation_required: completed review invocation could not be recovered")
-                return {"ticket_id":ticket_id,"attempt_number":attempt_number,"candidate_identity":identity,"review_artifact":str(response),"replayed":True}
+                return result_payload(recovered_review, response, replayed=True)
             raise RuntimeError("review_reconciliation_required: prior review invocation requires reconciliation")
         artifacts_root = self.config.validate_execution_roots()[2] / ticket_id / str(attempt_number); artifacts_root.mkdir(parents=True, exist_ok=True)
         invocation_id = uuid.uuid4().hex
@@ -1039,7 +1073,7 @@ class LocalFirstController:
         self._crash("review_invocation_completed")
         self.ledger.record_model_stage(ticket_id,attempt_number,"review",purpose="review",adapter=type(self.local_model).__name__,request_hash=packet_hash,response_artifact=str(review_path),worktree_path="",base_sha=str(validation["candidate_identity"]["base_sha"]),diff_hash=str(identity["implementation_diff_hash"]))
         self._crash("review_completed")
-        return {"ticket_id":ticket_id,"attempt_number":attempt_number,"candidate_identity":identity,"review_artifact":str(review_path),"replayed":False}
+        return result_payload(review, review_path, replayed=False)
 
     def review_historical_candidate(self, ticket_id: str, attempt_number: int, *, repository: Path, owner: str="local-first-reviewer") -> dict[str, object]:
         """Hand an R2d candidate to the ordinary fresh review machinery only."""
