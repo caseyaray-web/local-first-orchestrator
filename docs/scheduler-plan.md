@@ -67,7 +67,7 @@ Already complete or substantially complete:
 
 The remaining work should proceed in the following order.
 
-## 3. Deterministic validation stage
+## 3. Deterministic validation stage — Complete
 
 Make validation a first-class `process-next` stage rather than a helper hidden inside implementation.
 
