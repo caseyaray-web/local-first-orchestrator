@@ -138,7 +138,7 @@ Completion condition: triage creates at most the permitted bounded child set, ex
 
 **Current status:** Complete for this scheduler milestone. Triage is independently claimable only from a durable repair-routing decision, runs through a planning-only decomposition route, persists and recovers model provenance, materializes bounded children using ledger-assigned identities, atomically enqueues their retry-safe Hermes projections, preserves repository and criterion provenance, and blocks child implementation until external card creation is acknowledged. Restart coverage includes completed-invocation recovery and the post-materialization/pre-finalization boundary without duplicate inference or child creation.
 
-## 7. Acceptance / candidate-freeze stage
+## 7. Acceptance / candidate-freeze stage — Complete
 
 Persist the final accepted candidate identity after review passes.
 
@@ -151,6 +151,8 @@ Required slices:
 - Make acceptance independently replayable without rerunning review.
 
 Completion condition: there is one durable, immutable accepted-candidate identity that later Git integration can trust.
+
+**Current status:** Complete for this scheduler milestone. A durable pass-routing decision becomes independently acceptance-eligible; acceptance re-checks the live worktree/root/base and exact implementation diff, validates the frozen review candidate plus implementation/validation/review artifacts and hashes, persists an append-only `accepted_candidates` record, and transitions `local_review → accepted` atomically with scheduler effect completion. No Git commit is created in this stage. Restart after effect completion finalizes without re-running the acceptance inspection, while candidate or artifact drift fails closed.
 
 ## 8. Git integration / commit stage
 

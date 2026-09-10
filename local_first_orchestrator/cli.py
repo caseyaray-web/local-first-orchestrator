@@ -328,6 +328,9 @@ def run_command(args: argparse.Namespace) -> int:
                 review_execution_policy_hash=ctl.review_execution_policy_hash(),
                 triage_runner=None if triage_planner is None else lambda ticket_id: ctl.execute_triage_only(ticket_id, planner=triage_planner),
                 triage_execution_policy_hash=None if triage_planner is None else triage_planner.execution_policy_hash(),
+                acceptance_runner=lambda ticket_id: ctl.inspect_acceptance_candidate_only(
+                    ticket_id, repository=registered.canonical_repository
+                ),
             ).process_next()
             print(json.dumps(asdict(result),sort_keys=True))
         elif args.command in {"implementation-only", "implement-only"}:

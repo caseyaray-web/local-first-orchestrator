@@ -1257,6 +1257,42 @@ class LocalFirstController:
         self.ledger.record_runtime_stage(ticket_id, f"triage-applied-{attempt_number}", json.dumps(result, sort_keys=True, separators=(",", ":")), attempt_number=attempt_number)
         return result
 
+    def inspect_acceptance_candidate_only(self, ticket_id: str, *, repository: Path) -> dict[str, object]:
+        """Read the exact accepted-candidate worktree identity without mutating Git."""
+        claim = self.ledger.connection.execute(
+            "SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage LIKE 'acceptance:%' AND status='claimed' ORDER BY created_at DESC LIMIT 1",
+            (ticket_id,),
+        ).fetchone()
+        if claim is None or not claim["candidate_identity_json"]:
+            raise RuntimeError("acceptance_reconciliation_required: scheduler claim missing")
+        try:
+            identity = json.loads(str(claim["candidate_identity_json"])); attempt_number = int(identity["attempt_number"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("acceptance_reconciliation_required: claim identity malformed") from exc
+        binding = self.ledger.runtime_binding(ticket_id)
+        repo = Path(repository).resolve(strict=True)
+        if str(repo) != str(binding["repository_path"]):
+            raise RuntimeError("acceptance_reconciliation_required: repository binding drift")
+        configured_repo, worktree_root, _ = self.config.validate_execution_roots()
+        if configured_repo != repo:
+            raise RuntimeError("acceptance_reconciliation_required: configured repository drift")
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        if attempt is None or not attempt["worktree_path"] or not attempt["base_sha"]:
+            raise RuntimeError("acceptance_reconciliation_required: attempt provenance missing")
+        path = Path(str(attempt["worktree_path"]))
+        if not path.is_dir():
+            raise RuntimeError("acceptance_reconciliation_required: worktree missing")
+        adapter = GitWorktreeAdapter(repo, worktree_root)
+        try:
+            live_root = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            live_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            diff_hash = adapter.diff_hash(path)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError("acceptance_reconciliation_required: live worktree inspection failed") from exc
+        if live_root != str(path.resolve()) or live_head != str(attempt["base_sha"]):
+            raise RuntimeError("acceptance_reconciliation_required: worktree repository/base drift")
+        return {"ticket_id": ticket_id, "attempt_number": attempt_number, "current_diff_hash": diff_hash}
+
     def review_historical_candidate(self, ticket_id: str, attempt_number: int, *, repository: Path, owner: str="local-first-reviewer") -> dict[str, object]:
         """Hand an R2d candidate to the ordinary fresh review machinery only."""
         candidate = self.ledger.review_candidate(ticket_id, attempt_number)

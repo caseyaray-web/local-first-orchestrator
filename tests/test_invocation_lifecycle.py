@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import unittest
 from unittest import mock
@@ -945,6 +946,89 @@ class InvocationLifecycleTests(unittest.TestCase):
         self.assertEqual(self.ledger.get_ticket(ticket)["state"], "local_review")
         self.assertEqual(self.ledger.connection.execute("SELECT verdict FROM review_results WHERE ticket_id=? AND attempt_number=1", (ticket,)).fetchone()[0], "pass")
         self.assertIsNone(self.ledger.accepted_commit(ticket))
+
+    def test_scheduler_acceptance_freezes_exact_candidate_without_creating_commit(self) -> None:
+        model = SequencedLifecycleModel(["ok"]); ctl, ticket = self.controller(model)
+        scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo),
+            validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo),
+            review_runner=lambda value: ctl.execute_fresh_review_only(value, repository=self.repo),
+            review_execution_policy_hash=ctl.review_execution_policy_hash(),
+            acceptance_runner=lambda value: ctl.inspect_acceptance_candidate_only(value, repository=self.repo),
+        )
+        self.assertEqual(scheduler.process_next().stage, "implementation")
+        self.assertEqual(scheduler.process_next().stage, "validation")
+        self.run_until_stage(scheduler, "review")
+        self.run_until_stage(scheduler, "repair_routing")
+        self.assertEqual(preview_next(self.ledger, now=100).next_stage, "acceptance")
+        accepted = self.run_until_stage(scheduler, "acceptance")
+        self.assertEqual(accepted.status, "completed")
+        frozen = self.ledger.accepted_candidate(ticket)
+        self.assertIsNotNone(frozen)
+        candidate = self.ledger.review_candidate(ticket, 1)
+        self.assertEqual(frozen["candidate_fingerprint"], candidate["candidate_fingerprint"])
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "accepted")
+        self.assertIsNone(self.ledger.accepted_commit(ticket))
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (ticket,)).fetchone()
+        self.assertIsNone(attempt["accepted_commit_sha"])
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.ledger.connection.execute("UPDATE accepted_candidates SET evidence_hash='tampered' WHERE ticket_id=?", (ticket,))
+
+    def test_scheduler_acceptance_fails_closed_on_live_candidate_drift(self) -> None:
+        model = SequencedLifecycleModel(["ok"]); ctl, ticket = self.controller(model)
+        scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo),
+            validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo),
+            review_runner=lambda value: ctl.execute_fresh_review_only(value, repository=self.repo),
+            review_execution_policy_hash=ctl.review_execution_policy_hash(),
+            acceptance_runner=lambda value: ctl.inspect_acceptance_candidate_only(value, repository=self.repo),
+        )
+        self.assertEqual(scheduler.process_next().stage, "implementation")
+        self.assertEqual(scheduler.process_next().stage, "validation")
+        self.run_until_stage(scheduler, "review")
+        self.run_until_stage(scheduler, "repair_routing")
+        attempt = self.ledger.connection.execute("SELECT worktree_path FROM attempts WHERE ticket_id=? AND attempt_number=1", (ticket,)).fetchone()
+        Path(str(attempt["worktree_path"])) .joinpath("app.py").write_text("def value():\n    return 'drifted'\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "candidate worktree drift"):
+            self.run_until_stage(scheduler, "acceptance")
+        self.assertIsNone(self.ledger.accepted_candidate(ticket))
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "local_review")
+
+    def test_scheduler_acceptance_finalizes_after_restart_without_reinspection(self) -> None:
+        model = SequencedLifecycleModel(["ok"]); ctl, ticket = self.controller(model)
+        scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo),
+            validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo),
+            review_runner=lambda value: ctl.execute_fresh_review_only(value, repository=self.repo),
+            review_execution_policy_hash=ctl.review_execution_policy_hash(),
+        )
+        self.assertEqual(scheduler.process_next().stage, "implementation")
+        self.assertEqual(scheduler.process_next().stage, "validation")
+        self.run_until_stage(scheduler, "review")
+        self.run_until_stage(scheduler, "repair_routing")
+        claim = self.ledger.claim_next_scheduler_acceptance("crashed", lease_seconds=1, now=101)
+        assert claim is not None
+        claim_id = str(claim["claim_id"])
+        self.ledger.begin_scheduler_claim_effect(claim_id, "crashed", now=101)
+        inspected = ctl.inspect_acceptance_candidate_only(ticket, repository=self.repo)
+        applied = self.ledger.apply_scheduler_acceptance_effect(claim_id, "crashed", current_diff_hash=str(inspected["current_diff_hash"]), now=101)
+        self.assertIsNotNone(applied["side_effect_completed_at"])
+        self.assertIsNone(applied["finalized_at"])
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "accepted")
+        calls: list[str] = []
+        resumed = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="recovery", lease_seconds=30, clock=lambda: 103,
+            acceptance_runner=lambda value: calls.append(value) or (_ for _ in ()).throw(AssertionError("acceptance inspector must not rerun")),
+        )
+        result = self.run_until_stage(resumed, "acceptance")
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(calls, [])
+        self.assertEqual(self.ledger.scheduler_claim(claim_id)["status"], "completed")
+        transitions = [event for event in self.ledger.events_for(ticket) if event["event_type"] == "state_transition" and event["to_state"] == "accepted"]
+        self.assertEqual(len(transitions), 1)
 
     def test_scheduler_repair_routing_finalizes_after_restart_without_duplicate_transition(self) -> None:
         model = SequencedLifecycleModel(["still-bad"]); ctl, ticket = self.controller(model)

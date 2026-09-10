@@ -148,6 +148,27 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     if triage is not None:
         return ProcessNextPreview(next_stage="triage", ticket_id=str(triage["id"]), would_execute=True)
 
+    acceptance_replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage LIKE 'acceptance:%' AND status='claimed' "
+        "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+    ).fetchone()
+    if acceptance_replay is not None:
+        return ProcessNextPreview(next_stage="acceptance", ticket_id=str(acceptance_replay["ticket_id"]), would_execute=True)
+    acceptance = ledger.connection.execute("""
+        SELECT t.id FROM tickets t
+        JOIN runtime_stages route ON route.ticket_id=t.id AND route.stage=('repair-routing-' || route.attempt_number)
+        JOIN review_results rr ON rr.ticket_id=t.id AND rr.attempt_number=route.attempt_number
+        WHERE t.state='local_review'
+          AND json_valid(route.detail)=1
+          AND json_extract(route.detail,'$.action')='pass'
+          AND rr.verdict='pass'
+          AND NOT EXISTS (SELECT 1 FROM accepted_candidates ac WHERE ac.ticket_id=t.id)
+          AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('acceptance:' || route.attempt_number))
+        ORDER BY t.created_at,t.id LIMIT 1
+    """).fetchone()
+    if acceptance is not None:
+        return ProcessNextPreview(next_stage="acceptance", ticket_id=str(acceptance["id"]), would_execute=True)
+
     implementation_replay = ledger.connection.execute(
         "SELECT ticket_id FROM scheduler_stage_claims WHERE (stage='implementation' OR stage LIKE 'implementation:%') AND status='claimed' "
         "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
@@ -227,6 +248,7 @@ class ProcessNextScheduler:
         review_execution_policy_hash: str | None = None,
         triage_runner: Callable[[str], dict[str, Any]] | None = None,
         triage_execution_policy_hash: str | None = None,
+        acceptance_runner: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         if not worker_id or lease_seconds < 1:
             raise ValueError("process-next requires a worker id and positive lease")
@@ -246,6 +268,7 @@ class ProcessNextScheduler:
         self.review_execution_policy_hash = review_execution_policy_hash
         self.triage_runner = triage_runner
         self.triage_execution_policy_hash = triage_execution_policy_hash
+        self.acceptance_runner = acceptance_runner
         if self.review_runner is not None and not self.review_execution_policy_hash:
             raise ValueError("process-next review runner requires a review execution policy hash")
         if self.triage_runner is not None and not self.triage_execution_policy_hash:
@@ -411,6 +434,32 @@ class ProcessNextScheduler:
                     claim_id, execution_owner, triage_result, now=now
                 )
                 return ProcessNextResult("completed", "triage", ticket_id, claim_id)
+
+        if self.acceptance_runner is not None:
+            acceptance_claim = self.ledger.claim_next_scheduler_acceptance(
+                execution_owner, lease_seconds=self.lease_seconds, now=now
+            )
+            if acceptance_claim is not None:
+                claim_id = str(acceptance_claim["claim_id"])
+                ticket_id = str(acceptance_claim["ticket_id"])
+                current = self.ledger.scheduler_claim(claim_id)
+                if current.get("side_effect_completed_at") is not None and current.get("result_json"):
+                    acceptance_result = json.loads(str(current["result_json"]))
+                else:
+                    if current.get("side_effect_started_at") is None:
+                        self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+                    inspected = self.acceptance_runner(ticket_id)
+                    current = self.ledger.apply_scheduler_acceptance_effect(
+                        claim_id,
+                        execution_owner,
+                        current_diff_hash=str(inspected["current_diff_hash"]),
+                        now=now,
+                    )
+                    acceptance_result = json.loads(str(current["result_json"]))
+                self.ledger.complete_scheduler_claim(
+                    claim_id, execution_owner, acceptance_result, now=now
+                )
+                return ProcessNextResult("completed", "acceptance", ticket_id, claim_id)
 
         if self.implementation_runner is not None:
             implementation_claim = self.ledger.claim_next_scheduler_implementation(

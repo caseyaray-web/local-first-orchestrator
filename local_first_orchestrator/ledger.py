@@ -354,6 +354,26 @@ CREATE TABLE IF NOT EXISTS accepted_evidence (
     ticket_id TEXT PRIMARY KEY REFERENCES tickets(id), accepted_commit_sha TEXT NOT NULL,
     diff_summary TEXT NOT NULL, validation_summary TEXT NOT NULL, created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS accepted_candidates (
+    ticket_id TEXT PRIMARY KEY REFERENCES tickets(id),
+    attempt_number INTEGER NOT NULL,
+    candidate_fingerprint TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    worktree_path TEXT NOT NULL,
+    implementation_artifact TEXT NOT NULL,
+    implementation_artifact_sha256 TEXT NOT NULL,
+    validation_artifact TEXT NOT NULL,
+    validation_artifact_sha256 TEXT NOT NULL,
+    review_artifact TEXT NOT NULL,
+    review_artifact_sha256 TEXT NOT NULL,
+    review_result_id INTEGER NOT NULL,
+    evidence_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS accepted_candidates_immutable_update
+BEFORE UPDATE ON accepted_candidates BEGIN SELECT RAISE(ABORT, 'accepted candidates are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS accepted_candidates_immutable_delete
+BEFORE DELETE ON accepted_candidates BEGIN SELECT RAISE(ABORT, 'accepted candidates are append-only'); END;
 CREATE TABLE IF NOT EXISTS tranche_completion_evidence (
     tranche_id TEXT PRIMARY KEY REFERENCES tranches(id), root_planning_sha TEXT NOT NULL,
     final_integration_sha TEXT NOT NULL, accepted_ticket_ids_json TEXT NOT NULL,
@@ -1589,6 +1609,177 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=str(claim["ticket_id"]), event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": "triage", "result": result})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
+    def claim_next_scheduler_acceptance(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+        """Claim one reviewed pass candidate for pre-commit acceptance/freeze."""
+        if not owner or lease_seconds < 1:
+            raise ValueError("acceptance scheduler claim requires owner and positive lease")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
+                return None
+            replay = conn.execute(
+                "SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'acceptance:%' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
+                (now,),
+            ).fetchone()
+            if replay is not None:
+                changed = conn.execute(
+                    "UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?",
+                    (owner, now + lease_seconds, now, replay["claim_id"], now),
+                )
+                if changed.rowcount != 1:
+                    return None
+                conn.execute("UPDATE tickets SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=?", (owner, now + lease_seconds, now, replay["ticket_id"]))
+                self._append_event(conn, entity_type="ticket", entity_id=str(replay["ticket_id"]), event_type="scheduler_stage_reclaimed", actor_id=owner, payload={"claim_id": replay["claim_id"], "stage": "acceptance", "lease_expires_at": now + lease_seconds})
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
+
+            row = conn.execute("""
+                SELECT t.id, rr.attempt_number, rc.candidate_fingerprint, rc.runtime_identity_json,
+                       rr.id AS review_result_id, rr.verdict, rr.payload_json
+                FROM tickets t
+                JOIN runtime_stages route ON route.ticket_id=t.id AND route.stage=('repair-routing-' || route.attempt_number)
+                JOIN review_results rr ON rr.ticket_id=t.id AND rr.attempt_number=route.attempt_number
+                JOIN review_candidates rc ON rc.ticket_id=t.id AND rc.attempt_number=route.attempt_number
+                WHERE t.state='local_review'
+                  AND json_valid(route.detail)=1
+                  AND json_extract(route.detail,'$.action')='pass'
+                  AND rr.verdict='pass'
+                  AND NOT EXISTS (SELECT 1 FROM accepted_candidates ac WHERE ac.ticket_id=t.id)
+                  AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('acceptance:' || rr.attempt_number))
+                ORDER BY t.created_at,t.id LIMIT 1
+            """).fetchone()
+            if row is None:
+                return None
+            identity = {
+                "ticket_id": str(row["id"]),
+                "attempt_number": int(row["attempt_number"]),
+                "candidate_fingerprint": str(row["candidate_fingerprint"]),
+                "review_result_id": int(row["review_result_id"]),
+                "review_payload_hash": hashlib.sha256(str(row["payload_json"]).encode()).hexdigest(),
+                "runtime_identity_hash": hashlib.sha256(str(row["runtime_identity_json"]).encode()).hexdigest(),
+            }
+            encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+            stage = f"acceptance:{identity['attempt_number']}"
+            claim_id = hashlib.sha256((stage + ":" + encoded).encode()).hexdigest()[:32]
+            if conn.execute("UPDATE tickets SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=? AND state='local_review' AND (lease_expires_at IS NULL OR lease_expires_at<=?)", (owner,now+lease_seconds,now,row["id"],now)).rowcount != 1:
+                return None
+            conn.execute("INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,created_at,updated_at) VALUES (?,?,?,'claimed',?,?,1,?,?,?)", (claim_id,row["id"],stage,owner,now+lease_seconds,encoded,now,now))
+            self._append_event(conn, entity_type="ticket", entity_id=str(row["id"]), event_type="scheduler_stage_claimed", actor_id=owner, payload={"claim_id":claim_id,"stage":"acceptance","candidate_identity":identity})
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
+    def apply_scheduler_acceptance_effect(self, claim_id: str, owner: str, *, current_diff_hash: str, now: int | None = None) -> dict[str, Any]:
+        """Atomically freeze the exact reviewed candidate without creating a Git commit."""
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if claim is None or not str(claim["stage"]).startswith("acceptance:"):
+                raise ValueError("scheduler claim is not acceptance")
+            if claim["side_effect_started_at"] is None:
+                raise RuntimeError("scheduler claim effect was not durably started")
+            if claim["lease_owner"] != owner or claim["lease_expires_at"] is None or int(claim["lease_expires_at"]) <= now:
+                raise PermissionError("scheduler claim lease is not owned")
+            if claim["side_effect_completed_at"] is not None:
+                return dict(claim)
+            try:
+                identity = json.loads(str(claim["candidate_identity_json"] or ""))
+                attempt_number = int(identity["attempt_number"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("acceptance_reconciliation_required: claim identity malformed") from exc
+            ticket_id = str(claim["ticket_id"])
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            attempt = conn.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id,attempt_number)).fetchone()
+            implementation = conn.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='implementation'", (ticket_id,attempt_number)).fetchone()
+            validation = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id,f"validation-{attempt_number}")).fetchone()
+            review_stage = conn.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='review'", (ticket_id,attempt_number)).fetchone()
+            review = conn.execute("SELECT * FROM review_results WHERE ticket_id=? AND attempt_number=?", (ticket_id,attempt_number)).fetchone()
+            candidate = conn.execute("SELECT * FROM review_candidates WHERE ticket_id=? AND attempt_number=?", (ticket_id,attempt_number)).fetchone()
+            route = conn.execute("SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id,f"repair-routing-{attempt_number}")).fetchone()
+            if any(item is None for item in (ticket, attempt, implementation, validation, review_stage, review, candidate, route)):
+                raise RuntimeError("acceptance_reconciliation_required: acceptance evidence is incomplete")
+            if ticket["state"] != CanonicalState.LOCAL_REVIEW.value or review["verdict"] != "pass":
+                raise RuntimeError("acceptance_reconciliation_required: ticket/review is not pass-eligible")
+            try:
+                route_detail = json.loads(str(route["detail"])); validation_detail = json.loads(str(validation["detail"]))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("acceptance_reconciliation_required: acceptance evidence is malformed") from exc
+            if route_detail.get("action") != "pass" or not bool(validation_detail.get("passed")):
+                raise RuntimeError("acceptance_reconciliation_required: pass routing/validation missing")
+            if str(candidate["candidate_fingerprint"]) != str(identity["candidate_fingerprint"]) or str(current_diff_hash) != str(identity["candidate_fingerprint"]):
+                raise RuntimeError("acceptance_reconciliation_required: candidate worktree drift")
+            if int(review["id"]) != int(identity["review_result_id"]) or hashlib.sha256(str(review["payload_json"]).encode()).hexdigest() != str(identity["review_payload_hash"]):
+                raise RuntimeError("acceptance_reconciliation_required: review result drift")
+            if hashlib.sha256(str(candidate["runtime_identity_json"]).encode()).hexdigest() != str(identity["runtime_identity_hash"]):
+                raise RuntimeError("acceptance_reconciliation_required: runtime identity drift")
+
+            implementation_artifact = Path(str(implementation["response_artifact"] or ""))
+            validation_artifact = Path(str(validation["artifact_path"] or ""))
+            review_artifact = Path(str(review_stage["response_artifact"] or ""))
+            if not implementation_artifact.is_file() or not validation_artifact.is_file() or not review_artifact.is_file():
+                raise RuntimeError("acceptance_reconciliation_required: acceptance artifact missing")
+            implementation_sha = hashlib.sha256(implementation_artifact.read_bytes()).hexdigest()
+            validation_sha = hashlib.sha256(validation_artifact.read_bytes()).hexdigest()
+            review_sha = hashlib.sha256(review_artifact.read_bytes()).hexdigest()
+            if validation_sha != str(validation["artifact_sha256"]):
+                raise RuntimeError("acceptance_reconciliation_required: validation artifact drift")
+            validation_identity = validation_detail.get("candidate_identity")
+            expected_validation_identity = {
+                "ticket_id": ticket_id,
+                "attempt_number": attempt_number,
+                "implementation_artifact": str(implementation_artifact),
+                "implementation_artifact_sha256": implementation_sha,
+                "worktree_path": str(attempt["worktree_path"] or ""),
+                "base_sha": str(attempt["base_sha"] or implementation["base_sha"] or ""),
+                "implementation_diff_hash": str(candidate["candidate_fingerprint"]),
+                "validation_policy_hash": self._validation_policy_hash(ticket),
+            }
+            if validation_identity != expected_validation_identity or str(implementation["diff_hash"]) != str(candidate["candidate_fingerprint"]):
+                raise RuntimeError("acceptance_reconciliation_required: implementation/validation identity drift")
+            if str(review_stage["diff_hash"]) != str(candidate["candidate_fingerprint"]):
+                raise RuntimeError("acceptance_reconciliation_required: review candidate drift")
+            try:
+                review_envelope = json.loads(review_artifact.read_text(encoding="utf-8"))
+                review_payload = json.loads(str(review["payload_json"]))
+            except (OSError, TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("acceptance_reconciliation_required: invalid review artifact") from exc
+            if not isinstance(review_envelope, dict) or review_envelope.get("payload") != review_payload:
+                raise RuntimeError("acceptance_reconciliation_required: review artifact/result drift")
+            evidence = {
+                "ticket_id": ticket_id,
+                "attempt_number": attempt_number,
+                "candidate_fingerprint": str(candidate["candidate_fingerprint"]),
+                "base_sha": str(attempt["base_sha"] or implementation["base_sha"] or ""),
+                "worktree_path": str(attempt["worktree_path"] or ""),
+                "implementation_artifact": str(implementation_artifact),
+                "implementation_artifact_sha256": implementation_sha,
+                "validation_artifact": str(validation_artifact),
+                "validation_artifact_sha256": validation_sha,
+                "review_artifact": str(review_artifact),
+                "review_artifact_sha256": review_sha,
+                "review_result_id": int(review["id"]),
+            }
+            evidence_hash = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            existing = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if existing is not None:
+                if str(existing["evidence_hash"]) != evidence_hash:
+                    raise RuntimeError("acceptance_reconciliation_required: accepted candidate conflicts")
+            else:
+                conn.execute("INSERT INTO accepted_candidates(ticket_id,attempt_number,candidate_fingerprint,base_sha,worktree_path,implementation_artifact,implementation_artifact_sha256,validation_artifact,validation_artifact_sha256,review_artifact,review_artifact_sha256,review_result_id,evidence_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (ticket_id,attempt_number,evidence["candidate_fingerprint"],evidence["base_sha"],evidence["worktree_path"],evidence["implementation_artifact"],implementation_sha,evidence["validation_artifact"],validation_sha,evidence["review_artifact"],review_sha,evidence["review_result_id"],evidence_hash,now))
+                validate_transition(CanonicalState.LOCAL_REVIEW, CanonicalState.ACCEPTED)
+                if conn.execute("UPDATE tickets SET state=?,updated_at=? WHERE id=? AND state=?", (CanonicalState.ACCEPTED.value,now,ticket_id,CanonicalState.LOCAL_REVIEW.value)).rowcount != 1:
+                    raise RuntimeError("ticket changed concurrently")
+                event_id = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="state_transition", actor_id="acceptance", from_state=CanonicalState.LOCAL_REVIEW.value, to_state=CanonicalState.ACCEPTED.value, payload={"attempt_number":attempt_number,"candidate_fingerprint":evidence["candidate_fingerprint"],"evidence_hash":evidence_hash})
+                if CanonicalState.ACCEPTED.value in self._PROJECTABLE_STATES:
+                    self._enqueue_projection_bundle_in_transaction(conn, ticket_id=ticket_id, event_id=event_id, evidence=f"candidate accepted {evidence_hash}")
+            result = {**evidence, "evidence_hash": evidence_hash}
+            encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+            if conn.execute("UPDATE scheduler_stage_claims SET side_effect_completed_at=?,result_json=?,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_owner=? AND lease_expires_at>? AND side_effect_completed_at IS NULL", (now,encoded,now,claim_id,owner,now)).rowcount != 1:
+                raise PermissionError("scheduler claim lease is not owned")
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id":claim_id,"stage":"acceptance","result":result})
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
+    def accepted_candidate(self, ticket_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket_id,)).fetchone()
+        return dict(row) if row else None
+
     def claim_next_scheduler_repair_routing(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
         """Claim one failed validation or completed review for routing only."""
         if not owner or lease_seconds < 1:
@@ -2297,7 +2488,7 @@ class Ledger:
             if changed.rowcount != 1:
                 raise PermissionError("scheduler claim lease is not owned")
             self._append_event(conn, entity_type="ticket", entity_id=str(row["ticket_id"]), event_type="scheduler_stage_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": row["stage"], "result": result})
-            if row["stage"] == "implementation" or str(row["stage"]).startswith("implementation:") or str(row["stage"]).startswith("validation:") or str(row["stage"]).startswith("review:") or str(row["stage"]).startswith("repair_routing:") or str(row["stage"]).startswith("triage:"):
+            if row["stage"] == "implementation" or str(row["stage"]).startswith("implementation:") or str(row["stage"]).startswith("validation:") or str(row["stage"]).startswith("review:") or str(row["stage"]).startswith("repair_routing:") or str(row["stage"]).startswith("triage:") or str(row["stage"]).startswith("acceptance:"):
                 conn.execute(
                     "UPDATE tickets SET lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND lease_owner=?",
                     (now, row["ticket_id"], owner),
