@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import sqlite3
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from local_first_orchestrator.cli import register_cli
+from local_first_orchestrator.cli import main as cli_main, register_cli
 from local_first_orchestrator.ledger import Ledger
-from local_first_orchestrator.scheduler import ProcessNextScheduler
+from local_first_orchestrator.scheduler import ProcessNextScheduler, preview_next
 from local_first_orchestrator.states import CanonicalState
 
 
@@ -138,6 +140,45 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         self.assertEqual((third.stage, third.status), ("evidence_comment", "delivered"))
         self.assertEqual(len(self.board.comments), 1)
 
+    def test_preview_reports_next_stage_without_claims_events_or_effects(self) -> None:
+        ticket = self.ticket("ready")
+        before_events = self.ledger.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+
+        readiness = preview_next(self.ledger, now=100)
+
+        self.assertEqual((readiness.status, readiness.next_stage, readiness.ticket_id), ("dry_run", "dependency_readiness", ticket))
+        self.assertFalse(readiness.would_execute)
+        self.assertFalse(readiness.would_write_board)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM scheduler_stage_claims").fetchone()[0], 0)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM scheduler_tick_lease").fetchone()[0], 0)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0], before_events)
+        self.assertEqual((self.board.states, self.board.comments), ([], []))
+
+        ProcessNextScheduler(self.ledger, self.board, worker_id="scheduler", lease_seconds=30, clock=lambda: 100).process_next()
+        projection_before = dict(self.ledger.connection.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=?", (ticket,)).fetchone())
+        state = preview_next(self.ledger, now=100)
+        projection_after = dict(self.ledger.connection.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=?", (ticket,)).fetchone())
+        self.assertEqual((state.next_stage, state.ticket_id, state.would_write_board), ("state_projection", ticket, True))
+        self.assertEqual(projection_after, projection_before)
+        self.assertEqual((self.board.states, self.board.comments), ([], []))
+
+    def test_preview_reports_pause_busy_and_no_work_without_mutation(self) -> None:
+        empty = preview_next(self.ledger, now=100)
+        self.assertEqual((empty.status, empty.next_stage), ("dry_run", "no_work"))
+
+        self.ledger.claim_scheduler_tick("worker", "token", lease_seconds=30, now=100)
+        event_count = self.ledger.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        busy = preview_next(self.ledger, now=100)
+        self.assertEqual((busy.status, busy.next_stage), ("dry_run", "busy"))
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0], event_count)
+        self.ledger.release_scheduler_tick("worker", "token")
+
+        self.ledger.pause("operator", reason="maintenance")
+        event_count = self.ledger.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        paused = preview_next(self.ledger, now=100)
+        self.assertEqual((paused.status, paused.next_stage), ("dry_run", "paused"))
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0], event_count)
+
     def test_pause_prevents_all_autonomous_progression(self) -> None:
         ticket = self.ticket("ready")
         self.ledger.pause("operator", reason="maintenance")
@@ -207,6 +248,35 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         self.assertEqual(args.command, "process-next")
         self.assertFalse(args.execute)
         self.assertFalse(args.allow_board_writes)
+
+        ticket = self.ticket("cli-preview")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(cli_main(["--database", str(self.database), "process-next"]), 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual((payload["status"], payload["next_stage"], payload["ticket_id"]), ("dry_run", "dependency_readiness", ticket))
+        self.assertFalse(payload["would_execute"])
+        self.assertFalse(payload["would_write_board"])
+
+    def test_cli_preview_does_not_create_or_migrate_a_ledger(self) -> None:
+        absent = self.root / "absent.db"
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(cli_main(["--database", str(absent), "process-next"]), 0)
+        self.assertFalse(absent.exists())
+        self.assertEqual(json.loads(output.getvalue())["next_stage"], "no_work")
+
+        unmigrated = self.root / "unmigrated.db"
+        connection = sqlite3.connect(unmigrated)
+        connection.execute("CREATE TABLE unrelated(value TEXT)")
+        connection.commit()
+        connection.close()
+        before = unmigrated.read_bytes()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(cli_main(["--database", str(unmigrated), "process-next"]), 0)
+        self.assertEqual(unmigrated.read_bytes(), before)
+        self.assertEqual(json.loads(output.getvalue())["next_stage"], "no_work")
 
 
 if __name__ == "__main__":

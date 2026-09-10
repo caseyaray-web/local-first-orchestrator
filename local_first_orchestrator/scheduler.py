@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import uuid
+import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from .comment_delivery import CommentDeliveryWorker
@@ -16,6 +19,102 @@ class ProcessNextResult:
     stage: str | None = None
     ticket_id: str | None = None
     claim_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ProcessNextPreview:
+    status: str = "dry_run"
+    next_stage: str = "no_work"
+    ticket_id: str | None = None
+    would_execute: bool = False
+    would_write_board: bool = False
+
+
+def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPreview:
+    """Read the next eligible control stage without claiming or mutating it."""
+    now = Ledger._now() if now is None else now
+    paused = ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+    if paused is None or paused["paused"]:
+        return ProcessNextPreview(next_stage="paused")
+    tick = ledger.connection.execute("SELECT lease_expires_at FROM scheduler_tick_lease WHERE id=1").fetchone()
+    if tick is not None and int(tick["lease_expires_at"]) > now:
+        return ProcessNextPreview(next_stage="busy")
+
+    state = ledger.connection.execute(
+        "SELECT ticket_id,event_id FROM board_projection_outbox WHERE operation='set_state' AND acknowledged_at IS NULL "
+        "AND superseded_at IS NULL AND terminal_error IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) "
+        "AND (lease_expires_at IS NULL OR lease_expires_at<=?) ORDER BY queued_at,event_id LIMIT 1",
+        (now, now),
+    ).fetchone()
+    if state is not None:
+        latest = ledger.connection.execute(
+            "SELECT id FROM events WHERE entity_type='ticket' AND entity_id=? "
+            "AND event_type IN ('state_transition','review_reconciliation_authorized') ORDER BY id DESC LIMIT 1",
+            (state["ticket_id"],),
+        ).fetchone()
+        current = latest is None or int(latest["id"]) <= int(state["event_id"])
+        return ProcessNextPreview(next_stage="state_projection", ticket_id=str(state["ticket_id"]), would_write_board=current)
+
+    generated = ledger.connection.execute(
+        "SELECT ticket_id FROM board_projection_outbox WHERE operation='create_microticket' AND terminal_error IS NULL "
+        "AND acknowledged_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) "
+        "AND (lease_expires_at IS NULL OR lease_expires_at<=?) ORDER BY queued_at LIMIT 1",
+        (now, now),
+    ).fetchone()
+    if generated is not None:
+        return ProcessNextPreview(next_stage="generated_projection", ticket_id=str(generated["ticket_id"]), would_write_board=True)
+
+    comment = ledger.connection.execute(
+        "SELECT ticket_id FROM evidence_comment_outbox WHERE status IN ('pending','retryable') "
+        "AND (next_attempt_at IS NULL OR next_attempt_at<=?) ORDER BY created_at,operation_id LIMIT 1",
+        (now,),
+    ).fetchone()
+    if comment is not None:
+        return ProcessNextPreview(next_stage="evidence_comment", ticket_id=str(comment["ticket_id"]), would_write_board=True)
+
+    replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage='dependency_readiness' AND status='claimed' "
+        "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+    ).fetchone()
+    if replay is not None:
+        return ProcessNextPreview(next_stage="dependency_readiness", ticket_id=str(replay["ticket_id"]))
+    readiness = ledger.connection.execute("""
+        SELECT t.id FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id
+        WHERE t.state=? AND json_valid(t.dependencies_json)=1 AND json_type(t.dependencies_json)='array'
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(CASE WHEN json_valid(t.dependencies_json) THEN t.dependencies_json ELSE '[]' END) requested
+            LEFT JOIN tickets dependency ON dependency.id=requested.value
+            LEFT JOIN accepted_evidence evidence ON evidence.ticket_id=dependency.id
+            WHERE dependency.id IS NULL OR dependency.state NOT IN (?, ?)
+               OR (dependency.state=? AND evidence.ticket_id IS NULL)
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM scheduler_stage_claims claim
+            WHERE claim.ticket_id=t.id AND claim.stage='dependency_readiness'
+          )
+        ORDER BY t.created_at,t.id LIMIT 1
+    """, ("draft", "accepted", "done", "done")).fetchone()
+    if readiness is not None:
+        return ProcessNextPreview(next_stage="dependency_readiness", ticket_id=str(readiness["id"]))
+    return ProcessNextPreview()
+
+
+def preview_database(database: Path, *, now: int | None = None) -> ProcessNextPreview:
+    """Preview an existing migrated ledger through a strictly read-only handle."""
+    try:
+        path = Path(database).expanduser().resolve(strict=True)
+    except FileNotFoundError:
+        return ProcessNextPreview(next_stage="no_work")
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        return preview_next(SimpleNamespace(connection=connection), now=now)  # type: ignore[arg-type]
+    except sqlite3.DatabaseError:
+        return ProcessNextPreview(next_stage="no_work")
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 class ProcessNextScheduler:

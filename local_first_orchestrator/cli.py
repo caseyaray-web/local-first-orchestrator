@@ -17,7 +17,7 @@ from .hermes_board import HermesBoardAdapter
 from .ledger import Ledger
 from .local_qwen import LOCAL_QWEN_MODEL, LOCAL_QWEN_PROVIDER, LocalQwenAdapter
 from .operator_config import ModelRegistration, OperatorConfig, default_execution_roots, load_operator_config, save_operator_config
-from .scheduler import ProcessNextScheduler
+from .scheduler import ProcessNextScheduler, preview_database
 from .ticket import MicroTicket, PatchBudget, VerificationProfile
 
 
@@ -275,6 +275,10 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     snapshot_revalidate.add_argument("--planner-executable", default="hermes")
 def run_command(args: argparse.Namespace) -> int:
     """Run a parsed standalone or native Hermes CLI command."""
+    if args.command=="process-next" and not args.execute:
+        if args.ad_hoc_runtime: raise ValueError("process-next requires registered operator runtime")
+        print(json.dumps(asdict(preview_database(Path(args.database))),sort_keys=True))
+        return 0
     ledger=_ledger(args.database)
     try:
         if args.command=="migrate": pass
@@ -295,14 +299,11 @@ def run_command(args: argparse.Namespace) -> int:
             else: print(json.dumps({"executed":ctl.execute(args.task_id,repository=repository,allow_board_writes=True)}))
         elif args.command=="process-next":
             if args.ad_hoc_runtime: raise ValueError("process-next requires registered operator runtime")
-            if not args.execute:
-                print(json.dumps({"status":"dry_run","would_execute":False,"would_write_board":False},sort_keys=True))
-            else:
-                if not args.allow_board_writes: raise PermissionError("process-next --execute requires --allow-board-writes")
-                if not args.hermes_executable or not args.board: raise ValueError("process-next execution requires --hermes-executable and --board")
-                ctl, _ = _registered_controller(ledger,args,allow_board_writes=True)
-                result=ProcessNextScheduler(ledger,ctl.board,worker_id=args.worker_id,lease_seconds=ctl.config.lease_seconds).process_next()
-                print(json.dumps(asdict(result),sort_keys=True))
+            if not args.allow_board_writes: raise PermissionError("process-next --execute requires --allow-board-writes")
+            if not args.hermes_executable or not args.board: raise ValueError("process-next execution requires --hermes-executable and --board")
+            ctl, _ = _registered_controller(ledger,args,allow_board_writes=True)
+            result=ProcessNextScheduler(ledger,ctl.board,worker_id=args.worker_id,lease_seconds=ctl.config.lease_seconds).process_next()
+            print(json.dumps(asdict(result),sort_keys=True))
         elif args.command in {"implementation-only", "implement-only"}:
             if args.ad_hoc_runtime: raise ValueError("implementation-only execution requires registered operator runtime")
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
