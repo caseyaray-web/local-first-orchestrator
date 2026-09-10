@@ -73,6 +73,22 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     if comment is not None:
         return ProcessNextPreview(next_stage="evidence_comment", ticket_id=str(comment["ticket_id"]), would_write_board=True)
 
+    implementation_replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage='implementation' AND status='claimed' "
+        "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+    ).fetchone()
+    if implementation_replay is not None:
+        return ProcessNextPreview(next_stage="implementation", ticket_id=str(implementation_replay["ticket_id"]), would_execute=True)
+    implementation = ledger.connection.execute(
+        "SELECT t.id FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id "
+        "WHERE t.state=? AND (t.lease_expires_at IS NULL OR t.lease_expires_at<=?) "
+        "AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage='implementation' AND c.status='claimed') "
+        "ORDER BY t.created_at,t.id LIMIT 1",
+        ("ready_local", now),
+    ).fetchone()
+    if implementation is not None:
+        return ProcessNextPreview(next_stage="implementation", ticket_id=str(implementation["id"]), would_execute=True)
+
     replay = ledger.connection.execute(
         "SELECT ticket_id FROM scheduler_stage_claims WHERE stage='dependency_readiness' AND status='claimed' "
         "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
@@ -129,6 +145,7 @@ class ProcessNextScheduler:
         worker_id: str,
         lease_seconds: int = 60,
         clock: Callable[[], int] | None = None,
+        implementation_runner: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         if not worker_id or lease_seconds < 1:
             raise ValueError("process-next requires a worker id and positive lease")
@@ -142,6 +159,7 @@ class ProcessNextScheduler:
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
         self.clock = clock or Ledger._now
+        self.implementation_runner = implementation_runner
 
     def process_next(self) -> ProcessNextResult:
         now = int(self.clock())
@@ -179,6 +197,29 @@ class ProcessNextScheduler:
                 "evidence_comment",
                 str(row["ticket_id"]) if row else None,
             )
+
+        if self.implementation_runner is not None:
+            implementation_claim = self.ledger.claim_next_scheduler_implementation(
+                execution_owner, lease_seconds=self.lease_seconds, now=now
+            )
+            if implementation_claim is not None:
+                claim_id = str(implementation_claim["claim_id"])
+                ticket_id = str(implementation_claim["ticket_id"])
+                self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+                current = self.ledger.scheduler_claim(claim_id)
+                if current.get("side_effect_completed_at") is not None and current.get("result_json"):
+                    implementation_result = json.loads(str(current["result_json"]))
+                else:
+                    implementation_result = self.implementation_runner(ticket_id)
+                    self.ledger.complete_scheduler_implementation_effect(
+                        claim_id, execution_owner, implementation_result, now=now
+                    )
+                self.ledger.complete_scheduler_claim(
+                    claim_id, execution_owner, implementation_result, now=now
+                )
+                return ProcessNextResult(
+                    "completed", "implementation", ticket_id, claim_id
+                )
 
         claim = self.ledger.claim_next_scheduler_readiness(
             execution_owner, lease_seconds=self.lease_seconds, now=now

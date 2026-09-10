@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
 from local_first_orchestrator.hermes_board import ExternalTicket
 from local_first_orchestrator.ledger import Ledger
+from local_first_orchestrator.scheduler import ProcessNextScheduler
 from local_first_orchestrator.states import CanonicalState
 
 
@@ -27,6 +28,9 @@ def contract(*, new_test_files: list[str] | None = None) -> dict[str, object]:
 
 class Board:
     is_fake = False
+    allow_writes = True
+    writes_enabled = True
+    timeout_seconds = 1
     def set_state(self, ticket_id: str, state: object, *, idempotency_key: str) -> None: pass
 
 
@@ -101,6 +105,161 @@ class InvocationLifecycleTests(unittest.TestCase):
         resumed = LocalFirstController(self.ledger, Board(), self.config, local_model=model)
         with self.assertRaisesRegex(RuntimeError, "execution_reconciliation_required"): resumed.execute(ticket, repository=self.repo, allow_board_writes=True)
         self.assertEqual(model.calls, 0)
+
+    def test_scheduler_model_only_stage_stops_before_validation_or_review(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="scheduler",
+            lease_seconds=30,
+            clock=lambda: 100,
+            implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(ticket_id, repository=self.repo),
+        )
+
+        result = scheduler.process_next()
+
+        self.assertEqual((result.stage, result.status, result.ticket_id), ("implementation", "completed", ticket))
+        self.assertEqual(model.calls, 1)
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "implementing")
+        self.assertIsNotNone(self.ledger.model_stage(ticket, 1, "implementation"))
+        self.assertIsNone(self.ledger.runtime_stage(ticket, "validation_completed"))
+        self.assertEqual(self.ledger.review_invocations(ticket, 1), [])
+        self.assertIsNone(self.ledger.review_candidate(ticket))
+        claim = self.ledger.scheduler_claim(str(result.claim_id))
+        self.assertEqual(claim["status"], "completed")
+        self.assertIsNotNone(claim["side_effect_started_at"])
+        self.assertIsNotNone(claim["side_effect_completed_at"])
+        self.assertIsNotNone(claim["finalized_at"])
+        row = self.ledger.get_ticket(ticket)
+        self.assertIsNone(row["lease_owner"])
+        self.assertIsNone(row["lease_expires_at"])
+
+    def test_scheduler_replays_persisted_implementation_after_crash_without_reinvocation(self) -> None:
+        model = LifecycleModel(); crashing, ticket = self.controller(model, "implementation_completed")
+        first = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="scheduler-a",
+            lease_seconds=30,
+            clock=lambda: 100,
+            implementation_runner=lambda ticket_id: crashing.execute_implementation_model_only(ticket_id, repository=self.repo),
+        )
+        with self.assertRaisesRegex(RuntimeError, "simulated controller death"):
+            first.process_next()
+        self.assertEqual(model.calls, 1)
+        claim = self.ledger.connection.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage='implementation'", (ticket,)).fetchone()
+        self.assertIsNotNone(claim["side_effect_started_at"])
+        self.assertIsNone(claim["side_effect_completed_at"])
+        self.assertIsNotNone(self.ledger.model_stage(ticket, 1, "implementation"))
+
+        resumed = LocalFirstController(self.ledger, Board(), self.config, local_model=model)
+        second = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="scheduler-b",
+            lease_seconds=30,
+            clock=lambda: 131,
+            implementation_runner=lambda ticket_id: resumed.execute_implementation_model_only(ticket_id, repository=self.repo),
+        )
+        result = second.process_next()
+        self.assertEqual((result.stage, result.status), ("implementation", "completed"))
+        self.assertEqual(model.calls, 1)
+        final = self.ledger.scheduler_claim(str(result.claim_id))
+        self.assertEqual(final["attempt_count"], 2)
+        self.assertIsNotNone(final["side_effect_completed_at"])
+        self.assertIsNotNone(final["finalized_at"])
+
+    def test_scheduler_recovers_completed_invocation_before_model_stage_record_without_reinvocation(self) -> None:
+        model = LifecycleModel(); crashing, ticket = self.controller(model, "implementation_invocation_completed")
+        first = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="scheduler-a",
+            lease_seconds=30,
+            clock=lambda: 100,
+            implementation_runner=lambda ticket_id: crashing.execute_implementation_model_only(ticket_id, repository=self.repo),
+        )
+        with self.assertRaisesRegex(RuntimeError, "simulated controller death"):
+            first.process_next()
+        self.assertEqual(model.calls, 1)
+        invocation = self.invocation(ticket)
+        self.assertEqual(invocation["status"], "completed")
+        self.assertIsNone(self.ledger.model_stage(ticket, 1, "implementation"))
+
+        resumed = LocalFirstController(self.ledger, Board(), self.config, local_model=model)
+        second = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="scheduler-b",
+            lease_seconds=30,
+            clock=lambda: 131,
+            implementation_runner=lambda ticket_id: resumed.execute_implementation_model_only(ticket_id, repository=self.repo),
+        )
+        result = second.process_next()
+        self.assertEqual((result.stage, result.status), ("implementation", "completed"))
+        self.assertEqual(model.calls, 1)
+        self.assertIsNotNone(self.ledger.model_stage(ticket, 1, "implementation"))
+
+    def test_scheduler_does_not_retry_terminal_failed_model_invocation(self) -> None:
+        model = LifecycleModel("timeout"); ctl, ticket = self.controller(model)
+        first = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="scheduler-a",
+            lease_seconds=30,
+            clock=lambda: 100,
+            implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(ticket_id, repository=self.repo),
+        )
+        with self.assertRaises(subprocess.TimeoutExpired):
+            first.process_next()
+        self.assertEqual(model.calls, 1)
+        self.assertEqual(self.invocation(ticket)["status"], "timeout")
+
+        resumed = LocalFirstController(self.ledger, Board(), self.config, local_model=model)
+        second = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="scheduler-b",
+            lease_seconds=30,
+            clock=lambda: 131,
+            implementation_runner=lambda ticket_id: resumed.execute_implementation_model_only(ticket_id, repository=self.repo),
+        )
+        with self.assertRaisesRegex(RuntimeError, "execution_reconciliation_required"):
+            second.process_next()
+        self.assertEqual(model.calls, 1)
+
+    def test_scheduler_never_reinvokes_unknown_started_model_invocation(self) -> None:
+        model = LifecycleModel(); crashing, ticket = self.controller(model, "implementation_invocation_started")
+        first = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="scheduler-a",
+            lease_seconds=30,
+            clock=lambda: 100,
+            implementation_runner=lambda ticket_id: crashing.execute_implementation_model_only(ticket_id, repository=self.repo),
+        )
+        with self.assertRaisesRegex(RuntimeError, "simulated controller death"):
+            first.process_next()
+        self.assertEqual(model.calls, 0)
+        self.assertEqual(len(self.ledger.incomplete_model_invocations(ticket)), 1)
+
+        resumed = LocalFirstController(self.ledger, Board(), self.config, local_model=model)
+        second = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="scheduler-b",
+            lease_seconds=30,
+            clock=lambda: 131,
+            implementation_runner=lambda ticket_id: resumed.execute_implementation_model_only(ticket_id, repository=self.repo),
+        )
+        with self.assertRaisesRegex(RuntimeError, "execution_reconciliation_required"):
+            second.process_next()
+        self.assertEqual(model.calls, 0)
+        claim = self.ledger.connection.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage='implementation'", (ticket,)).fetchone()
+        self.assertEqual(claim["status"], "claimed")
+        self.assertIsNotNone(claim["side_effect_started_at"])
+        self.assertIsNone(claim["side_effect_completed_at"])
 
     def test_implementation_only_freezes_candidate_without_review_and_replays(self) -> None:
         model = LifecycleModel(); ctl, ticket = self.controller(model)

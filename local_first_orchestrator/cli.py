@@ -301,8 +301,16 @@ def run_command(args: argparse.Namespace) -> int:
             if args.ad_hoc_runtime: raise ValueError("process-next requires registered operator runtime")
             if not args.allow_board_writes: raise PermissionError("process-next --execute requires --allow-board-writes")
             if not args.hermes_executable or not args.board: raise ValueError("process-next execution requires --hermes-executable and --board")
-            ctl, _ = _registered_controller(ledger,args,allow_board_writes=True)
-            result=ProcessNextScheduler(ledger,ctl.board,worker_id=args.worker_id,lease_seconds=ctl.config.lease_seconds).process_next()
+            ctl, registered = _registered_controller(ledger,args,allow_board_writes=True)
+            result=ProcessNextScheduler(
+                ledger,
+                ctl.board,
+                worker_id=args.worker_id,
+                lease_seconds=ctl.config.lease_seconds,
+                implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(
+                    ticket_id, repository=registered.canonical_repository
+                ),
+            ).process_next()
             print(json.dumps(asdict(result),sort_keys=True))
         elif args.command in {"implementation-only", "implement-only"}:
             if args.ad_hoc_runtime: raise ValueError("implementation-only execution requires registered operator runtime")

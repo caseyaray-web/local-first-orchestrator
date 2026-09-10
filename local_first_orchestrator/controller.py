@@ -261,6 +261,157 @@ class LocalFirstController:
         adapter=GitWorktreeAdapter(repository,worktree_root); fingerprint=adapter.diff_hash(path)
         return self.ledger.authorize_review_resume(ticket_id,operator_id=operator_id,candidate_fingerprint=fingerprint,runtime_identity=self.effective_runtime_identity())
 
+    def execute_implementation_model_only(self, ticket_id: str, *, repository: Path) -> dict[str, object]:
+        """Run or replay exactly the implementation-model stage.
+
+        This operation assumes the scheduler already moved the ticket to
+        ``implementing`` and owns the durable scheduler claim.  It never runs
+        deterministic validation, review, repair, commit, or integration.
+        """
+        binding = self.ledger.runtime_binding(ticket_id)
+        raw_repository = Path(repository).resolve(strict=True)
+        if str(raw_repository) != binding["repository_path"]:
+            raise ValueError("repository mismatch with imported binding")
+        repo, worktree_root, artifact_root = self.config.validate_execution_roots()
+        if repo != raw_repository:
+            raise ValueError("repository mismatch with configured canonical repository")
+        ticket = ticket_from_ledger(self.ledger.get_ticket(ticket_id))
+        if ticket.risk != "low":
+            raise PermissionError("only low-risk tickets may execute locally")
+        state = CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
+        if state != CanonicalState.IMPLEMENTING:
+            raise RuntimeError("implementation model stage requires implementing state")
+        incomplete = self.ledger.incomplete_model_invocations(ticket_id)
+        if incomplete:
+            raise RuntimeError("execution_reconciliation_required: incomplete model invocation")
+        reconciliation = self.ledger.failed_attempt_reconciliation(ticket_id)
+        if reconciliation is not None and bool(reconciliation["cleanup_required"]) and not self.ledger.cleanup_confirmed(ticket_id, int(reconciliation["retired_attempt_number"])):
+            raise RuntimeError("retired attempt cleanup confirmation required before retry execution")
+
+        planning_base = str(binding["starting_sha"])
+        canonical_sha = self._canonical_provenance_sha(ticket_id)
+        worktrees = GitWorktreeAdapter(repo, worktree_root)
+        base = worktrees.resolve_execution_base(self.ledger.get_ticket(ticket_id)["tranche_id"] or None, planning_base)
+        self.ledger.record_runtime_stage(ticket_id, "execution_base", base)
+        reconciliation = self.ledger.failed_attempt_reconciliation(ticket_id)
+        if reconciliation is not None:
+            attempt_number = int(reconciliation["prospective_next_attempt_number"])
+            if self.ledger.connection.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone():
+                raise RuntimeError("reconciliation-authorized attempt already exists; reconciliation required")
+        else:
+            latest = self.ledger.connection.execute("SELECT attempt_number, worktree_path FROM attempts WHERE ticket_id=? ORDER BY attempt_number DESC LIMIT 1", (ticket_id,)).fetchone()
+            if latest is not None and latest["worktree_path"]:
+                attempt_number = int(latest["attempt_number"])
+            else:
+                attempt_number = self.ledger.next_attempt_number(ticket_id)
+        if attempt_number > ticket.max_attempts:
+            raise RuntimeError("implementation attempt limit exhausted")
+
+        existing_attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        fresh_attempt = not bool(existing_attempt and existing_attempt["worktree_path"])
+        self.ledger.ensure_attempt(ticket_id, attempt_number)
+        existing_stage = self.ledger.model_stage(ticket_id, attempt_number, "implementation")
+        prior_invocation = self.ledger.invocation_for_stage(ticket_id, attempt_number, "implementation")
+        if existing_stage is None and prior_invocation is not None:
+            prior_status = str(prior_invocation["status"])
+            if prior_status == "completed":
+                artifact_value = prior_invocation.get("model_artifact")
+                if not artifact_value:
+                    raise RuntimeError("completed implementation invocation is missing its artifact; reconciliation required")
+                artifact = Path(str(artifact_value))
+                attempt_path = Path(str(prior_invocation["worktree_path"]))
+                if not artifact.is_file() or not attempt_path.is_dir():
+                    raise RuntimeError("completed implementation invocation artifacts are incomplete; reconciliation required")
+                diff_hash = worktrees.diff_hash(attempt_path)
+                recorded = self.ledger.record_model_stage(
+                    ticket_id,
+                    attempt_number,
+                    "implementation",
+                    purpose="implementation",
+                    adapter=type(self.local_model).__name__,
+                    request_hash=str(prior_invocation["packet_hash"]),
+                    response_artifact=str(artifact),
+                    worktree_path=str(attempt_path),
+                    base_sha=base,
+                    diff_hash=diff_hash,
+                )
+                if not recorded and self.ledger.model_stage(ticket_id, attempt_number, "implementation") is None:
+                    raise RuntimeError("completed implementation invocation could not be recovered")
+                self.ledger.record_runtime_stage(ticket_id, f"implementation-{attempt_number}", str(artifact))
+                self.ledger.record_runtime_stage(ticket_id, "implementation_completed", str(artifact))
+                return {
+                    "ticket_id": ticket_id,
+                    "attempt_number": attempt_number,
+                    "implementation_artifact": str(artifact),
+                    "diff_hash": diff_hash,
+                    "replayed": True,
+                }
+            if prior_status in {"timeout", "process_error", "malformed_output"}:
+                raise RuntimeError("execution_reconciliation_required: prior implementation invocation failed")
+        attempt = self._attempt(worktrees, ticket_id, attempt_number, base)
+        if existing_stage is not None:
+            artifact = Path(str(existing_stage["response_artifact"]))
+            if not artifact.is_file():
+                raise RuntimeError("persisted implementation artifact is missing")
+            if worktrees.diff_hash(attempt.path) != str(existing_stage["diff_hash"]):
+                raise RuntimeError("persisted implementation diff does not match; reconciliation required")
+            return {
+                "ticket_id": ticket_id,
+                "attempt_number": attempt_number,
+                "implementation_artifact": str(artifact),
+                "diff_hash": str(existing_stage["diff_hash"]),
+                "replayed": True,
+            }
+
+        if fresh_attempt:
+            self._assert_pre_inference_isolation(repository=repo, attempt=attempt, base_sha=base, ticket=ticket, canonical_sha=canonical_sha)
+        artifacts_root = artifact_root / ticket_id / str(attempt_number)
+        artifacts_root.mkdir(parents=True, exist_ok=True)
+        packet = ContextPacketBuilder().build_from_repository(ticket, attempt.path, repository_rules="Edit only allowed files. Return JSON only.")
+        ContextPacketBuilder().write_artifacts(packet, artifact_root=artifacts_root)
+        request_hash = hashlib.sha256(packet.text.encode()).hexdigest()
+        if hasattr(self.local_model, "implementation_timeout_seconds"):
+            self.local_model.implementation_timeout_seconds = self.config.implementation_timeout_seconds
+        invocation_id = uuid.uuid4().hex
+        provider = str(getattr(self.local_model, "provider", type(self.local_model).__name__))
+        model = str(getattr(self.local_model, "model", type(self.local_model).__name__))
+        self.ledger.start_model_invocation(
+            invocation_id=invocation_id,
+            ticket_id=ticket_id,
+            attempt_number=attempt_number,
+            stage="implementation",
+            provider=provider,
+            model=model,
+            packet_hash=request_hash,
+            worktree_path=str(attempt.path),
+            timeout_seconds=self.config.implementation_timeout_seconds,
+        )
+        self._crash("implementation_invocation_started")
+        started = time.monotonic()
+        try:
+            result = self.local_model.invoke("implementation", packet.text, artifact_dir=artifacts_root, workdir=attempt.path)
+        except subprocess.TimeoutExpired as exc:
+            self.ledger.finish_model_invocation(invocation_id, status="timeout", duration_seconds=time.monotonic() - started, error={"type": "TimeoutExpired", "timeout_seconds": self.config.implementation_timeout_seconds, "process": str(exc)[:1000]})
+            raise
+        except Exception as exc:
+            self.ledger.finish_model_invocation(invocation_id, status="process_error", duration_seconds=time.monotonic() - started, error={"type": type(exc).__name__, "message": str(exc)[:1000]})
+            raise
+        response_path = getattr(result, "artifact_path", artifacts_root / "implementation-result.json")
+        self.ledger.finish_model_invocation(invocation_id, status="completed", duration_seconds=time.monotonic() - started, model_artifact=str(response_path))
+        self._crash("implementation_invocation_completed")
+        diff_hash = worktrees.diff_hash(attempt.path)
+        self.ledger.record_model_stage(ticket_id, attempt_number, "implementation", purpose="implementation", adapter=type(self.local_model).__name__, request_hash=request_hash, response_artifact=str(response_path), worktree_path=str(attempt.path), base_sha=base, diff_hash=diff_hash)
+        self.ledger.record_runtime_stage(ticket_id, f"implementation-{attempt_number}", str(response_path))
+        self.ledger.record_runtime_stage(ticket_id, "implementation_completed", str(response_path))
+        self._crash("implementation_completed")
+        return {
+            "ticket_id": ticket_id,
+            "attempt_number": attempt_number,
+            "implementation_artifact": str(response_path),
+            "diff_hash": diff_hash,
+            "replayed": False,
+        }
+
     def _implementation_stage(self, ticket_id: str, *, repository: Path, owner: str, allow_validation_repair: bool, failure_evidence: str = "", explicit_operator: bool = False) -> dict[str, object] | None:
         """Run implementation through validation and candidate freezing only.
 

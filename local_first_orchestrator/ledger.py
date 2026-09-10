@@ -1423,6 +1423,102 @@ class Ledger:
             raise KeyError(claim_id)
         return dict(row)
 
+    def claim_next_scheduler_implementation(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+        """Claim one ready-local implementation stage, including expired replay."""
+        if not owner or lease_seconds < 1:
+            raise ValueError("scheduler claim requires an owner and positive lease")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or paused["paused"]:
+                return None
+            replay = conn.execute(
+                "SELECT * FROM scheduler_stage_claims WHERE stage='implementation' AND status='claimed' "
+                "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+            ).fetchone()
+            if replay is not None:
+                changed = conn.execute(
+                    "UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? "
+                    "WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?",
+                    (owner, now + lease_seconds, now, replay["claim_id"], now),
+                )
+                if changed.rowcount != 1:
+                    return None
+                conn.execute(
+                    "UPDATE tickets SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=? AND state=?",
+                    (owner, now + lease_seconds, now, replay["ticket_id"], CanonicalState.IMPLEMENTING.value),
+                )
+                self._append_event(conn, entity_type="ticket", entity_id=str(replay["ticket_id"]), event_type="scheduler_stage_reclaimed", actor_id=owner, payload={"claim_id": replay["claim_id"], "stage": replay["stage"], "lease_expires_at": now + lease_seconds})
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
+
+            candidate = conn.execute(
+                "SELECT t.id FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id "
+                "WHERE t.state=? AND (t.lease_expires_at IS NULL OR t.lease_expires_at<=?) "
+                "AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage='implementation' AND c.status='claimed') "
+                "ORDER BY t.created_at,t.id LIMIT 1",
+                (CanonicalState.READY_LOCAL.value, now),
+            ).fetchone()
+            if candidate is None:
+                return None
+            ticket_id = str(candidate["id"])
+            ordinal = int(conn.execute("SELECT COUNT(*) AS n FROM scheduler_stage_claims WHERE ticket_id=? AND stage='implementation'", (ticket_id,)).fetchone()["n"]) + 1
+            claim_id = hashlib.sha256(f"implementation:{ticket_id}:{ordinal}".encode()).hexdigest()[:32]
+            changed = conn.execute(
+                "UPDATE tickets SET state=?,lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=? AND state=? AND (lease_expires_at IS NULL OR lease_expires_at<=?)",
+                (CanonicalState.IMPLEMENTING.value, owner, now + lease_seconds, now, ticket_id, CanonicalState.READY_LOCAL.value, now),
+            )
+            if changed.rowcount != 1:
+                return None
+            conn.execute(
+                "INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,created_at,updated_at) VALUES (?,?,?,'claimed',?,?,1,?,?)",
+                (claim_id, ticket_id, "implementation", owner, now + lease_seconds, now, now),
+            )
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="lease_claimed", actor_id=owner, from_state=CanonicalState.READY_LOCAL.value, to_state=CanonicalState.IMPLEMENTING.value, payload={"lease_expires_at": now + lease_seconds, "scheduler_claim_id": claim_id})
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_claimed", actor_id=owner, payload={"claim_id": claim_id, "stage": "implementation", "lease_expires_at": now + lease_seconds})
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
+    def complete_scheduler_implementation_effect(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        """Persist model-stage completion before scheduler-claim finalization."""
+        now = self._now() if now is None else now
+        encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if claim is None:
+                raise KeyError(claim_id)
+            if claim["stage"] != "implementation":
+                raise ValueError("scheduler claim is not implementation")
+            if claim["side_effect_completed_at"] is not None:
+                return dict(claim)
+            if claim["side_effect_started_at"] is None:
+                raise RuntimeError("scheduler claim effect was not durably started")
+            if claim["lease_owner"] != owner or claim["lease_expires_at"] is None or int(claim["lease_expires_at"]) <= now:
+                raise PermissionError("scheduler claim lease is not owned")
+            ticket_id = str(claim["ticket_id"])
+            if str(result.get("ticket_id") or "") != ticket_id:
+                raise RuntimeError("implementation result ticket does not match scheduler claim")
+            try:
+                attempt_number = int(result["attempt_number"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError("implementation result is missing a valid attempt number") from exc
+            model_stage = conn.execute(
+                "SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='implementation'",
+                (ticket_id, attempt_number),
+            ).fetchone()
+            if model_stage is None:
+                raise RuntimeError("implementation model stage is not durably recorded")
+            if str(result.get("implementation_artifact") or "") != str(model_stage["response_artifact"]):
+                raise RuntimeError("implementation result artifact does not match durable model stage")
+            if str(result.get("diff_hash") or "") != str(model_stage["diff_hash"]):
+                raise RuntimeError("implementation result diff does not match durable model stage")
+            changed = conn.execute(
+                "UPDATE scheduler_stage_claims SET side_effect_completed_at=?,result_json=?,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_owner=? AND lease_expires_at>? AND side_effect_completed_at IS NULL",
+                (now, encoded, now, claim_id, owner, now),
+            )
+            if changed.rowcount != 1:
+                raise PermissionError("scheduler claim lease is not owned")
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": "implementation", "result": result})
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
     def claim_next_scheduler_readiness(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
         """Claim one dependency-ready admission stage, including expired replay."""
         if not owner or lease_seconds < 1:
@@ -1636,6 +1732,11 @@ class Ledger:
             if changed.rowcount != 1:
                 raise PermissionError("scheduler claim lease is not owned")
             self._append_event(conn, entity_type="ticket", entity_id=str(row["ticket_id"]), event_type="scheduler_stage_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": row["stage"], "result": result})
+            if row["stage"] == "implementation":
+                conn.execute(
+                    "UPDATE tickets SET lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND lease_owner=?",
+                    (now, row["ticket_id"], owner),
+                )
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
     def record_runtime_stage(self, ticket_id: str, stage: str, detail: str, *, attempt_number: int | None = None, artifact_path: str | None = None, artifact_sha256: str | None = None, base_sha: str | None = None) -> bool:

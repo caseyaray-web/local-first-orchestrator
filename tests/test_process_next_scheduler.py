@@ -192,6 +192,57 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         self.assertEqual(projection_after, projection_before)
         self.assertEqual((self.board.states, self.board.comments), ([], []))
 
+    def test_preview_reports_ready_local_implementation_without_mutation(self) -> None:
+        ticket = self.ticket("implement", state=CanonicalState.READY_LOCAL)
+        before_events = self.ledger.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+
+        preview = preview_next(self.ledger, now=100)
+
+        self.assertEqual((preview.status, preview.next_stage, preview.ticket_id), ("dry_run", "implementation", ticket))
+        self.assertTrue(preview.would_execute)
+        self.assertFalse(preview.would_write_board)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM scheduler_stage_claims").fetchone()[0], 0)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0], before_events)
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "ready_local")
+
+    def test_completed_implementation_effect_finalizes_after_restart_without_runner(self) -> None:
+        ticket = self.ticket("implement", state=CanonicalState.READY_LOCAL)
+        claim = self.ledger.claim_next_scheduler_implementation("worker-a", lease_seconds=1, now=100)
+        assert claim is not None
+        claim_id = str(claim["claim_id"])
+        self.ledger.begin_scheduler_claim_effect(claim_id, "worker-a", now=100)
+        self.ledger.ensure_attempt(ticket, 1)
+        self.ledger.record_model_stage(
+            ticket,
+            1,
+            "implementation",
+            purpose="implementation",
+            adapter="fixture",
+            request_hash="request",
+            response_artifact=str(self.root / "artifact.json"),
+            worktree_path=str(self.root / "worktree"),
+            base_sha="a" * 40,
+            diff_hash="diff",
+        )
+        result = {"ticket_id": ticket, "attempt_number": 1, "implementation_artifact": str(self.root / "artifact.json"), "diff_hash": "diff", "replayed": False}
+        self.ledger.complete_scheduler_implementation_effect(claim_id, "worker-a", result, now=100)
+        calls: list[str] = []
+
+        resumed = ProcessNextScheduler(
+            self.ledger,
+            self.board,
+            worker_id="worker-b",
+            lease_seconds=30,
+            clock=lambda: 102,
+            implementation_runner=lambda ticket_id: calls.append(ticket_id) or (_ for _ in ()).throw(AssertionError("runner must not be called")),
+        ).process_next()
+
+        self.assertEqual((resumed.stage, resumed.status, resumed.ticket_id), ("implementation", "completed", ticket))
+        self.assertEqual(calls, [])
+        final = self.ledger.scheduler_claim(claim_id)
+        self.assertEqual(final["status"], "completed")
+        self.assertIsNotNone(final["finalized_at"])
+
     def test_preview_reports_pause_busy_and_no_work_without_mutation(self) -> None:
         empty = preview_next(self.ledger, now=100)
         self.assertEqual((empty.status, empty.next_stage), ("dry_run", "no_work"))
