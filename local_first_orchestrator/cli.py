@@ -313,6 +313,9 @@ def run_command(args: argparse.Namespace) -> int:
                 validation_runner=lambda ticket_id: ctl.execute_deterministic_validation_only(
                     ticket_id, repository=registered.canonical_repository
                 ),
+                review_runner=lambda ticket_id: ctl.execute_fresh_review_only(
+                    ticket_id, repository=registered.canonical_repository
+                ),
             ).process_next()
             print(json.dumps(asdict(result),sort_keys=True))
         elif args.command in {"implementation-only", "implement-only"}:

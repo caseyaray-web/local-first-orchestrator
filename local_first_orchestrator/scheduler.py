@@ -89,6 +89,21 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     if validation is not None:
         return ProcessNextPreview(next_stage="validation", ticket_id=str(validation["id"]), would_execute=True)
 
+    review_replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage LIKE 'review:%' AND status='claimed' "
+        "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+    ).fetchone()
+    if review_replay is not None:
+        return ProcessNextPreview(next_stage="review", ticket_id=str(review_replay["ticket_id"]), would_execute=True)
+    review = ledger.connection.execute(
+        "SELECT t.id FROM tickets t JOIN runtime_stages r ON r.ticket_id=t.id AND r.stage='validation_completed' "
+        "WHERE t.state='local_review' AND EXISTS (SELECT 1 FROM scheduler_stage_claims v WHERE v.ticket_id=t.id AND v.stage=('validation:' || r.attempt_number) AND v.side_effect_completed_at IS NOT NULL) "
+        "AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('review:' || r.attempt_number)) "
+        "ORDER BY t.created_at,t.id LIMIT 1"
+    ).fetchone()
+    if review is not None:
+        return ProcessNextPreview(next_stage="review", ticket_id=str(review["id"]), would_execute=True)
+
     implementation_replay = ledger.connection.execute(
         "SELECT ticket_id FROM scheduler_stage_claims WHERE stage='implementation' AND status='claimed' "
         "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
@@ -163,6 +178,7 @@ class ProcessNextScheduler:
         clock: Callable[[], int] | None = None,
         implementation_runner: Callable[[str], dict[str, Any]] | None = None,
         validation_runner: Callable[[str], dict[str, Any]] | None = None,
+        review_runner: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         if not worker_id or lease_seconds < 1:
             raise ValueError("process-next requires a worker id and positive lease")
@@ -178,6 +194,7 @@ class ProcessNextScheduler:
         self.clock = clock or Ledger._now
         self.implementation_runner = implementation_runner
         self.validation_runner = validation_runner
+        self.review_runner = review_runner
 
     def process_next(self) -> ProcessNextResult:
         now = int(self.clock())
@@ -251,6 +268,29 @@ class ProcessNextScheduler:
                     claim_id, execution_owner, validation_result, now=now
                 )
                 return ProcessNextResult("completed", "validation", ticket_id, claim_id)
+
+        if self.review_runner is not None:
+            review_claim = self.ledger.claim_next_scheduler_review(
+                execution_owner, lease_seconds=self.lease_seconds, now=now
+            )
+            if review_claim is not None:
+                claim_id = str(review_claim["claim_id"])
+                ticket_id = str(review_claim["ticket_id"])
+                current = self.ledger.scheduler_claim(claim_id)
+                if current.get("side_effect_completed_at") is not None and current.get("result_json"):
+                    review_result = json.loads(str(current["result_json"]))
+                else:
+                    if current.get("side_effect_started_at") is not None:
+                        raise RuntimeError("review_reconciliation_required: started review outcome is unknown")
+                    self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+                    review_result = self.review_runner(ticket_id)
+                    self.ledger.complete_scheduler_review_effect(
+                        claim_id, execution_owner, review_result, now=now
+                    )
+                self.ledger.complete_scheduler_claim(
+                    claim_id, execution_owner, review_result, now=now
+                )
+                return ProcessNextResult("completed", "review", ticket_id, claim_id)
 
         if self.implementation_runner is not None:
             implementation_claim = self.ledger.claim_next_scheduler_implementation(

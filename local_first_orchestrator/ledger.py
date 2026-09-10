@@ -1647,6 +1647,87 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=str(claim["ticket_id"]), event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": "validation", "result": result})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
+    def claim_next_scheduler_review(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+        """Claim one exact passing validation candidate for packet-only review."""
+        if not owner or lease_seconds < 1:
+            raise ValueError("scheduler claim requires an owner and positive lease")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
+                return None
+            replay = conn.execute("SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'review:%' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,)).fetchone()
+            if replay is not None:
+                if conn.execute("UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?", (owner, now + lease_seconds, now, replay["claim_id"], now)).rowcount != 1:
+                    return None
+                conn.execute("UPDATE tickets SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=?", (owner, now + lease_seconds, now, replay["ticket_id"]))
+                self._append_event(conn, entity_type="ticket", entity_id=str(replay["ticket_id"]), event_type="scheduler_stage_reclaimed", actor_id=owner, payload={"claim_id": replay["claim_id"], "stage": "review", "lease_expires_at": now + lease_seconds})
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
+            row = conn.execute("""
+                SELECT t.*, r.detail, r.artifact_path, r.artifact_sha256, m.response_artifact, m.diff_hash,
+                       mi.invocation_id FROM tickets t
+                JOIN runtime_stages r ON r.ticket_id=t.id AND r.stage='validation_completed'
+                JOIN model_stage_artifacts m ON m.ticket_id=t.id AND m.attempt_number=r.attempt_number AND m.stage='implementation'
+                JOIN model_invocations mi ON mi.ticket_id=t.id AND mi.attempt_number=r.attempt_number AND mi.stage='implementation' AND mi.status='completed'
+                WHERE t.state=? AND EXISTS (SELECT 1 FROM scheduler_stage_claims v WHERE v.ticket_id=t.id AND v.stage=('validation:' || r.attempt_number) AND v.side_effect_completed_at IS NOT NULL)
+                AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('review:' || r.attempt_number))
+                ORDER BY t.created_at,t.id LIMIT 1
+            """, (CanonicalState.LOCAL_REVIEW.value,)).fetchone()
+            if row is None:
+                return None
+            try:
+                validation = json.loads(str(row["detail"]))
+                attempt_number = int(validation["candidate_identity"]["attempt_number"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("review_reconciliation_required: validation evidence is malformed") from exc
+            artifact = Path(str(row["artifact_path"] or ""))
+            if not bool(validation.get("passed")) or not artifact.is_file() or hashlib.sha256(artifact.read_bytes()).hexdigest() != str(row["artifact_sha256"]):
+                raise RuntimeError("review_reconciliation_required: validation evidence is incomplete")
+            if str(validation["candidate_identity"].get("implementation_diff_hash")) != str(row["diff_hash"]):
+                raise RuntimeError("review_reconciliation_required: validated candidate drift")
+            ticket_id = str(row["id"])
+            policy = self._validation_policy_hash(row)
+            identity = {"ticket_id": ticket_id, "attempt_number": attempt_number, "implementation_diff_hash": str(row["diff_hash"]), "validation_artifact": str(row["artifact_path"]), "validation_artifact_sha256": str(row["artifact_sha256"]), "validation_evidence_hash": hashlib.sha256(str(validation.get("compact_evidence", "")).encode()).hexdigest(), "review_policy_hash": policy}
+            candidate = conn.execute("SELECT * FROM review_candidates WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            encoded_identity = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+            if candidate is None:
+                conn.execute("INSERT INTO review_candidates(ticket_id,attempt_number,candidate_fingerprint,validation_evidence,implementation_invocation_id,runtime_identity_json,status,historical_review_attempted,historical_provenance_json,created_at,updated_at) VALUES (?,?,?,?,?,?, 'review_pending',0,'{}',?,?)", (ticket_id,attempt_number,str(row["diff_hash"]),str(validation["compact_evidence"]),str(row["invocation_id"]),encoded_identity,now,now))
+                self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="validated_review_candidate_frozen", actor_id="scheduler", payload={"attempt_number":attempt_number,"candidate_fingerprint":str(row["diff_hash"])})
+            elif candidate["candidate_fingerprint"] != str(row["diff_hash"]) or candidate["validation_evidence"] != str(validation["compact_evidence"]) or candidate["runtime_identity_json"] != encoded_identity:
+                raise RuntimeError("review_reconciliation_required: review candidate identity drift")
+            claim_id = hashlib.sha256(("review:" + encoded_identity).encode()).hexdigest()[:32]
+            if conn.execute("UPDATE tickets SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=? AND state=?", (owner,now+lease_seconds,now,ticket_id,CanonicalState.LOCAL_REVIEW.value)).rowcount != 1:
+                return None
+            conn.execute("INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,created_at,updated_at) VALUES (?,?,?,'claimed',?,?,1,?,?,?)", (claim_id,ticket_id,f"review:{attempt_number}",owner,now+lease_seconds,encoded_identity,now,now))
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_claimed", actor_id=owner, payload={"claim_id":claim_id,"stage":"review","candidate_identity":identity})
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
+    def complete_scheduler_review_effect(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        """Complete only after the exact review model stage has been persisted."""
+        now = self._now() if now is None else now
+        encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if claim is None or not str(claim["stage"]).startswith("review:"):
+                raise ValueError("scheduler claim is not review")
+            if claim["side_effect_started_at"] is None:
+                raise RuntimeError("scheduler claim effect was not durably started")
+            if claim["lease_owner"] != owner or claim["lease_expires_at"] is None or int(claim["lease_expires_at"]) <= now:
+                raise PermissionError("scheduler claim lease is not owned")
+            identity = json.loads(str(claim["candidate_identity_json"] or ""))
+            if result.get("candidate_identity") != identity:
+                raise RuntimeError("review result candidate identity does not match scheduler claim")
+            stage = conn.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='review'", (claim["ticket_id"], identity["attempt_number"])).fetchone()
+            artifact = Path(str(stage["response_artifact"] or "")) if stage is not None else None
+            if stage is None or not artifact.is_file() or str(stage["diff_hash"]) != str(identity["implementation_diff_hash"]):
+                raise RuntimeError("review_reconciliation_required: review output is not durably recorded")
+            if claim["side_effect_completed_at"] is not None:
+                if claim["result_json"] != encoded: raise RuntimeError("review completed effect result conflicts")
+                return dict(claim)
+            if conn.execute("UPDATE scheduler_stage_claims SET side_effect_completed_at=?,result_json=?,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_owner=? AND lease_expires_at>? AND side_effect_completed_at IS NULL", (now,encoded,now,claim_id,owner,now)).rowcount != 1:
+                raise PermissionError("scheduler claim lease is not owned")
+            self._append_event(conn, entity_type="ticket", entity_id=str(claim["ticket_id"]), event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id":claim_id,"stage":"review","result":result})
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
     def claim_next_scheduler_readiness(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
         """Claim one dependency-ready admission stage, including expired replay."""
         if not owner or lease_seconds < 1:
@@ -1860,7 +1941,7 @@ class Ledger:
             if changed.rowcount != 1:
                 raise PermissionError("scheduler claim lease is not owned")
             self._append_event(conn, entity_type="ticket", entity_id=str(row["ticket_id"]), event_type="scheduler_stage_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": row["stage"], "result": result})
-            if row["stage"] == "implementation" or str(row["stage"]).startswith("validation:"):
+            if row["stage"] == "implementation" or str(row["stage"]).startswith("validation:") or str(row["stage"]).startswith("review:"):
                 conn.execute(
                     "UPDATE tickets SET lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND lease_owner=?",
                     (now, row["ticket_id"], owner),

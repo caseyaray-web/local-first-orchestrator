@@ -174,6 +174,89 @@ class InvocationLifecycleTests(unittest.TestCase):
         self.assertIsNone(row["lease_owner"])
         self.assertIsNone(row["lease_expires_at"])
 
+    def test_scheduler_review_persists_independent_packet_only_evidence_without_repair_or_acceptance(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler-implementation", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(ticket_id, repository=self.repo),
+        ).process_next()
+        ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler-validation", lease_seconds=30, clock=lambda: 101,
+            validation_runner=lambda ticket_id: ctl.execute_deterministic_validation_only(ticket_id, repository=self.repo),
+        ).process_next()
+
+        scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler-review", lease_seconds=30, clock=lambda: 102,
+            review_runner=lambda ticket_id: ctl.execute_fresh_review_only(ticket_id, repository=self.repo),
+        )
+        results = [scheduler.process_next() for _ in range(3)]
+        result = next(item for item in results if item.stage == "review")
+
+        self.assertEqual((result.stage, result.status, result.ticket_id), ("review", "completed", ticket))
+        self.assertEqual(model.calls, 2)
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "local_review")
+        self.assertIsNotNone(self.ledger.review_candidate(ticket, 1))
+        self.assertIsNotNone(self.ledger.model_stage(ticket, 1, "review"))
+        self.assertIsNone(self.ledger.connection.execute("SELECT * FROM review_results WHERE ticket_id=?", (ticket,)).fetchone())
+        self.assertIsNone(self.ledger.accepted_commit(ticket))
+        review_call = self.ledger.review_invocations(ticket, 1)[0]
+        self.assertEqual(review_call["worktree_path"], "packet-only")
+        claim = self.ledger.scheduler_claim(str(result.claim_id))
+        self.assertEqual(claim["status"], "completed")
+        self.assertIsNotNone(claim["side_effect_completed_at"])
+        self.assertIsNotNone(claim["finalized_at"])
+
+    def test_scheduler_review_recovery_finalizes_completed_output_without_reinvocation(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        ProcessNextScheduler(self.ledger, Board(), worker_id="implementation", lease_seconds=30, clock=lambda: 100, implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo)).process_next()
+        ProcessNextScheduler(self.ledger, Board(), worker_id="validation", lease_seconds=30, clock=lambda: 101, validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo)).process_next()
+        claim = self.ledger.claim_next_scheduler_review("crashed", lease_seconds=1, now=102)
+        assert claim is not None
+        claim_id = str(claim["claim_id"])
+        self.ledger.begin_scheduler_claim_effect(claim_id, "crashed", now=102)
+        persisted = ctl.execute_fresh_review_only(ticket, repository=self.repo)
+        self.ledger.complete_scheduler_review_effect(claim_id, "crashed", persisted, now=102)
+        calls: list[str] = []
+        resumed = ProcessNextScheduler(self.ledger, Board(), worker_id="recovery", lease_seconds=30, clock=lambda: 104, review_runner=lambda value: calls.append(value) or (_ for _ in ()).throw(AssertionError("reviewer must not be reinvoked")))
+
+        results = [resumed.process_next() for _ in range(3)]
+
+        final = next(item for item in results if item.stage == "review")
+        self.assertEqual((final.status, final.ticket_id), ("completed", ticket))
+        self.assertEqual(calls, [])
+        self.assertIsNotNone(self.ledger.scheduler_claim(claim_id)["finalized_at"])
+
+    def test_scheduler_review_refuses_unknown_started_review_without_reinvocation(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        ProcessNextScheduler(self.ledger, Board(), worker_id="implementation", lease_seconds=30, clock=lambda: 100, implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo)).process_next()
+        ProcessNextScheduler(self.ledger, Board(), worker_id="validation", lease_seconds=30, clock=lambda: 101, validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo)).process_next()
+        claim = self.ledger.claim_next_scheduler_review("crashed", lease_seconds=1, now=102)
+        assert claim is not None
+        self.ledger.begin_scheduler_claim_effect(str(claim["claim_id"]), "crashed", now=102)
+        calls: list[str] = []
+        resumed = ProcessNextScheduler(self.ledger, Board(), worker_id="recovery", lease_seconds=30, clock=lambda: 104, review_runner=lambda value: calls.append(value) or ctl.execute_fresh_review_only(value, repository=self.repo))
+
+        with self.assertRaisesRegex(RuntimeError, "review_reconciliation_required"):
+            for _ in range(3): resumed.process_next()
+
+        self.assertEqual(calls, [])
+        self.assertIsNone(self.ledger.scheduler_claim(str(claim["claim_id"]))["side_effect_completed_at"])
+
+    def test_scheduler_review_fails_closed_when_candidate_identity_drifts(self) -> None:
+        model = LifecycleModel(); ctl, ticket = self.controller(model)
+        ProcessNextScheduler(self.ledger, Board(), worker_id="implementation", lease_seconds=30, clock=lambda: 100, implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo)).process_next()
+        ProcessNextScheduler(self.ledger, Board(), worker_id="validation", lease_seconds=30, clock=lambda: 101, validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo)).process_next()
+        claim = self.ledger.claim_next_scheduler_review("reviewer", lease_seconds=30, now=102)
+        assert claim is not None
+        self.ledger.begin_scheduler_claim_effect(str(claim["claim_id"]), "reviewer", now=102)
+        self.ledger.connection.execute("UPDATE review_candidates SET runtime_identity_json='{}' WHERE ticket_id=? AND attempt_number=1", (ticket,))
+
+        with self.assertRaisesRegex(RuntimeError, "review_reconciliation_required"):
+            ctl.execute_fresh_review_only(ticket, repository=self.repo)
+
+        self.assertEqual(model.calls, 1)
+        self.assertIsNone(self.ledger.model_stage(ticket, 1, "review"))
+
     def test_scheduler_validation_rejects_post_validation_worktree_drift(self) -> None:
         model = LifecycleModel(); ctl, ticket = self.controller(model)
         ProcessNextScheduler(
