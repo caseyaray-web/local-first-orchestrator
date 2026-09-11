@@ -10,6 +10,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.cli import main as cli_main, register_cli
+from local_first_orchestrator.execution_handoff import HANDOFF_MARKER
 from local_first_orchestrator.hermes_board import ExternalTicket
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.scheduler import ProcessNextScheduler, preview_next
@@ -50,15 +51,15 @@ class NativeBoard(Board):
         self.link_calls: list[tuple[str, str]] = []
         self.fail_after_link_once = False
 
-    def add_task(self, task_id: str, *, status: str) -> None:
-        self.tasks[task_id] = {"status": status, "parents": set(), "children": set()}
+    def add_task(self, task_id: str, *, status: str, body: str = "") -> None:
+        self.tasks[task_id] = {"status": status, "body": body, "parents": set(), "children": set()}
 
     def get_task(self, task_id: str) -> ExternalTicket:
         row = self.tasks[task_id]
         return ExternalTicket(
             task_id,
             task_id,
-            "",
+            str(row.get("body") or ""),
             str(row["status"]),
             None,
             tuple(sorted(row["parents"])),
@@ -82,8 +83,15 @@ class NativeBoard(Board):
             self.tasks[ticket_id]["status"] = "done"
             for child in tuple(self.tasks[ticket_id]["children"]):
                 self._recompute(str(child))
+        elif state == CanonicalState.READY_LOCAL:
+            parents = self.tasks[ticket_id]["parents"]
+            self.tasks[ticket_id]["status"] = "ready" if not parents else (
+                "ready" if all(self.tasks[str(parent)]["status"] == "done" for parent in parents) else "todo"
+            )
 
     def _recompute(self, child_task_id: str) -> None:
+        if self.tasks[child_task_id]["status"] == "blocked":
+            return
         parents = self.tasks[child_task_id]["parents"]
         self.tasks[child_task_id]["status"] = (
             "ready" if parents and all(self.tasks[str(parent)]["status"] == "done" for parent in parents) else "todo"
@@ -172,8 +180,44 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         release = self.ledger.native_dependency_release(child)
         self.assertEqual(release["hermes_status"], "ready")
         self.assertEqual(release["graph_hash"], graph["graph_hash"])
-        self.assertEqual(self.ledger.get_ticket(child)["state"], "draft")
+        self.assertEqual(self.ledger.get_ticket(child)["state"], "ready_local")
+        projection = self.ledger.plan_projection(child)
+        self.assertIsNotNone(projection)
+        self.assertIsNotNone(projection["state"]["acknowledged_at"])
+        self.assertEqual(projection["comment"]["status"], "pending")
         self.assertIsNone(self.ledger.claim_next_scheduler_readiness("legacy", lease_seconds=30, now=100))
+
+    def test_handoff_dependent_is_unblocked_only_after_graph_converges(self) -> None:
+        board = NativeBoard()
+        parent = self.ticket("parent", state=CanonicalState.ACCEPTED)
+        child = self.ticket("child", dependencies=(parent,))
+        board.add_task("external-parent", status="ready", body=HANDOFF_MARKER)
+        board.add_task("external-child", status="blocked", body=HANDOFF_MARKER)
+        scheduler = ProcessNextScheduler(self.ledger, board, worker_id="native", lease_seconds=30, clock=lambda: 100)
+
+        result = scheduler.process_next()
+
+        self.assertEqual((result.stage, result.ticket_id), ("native_dependency_graph", child))
+        self.assertEqual(board.get_task("external-child").parents, ("external-parent",))
+        self.assertEqual(board.get_task("external-child").status, "todo")
+        self.assertEqual(board.states[-1][0:2], ("external-child", "ready_local"))
+        self.assertEqual(self.ledger.get_ticket(child)["state"], "draft")
+
+    def test_generated_activation_runner_uses_dependency_readiness_slot(self) -> None:
+        calls: list[str] = []
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            self.board,
+            worker_id="activation",
+            lease_seconds=30,
+            clock=lambda: 100,
+            generated_activation_runner=lambda: calls.append("run") or {"ticket_id": "generated-1", "status": "activated_waiting"},
+        )
+
+        result = scheduler.process_next()
+
+        self.assertEqual((result.stage, result.status, result.ticket_id), ("dependency_readiness", "activated_waiting", "generated-1"))
+        self.assertEqual(calls, ["run"])
 
     def test_native_dependency_graph_replays_after_link_transport_loss_without_duplicate_edge(self) -> None:
         board = NativeBoard()
@@ -218,7 +262,7 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         self.assertEqual(self.ledger.scheduler_claim(claim_id)["status"], "completed")
         self.assertEqual(self.ledger.native_dependency_release(child)["hermes_status"], "ready")
         self.assertEqual(board.link_calls, [("external-parent", "external-child")])
-        self.assertEqual(self.ledger.get_ticket(child)["state"], "draft")
+        self.assertEqual(self.ledger.get_ticket(child)["state"], "ready_local")
 
     def test_native_dependency_graph_stops_on_extra_hermes_parent(self) -> None:
         board = NativeBoard()

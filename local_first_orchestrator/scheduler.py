@@ -8,11 +8,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .comment_delivery import CommentDeliveryWorker
+from .execution_handoff import HANDOFF_MARKER
 from .generated_projection import GeneratedProjectionWorker
 from .ledger import Ledger
 from .paid_model import PaidInvocationError
 from .reconciliation import ReconciliationAction
 from .state_projection import StateProjectionWorker
+from .states import CanonicalState
 
 
 SCHEDULER_STAGE_ORDER: tuple[str, ...] = (
@@ -598,6 +600,16 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     ).fetchone()
     if replay is not None:
         return ProcessNextPreview(next_stage="dependency_readiness", ticket_id=str(replay["ticket_id"]))
+    generated_activation = ledger.connection.execute("""
+        SELECT DISTINCT t.id FROM tickets t
+        JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket'
+        WHERE b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL
+          AND t.state='draft'
+          AND NOT EXISTS (SELECT 1 FROM runtime_bindings rb WHERE rb.ticket_id=t.id)
+        ORDER BY t.created_at,t.id LIMIT 1
+    """).fetchone()
+    if generated_activation is not None:
+        return ProcessNextPreview(next_stage="dependency_readiness", ticket_id=str(generated_activation["id"]), would_execute=True)
     readiness = ledger.connection.execute("""
         SELECT t.id FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id
         WHERE t.state=? AND json_valid(t.dependencies_json)=1 AND json_type(t.dependencies_json)='array'
@@ -652,6 +664,8 @@ class ProcessNextScheduler:
         lease_seconds: int = 60,
         clock: Callable[[], int] | None = None,
         hermes_execution_runner: Callable[[], dict[str, Any] | None] | None = None,
+        generated_activation_runner: Callable[[], dict[str, Any] | None] | None = None,
+        native_dependency_release_prepare_runner: Callable[[str, str], dict[str, Any]] | None = None,
         implementation_runner: Callable[[str], dict[str, Any]] | None = None,
         validation_runner: Callable[[str], dict[str, Any]] | None = None,
         review_runner: Callable[[str], dict[str, Any]] | None = None,
@@ -680,6 +694,8 @@ class ProcessNextScheduler:
         self.lease_seconds = lease_seconds
         self.clock = clock or Ledger._now
         self.hermes_execution_runner = hermes_execution_runner
+        self.generated_activation_runner = generated_activation_runner
+        self.native_dependency_release_prepare_runner = native_dependency_release_prepare_runner
         self.implementation_runner = implementation_runner
         self.validation_runner = validation_runner
         self.review_runner = review_runner
@@ -1011,6 +1027,9 @@ class ProcessNextScheduler:
                     actual_parents = sorted(set(getattr(task, "parents", ())))
                     if actual_parents != expected_parents:
                         raise RuntimeError("native_dependency_graph_reconciliation_required: Hermes graph did not converge")
+                    if HANDOFF_MARKER in str(getattr(task, "body", "")) and str(getattr(task, "status", "")) == "blocked":
+                        self.board.set_state(child_external_id, CanonicalState.READY_LOCAL, idempotency_key=f"native-graph-release:{identity['graph_hash']}")
+                        task = self.board.get_task(child_external_id)
                     graph_result = {
                         "ticket_id": ticket_id,
                         "candidate_identity": identity,
@@ -1041,7 +1060,11 @@ class ProcessNextScheduler:
                     identity = json.loads(str(current["candidate_identity_json"]))
                     graph = self.ledger.native_dependency_graph(ticket_id)
                     expected_parents = sorted(json.loads(str(graph["parent_external_ids_json"])))
-                    task = self.board.get_task(str(identity["child_external_id"]))
+                    child_external_id = str(identity["child_external_id"])
+                    prepared: dict[str, Any] = {}
+                    if self.native_dependency_release_prepare_runner is not None:
+                        prepared = self.native_dependency_release_prepare_runner(ticket_id, child_external_id)
+                    task = self.board.get_task(child_external_id)
                     actual_parents = sorted(set(getattr(task, "parents", ())))
                     if actual_parents != expected_parents:
                         raise RuntimeError("native_dependency_release_reconciliation_required: Hermes graph diverged")
@@ -1053,6 +1076,7 @@ class ProcessNextScheduler:
                         "candidate_identity": identity,
                         "actual_parent_external_ids": actual_parents,
                         "hermes_status": hermes_status,
+                        "prepared_execution": prepared,
                     }
                     current = self.ledger.apply_scheduler_native_dependency_release_effect(
                         claim_id, execution_owner, release_result, now=now
@@ -1158,6 +1182,15 @@ class ProcessNextScheduler:
             activation_result = json.loads(str(current["result_json"]))
             self.ledger.complete_scheduler_claim(claim_id, execution_owner, activation_result, now=now)
             return ProcessNextResult("completed", "next_tranche_activation", ticket_id, claim_id)
+
+        if stage_allowed("dependency_readiness") and self.generated_activation_runner is not None:
+            activation = self.generated_activation_runner()
+            if activation is not None:
+                return ProcessNextResult(
+                    str(activation.get("status") or "completed"),
+                    "dependency_readiness",
+                    str(activation["ticket_id"]),
+                )
 
         claim = self.ledger.claim_next_scheduler_readiness(
             execution_owner, lease_seconds=self.lease_seconds, now=now

@@ -154,6 +154,36 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
         self._make_generated_owned()
         self.assertIsNone(self.ledger.claim_next_scheduler_implementation("local-worker", lease_seconds=30, now=100))
 
+    def test_prepare_hermes_dispatch_worktree_uses_advanced_tranche_integration_head(self) -> None:
+        subprocess.run(("git", "checkout", "--", "app.py"), cwd=self.repo, check=True)
+        self.ledger.connection.execute("INSERT INTO features(id,title,objective,status,created_at,updated_at) VALUES ('F','f','f','planned',1,1)")
+        self.ledger.connection.execute("INSERT INTO tranches(id,feature_id,ordinal,status,base_sha,integration_commands_json) VALUES ('T','F',0,'active',?,'[]')", (self.base,))
+        self.ledger.connection.execute("UPDATE tickets SET feature_id='F',tranche_id='T' WHERE id=?", (self.ticket_id,))
+
+        advanced_worktree = self.root / "advanced"
+        subprocess.run(("git", "worktree", "add", "-q", "-b", "advanced-test", str(advanced_worktree), self.base), cwd=self.repo, check=True)
+        (advanced_worktree / "app.py").write_text('def value():\n    return "advanced"\n')
+        subprocess.run(("git", "add", "app.py"), cwd=advanced_worktree, check=True)
+        subprocess.run(("git", "commit", "-qm", "advanced"), cwd=advanced_worktree, check=True)
+        advanced = subprocess.run(("git", "rev-parse", "HEAD"), cwd=advanced_worktree, text=True, capture_output=True, check=True).stdout.strip()
+        subprocess.run(("git", "worktree", "remove", "--force", str(advanced_worktree)), cwd=self.repo, check=True)
+        subprocess.run(("git", "update-ref", "refs/local-first/tranches/T/integration-head", advanced), cwd=self.repo, check=True)
+
+        result = self.controller.prepare_hermes_dispatch_worktree(self.ticket_id, "H-1")
+        target = self.repo / ".worktrees" / "H-1"
+
+        self.assertEqual(result["workspace_path"], str(target.resolve()))
+        self.assertEqual(result["branch_name"], "wt/H-1")
+        self.assertEqual(result["base_sha"], advanced)
+        self.assertEqual(subprocess.run(("git", "rev-parse", "HEAD"), cwd=target, text=True, capture_output=True, check=True).stdout.strip(), advanced)
+        self.assertEqual(subprocess.run(("git", "branch", "--show-current"), cwd=target, text=True, capture_output=True, check=True).stdout.strip(), "wt/H-1")
+        self.assertEqual(subprocess.run(("git", "rev-parse", "HEAD"), cwd=self.repo, text=True, capture_output=True, check=True).stdout.strip(), self.base)
+        self.assertEqual(self.controller.prepare_hermes_dispatch_worktree(self.ticket_id, "H-1"), result)
+
+        (target / "app.py").write_text('def value():\n    return "dirty"\n')
+        with self.assertRaisesRegex(RuntimeError, "existing worktree drift"):
+            self.controller.prepare_hermes_dispatch_worktree(self.ticket_id, "H-1")
+
     def test_scheduler_auto_reconciles_blocked_handoff_then_validation_wins_next_tick(self) -> None:
         self._make_generated_owned()
         self.board.snapshot = ExternalExecutionSnapshot(

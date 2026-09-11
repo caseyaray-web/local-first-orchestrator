@@ -18,6 +18,7 @@ from local_first_orchestrator.planning_coordinator import PlanningCoordinator
 from local_first_orchestrator.repository_snapshot import RepositoryPlanValidator, snapshot
 from local_first_orchestrator.scheduler import ProcessNextScheduler, preview_next
 from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
+from local_first_orchestrator.generated_activation import resolve_generated_activation_context, activate_generated_ticket
 
 
 def ticket(ticket_id: str, objective: str, criterion: str, symbol: str, path: str) -> MicroTicket:
@@ -144,6 +145,31 @@ class TrancheHandoffTests(unittest.TestCase):
         self.assertEqual(planner.calls[0][1].base_sha,self.a1)
         self.assertEqual(self.ledger.connection.execute("SELECT status FROM tranches WHERE id='T1'").fetchone()[0],"completed")
         self.assertEqual(self.ledger.connection.execute("SELECT status FROM tranches WHERE id='T2'").fetchone()[0],"active")
+
+    def test_successor_generated_activation_uses_materialized_successor_base(self):
+        self.prepare_scheduler_activation_authority()
+        proposal = DecompositionPlan(1,"F",self.feature.contract_hash,"wrong","wrong",(),{"next":("B",)},(Tranche("proposal",0,"beta",(),("B",),(self.b,)),))
+        coordinator = PlanningCoordinator(self.ledger,self.config,NextPlanner(proposal))
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            SchedulerBoard(),
+            worker_id="activation",
+            lease_seconds=30,
+            clock=lambda:100,
+            next_tranche_materialize_runner=self.scheduler_materialize_runner(coordinator),
+        )
+        self.assertEqual(scheduler.process_next().stage,"next_tranche_materialize")
+        self.ledger.connection.execute(
+            "UPDATE board_projection_outbox SET external_task_id='ext-B',acknowledged_at=100 WHERE ticket_id='B' AND operation='create_microticket'"
+        )
+
+        context = resolve_generated_activation_context("B", self.config, self.ledger)
+        result = activate_generated_ticket("B", self.config, self.ledger)
+
+        self.assertEqual(context.starting_sha,self.a1)
+        self.assertEqual(context.repository_identity,str(self.repo))
+        self.assertEqual(result.starting_sha,self.a1)
+        self.assertEqual(self.ledger.runtime_binding("B")["starting_sha"],self.a1)
 
     def test_scheduler_next_tranche_recovers_materialized_before_effect_without_replanning(self):
         self.prepare_scheduler_activation_authority()

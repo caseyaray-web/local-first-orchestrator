@@ -7,8 +7,8 @@ Native plugin discovery, registered operator configuration, real Hermes board re
 The native-integration work that remains is narrower than the original bootstrap scope:
 
 1. **Hermes-dispatched execution reconciliation — complete for representative dispatcher-owned execution:** generated Local First cards are Hermes-owned for implementation, automatically polled for blocked handoff runs, excluded from the Local First implementation launcher, reconciled into deterministic Local First attempts, and kept non-final until Local First acceptance/integration projects `done`. The real dispatcher proof completed with zero Local First implementation model calls; see `docs/hermes-dispatch-execution-acceptance.md`.
-2. **Full scheduler-generated tranche graph proof — next:** exercise multiple generated cards plus exact native dependency projection/release across a real active tranche, reconcile dispatcher-owned execution ticket-by-ticket, integrate/checkpoint the tranche, and activate the successor tranche.
-3. **Broader live operational proof:** exhaustively crash/restart real external boundaries and exercise the paid checkpoint/escalation route against a live paid provider.
+2. **Full scheduler-generated tranche graph proof — complete:** a real generated two-ticket tranche with exact Hermes-native dependency readiness was executed ticket-by-ticket by dispatcher workers, reconciled and integrated through a rolling Local First integration head, checkpointed, and followed by real standard-model successor materialization plus exact `next_tranche_activation`. Successor runtime binding/worktree preparation at the predecessor final integration SHA was separately re-verified after the final provenance fix. See `docs/multi-ticket-native-tranche-acceptance.md`.
+3. **Broader live operational proof — next:** exhaustively crash/restart real external boundaries and exercise the paid checkpoint/escalation route against a live paid provider.
 
 The historical installation/dashboard notes below remain valid where they describe Hermes plugin mechanics; `docs/design-v2.md` is authoritative for current full-project status.
 
@@ -28,6 +28,17 @@ Automatic reconciliation accepts only an unreconciled blocked sentinel run. It v
 
 The real proof dispatched Hermes task `t_6ddb14ba` to `worker-code-local`, reconciled run `1`, passed deterministic validation and independent review, committed `59b1b6c0da7bc7402d4c12758ccf2b268e0e5688`, finalized Local First, then projected Hermes `done`. Checkpointing also recovered correctly after Hermes removed its worker worktree by reconstructing from the immutable final commit. See `docs/hermes-dispatch-execution-acceptance.md`.
 
+
+
+### Multi-ticket native tranche graph — completed live path
+
+The scheduler now owns generated-ticket activation as part of its bounded `dependency_readiness` work. Independent generated tickets are bound and prepared automatically; dependent tickets are bound while local `draft`, projected into the exact Hermes native graph, unblocked only after graph convergence, and admitted locally only after Hermes itself reports the child `ready`. Native release records immutable evidence and atomically performs local `draft -> ready_local`; because Hermes readiness was just observed authoritatively, the corresponding state projection is acknowledged locally rather than sent back as a redundant remote unblock that could race a fast worker handoff.
+
+Before any dispatcher-owned generated ticket becomes runnable, Local First prepares Hermes' canonical `<repo>/.worktrees/<task-id>` / `wt/<task-id>` worktree at the authoritative tranche execution base. For dependent tickets this is the current rolling integration head, so later workers cannot accidentally start from a stale canonical checkout. The live proof demonstrated `T1-A -> T1-B`, with B's worktree HEAD exactly equal to A's accepted commit before B dispatch.
+
+Successor planning now has a dedicated `propose_next` request that constrains the real standard planner to exactly the selected coarse successor tranche and criterion set, excludes completed criteria, fixes the predecessor final integration SHA, and rejects scope expansion both in the prompt contract and after parsing. Successor generated-card projection, activation identity, and runtime binding all derive repository/base/snapshot provenance from immutable `next_tranche_materializations` evidence rather than the original feature baseline.
+
+A new operator-only `reopen-terminal-generated-projection` command can reopen a deterministic pre-create projection failure only when no external task or acknowledgement exists, no lease is active, and the current durable payload now revalidates against authoritative identity. It never retries an ambiguous external create. This was used in the acceptance run after fixing a successor projection verifier bug that had failed before any Hermes create.
 
 ## Implemented surface
 

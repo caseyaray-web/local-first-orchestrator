@@ -35,9 +35,13 @@ def resolve_generated_activation_context(ticket_id: str, runtime_config: Runtime
     rows = ledger.connection.execute("""
         SELECT t.id ticket_id,t.feature_id,t.tranche_id,tr.feature_id tranche_feature_id,tr.status tranche_status,
                p.id plan_id,p.status plan_status,p.repository_identity,p.repo_base_sha,p.repo_snapshot_hash,p.repo_snapshot_manifest_json,
+               m.feature_id successor_feature_id,m.repository_identity successor_repository_identity,
+               m.repo_base_sha successor_repo_base_sha,m.repo_snapshot_hash successor_repo_snapshot_hash,
+               m.ticket_ids_json successor_ticket_ids_json,
                b.acknowledged_at,b.external_task_id,b.terminal_error,b.operation,e.entity_type,e.entity_id,e.event_type
         FROM tickets t JOIN tranches tr ON tr.id=t.tranche_id
         LEFT JOIN decomposition_plans p ON p.feature_id=t.feature_id AND p.status='active'
+        LEFT JOIN next_tranche_materializations m ON m.successor_tranche_id=t.tranche_id
         LEFT JOIN events e ON e.entity_id=t.id AND e.entity_type='ticket' AND e.event_type='generated_microticket_created'
         LEFT JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.event_id=e.id AND b.operation='create_microticket'
         WHERE t.id=?
@@ -56,20 +60,38 @@ def resolve_generated_activation_context(ticket_id: str, runtime_config: Runtime
     if row['terminal_error'] is not None: raise GeneratedActivationError('projection_terminal_failed')
     if not isinstance(row['external_task_id'],str) or not row['external_task_id']:
         raise GeneratedActivationError('missing_external_task_id')
-    values=tuple(row[x] for x in ('repository_identity','repo_base_sha','repo_snapshot_hash','repo_snapshot_manifest_json'))
-    if not all(values): raise GeneratedActivationError('missing_repository_provenance')
-    try: manifest=json.loads(row['repo_snapshot_manifest_json'])
-    except (TypeError,json.JSONDecodeError): raise GeneratedActivationError('invalid_snapshot_provenance')
-    if canonical_json(manifest) != row['repo_snapshot_manifest_json'] or hashlib.sha256(row['repo_snapshot_manifest_json'].encode()).hexdigest()!=row['repo_snapshot_hash'] or (manifest.get('repository_identity'),manifest.get('repo_base_sha')) != (row['repository_identity'],row['repo_base_sha']):
-        raise GeneratedActivationError('invalid_snapshot_provenance')
+    if row['successor_repo_base_sha'] is not None:
+        if row['successor_feature_id'] != row['feature_id']:
+            raise GeneratedActivationError('invalid_successor_provenance')
+        try:
+            successor_ticket_ids = json.loads(str(row['successor_ticket_ids_json']))
+        except (TypeError,json.JSONDecodeError) as exc:
+            raise GeneratedActivationError('invalid_successor_provenance') from exc
+        if not isinstance(successor_ticket_ids,list) or ticket_id not in successor_ticket_ids:
+            raise GeneratedActivationError('invalid_successor_provenance')
+        repository_identity = row['successor_repository_identity']
+        repo_base_sha = row['successor_repo_base_sha']
+        repo_snapshot_hash = row['successor_repo_snapshot_hash']
+        if not all(isinstance(value,str) and value for value in (repository_identity,repo_base_sha,repo_snapshot_hash)):
+            raise GeneratedActivationError('missing_repository_provenance')
+    else:
+        values=tuple(row[x] for x in ('repository_identity','repo_base_sha','repo_snapshot_hash','repo_snapshot_manifest_json'))
+        if not all(values): raise GeneratedActivationError('missing_repository_provenance')
+        try: manifest=json.loads(row['repo_snapshot_manifest_json'])
+        except (TypeError,json.JSONDecodeError): raise GeneratedActivationError('invalid_snapshot_provenance')
+        if canonical_json(manifest) != row['repo_snapshot_manifest_json'] or hashlib.sha256(row['repo_snapshot_manifest_json'].encode()).hexdigest()!=row['repo_snapshot_hash'] or (manifest.get('repository_identity'),manifest.get('repo_base_sha')) != (row['repository_identity'],row['repo_base_sha']):
+            raise GeneratedActivationError('invalid_snapshot_provenance')
+        repository_identity = row['repository_identity']
+        repo_base_sha = row['repo_base_sha']
+        repo_snapshot_hash = row['repo_snapshot_hash']
     try: repository=runtime_config.canonical_repository(runtime_config.repository)
     except Exception as exc: raise GeneratedActivationError('repository_identity_mismatch') from exc
-    if str(repository) != row['repository_identity']: raise GeneratedActivationError('repository_identity_mismatch')
+    if str(repository) != repository_identity: raise GeneratedActivationError('repository_identity_mismatch')
     try:
-        sha=subprocess.run(('git','rev-parse','--verify',str(row['repo_base_sha'])+'^{commit}'),cwd=repository,text=True,capture_output=True,check=True).stdout.strip()
+        sha=subprocess.run(('git','rev-parse','--verify',str(repo_base_sha)+'^{commit}'),cwd=repository,text=True,capture_output=True,check=True).stdout.strip()
     except subprocess.CalledProcessError as exc: raise GeneratedActivationError('missing_base_commit') from exc
-    if sha != row['repo_base_sha']: raise GeneratedActivationError('base_sha_mismatch')
-    return GeneratedActivationContext(ticket_id,str(row['feature_id']),str(row['tranche_id']),str(row['plan_id']),row['external_task_id'],row['repository_identity'],repository,sha,row['repo_snapshot_hash'])
+    if sha != repo_base_sha: raise GeneratedActivationError('base_sha_mismatch')
+    return GeneratedActivationContext(ticket_id,str(row['feature_id']),str(row['tranche_id']),str(row['plan_id']),row['external_task_id'],str(repository_identity),repository,sha,str(repo_snapshot_hash))
 
 
 @dataclass(frozen=True)

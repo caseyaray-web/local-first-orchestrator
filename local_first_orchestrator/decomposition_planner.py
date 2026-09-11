@@ -222,3 +222,80 @@ class LocalDecompositionPlanner:
                 except Exception:
                     pass
         raise failure or PlannerError('planner failed')
+
+    def propose_next(self, feature, snapshot, *, coarse_tranche, completion_evidence, artifact_dir: Path, repository: Path | None = None):
+        if self.cost_class == 'unknown':
+            raise PlannerError('unknown planner cost class')
+        base = json.loads(packet(feature, snapshot, allowed_paths=self.allowed_paths))
+        target_criteria = list(coarse_tranche.criterion_ids)
+        completed_criteria = sorted({c.id for c in feature.acceptance_criteria if c.id not in set(target_criteria)})
+        base['successor_scope'] = {
+            'coarse_tranche_id': coarse_tranche.id,
+            'coarse_tranche_objective': coarse_tranche.objective,
+            'coarse_tranche_capabilities': list(coarse_tranche.capabilities),
+            'allowed_criterion_ids': target_criteria,
+            'completed_criterion_ids': completed_criteria,
+            'predecessor_completion': completion_evidence,
+            'required_repo_base_sha': snapshot.base_sha,
+        }
+        base['rules'] = [
+            *base['rules'],
+            'successor planning only: return exactly one tranche and only the criteria listed in successor_scope.allowed_criterion_ids',
+            'do not include, rematerialize, cover, or create tickets for successor_scope.completed_criterion_ids',
+            'criterion_coverage keys must equal successor_scope.allowed_criterion_ids exactly',
+            'the single output tranche criterion_ids must equal successor_scope.allowed_criterion_ids exactly',
+            'the single output tranche must implement only successor_scope.coarse_tranche_objective and capabilities',
+            'repo_base_sha must equal successor_scope.required_repo_base_sha exactly',
+            'scope_change_proposals must be empty for successor materialization; never broaden the coarse tranche',
+        ]
+        payload = json.dumps(base, sort_keys=True, separators=(',', ':'))
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        scratch = artifact_dir / 'planner-scratch'
+        scratch.mkdir(exist_ok=True)
+        provenance = {'role': self.role, 'routing_source': self.routing_source, 'planner_contract_hash': self.planner_contract_hash, 'provider': self.provider, 'model': self.model, 'profile': self.profile, 'cost_class': self.cost_class, 'mechanism': 'hermes-chat', 'tool_mode': 'safe-no-mutation-tools', 'toolsets': ['safe'], 'cwd': str(scratch), 'successor_scope': True}
+        (artifact_dir / 'planner-request.json').write_text(payload, encoding='utf-8')
+        (artifact_dir / 'planner-provenance.json').write_text(json.dumps(provenance, sort_keys=True, separators=(',', ':')), encoding='utf-8')
+        before = _protected_fingerprint(repository) if repository is not None else None
+        if before is not None:
+            (artifact_dir / 'protected-before.json').write_text(json.dumps(before, sort_keys=True, separators=(',', ':')), encoding='utf-8')
+        failure = None
+        try:
+            argv = [self.executable, 'chat', '--toolsets', 'safe']
+            if self.provider != 'unresolved': argv.extend(('--provider', self.provider))
+            if self.model != 'unresolved': argv.extend(('--model', self.model))
+            argv.extend(('--query', payload, '--quiet'))
+            result = self.runner(tuple(argv), text=True, capture_output=True, timeout=300, check=False, cwd=str(scratch))
+            raw = result.stdout or ''
+            (artifact_dir / 'planner-response.json').write_text(raw, encoding='utf-8')
+            if result.returncode:
+                failure = PlannerError('planner failure')
+            elif not raw.strip():
+                failure = PlannerError('empty planner response')
+            else:
+                plan = parse(raw)
+                if len(plan.tranches) != 1:
+                    failure = PlannerError('successor planner returned multiple tranches')
+                elif set(plan.criterion_coverage) != set(target_criteria):
+                    failure = PlannerError('successor planner criterion scope expanded')
+                elif set(plan.tranches[0].criterion_ids) != set(target_criteria):
+                    failure = PlannerError('successor planner tranche criterion scope expanded')
+                elif plan.scope_change_proposals:
+                    failure = PlannerError('successor planner proposed scope expansion')
+                if failure is None and before is not None:
+                    after = _protected_fingerprint(repository)
+                    (artifact_dir / 'protected-after.json').write_text(json.dumps(after, sort_keys=True, separators=(',', ':')), encoding='utf-8')
+                    if before != after:
+                        failure = PlannerError('protected repository mutated: ' + json.dumps({'before': before, 'after': after}, sort_keys=True, separators=(',', ':')))
+                if failure is None:
+                    return plan
+        except subprocess.TimeoutExpired:
+            failure = PlannerError('planner timeout')
+        except PlannerError as exc:
+            failure = exc
+        finally:
+            if before is not None and not (artifact_dir / 'protected-after.json').exists():
+                try:
+                    (artifact_dir / 'protected-after.json').write_text(json.dumps(_protected_fingerprint(repository), sort_keys=True, separators=(',', ':')), encoding='utf-8')
+                except Exception:
+                    pass
+        raise failure or PlannerError('planner failed')

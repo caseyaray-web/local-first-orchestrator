@@ -2435,6 +2435,45 @@ class Ledger:
                     "INSERT INTO native_dependency_releases(ticket_id,graph_hash,child_external_id,parent_completion_hash,hermes_status,observed_at) VALUES (?,?,?,?,?,?)",
                     (claim["ticket_id"], *values, now),
                 )
+            ticket = conn.execute("SELECT state FROM tickets WHERE id=?", (claim["ticket_id"],)).fetchone()
+            if ticket is None:
+                raise RuntimeError("native_dependency_release_reconciliation_required: child ticket missing")
+            if ticket["state"] == CanonicalState.DRAFT.value:
+                validate_transition(CanonicalState.DRAFT, CanonicalState.READY_LOCAL)
+                changed_state = conn.execute(
+                    "UPDATE tickets SET state=?,updated_at=? WHERE id=? AND state=?",
+                    (CanonicalState.READY_LOCAL.value, now, claim["ticket_id"], CanonicalState.DRAFT.value),
+                )
+                if changed_state.rowcount != 1:
+                    raise RuntimeError("native_dependency_release_reconciliation_required: child changed concurrently")
+                event_id = self._append_event(
+                    conn,
+                    entity_type="ticket",
+                    entity_id=str(claim["ticket_id"]),
+                    event_type="state_transition",
+                    actor_id="native_dependency_release",
+                    from_state=CanonicalState.DRAFT.value,
+                    to_state=CanonicalState.READY_LOCAL.value,
+                    payload={"graph_hash": values[0], "hermes_status": "ready"},
+                )
+                bundle = self._enqueue_projection_bundle_in_transaction(
+                    conn,
+                    ticket_id=str(claim["ticket_id"]),
+                    event_id=event_id,
+                    evidence=f"state={CanonicalState.READY_LOCAL.value}",
+                    state_payload={"graph_hash": values[0], "hermes_status": "ready"},
+                )
+                state_intent = bundle["state"]
+                if state_intent["acknowledged_at"] is None:
+                    acknowledged = conn.execute(
+                        "UPDATE board_projection_outbox SET acknowledged_at=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,last_error=NULL "
+                        "WHERE ticket_id=? AND event_id=? AND operation='set_state' AND acknowledged_at IS NULL",
+                        (now, claim["ticket_id"], event_id),
+                    )
+                    if acknowledged.rowcount != 1:
+                        raise RuntimeError("native_dependency_release_reconciliation_required: ready projection acknowledgement failed")
+            elif ticket["state"] != CanonicalState.READY_LOCAL.value:
+                raise RuntimeError("native_dependency_release_reconciliation_required: child state drift")
             changed = conn.execute(
                 "UPDATE scheduler_stage_claims SET side_effect_completed_at=?,result_json=?,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_owner=? AND lease_expires_at>? AND side_effect_completed_at IS NULL",
                 (now, encoded, now, claim_id, owner, now),
@@ -3226,6 +3265,18 @@ class Ledger:
             "AND t.state IN (?,?,?) "
             "ORDER BY t.created_at,t.id,b.external_task_id",
             (CanonicalState.READY_LOCAL.value, CanonicalState.IMPLEMENTING.value, CanonicalState.REPAIRING.value),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def generated_activation_candidates(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT DISTINCT t.id AS ticket_id,b.external_task_id,t.created_at "
+            "FROM tickets t JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket' "
+            "WHERE b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL "
+            "AND t.state=? "
+            "AND NOT EXISTS (SELECT 1 FROM runtime_bindings rb WHERE rb.ticket_id=t.id) "
+            "ORDER BY t.created_at,t.id,b.external_task_id",
+            (CanonicalState.DRAFT.value,),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -4338,7 +4389,11 @@ class Ledger:
             raise KeyError("authoritative generated projection identity missing")
         if row["feature_id"] != row["tranche_feature_id"] or row["feature_id"] != row["resolved_feature_id"]:
             raise ValueError("authoritative generated projection identity conflicts")
-        normal = self.connection.execute(
+        successor = self.connection.execute(
+            "SELECT repository_identity,repo_base_sha,repo_snapshot_hash FROM next_tranche_materializations WHERE successor_tranche_id=?",
+            (row["tranche_id"],),
+        ).fetchall()
+        normal = successor if successor else self.connection.execute(
             "SELECT id,repository_identity,repo_base_sha,repo_snapshot_hash FROM decomposition_plans "
             "WHERE feature_id=? AND status='active' ORDER BY id", (row["feature_id"],)
         ).fetchall()
@@ -4471,6 +4526,39 @@ class Ledger:
         with self._transaction() as conn:
             changed=conn.execute("UPDATE board_projection_outbox SET terminal_error=?,last_error=?,lease_owner=NULL,lease_expires_at=NULL WHERE ticket_id=? AND event_id=? AND operation='create_microticket' AND terminal_error IS NULL AND acknowledged_at IS NULL AND lease_owner=? AND lease_expires_at>?",(error[:2000],error[:2000],ticket_id,event_id,owner,now))
             if not changed.rowcount: raise PermissionError('create projection lease not owned')
+
+    def reopen_terminal_generated_projection(self, ticket_id: str, event_id: int) -> dict[str, Any]:
+        """Explicitly reopen a deterministic create failure that never reached Hermes.
+
+        Recovery is allowed only after the current durable payload verifies against
+        current authoritative projection identity and only when no external task,
+        acknowledgement, or active lease exists. This never repairs/changes payload
+        bytes and never retries an ambiguous external create.
+        """
+        from .generated_projection import DeterministicProjectionError, _canonical_payload
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id,event_id)).fetchone()
+            if row is None or row["operation"] != "create_microticket":
+                raise KeyError("create projection")
+            if row["terminal_error"] is None:
+                return dict(row)
+            if row["acknowledged_at"] is not None or row["external_task_id"] is not None or row["lease_owner"] is not None or row["lease_expires_at"] is not None:
+                raise RuntimeError("generated_projection_recovery_required: projection may have external effects")
+            event = conn.execute("SELECT event_type FROM events WHERE id=?", (event_id,)).fetchone()
+            if event is None:
+                raise RuntimeError("generated_projection_recovery_required: event missing")
+            try:
+                identity = self.triage_projection_identity(ticket_id,event_id) if event["event_type"] == "triage_child_created" else self.generated_projection_identity(ticket_id,event_id)
+                _canonical_payload(dict(row), identity)
+            except (DeterministicProjectionError, KeyError, ValueError) as exc:
+                raise RuntimeError("generated_projection_recovery_required: current payload still invalid") from exc
+            changed = conn.execute(
+                "UPDATE board_projection_outbox SET terminal_error=NULL,last_error=NULL,next_attempt_at=NULL WHERE ticket_id=? AND event_id=? AND operation='create_microticket' AND terminal_error IS NOT NULL AND acknowledged_at IS NULL AND external_task_id IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL",
+                (ticket_id,event_id),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("generated_projection_recovery_required: projection changed concurrently")
+            return dict(conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id,event_id)).fetchone())
 
     def complete_generated_create_projection(self, ticket_id: str, event_id: int, owner: str, external_task_id: str, *, now: int | None = None) -> None:
         if not isinstance(external_task_id,str) or not external_task_id: raise ValueError('external task id required')

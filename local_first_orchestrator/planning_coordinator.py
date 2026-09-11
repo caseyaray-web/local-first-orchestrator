@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .decomposition import (
+    Criterion,
     DecompositionPlan,
     FeatureContract,
     PlanValidationResult,
@@ -95,10 +96,35 @@ class PlanningCoordinator:
         spec = decode_persisted_admission_envelope(row["contract_json"], expected_feature_id=feature_id, expected_contract_hash=row["contract_hash"])
         return spec
 
+    def _authorized_repository_paths(self, feature_id: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        try:
+            spec = self._persisted_feature_spec(feature_id)
+            return (
+                tuple(file.path for file in spec.files if file.disposition == "modify"),
+                tuple(file.path for file in spec.files if file.disposition == "create"),
+            )
+        except ValueError as authority_error:
+            plan_row = self.ledger.connection.execute(
+                "SELECT plan_json FROM decomposition_plans WHERE feature_id=? ORDER BY created_at,id LIMIT 1",
+                (feature_id,),
+            ).fetchone()
+            if plan_row is None:
+                raise authority_error
+            try:
+                envelope = json.loads(str(plan_row["plan_json"]))
+                manifest = json.loads(str(envelope["plan"]["repo_snapshot_manifest_json"]))
+                modify = tuple(map(str, manifest["authorized_modify_paths"]))
+                create = tuple(map(str, manifest["authorized_create_paths"]))
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("persisted repository authorization is malformed") from exc
+            if not modify and not create:
+                raise ValueError("persisted repository authorization is empty")
+            return modify, create
+
     def _snapshot_for_feature(self, feature: FeatureContract, base_sha: str, *, feature_terms: tuple[str, ...] = ()) -> RepositorySnapshot:
         repo = self.config.canonical_repository(self.config.repository)
-        spec = self._persisted_feature_spec(feature.id)
-        return snapshot(repo, base_sha, feature, feature_terms, authorized_modify_paths=tuple(file.path for file in spec.files if file.disposition == "modify"), authorized_create_paths=tuple(file.path for file in spec.files if file.disposition == "create"))
+        modify, create = self._authorized_repository_paths(feature.id)
+        return snapshot(repo, base_sha, feature, feature_terms, authorized_modify_paths=modify, authorized_create_paths=create)
 
     def _request_key(self, feature: FeatureContract, snap: RepositorySnapshot) -> str:
         material = {
@@ -174,8 +200,28 @@ class PlanningCoordinator:
         row = self.ledger.connection.execute("SELECT * FROM feature_contracts WHERE feature_id=?", (feature_id,)).fetchone()
         stored_plan = self.ledger.connection.execute("SELECT * FROM decomposition_plans WHERE feature_id=? ORDER BY created_at LIMIT 1", (feature_id,)).fetchone()
         if row is None or stored_plan is None: return PlanningOutcome("planner_failed", feature_id, reasons=("feature plan missing",))
-        spec = decode_persisted_admission_envelope(row["contract_json"], expected_feature_id=feature_id, expected_contract_hash=row["contract_hash"])
-        feature = spec.contract
+        try:
+            spec = decode_persisted_admission_envelope(row["contract_json"], expected_feature_id=feature_id, expected_contract_hash=row["contract_hash"])
+            feature = spec.contract
+        except ValueError:
+            raw_contract = json.loads(str(row["contract_json"]))
+            if type(raw_contract) is not dict or "spec" in raw_contract:
+                raise
+            try:
+                feature = FeatureContract(
+                    str(raw_contract["id"]),
+                    str(raw_contract["title"]),
+                    str(raw_contract["objective"]),
+                    tuple(Criterion(str(item["id"]), str(item["statement"]), str(item.get("verification_hint", ""))) for item in raw_contract["acceptance_criteria"]),
+                    tuple(map(str, raw_contract["non_goals"])),
+                    tuple(map(str, raw_contract["invariants"])),
+                    tuple(map(str, raw_contract["constraints"])),
+                    str(raw_contract["source_revision"]),
+                )
+            except (KeyError, TypeError) as exc:
+                raise ValueError("persisted feature contract is malformed") from exc
+            if feature.id != feature_id or feature.contract_hash != str(row["contract_hash"]):
+                raise ValueError("persisted feature contract identity conflicts")
         stored = json.loads(stored_plan["plan_json"]); coarse_plan = parse(json.dumps(stored["plan"], sort_keys=True, separators=(",", ":")))
         active_row = self.ledger.connection.execute("SELECT * FROM tranches WHERE feature_id=? AND status='active' ORDER BY ordinal", (feature_id,)).fetchone()
         if active_row is None: return PlanningOutcome("planner_failed", feature_id, reasons=("active tranche missing",))

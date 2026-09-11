@@ -256,6 +256,47 @@ class LocalFirstController:
         )
         return {**row, "status": "reconciled"}
 
+    def prepare_hermes_dispatch_worktree(self, ticket_id: str, external_task_id: str) -> dict[str, str]:
+        """Prepare Hermes' canonical task worktree at the Local First execution base."""
+        repository, worktree_root, _ = self.config.validate_execution_roots()
+        ticket = self.ledger.get_ticket(ticket_id)
+        binding = self.ledger.runtime_binding(ticket_id)
+        if self.ledger.resolve_external_task_id(ticket_id) != external_task_id:
+            raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: external identity drift")
+        adapter = GitWorktreeAdapter(repository, worktree_root)
+        base_sha = adapter.resolve_execution_base(ticket.get("tranche_id") or None, str(binding["starting_sha"]))
+        target = (repository / ".worktrees" / external_task_id).resolve(strict=False)
+        branch = f"wt/{external_task_id}"
+
+        def git(*args: str, cwd: Path = repository, check: bool = True) -> subprocess.CompletedProcess[str]:
+            try:
+                return subprocess.run(("git", *args), cwd=cwd, text=True, capture_output=True, timeout=30, check=check)
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(exc.stderr.strip() or exc.stdout.strip() or "Hermes dispatch worktree preparation failed") from exc
+
+        repo_common_raw = git("rev-parse", "--git-common-dir").stdout.strip()
+        repo_common = (repository / repo_common_raw).resolve(strict=True) if not Path(repo_common_raw).is_absolute() else Path(repo_common_raw).resolve(strict=True)
+        if target.exists():
+            target_root = Path(git("rev-parse", "--show-toplevel", cwd=target).stdout.strip()).resolve(strict=True)
+            common_raw = git("rev-parse", "--git-common-dir", cwd=target).stdout.strip()
+            target_common = (target / common_raw).resolve(strict=True) if not Path(common_raw).is_absolute() else Path(common_raw).resolve(strict=True)
+            head = git("rev-parse", "HEAD", cwd=target).stdout.strip()
+            actual_branch = git("branch", "--show-current", cwd=target).stdout.strip()
+            status = git("status", "--porcelain=v1", cwd=target).stdout.strip()
+            if target_root != target or target_common != repo_common or head != base_sha or actual_branch != branch or status:
+                raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: existing worktree drift")
+            return {"workspace_path": str(target), "branch_name": branch, "base_sha": base_sha}
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        branch_check = git("rev-parse", "--verify", f"refs/heads/{branch}", check=False)
+        if branch_check.returncode == 0:
+            if branch_check.stdout.strip() != base_sha:
+                raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: existing branch drift")
+            git("worktree", "add", "-q", str(target), branch)
+        else:
+            git("worktree", "add", "-q", "-b", branch, str(target), base_sha)
+        return {"workspace_path": str(target), "branch_name": branch, "base_sha": base_sha}
+
     def dry_run(self, task_id: str) -> dict[str, object]:
         row=self.ledger.get_ticket(task_id); binding=self.ledger.runtime_binding(task_id)
         return {"ticket_id":task_id,"state":row["state"],"repository":binding["repository_path"],"starting_sha":binding["starting_sha"],"would_invoke_model":False,"would_write_board":False,"would_modify_repository":False}

@@ -31,6 +31,32 @@ class Planner(unittest.TestCase):
             self.assertIn('--toolsets', argv); self.assertIn('safe', argv); self.assertNotIn('--yolo', argv); self.assertNotEqual(Path(kwargs['cwd']).resolve(), repo.resolve())
             provenance = json.loads((root / 'artifacts' / 'planner-provenance.json').read_text()); self.assertEqual(provenance['tool_mode'], 'safe-no-mutation-tools'); self.assertEqual(provenance['model'], 'm'); self.assertTrue((root / 'artifacts' / 'protected-before.json').exists()); self.assertTrue((root / 'artifacts' / 'protected-after.json').exists())
 
+    def test_successor_request_is_scoped_to_coarse_tranche_and_rejects_completed_criteria(self):
+        f, s, raw = self.raw_plan(); coarse = Plans().plan().tranches[1]; value = json.loads(raw)
+        value['criterion_coverage'] = {'B': ['two']}
+        value['tranches'] = [value['tranches'][1]]
+        value['tranches'][0]['criterion_ids'] = ['B']
+        calls = []
+        def run(argv, **kw):
+            calls.append((argv, kw)); return subprocess.CompletedProcess(argv, 0, json.dumps(value), '')
+        with TemporaryDirectory() as d:
+            got = LocalDecompositionPlanner(run, cost_class='standard', provider='p', model='m').propose_next(
+                f, s, coarse_tranche=coarse, completion_evidence={'final_integration_sha': s.base_sha}, artifact_dir=Path(d)
+            )
+            self.assertEqual(got.tranches[0].criterion_ids, ('B',))
+            request = json.loads((Path(d) / 'planner-request.json').read_text())
+            self.assertEqual(request['successor_scope']['allowed_criterion_ids'], ['B'])
+            self.assertEqual(request['successor_scope']['completed_criterion_ids'], ['A'])
+            self.assertTrue(request['planner_contract_hash'])
+        expanded = json.loads(json.dumps(value))
+        expanded['criterion_coverage'] = {'A': ['one'], 'B': ['two']}
+        expanded['tranches'][0]['criterion_ids'] = ['A', 'B']
+        with TemporaryDirectory() as d:
+            with self.assertRaisesRegex(PlannerError, 'criterion scope expanded'):
+                LocalDecompositionPlanner(lambda *a, **k: subprocess.CompletedProcess(a, 0, json.dumps(expanded), ''), cost_class='standard').propose_next(
+                    f, s, coarse_tranche=coarse, completion_evidence={}, artifact_dir=Path(d)
+                )
+
     def test_mutation_tripwire_fails_closed_and_retains_evidence(self):
         f, s, raw = self.raw_plan()
         with TemporaryDirectory() as d:

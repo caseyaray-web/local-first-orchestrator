@@ -20,6 +20,7 @@ from .local_qwen import LOCAL_QWEN_MODEL, LOCAL_QWEN_PROVIDER, LocalQwenAdapter
 from .operator_config import ModelRegistration, OperatorConfig, default_execution_roots, load_operator_config, save_operator_config
 from .paid_model import HermesPaidModelAdapter
 from .scheduler import ProcessNextScheduler, preview_database, scheduler_observability
+from .states import CanonicalState
 from .ticket import MicroTicket, PatchBudget, VerificationProfile
 from .triage import LocalTriagePlanner
 from .usage_governor import PaidPurpose, UsageGovernor
@@ -247,6 +248,25 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
                 raise
         return None
 
+    def activate_generated_work() -> dict[str, Any] | None:
+        candidates = ledger.generated_activation_candidates()
+        if not candidates:
+            return None
+        ticket_id = str(candidates[0]["ticket_id"])
+        result = activate_generated_ticket(ticket_id, ctl.config, ledger)
+        prepared: dict[str, Any] | None = None
+        if ledger.get_ticket(ticket_id)["state"] == CanonicalState.READY_LOCAL.value:
+            external_task_id = ledger.resolve_external_task_id(ticket_id)
+            prepared = ctl.prepare_hermes_dispatch_worktree(ticket_id, external_task_id)
+        return {
+            "ticket_id": ticket_id,
+            "status": result.status,
+            "repository_path": str(result.repository_path) if result.repository_path else None,
+            "starting_sha": result.starting_sha,
+            "readiness_status": result.readiness_status,
+            "prepared_execution": prepared,
+        }
+
     def materialize_successor(identity: dict[str, Any]) -> dict[str, Any]:
         if successor_route is None:
             raise RuntimeError("next tranche activation requires registered standard decomposition route")
@@ -254,8 +274,26 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         if row is None:
             raise RuntimeError("next tranche activation feature contract is missing")
         stored = json.loads(str(row["contract_json"]))
-        spec = FeatureAdmissionSpec.from_json(stored["spec"])
-        allowed_paths = tuple((item.path, item.disposition) for item in spec.files)
+        if isinstance(stored.get("spec"), dict):
+            spec = FeatureAdmissionSpec.from_json(stored["spec"])
+            allowed_paths = tuple((item.path, item.disposition) for item in spec.files)
+        else:
+            plan_row = ledger.connection.execute(
+                "SELECT plan_json FROM decomposition_plans WHERE feature_id=? ORDER BY created_at,id LIMIT 1",
+                (identity["feature_id"],),
+            ).fetchone()
+            if plan_row is None:
+                raise RuntimeError("next tranche activation authorized repository paths are missing")
+            try:
+                envelope = json.loads(str(plan_row["plan_json"]))
+                manifest = json.loads(str(envelope["plan"]["repo_snapshot_manifest_json"]))
+                modify = tuple((str(path), "modify") for path in manifest["authorized_modify_paths"])
+                create = tuple((str(path), "create") for path in manifest["authorized_create_paths"])
+                allowed_paths = modify + create
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("next tranche activation authorized repository paths are malformed") from exc
+            if not allowed_paths:
+                raise RuntimeError("next tranche activation authorized repository paths are empty")
         planner = LocalDecompositionPlanner(
             executable=args.planner_executable,
             cost_class="standard",
@@ -302,6 +340,8 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         worker_id=args.worker_id,
         lease_seconds=ctl.config.lease_seconds,
         hermes_execution_runner=reconcile_hermes_owned_execution,
+        generated_activation_runner=activate_generated_work,
+        native_dependency_release_prepare_runner=lambda ticket_id, external_task_id: ctl.prepare_hermes_dispatch_worktree(ticket_id, external_task_id),
         implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(
             ticket_id, repository=registered.canonical_repository
         ),
@@ -407,6 +447,9 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     review_resume.add_argument("--operator-id", default="local-first-cli")
     state_reconcile=commands.add_parser("reconcile-state-projections", help="ledger-only: supersede stale state intents and ensure the current state intent")
     state_reconcile.add_argument("--task-id", required=True)
+    reopen_generated=commands.add_parser("reopen-terminal-generated-projection", help="ledger-only: reopen a terminal generated-card projection only when no external task was created and the current durable payload now verifies")
+    reopen_generated.add_argument("--task-id", required=True)
+    reopen_generated.add_argument("--event-id", required=True, type=int)
     hermes_execution=commands.add_parser("reconcile-hermes-execution", help="bind one completed dispatcher-owned Hermes run into a Local First attempt; never launches implementation")
     hermes_execution.add_argument("--task-id", required=True, help="Hermes task id / Local First external task id")
     hermes_execution.add_argument("--run-id", type=int, help="explicit Hermes run id; required when multiple unreconciled completed worker runs exist")
@@ -611,6 +654,8 @@ def run_command(args: argparse.Namespace) -> int:
             print(json.dumps(ctl.resume_failed_review(args.task_id,operator_id=args.operator_id),sort_keys=True))
         elif args.command=="reconcile-state-projections":
             print(json.dumps(ledger.reconcile_state_projections(args.task_id), sort_keys=True))
+        elif args.command=="reopen-terminal-generated-projection":
+            print(json.dumps(ledger.reopen_terminal_generated_projection(args.task_id,args.event_id),sort_keys=True))
         elif args.command=="reconcile-hermes-execution":
             if args.ad_hoc_runtime: raise ValueError("Hermes execution reconciliation requires registered operator runtime")
             if not args.hermes_executable or not args.board: raise ValueError("Hermes execution reconciliation requires --hermes-executable and --board")

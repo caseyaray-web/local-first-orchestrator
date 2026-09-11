@@ -168,6 +168,41 @@ class GeneratedProjectionDeliveryTests(unittest.TestCase):
         self.assertEqual(contract["repo_base_sha"], plan["repo_base_sha"])
         self.assertEqual(contract["repo_snapshot_hash"], plan["repo_snapshot_hash"])
 
+    def test_operator_can_reopen_terminal_precreate_failure_after_payload_is_valid_again(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        original = self.ledger.connection.execute(
+            "SELECT payload_json FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",
+            (ticket_id,event_id),
+        ).fetchone()["payload_json"]
+        self.ledger.connection.execute(
+            "UPDATE board_projection_outbox SET payload_json='{}' WHERE ticket_id=? AND event_id=?",
+            (ticket_id,event_id),
+        )
+
+        failed = self.worker().deliver_one()
+
+        self.assertEqual(failed.status, "terminal_failed")
+        self.assertEqual(self.calls(), [])
+        terminal = self.ledger.connection.execute(
+            "SELECT terminal_error,external_task_id,acknowledged_at FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",
+            (ticket_id,event_id),
+        ).fetchone()
+        self.assertIsNotNone(terminal["terminal_error"])
+        self.assertIsNone(terminal["external_task_id"])
+        self.assertIsNone(terminal["acknowledged_at"])
+
+        self.ledger.connection.execute(
+            "UPDATE board_projection_outbox SET payload_json=? WHERE ticket_id=? AND event_id=?",
+            (original,ticket_id,event_id),
+        )
+        reopened = self.ledger.reopen_terminal_generated_projection(ticket_id,event_id)
+        self.assertIsNone(reopened["terminal_error"])
+        self.assertIsNone(reopened["last_error"])
+
+        delivered = self.worker(now=101).deliver_one()
+        self.assertEqual(delivered.status, "delivered")
+        self.assertEqual(delivered.external_task_id, "1")
+
     def test_missing_or_mismatched_projected_provenance_fails_before_hermes_create(self) -> None:
         ticket_id, event_id = self.activate_one()
         original = self.ledger.connection.execute("SELECT payload_json FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()["payload_json"]
