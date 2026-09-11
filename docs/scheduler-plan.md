@@ -176,6 +176,15 @@ Already complete or substantially complete:
    - the crash-policy registry is tested against `SCHEDULER_STAGE_ORDER`, so adding a new scheduler work class without a crash policy fails the suite
    - injected-crash tests prove no duplicate model calls, validation evidence, review calls, repair/triage transitions, generated child/outbox rows, accepted candidates, Git commits, board effects, dependency/tranche activation, or paid calls/reservations
 
+18. **Scheduler observability — Complete for the current scheduler slice**
+   - `scheduler_observability()` is a bounded read-only projection over existing durable authorities; it does not persist a second metrics/state model
+   - the snapshot reports current/next stage, selected ticket, claim ID/status, lease owner/expiry, claim attempt count, lifecycle attempt number, side-effect timestamps, and reconciliation state/action/reason
+   - pending generated-card, state-projection, and evidence-comment counts plus bounded active outbox leases show outstanding board effects
+   - latest runtime-stage artifact path/SHA/base identity, latest model invocation identity/status, review result identity, accepted-candidate hashes, Git intent/evidence, and paid reservation state are exposed when present
+   - claim selection follows the same `preview_next()` / reconciliation choice when possible so the operator sees the boundary the scheduler would actually act on
+   - the lightweight default `status` output remains unchanged; `status --scheduler-detail` opts into the deeper lifecycle snapshot
+   - observability tests verify the snapshot performs zero SQLite writes and pinpoints both normal next-stage work and fail-closed model reconciliation
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage — Complete
@@ -459,7 +468,7 @@ Completion condition: every injected crash either resumes safely, replays an alr
 
 **Current status:** Complete for this scheduler milestone. `SCHEDULER_CRASH_POLICIES` now makes the safe started-effect action explicit for every scheduler-owned work class and is checked for exact coverage against the canonical scheduler stage order (excluding only the meta recovery slot). The shared durable-boundary actions are fixed as retry before an effect starts, reconcile when the external/durable effect is complete but scheduler-local completion is not, resume when local completion is recorded but downstream projection remains, and resume after full finalization. Model-backed implementation/review/triage and paid checkpoint/escalation remain fail-closed on a started-but-unknown outcome; deterministic/local stages and exact/idempotent external authorities replay instead. The matrix is paired with existing injected-failure tests covering completed and ambiguous model invocations, validation persistence, review replay, repair/triage restart, child materialization/outbox idempotency, acceptance finalization, Git commit/tranche-ref recovery, completion/outbox restart, native dependency link replay, tranche checkpoint artifact replay, next-tranche materialization replay, paid unknown-outcome no-repeat, and completed paid-call replay. The targeted matrix run passes 106 tests / 21 subtests, and the complete repository suite passes 720 tests / 179 subtests.
 
-## 18. Scheduler observability
+## 18. Scheduler observability — Complete
 
 Expose enough durable state for an operator to understand exactly where orchestration is stopped.
 
@@ -478,6 +487,8 @@ Required data should include:
 - paid reservation state when present.
 
 Completion condition: an operator can inspect the system and identify the exact durable lifecycle boundary without reconstructing state from logs.
+
+**Current status:** Complete for this scheduler milestone. The scheduler now exposes a single bounded `scheduler_observability()` read model that composes the same durable sources used for execution/reconciliation rather than introducing a parallel metrics database. It reports the selected current/next stage and ticket, current claim identity/status, lease owner/expiry, claim attempt count, lifecycle attempt number, side-effect start/completion/finalization timestamps, and any expired-claim reconciliation classification/action/reason. It also reports pending generated-card/state/comment effects and bounded active board-effect leases; latest durable runtime-stage artifact identity (path/SHA/base); latest model invocation provider/model/status/artifact/error identity; review result identity; accepted-candidate artifact hashes/evidence hash; Git intent/evidence/commit/integration-head identity; and paid reservation request/status when the selected claim owns one. Claim selection follows `preview_next()` where possible so operator inspection matches the next scheduler decision. The existing lightweight `status` response remains the default; `status --scheduler-detail` adds this deeper snapshot. Focused observability/scheduler tests pass 37 tests, and the full repository suite passes 725 tests / 179 subtests.
 
 ## 19. Daemon wrapper
 

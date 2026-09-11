@@ -18,7 +18,7 @@ from .ledger import Ledger
 from .local_qwen import LOCAL_QWEN_MODEL, LOCAL_QWEN_PROVIDER, LocalQwenAdapter
 from .operator_config import ModelRegistration, OperatorConfig, default_execution_roots, load_operator_config, save_operator_config
 from .paid_model import HermesPaidModelAdapter
-from .scheduler import ProcessNextScheduler, preview_database
+from .scheduler import ProcessNextScheduler, preview_database, scheduler_observability
 from .ticket import MicroTicket, PatchBudget, VerificationProfile
 from .triage import LocalTriagePlanner
 from .usage_governor import PaidPurpose, UsageGovernor
@@ -211,7 +211,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--board", help="Hermes board name for explicit board access")
     commands=parser.add_subparsers(dest="command",required=True)
     commands.add_parser("migrate")
-    status=commands.add_parser("status"); status.add_argument("--active",action="store_true")
+    status=commands.add_parser("status"); status.add_argument("--active",action="store_true"); status.add_argument("--scheduler-detail",action="store_true",help="include one read-only scheduler lifecycle boundary snapshot")
     imported=commands.add_parser("import"); imported.add_argument("--task-id",required=True)
     run=commands.add_parser("run-once"); run.add_argument("--task-id",required=True); run.add_argument("--dry-run",action="store_true",default=True); run.add_argument("--execute",action="store_true"); run.add_argument("--allow-board-writes",action="store_true")
     process_next=commands.add_parser("process-next", help="run at most one durable Local First control stage; dry-run by default")
@@ -301,6 +301,7 @@ def run_command(args: argparse.Namespace) -> int:
         elif args.command=="status":
             data=ledger.status()
             if args.active: data["active"]=[dict(r) for r in ledger.connection.execute("SELECT id, external_id, state, lease_owner, lease_expires_at FROM tickets WHERE state IN ('implementing','verifying','local_review','repairing') ORDER BY updated_at")]
+            if getattr(args,"scheduler_detail",False): data["scheduler_detail"]=scheduler_observability(ledger)
             if getattr(args,"show_cleanup_prerequisites",False): data["cleanup_prerequisites"]=ledger.cleanup_prerequisites()
             print(json.dumps(data,sort_keys=True))
         elif args.command=="import":

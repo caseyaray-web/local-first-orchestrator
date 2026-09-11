@@ -47,6 +47,156 @@ def scheduler_stage_rank(stage: str) -> int:
     return SCHEDULER_STAGE_RANK[stage]
 
 
+def scheduler_observability(ledger: Ledger, *, now: int | None = None) -> dict[str, Any]:
+    """Return one bounded, read-only scheduler lifecycle snapshot.
+
+    This is a projection over existing durable authorities.  It never writes or
+    persists a second metrics/recovery state machine.
+    """
+    now = ledger._now() if now is None else now
+    preview = preview_next(ledger, now=now)
+    claim = None
+    if preview.claim_id is not None:
+        claim = ledger.connection.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (preview.claim_id,)).fetchone()
+    if claim is None and preview.ticket_id is not None:
+        claim = ledger.connection.execute(
+            "SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND status='claimed' ORDER BY created_at,claim_id LIMIT 1",
+            (preview.ticket_id,),
+        ).fetchone()
+    if claim is None:
+        claim = ledger.connection.execute(
+            "SELECT * FROM scheduler_stage_claims WHERE status='claimed' ORDER BY created_at,claim_id LIMIT 1"
+        ).fetchone()
+    claim_dict = None if claim is None else dict(claim)
+    ticket_id = preview.ticket_id or (None if claim is None else str(claim["ticket_id"]))
+    current_stage = None if claim is None else str(claim["stage"])
+
+    attempt_number = None
+    reconciliation = None
+    if claim is not None:
+        identity = {}
+        try:
+            identity = json.loads(str(claim["candidate_identity_json"] or "{}"))
+        except json.JSONDecodeError:
+            identity = {}
+        if isinstance(identity.get("attempt_number"), int):
+            attempt_number = int(identity["attempt_number"])
+        if claim["lease_expires_at"] is not None and int(claim["lease_expires_at"]) <= now:
+            decision = ledger.scheduler_reconciliation(str(claim["claim_id"]))
+            reconciliation = {
+                "state": decision.state.value,
+                "action": decision.action.value,
+                "reason": decision.reason,
+                "evidence_kind": decision.evidence_kind,
+            }
+
+    if ticket_id is not None and attempt_number is None:
+        row = ledger.connection.execute(
+            "SELECT attempt_number FROM attempts WHERE ticket_id=? ORDER BY attempt_number DESC LIMIT 1", (ticket_id,)
+        ).fetchone()
+        if row is not None:
+            attempt_number = int(row["attempt_number"])
+
+    model = None
+    runtime_stage = None
+    review = None
+    accepted = None
+    git = None
+    paid = None
+    if ticket_id is not None:
+        row = ledger.connection.execute(
+            "SELECT invocation_id,attempt_number,stage,provider,model,status,started_at,completed_at,error_json,model_artifact "
+            "FROM model_invocations WHERE ticket_id=? ORDER BY started_at DESC,invocation_id DESC LIMIT 1",
+            (ticket_id,),
+        ).fetchone()
+        if row is not None:
+            model = dict(row)
+        row = ledger.connection.execute(
+            "SELECT stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at "
+            "FROM runtime_stages WHERE ticket_id=? ORDER BY created_at DESC,stage DESC LIMIT 1",
+            (ticket_id,),
+        ).fetchone()
+        if row is not None:
+            runtime_stage = dict(row)
+        row = ledger.connection.execute(
+            "SELECT id,attempt_number,verdict,created_at FROM review_results WHERE ticket_id=? ORDER BY attempt_number DESC LIMIT 1",
+            (ticket_id,),
+        ).fetchone()
+        if row is not None:
+            review = dict(row)
+        row = ledger.connection.execute(
+            "SELECT attempt_number,candidate_fingerprint,implementation_artifact,implementation_artifact_sha256,validation_artifact,validation_artifact_sha256,review_artifact,review_artifact_sha256,review_result_id,evidence_hash,created_at "
+            "FROM accepted_candidates WHERE ticket_id=?",
+            (ticket_id,),
+        ).fetchone()
+        if row is not None:
+            accepted = dict(row)
+        row = ledger.connection.execute(
+            "SELECT attempt_number,status,commit_sha,created_at,completed_at FROM git_commit_intents WHERE ticket_id=?",
+            (ticket_id,),
+        ).fetchone()
+        evidence = ledger.connection.execute(
+            "SELECT attempt_number,commit_sha,tranche_id,integration_head_before,integration_head_after,created_at FROM git_commit_evidence WHERE ticket_id=?",
+            (ticket_id,),
+        ).fetchone()
+        if row is not None or evidence is not None:
+            git = {"intent": None if row is None else dict(row), "evidence": None if evidence is None else dict(evidence)}
+
+    if claim is not None:
+        reservation = ledger.connection.execute(
+            "SELECT id,feature_id,purpose,request_key,status,created_at,updated_at FROM paid_reservations WHERE request_key=? ORDER BY created_at DESC LIMIT 1",
+            (str(claim["claim_id"]),),
+        ).fetchone()
+        if reservation is not None:
+            paid = dict(reservation)
+
+    effects = {
+        "generated_projection": int(ledger.connection.execute(
+            "SELECT COUNT(*) FROM board_projection_outbox WHERE operation='create_microticket' AND acknowledged_at IS NULL AND superseded_at IS NULL"
+        ).fetchone()[0]),
+        "state_projection": int(ledger.connection.execute(
+            "SELECT COUNT(*) FROM board_projection_outbox WHERE operation='set_state' AND acknowledged_at IS NULL AND superseded_at IS NULL"
+        ).fetchone()[0]),
+        "evidence_comment": int(ledger.connection.execute(
+            "SELECT COUNT(*) FROM evidence_comment_outbox WHERE status IN ('pending','retryable','delivering')"
+        ).fetchone()[0]),
+    }
+    leased_effects = [dict(row) for row in ledger.connection.execute(
+        "SELECT ticket_id,operation,lease_owner,lease_expires_at FROM board_projection_outbox "
+        "WHERE acknowledged_at IS NULL AND superseded_at IS NULL AND lease_owner IS NOT NULL "
+        "ORDER BY queued_at,event_id LIMIT 10"
+    )]
+
+    return {
+        "observed_at": now,
+        "paused": bool(ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()[0]),
+        "current_stage": current_stage,
+        "next_stage": preview.next_stage,
+        "ticket_id": ticket_id,
+        "claim": None if claim_dict is None else {
+            "claim_id": claim_dict["claim_id"],
+            "stage": claim_dict["stage"],
+            "status": claim_dict["status"],
+            "lease_owner": claim_dict["lease_owner"],
+            "lease_expires_at": claim_dict["lease_expires_at"],
+            "attempt_count": claim_dict["attempt_count"],
+            "side_effect_started_at": claim_dict["side_effect_started_at"],
+            "side_effect_completed_at": claim_dict["side_effect_completed_at"],
+            "finalized_at": claim_dict["finalized_at"],
+        },
+        "attempt_number": attempt_number,
+        "reconciliation": reconciliation,
+        "pending_effects": effects,
+        "leased_effects": leased_effects,
+        "latest_runtime_stage": runtime_stage,
+        "model_invocation": model,
+        "review_result": review,
+        "accepted_candidate": accepted,
+        "git": git,
+        "paid_reservation": paid,
+    }
+
+
 @dataclass(frozen=True)
 class ProcessNextResult:
     status: str
