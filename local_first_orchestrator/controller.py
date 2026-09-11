@@ -19,6 +19,7 @@ from .git_adapter import AttemptWorktree, GitWorktreeAdapter
 from .historical_revalidation import attestation_hash_from_row, authorization_hash_from_row, classify_obsolete_validation_failure, derive_obsolete_validation_failure, historical_validation_result_hash
 from .ledger import Ledger, _completion_evidence_hash, _recheck_evidence_hash
 from .local_qwen import LocalQwenAdapter, REVIEW_JSON_SCHEMA
+from .paid_model import PaidModelAdapter
 from .readiness import validate_ticket
 from .review import LocalReviewAdapter, ReviewPacketBuilder, SameTicketRepairCoordinator, normalize_review
 from .repository_snapshot import snapshot as repository_snapshot
@@ -26,6 +27,7 @@ from .corrections import CorrectionService
 from .states import CanonicalState
 from .ticket import MicroTicket, PatchBudget, VerificationProfile
 from .triage import LocalTriagePlanner, TriageCoordinator, TriageError, normalize_triage
+from .usage_governor import PaidPurpose
 from .validation import DeterministicValidator
 
 
@@ -1569,6 +1571,57 @@ class LocalFirstController:
             "decision": checkpoint_packet["decision"],
             "checkpoint_artifact": str(artifact),
             "checkpoint_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        }
+
+    def execute_paid_stage_only(self, tranche_id: str, *, adapter: PaidModelAdapter, purpose: PaidPurpose) -> dict[str, object]:
+        stage = "paid_checkpoint" if purpose == PaidPurpose.INTEGRATION_CHECKPOINT else "paid_escalation"
+        claim = self.ledger.connection.execute(
+            "SELECT * FROM scheduler_stage_claims WHERE stage=? AND status='claimed' AND json_extract(candidate_identity_json,'$.tranche_id')=? ORDER BY created_at DESC LIMIT 1",
+            (stage, tranche_id),
+        ).fetchone()
+        if claim is None or not claim["candidate_identity_json"]:
+            raise RuntimeError("paid_checkpoint_reconciliation_required: scheduler claim missing")
+        identity = json.loads(str(claim["candidate_identity_json"]))
+        if identity.get("purpose") != purpose.value:
+            raise RuntimeError("paid_checkpoint_reconciliation_required: purpose identity drift")
+        artifact = Path(str(identity["checkpoint_artifact"]))
+        if not artifact.is_file() or hashlib.sha256(artifact.read_bytes()).hexdigest() != identity["checkpoint_artifact_sha256"]:
+            raise RuntimeError("paid_checkpoint_reconciliation_required: checkpoint artifact drift")
+        try:
+            checkpoint_packet = json.loads(artifact.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("paid_checkpoint_reconciliation_required: checkpoint artifact malformed") from exc
+        packet = {
+            "version": 1,
+            "role": "integration_checkpoint" if purpose == PaidPurpose.INTEGRATION_CHECKPOINT else "escalation",
+            "feature_id": identity["feature_id"],
+            "tranche_id": tranche_id,
+            "checkpoint_artifact_sha256": identity["checkpoint_artifact_sha256"],
+            "checkpoint_completion_hash": identity["checkpoint_completion_hash"],
+            "final_integration_sha": identity["final_integration_sha"],
+            "checkpoint": checkpoint_packet,
+            "prior_checkpoint_decision": identity.get("prior_checkpoint_decision"),
+            "output_contract": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["decision", "rationale"],
+                "decision": ["approve", "escalate", "reject"],
+                "rationale_max_chars": 4000,
+            },
+        }
+        response = adapter.invoke(str(identity["feature_id"]), purpose, str(claim["claim_id"]), packet)
+        if set(response) != {"decision", "rationale"}:
+            raise RuntimeError("paid_checkpoint_reconciliation_required: response schema mismatch")
+        decision = response.get("decision")
+        rationale = response.get("rationale")
+        if decision not in {"approve", "escalate", "reject"} or not isinstance(rationale, str) or not rationale.strip() or len(rationale) > 4000:
+            raise RuntimeError("paid_checkpoint_reconciliation_required: invalid paid response")
+        return {
+            "tranche_id": tranche_id,
+            "candidate_identity": identity,
+            "decision": decision,
+            "rationale": rationale.strip(),
+            "response": {"decision": decision, "rationale": rationale.strip()},
         }
 
     def review_historical_candidate(self, ticket_id: str, attempt_number: int, *, repository: Path, owner: str="local-first-reviewer") -> dict[str, object]:

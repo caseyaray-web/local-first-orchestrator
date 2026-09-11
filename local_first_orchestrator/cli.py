@@ -17,9 +17,11 @@ from .hermes_board import HermesBoardAdapter
 from .ledger import Ledger
 from .local_qwen import LOCAL_QWEN_MODEL, LOCAL_QWEN_PROVIDER, LocalQwenAdapter
 from .operator_config import ModelRegistration, OperatorConfig, default_execution_roots, load_operator_config, save_operator_config
+from .paid_model import HermesPaidModelAdapter
 from .scheduler import ProcessNextScheduler, preview_database
 from .ticket import MicroTicket, PatchBudget, VerificationProfile
 from .triage import LocalTriagePlanner
+from .usage_governor import PaidPurpose, UsageGovernor
 
 
 def _correction_service(ledger: Ledger, args: argparse.Namespace) -> CorrectionService:
@@ -265,6 +267,18 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     register.add_argument("--decomposition-standard-profile")
     register.add_argument("--decomposition-standard-provider")
     register.add_argument("--decomposition-standard-model")
+    register.add_argument("--paid-checkpoint-profile")
+    register.add_argument("--paid-checkpoint-provider")
+    register.add_argument("--paid-checkpoint-model")
+    register.add_argument("--paid-escalation-profile")
+    register.add_argument("--paid-escalation-provider")
+    register.add_argument("--paid-escalation-model")
+    paid_approve=commands.add_parser("approve-paid", help="grant exactly one additional paid call for one feature/purpose")
+    paid_approve.add_argument("--feature-id", required=True)
+    paid_approve.add_argument("--purpose", required=True, choices=(PaidPurpose.ARCHITECTURE.value, PaidPurpose.INTEGRATION_CHECKPOINT.value, PaidPurpose.ESCALATION.value))
+    paid_approve.add_argument("--reason", required=True)
+    paid_approve.add_argument("--idempotency-key", required=True)
+    paid_approve.add_argument("--operator-id", default="local-first-cli")
     admission=commands.add_parser("admit-feature-contract", help="admit one paused, predecessor-authorized feature contract without planning")
     admission.add_argument("--spec-file", required=True)
     planning=commands.add_parser("plan-feature", help="generate and persist one validated decomposition plan without activation")
@@ -311,6 +325,25 @@ def run_command(args: argparse.Namespace) -> int:
                 profile=triage_route.profile,
                 timeout_seconds=ctl.config.review_timeout_seconds,
             )
+            governor = UsageGovernor(ledger)
+            paid_checkpoint = None if registered.paid_checkpoint is None else HermesPaidModelAdapter(
+                ledger,
+                governor,
+                executable=args.hermes_executable,
+                provider=registered.paid_checkpoint.provider,
+                model=registered.paid_checkpoint.model,
+                profile=registered.paid_checkpoint.profile,
+                timeout_seconds=ctl.config.review_timeout_seconds,
+            )
+            paid_escalation = None if registered.paid_escalation is None else HermesPaidModelAdapter(
+                ledger,
+                governor,
+                executable=args.hermes_executable,
+                provider=registered.paid_escalation.provider,
+                model=registered.paid_escalation.model,
+                profile=registered.paid_escalation.profile,
+                timeout_seconds=ctl.config.review_timeout_seconds,
+            )
             result=ProcessNextScheduler(
                 ledger,
                 ctl.board,
@@ -336,6 +369,18 @@ def run_command(args: argparse.Namespace) -> int:
                 ),
                 tranche_checkpoint_runner=lambda tranche_id: ctl.execute_tranche_checkpoint_only(
                     tranche_id, repository=registered.canonical_repository
+                ),
+                paid_checkpoint_runner=None if paid_checkpoint is None else lambda tranche_id: ctl.execute_paid_stage_only(
+                    tranche_id, adapter=paid_checkpoint, purpose=PaidPurpose.INTEGRATION_CHECKPOINT
+                ),
+                paid_checkpoint_route=None if registered.paid_checkpoint is None else (
+                    registered.paid_checkpoint.provider, registered.paid_checkpoint.model, registered.paid_checkpoint.profile
+                ),
+                paid_escalation_runner=None if paid_escalation is None else lambda tranche_id: ctl.execute_paid_stage_only(
+                    tranche_id, adapter=paid_escalation, purpose=PaidPurpose.ESCALATION
+                ),
+                paid_escalation_route=None if registered.paid_escalation is None else (
+                    registered.paid_escalation.provider, registered.paid_escalation.model, registered.paid_escalation.profile
                 ),
             ).process_next()
             print(json.dumps(asdict(result),sort_keys=True))
@@ -413,6 +458,13 @@ def run_command(args: argparse.Namespace) -> int:
                     if not all(isinstance(value, str) and value.strip() for value in supplied):
                         raise ValueError(f"decomposition {cost} route requires profile, provider, and model together")
                     decomposition_routes[cost] = ModelRegistration(profile, provider, model)
+            paid_routes = {}
+            for purpose in ("checkpoint", "escalation"):
+                supplied = tuple(getattr(args, f"paid_{purpose}_{field}") for field in ("profile", "provider", "model"))
+                if any(value is not None for value in supplied):
+                    if not all(isinstance(value, str) and value.strip() for value in supplied):
+                        raise ValueError(f"paid {purpose} route requires profile, provider, and model together")
+                    paid_routes[purpose] = ModelRegistration(*supplied)
             config=OperatorConfig(
                 ledger_path=Path(args.database),
                 canonical_repository=root,
@@ -424,9 +476,15 @@ def run_command(args: argparse.Namespace) -> int:
                 implementation_timeout_seconds=args.implementation_timeout_seconds or 300,
                 review_timeout_seconds=args.review_timeout_seconds or 900,
                 decomposition=tuple(sorted(decomposition_routes.items())),
+                paid_checkpoint=paid_routes.get("checkpoint"),
+                paid_escalation=paid_routes.get("escalation"),
             )
             path=save_operator_config(config, Path(args.config_path) if args.config_path else None)
             print(json.dumps({"registered": str(path)}, sort_keys=True))
+        elif args.command=="approve-paid":
+            governor=UsageGovernor(ledger)
+            approval=governor.approve(args.feature_id,PaidPurpose(args.purpose),args.operator_id,args.reason,args.idempotency_key)
+            print(json.dumps(asdict(approval),sort_keys=True))
         elif args.command=="reconcile-failed-attempt":
             if args.ad_hoc_runtime: raise ValueError("failed-attempt reconciliation requires registered operator runtime")
             ctl, _ = _registered_controller(ledger,args,allow_board_writes=False)

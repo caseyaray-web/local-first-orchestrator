@@ -282,6 +282,40 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     if tranche_checkpoint is not None:
         return ProcessNextPreview(next_stage="tranche_checkpoint", ticket_id=str(tranche_checkpoint["ticket_id"]), would_execute=True)
 
+    paid_checkpoint_replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage='paid_checkpoint' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
+        (now,),
+    ).fetchone()
+    if paid_checkpoint_replay is not None:
+        return ProcessNextPreview(next_stage="paid_checkpoint", ticket_id=str(paid_checkpoint_replay["ticket_id"]), would_execute=True)
+    paid_checkpoint = ledger.connection.execute("""
+        SELECT t.id AS ticket_id FROM tranche_checkpoint_evidence c
+        JOIN tickets t ON t.tranche_id=c.tranche_id
+        WHERE c.decision='ready_for_checkpoint'
+          AND NOT EXISTS (SELECT 1 FROM paid_checkpoint_evidence p WHERE p.tranche_id=c.tranche_id AND p.purpose='integration_checkpoint')
+          AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims s WHERE s.stage='paid_checkpoint' AND json_extract(s.candidate_identity_json,'$.tranche_id')=c.tranche_id)
+        ORDER BY c.created_at,c.tranche_id,t.created_at DESC,t.id DESC LIMIT 1
+    """).fetchone()
+    if paid_checkpoint is not None:
+        return ProcessNextPreview(next_stage="paid_checkpoint", ticket_id=str(paid_checkpoint["ticket_id"]), would_execute=True)
+
+    paid_escalation_replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage='paid_escalation' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
+        (now,),
+    ).fetchone()
+    if paid_escalation_replay is not None:
+        return ProcessNextPreview(next_stage="paid_escalation", ticket_id=str(paid_escalation_replay["ticket_id"]), would_execute=True)
+    paid_escalation = ledger.connection.execute("""
+        SELECT t.id AS ticket_id FROM paid_checkpoint_evidence p
+        JOIN tickets t ON t.tranche_id=p.tranche_id
+        WHERE p.purpose='integration_checkpoint' AND p.decision='escalate'
+          AND NOT EXISTS (SELECT 1 FROM paid_checkpoint_evidence e WHERE e.tranche_id=p.tranche_id AND e.purpose='escalation')
+          AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims s WHERE s.stage='paid_escalation' AND json_extract(s.candidate_identity_json,'$.tranche_id')=p.tranche_id)
+        ORDER BY p.created_at,p.tranche_id,t.created_at DESC,t.id DESC LIMIT 1
+    """).fetchone()
+    if paid_escalation is not None:
+        return ProcessNextPreview(next_stage="paid_escalation", ticket_id=str(paid_escalation["ticket_id"]), would_execute=True)
+
     implementation_replay = ledger.connection.execute(
         "SELECT ticket_id FROM scheduler_stage_claims WHERE (stage='implementation' OR stage LIKE 'implementation:%') AND status='claimed' "
         "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
@@ -365,6 +399,10 @@ class ProcessNextScheduler:
         acceptance_runner: Callable[[str], dict[str, Any]] | None = None,
         git_integration_runner: Callable[[str], dict[str, Any]] | None = None,
         tranche_checkpoint_runner: Callable[[str], dict[str, Any]] | None = None,
+        paid_checkpoint_runner: Callable[[str], dict[str, Any]] | None = None,
+        paid_checkpoint_route: tuple[str, str, str] | None = None,
+        paid_escalation_runner: Callable[[str], dict[str, Any]] | None = None,
+        paid_escalation_route: tuple[str, str, str] | None = None,
     ) -> None:
         if not worker_id or lease_seconds < 1:
             raise ValueError("process-next requires a worker id and positive lease")
@@ -387,10 +425,18 @@ class ProcessNextScheduler:
         self.acceptance_runner = acceptance_runner
         self.git_integration_runner = git_integration_runner
         self.tranche_checkpoint_runner = tranche_checkpoint_runner
+        self.paid_checkpoint_runner = paid_checkpoint_runner
+        self.paid_checkpoint_route = paid_checkpoint_route
+        self.paid_escalation_runner = paid_escalation_runner
+        self.paid_escalation_route = paid_escalation_route
         if self.review_runner is not None and not self.review_execution_policy_hash:
             raise ValueError("process-next review runner requires a review execution policy hash")
         if self.triage_runner is not None and not self.triage_execution_policy_hash:
             raise ValueError("process-next triage runner requires a triage execution policy hash")
+        if (self.paid_checkpoint_runner is None) != (self.paid_checkpoint_route is None):
+            raise ValueError("process-next paid checkpoint runner and route must be configured together")
+        if (self.paid_escalation_runner is None) != (self.paid_escalation_route is None):
+            raise ValueError("process-next paid escalation runner and route must be configured together")
 
     def process_next(self) -> ProcessNextResult:
         now = int(self.clock())
@@ -725,6 +771,39 @@ class ProcessNextScheduler:
                     claim_id, execution_owner, checkpoint_result, now=now
                 )
                 return ProcessNextResult("completed", "tranche_checkpoint", ticket_id, claim_id)
+
+        for stage, purpose, runner, route in (
+            ("paid_checkpoint", "integration_checkpoint", self.paid_checkpoint_runner, self.paid_checkpoint_route),
+            ("paid_escalation", "escalation", self.paid_escalation_runner, self.paid_escalation_route),
+        ):
+            if runner is None or route is None:
+                continue
+            provider, model, profile = route
+            paid_claim = self.ledger.claim_next_scheduler_paid_stage(
+                execution_owner,
+                lease_seconds=self.lease_seconds,
+                purpose=purpose,
+                provider=provider,
+                model=model,
+                profile=profile,
+                now=now,
+            )
+            if paid_claim is None:
+                continue
+            claim_id = str(paid_claim["claim_id"])
+            ticket_id = str(paid_claim["ticket_id"])
+            current = self.ledger.scheduler_claim(claim_id)
+            if current.get("side_effect_completed_at") is not None and current.get("result_json"):
+                paid_result = json.loads(str(current["result_json"]))
+            else:
+                if current.get("side_effect_started_at") is None:
+                    self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+                identity = json.loads(str(current["candidate_identity_json"]))
+                paid_result = runner(str(identity["tranche_id"]))
+                current = self.ledger.apply_scheduler_paid_stage_effect(claim_id, execution_owner, paid_result, now=now)
+                paid_result = json.loads(str(current["result_json"]))
+            self.ledger.complete_scheduler_claim(claim_id, execution_owner, paid_result, now=now)
+            return ProcessNextResult("completed", stage, ticket_id, claim_id)
 
         if self.implementation_runner is not None:
             implementation_claim = self.ledger.claim_next_scheduler_implementation(

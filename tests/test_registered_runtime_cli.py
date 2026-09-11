@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from local_first_orchestrator.cli import _ad_hoc_controller, _registered_controller, register_cli
+from local_first_orchestrator.cli import _ad_hoc_controller, _registered_controller, main as cli_main, register_cli
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.operator_config import ModelRegistration, OperatorConfig, save_operator_config
 
@@ -38,5 +38,21 @@ class RegisteredRuntimeCliTests(unittest.TestCase):
         for command, tail in (("import", ["--task-id", "card"]), ("run-once", ["--task-id", "ticket"])):
             args = parser.parse_args(["--database", str(self.database), "--board", "board", "--hermes-executable", "hermes", command, *tail])
             self.assertEqual(args.board, "board"); self.assertEqual(args.hermes_executable, "hermes")
+
+    def test_approve_paid_cli_persists_one_purpose_scoped_call(self) -> None:
+        self.assertEqual(
+            cli_main([
+                "--database", str(self.database),
+                "approve-paid",
+                "--feature-id", "F-paid",
+                "--purpose", "integration_checkpoint",
+                "--reason", "operator permits one checkpoint call",
+                "--idempotency-key", "approval-paid-1",
+                "--operator-id", "operator",
+            ]),
+            0,
+        )
+        row = self.ledger.connection.execute("SELECT * FROM paid_approvals WHERE idempotency_key='approval-paid-1'").fetchone()
+        self.assertEqual((row["feature_id"], row["purpose"], row["calls"], row["actor_id"]), ("F-paid", "integration_checkpoint", 1, "operator"))
 
 if __name__ == "__main__": unittest.main()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import uuid
 from collections.abc import Callable
 from typing import Any, Protocol
@@ -76,3 +77,62 @@ class InjectedPaidModelAdapter:
         with self.ledger._transaction() as conn:
             conn.execute("UPDATE model_calls SET status='completed', response_artifact_json=?, input_tokens=0, output_tokens=0, updated_at=? WHERE id=?", (json.dumps(proposal, sort_keys=True), self.ledger._now(), call_id))
         return proposal
+
+
+class HermesPaidModelAdapter(InjectedPaidModelAdapter):
+    """Governor-backed paid Hermes chat adapter with packet-only safe-tool execution."""
+
+    is_paid = True
+    cost_class = "paid"
+    role = "checkpoint"
+    routing_source = "operator-config.paid"
+
+    def __init__(
+        self,
+        ledger: Ledger,
+        governor: UsageGovernor,
+        *,
+        executable: str,
+        provider: str,
+        model: str,
+        profile: str,
+        timeout_seconds: int = 900,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    ) -> None:
+        if not all(isinstance(value, str) and value.strip() for value in (executable, provider, model, profile)):
+            raise ValueError("paid Hermes route requires executable, provider, model, and profile")
+        if timeout_seconds < 1:
+            raise ValueError("paid Hermes timeout must be positive")
+        self.executable = executable
+        self.provider = provider
+        self.model = model
+        self.profile = profile
+        self.timeout_seconds = timeout_seconds
+        self.process_runner = runner
+        super().__init__(ledger, governor, self._invoke_hermes)
+
+    def _invoke_hermes(self, packet: dict[str, Any]) -> dict[str, Any]:
+        payload = json.dumps(packet, sort_keys=True, separators=(",", ":"))
+        argv = (
+            self.executable,
+            "chat",
+            "--toolsets",
+            "safe",
+            "--provider",
+            self.provider,
+            "--model",
+            self.model,
+            "--query",
+            payload,
+            "--quiet",
+        )
+        result = self.process_runner(argv, text=True, capture_output=True, timeout=self.timeout_seconds, check=False)
+        if result.returncode:
+            raise RuntimeError(f"paid Hermes invocation failed with status {result.returncode}")
+        try:
+            response = json.loads(result.stdout or "")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("paid Hermes invocation returned malformed JSON") from exc
+        if not isinstance(response, dict):
+            raise RuntimeError("paid Hermes invocation must return one JSON object")
+        return response

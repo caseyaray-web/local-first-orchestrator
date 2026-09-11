@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.architecture import ArchitectureError, import_architecture_packet
 from local_first_orchestrator.ledger import Ledger
-from local_first_orchestrator.paid_model import InjectedPaidModelAdapter, PaidInvocationError
+from local_first_orchestrator.paid_model import HermesPaidModelAdapter, InjectedPaidModelAdapter, PaidInvocationError
 from local_first_orchestrator.usage_governor import PaidPurpose, UsageGovernor
 
 
@@ -126,6 +126,31 @@ class Phase5Tests(unittest.TestCase):
             adapter.invoke("F", PaidPurpose.ARCHITECTURE, "interrupted", {"request": 1})
         self.assertEqual(calls, [])
         self.assertEqual(governor.usage("F", PaidPurpose.ARCHITECTURE)["unknown_outcome"], 1)
+
+    def test_hermes_paid_adapter_uses_safe_explicit_provider_model_route(self) -> None:
+        governor = UsageGovernor(self.ledger)
+        governor.configure("F", architecture=0, checkpoint=1, escalation=0)
+        calls = []
+        def runner(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return type("P", (), {"returncode": 0, "stdout": '{"decision":"approve","rationale":"ok"}', "stderr": ""})()
+        adapter = HermesPaidModelAdapter(
+            self.ledger,
+            governor,
+            executable="hermes",
+            provider="paid-provider",
+            model="paid-model",
+            profile="paid-profile",
+            runner=runner,
+        )
+        result = adapter.invoke("F", PaidPurpose.INTEGRATION_CHECKPOINT, "request", {"x": 1})
+        self.assertEqual(result["decision"], "approve")
+        argv, kwargs = calls[0]
+        self.assertEqual(argv[:4], ("hermes", "chat", "--toolsets", "safe"))
+        self.assertIn(("--provider", "paid-provider"), tuple(zip(argv, argv[1:])))
+        self.assertIn(("--model", "paid-model"), tuple(zip(argv, argv[1:])))
+        self.assertTrue(kwargs["capture_output"])
+        self.assertEqual(governor.usage("F", PaidPurpose.INTEGRATION_CHECKPOINT)["completed"], 1)
 
 
 if __name__ == "__main__":

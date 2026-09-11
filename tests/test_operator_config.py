@@ -30,5 +30,23 @@ class OperatorConfigSchemaTests(unittest.TestCase):
     def test_save_requires_explicit_runtime_configuration(self) -> None:
         config = OperatorConfig(self.ledger, self.repo, (self.repo,), ModelRegistration("impl","p","m"), ModelRegistration("review","p","m"))
         with self.assertRaisesRegex(ValueError, "execution_runtime_not_configured"): save_operator_config(config, self.root / "out.json")
+    def test_paid_routes_round_trip_without_breaking_legacy_optional_schema(self) -> None:
+        raw = {
+            **self.base,
+            "worktree_root": str(self.root / "worktrees"),
+            "artifact_root": str(self.root / "artifacts"),
+            "implementation_timeout_seconds": 1800,
+            "review_timeout_seconds": 900,
+            "paid_checkpoint": {"profile":"checkpoint","provider":"paid-provider","model":"paid-model"},
+            "paid_escalation": {"profile":"escalation","provider":"frontier-provider","model":"frontier-model"},
+        }
+        config = load_operator_config(self.write(raw))
+        self.assertEqual(config.paid_checkpoint, ModelRegistration("checkpoint","paid-provider","paid-model"))
+        self.assertEqual(config.paid_escalation, ModelRegistration("escalation","frontier-provider","frontier-model"))
+        target = self.root / "saved.json"
+        save_operator_config(config, target)
+        saved = json.loads(target.read_text())
+        self.assertEqual(saved["paid_checkpoint"], raw["paid_checkpoint"])
+        self.assertEqual(saved["paid_escalation"], raw["paid_escalation"])
 
 if __name__ == "__main__": unittest.main()

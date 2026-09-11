@@ -108,6 +108,18 @@ Already complete or substantially complete:
    - checkpoint effect replay finalizes without rerunning integration commands
    - no paid call and no next-tranche activation occurs in this stage
 
+12. **Paid checkpoint / escalation stage — Complete for the current scheduler slice**
+   - only immutable `ready_for_checkpoint` tranche evidence is eligible for paid checkpoint review
+   - claim identity binds feature/tranche, checkpoint artifact/completion hashes, final integration SHA, purpose, provider, model, and registered profile provenance
+   - the scheduler claim ID is the usage-governor request key, so one logical stage cannot obtain a second reservation
+   - the existing governor atomically reserves budget before `model_calls` records an in-flight paid invocation and before provider execution
+   - registered paid routes use Hermes packet-only `chat --toolsets safe` with explicit provider/model selectors
+   - exact `{decision, rationale}` output is required and immutable paid evidence binds the reservation/model-call IDs
+   - `escalate` from checkpoint review enables one distinct purpose-scoped escalation stage; approval/rejection never activate the next tranche in this milestone
+   - budget exhaustion leaves the scheduler claim blocked until an explicit one-call approval is granted
+   - ambiguous paid outcomes become durable `unknown_outcome` reservations and replay never calls the provider again
+   - completed paid calls can be recovered after a crash before scheduler effect persistence without repeating the provider call
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage — Complete
@@ -263,7 +275,7 @@ Completion condition: a tranche can finish, integrate, checkpoint, and become el
 
 **Current status:** Complete for this scheduler milestone. The scheduler now detects active tranches whose materialized tickets are all `done` with accepted commit evidence, binds the exact ticket/commit set plus active planning snapshot provenance and configured integration commands into a durable tranche-checkpoint claim, and executes deterministic checkpoint work against the canonical repository and final integrated worktree. The controller revalidates the stored planning snapshot hash/content at its original base, reuses `completion_evidence(...)` to prove the serialized integration chain and integration-head identity, requires the final accepted worktree to be clean at the final integration commit, and runs the tranche's configured integration commands with bounded captured output. The ledger independently validates command/result pairing and the derived decision, persists immutable `tranche_completion_evidence` plus immutable `tranche_checkpoint_evidence`, and binds both to a hashed checkpoint artifact. `ready_for_checkpoint` and `integration_failed` are durable decisions; neither paid checkpoint review nor next-tranche activation occurs in this stage. A completed effect can be finalized after restart without re-running integration commands.
 
-## 12. Paid checkpoint / escalation stage
+## 12. Paid checkpoint / escalation stage — Complete
 
 Integrate paid-model work under the existing usage governor.
 
@@ -277,6 +289,8 @@ Required slices:
 - Support explicit approval/rejection where required by the design.
 
 Completion condition: restart or retry can never duplicate a paid call or spend outside the governor’s durable authorization.
+
+**Current status:** Complete for this scheduler milestone. Paid checkpoint claims are created only from immutable deterministic tranche checkpoints whose decision is `ready_for_checkpoint`. The claim freezes feature/tranche identity, checkpoint artifact and completion hashes, final integration SHA, purpose, and registered provider/model/profile provenance; its deterministic claim ID is reused as the `UsageGovernor` request key. The existing governor therefore reserves budget atomically before a `model_calls` row is marked in flight and before the provider side effect. Production registered routes use `HermesPaidModelAdapter`, which invokes packet-only Hermes `chat --toolsets safe` with explicit provider/model selectors; the registered profile is retained as route provenance because Hermes chat has no profile CLI flag. Responses must be exactly `{decision, rationale}` with `approve`, `escalate`, or `reject`. Immutable `paid_checkpoint_evidence` binds the checkpoint lineage, scheduler claim, governor reservation, model-call record, route identity, response, and decision. An `escalate` checkpoint result enables one separate escalation-purpose claim/call. Budget exhaustion performs no provider call and leaves the claim blocked; the `approve-paid` operator command grants exactly one additional purpose-scoped call, after which expired-lease replay reuses the same claim/request key. Ambiguous provider outcomes are marked `unknown_outcome` and cannot be re-invoked; a provider call that completed before a crash but whose scheduler effect was not yet applied is recovered from the completed durable model-call response without a second provider call. Next-tranche activation remains a distinct later stage.
 
 ## 13. Next-tranche activation stage
 

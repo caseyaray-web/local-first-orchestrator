@@ -17,6 +17,7 @@ _CONFIG_ENV = "LOCAL_FIRST_OPERATOR_CONFIG"
 _LEGACY_FIELDS = frozenset({"ledger_path", "canonical_repository", "repository_allowlist", "implementation", "review"})
 _RUNTIME_FIELDS = frozenset({"worktree_root", "artifact_root", "implementation_timeout_seconds", "review_timeout_seconds"})
 _ROUTING_FIELDS = frozenset({"decomposition"})
+_PAID_FIELDS = frozenset({"paid_checkpoint", "paid_escalation"})
 
 
 def default_config_path() -> Path:
@@ -64,6 +65,8 @@ class OperatorConfig:
     implementation_timeout_seconds: int | None = None
     review_timeout_seconds: int | None = None
     decomposition: tuple[tuple[str, ModelRegistration], ...] = ()
+    paid_checkpoint: ModelRegistration | None = None
+    paid_escalation: ModelRegistration | None = None
 
     def decomposition_route(self, cost_class: str) -> ModelRegistration:
         routes = dict(self.decomposition)
@@ -87,7 +90,7 @@ class OperatorConfig:
             raise ValueError("execution_runtime_not_configured")
         if self.worktree_root is not None and (not isinstance(self.worktree_root, Path) or not isinstance(self.artifact_root, Path) or not isinstance(self.implementation_timeout_seconds, int) or not isinstance(self.review_timeout_seconds, int)):
             raise ValueError("execution_runtime_not_configured")
-        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review, self.worktree_root, self.artifact_root, self.implementation_timeout_seconds, self.review_timeout_seconds, self.decomposition)
+        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review, self.worktree_root, self.artifact_root, self.implementation_timeout_seconds, self.review_timeout_seconds, self.decomposition, self.paid_checkpoint, self.paid_escalation)
 
     @property
     def execution_configured(self) -> bool:
@@ -119,6 +122,10 @@ class OperatorConfig:
         }
         if self.decomposition:
             result["decomposition"] = {cost: asdict(route) for cost, route in self.decomposition}
+        if self.paid_checkpoint is not None:
+            result["paid_checkpoint"] = asdict(self.paid_checkpoint)
+        if self.paid_escalation is not None:
+            result["paid_escalation"] = asdict(self.paid_escalation)
         return result
 
 
@@ -130,8 +137,10 @@ def load_operator_config(path: Path | None = None) -> OperatorConfig:
         raise ValueError("operator dashboard is not registered") from exc
     except json.JSONDecodeError as exc:
         raise ValueError("operator registration is not valid JSON") from exc
-    if not isinstance(raw, dict) or set(raw) not in { _LEGACY_FIELDS, _LEGACY_FIELDS | _RUNTIME_FIELDS, _LEGACY_FIELDS | _ROUTING_FIELDS, _LEGACY_FIELDS | _RUNTIME_FIELDS | _ROUTING_FIELDS }:
+    if not isinstance(raw, dict) or not _LEGACY_FIELDS <= set(raw) or set(raw) - (_LEGACY_FIELDS | _RUNTIME_FIELDS | _ROUTING_FIELDS | _PAID_FIELDS):
         raise ValueError("operator registration has unexpected fields")
+    if bool(set(raw) & _RUNTIME_FIELDS) and not _RUNTIME_FIELDS <= set(raw):
+        raise ValueError("execution_runtime_not_configured")
     paths = raw["repository_allowlist"]
     if not isinstance(paths, list) or not paths or not all(isinstance(item, str) for item in paths):
         raise ValueError("repository_allowlist must be a non-empty list of paths")
@@ -148,7 +157,9 @@ def load_operator_config(path: Path | None = None) -> OperatorConfig:
         if not isinstance(raw["decomposition"], dict) or not raw["decomposition"]:
             raise ValueError("decomposition must be a non-empty cost-class route mapping")
         decomposition = tuple(sorted((str(cost), ModelRegistration.parse(value, f"decomposition.{cost}")) for cost, value in raw["decomposition"].items()))
-    return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review"), *runtime, decomposition).validated(require_ledger=True)
+    paid_checkpoint = ModelRegistration.parse(raw["paid_checkpoint"], "paid_checkpoint") if "paid_checkpoint" in raw else None
+    paid_escalation = ModelRegistration.parse(raw["paid_escalation"], "paid_escalation") if "paid_escalation" in raw else None
+    return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review"), *runtime, decomposition, paid_checkpoint, paid_escalation).validated(require_ledger=True)
 
 
 def save_operator_config(config: OperatorConfig, path: Path | None = None) -> Path:

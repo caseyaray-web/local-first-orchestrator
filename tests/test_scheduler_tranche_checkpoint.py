@@ -8,9 +8,11 @@ from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
 from local_first_orchestrator.ledger import Ledger
+from local_first_orchestrator.paid_model import InjectedPaidModelAdapter, PaidInvocationError
 from local_first_orchestrator.repository_snapshot import snapshot
 from local_first_orchestrator.scheduler import ProcessNextScheduler, preview_next
 from local_first_orchestrator.states import CanonicalState
+from local_first_orchestrator.usage_governor import PaidPurpose, UsageGovernor
 
 
 class Board:
@@ -194,6 +196,161 @@ class SchedulerTrancheCheckpointTests(unittest.TestCase):
         self.assertEqual((result.stage, result.status), ("tranche_checkpoint", "completed"))
         self.assertEqual(counter.read_text(), "x")
         self.assertIsNotNone(self.ledger.tranche_checkpoint("T"))
+
+    def _prepare_paid_checkpoint(self) -> None:
+        self.assertEqual(self.scheduler().process_next().stage, "tranche_checkpoint")
+        self.assertEqual(self.ledger.tranche_checkpoint("T")["decision"], "ready_for_checkpoint")
+
+    def test_paid_checkpoint_approval_is_reserved_and_persisted_once(self) -> None:
+        self._prepare_paid_checkpoint()
+        governor = UsageGovernor(self.ledger)
+        governor.configure("F", architecture=0, checkpoint=1, escalation=0)
+        calls: list[dict[str, object]] = []
+        adapter = InjectedPaidModelAdapter(self.ledger, governor, lambda packet: calls.append(packet) or {"decision": "approve", "rationale": "checkpoint is acceptable"})
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="paid",
+            lease_seconds=30,
+            clock=lambda: 100,
+            paid_checkpoint_runner=lambda tranche_id: self.controller.execute_paid_stage_only(tranche_id, adapter=adapter, purpose=PaidPurpose.INTEGRATION_CHECKPOINT),
+            paid_checkpoint_route=(adapter.provider, adapter.model, adapter.profile),
+        )
+        self.assertEqual(preview_next(self.ledger, now=100).next_stage, "paid_checkpoint")
+        result = scheduler.process_next()
+        self.assertEqual((result.stage, result.status), ("paid_checkpoint", "completed"))
+        evidence = self.ledger.paid_checkpoint("T")
+        self.assertEqual(evidence["decision"], "approve")
+        self.assertEqual(evidence["request_key"], result.claim_id)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(governor.usage("F", PaidPurpose.INTEGRATION_CHECKPOINT)["completed"], 1)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM model_calls WHERE feature_id='F' AND purpose='integration_checkpoint'").fetchone()[0], 1)
+
+    def test_paid_checkpoint_escalation_chains_to_one_escalation_call(self) -> None:
+        self._prepare_paid_checkpoint()
+        governor = UsageGovernor(self.ledger)
+        governor.configure("F", architecture=0, checkpoint=1, escalation=1)
+        checkpoint = InjectedPaidModelAdapter(self.ledger, governor, lambda packet: {"decision": "escalate", "rationale": "needs higher-capability review"})
+        escalation_calls: list[dict[str, object]] = []
+        escalation = InjectedPaidModelAdapter(self.ledger, governor, lambda packet: escalation_calls.append(packet) or {"decision": "approve", "rationale": "escalation approved"})
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="paid",
+            lease_seconds=30,
+            clock=lambda: 100,
+            paid_checkpoint_runner=lambda tranche_id: self.controller.execute_paid_stage_only(tranche_id, adapter=checkpoint, purpose=PaidPurpose.INTEGRATION_CHECKPOINT),
+            paid_checkpoint_route=(checkpoint.provider, checkpoint.model, checkpoint.profile),
+            paid_escalation_runner=lambda tranche_id: self.controller.execute_paid_stage_only(tranche_id, adapter=escalation, purpose=PaidPurpose.ESCALATION),
+            paid_escalation_route=(escalation.provider, escalation.model, escalation.profile),
+        )
+        self.assertEqual(scheduler.process_next().stage, "paid_checkpoint")
+        self.assertEqual(self.ledger.paid_checkpoint("T")["decision"], "escalate")
+        self.assertEqual(preview_next(self.ledger, now=100).next_stage, "paid_escalation")
+        self.assertEqual(scheduler.process_next().stage, "paid_escalation")
+        escalated = self.ledger.paid_checkpoint("T", "escalation")
+        self.assertEqual(escalated["decision"], "approve")
+        self.assertEqual(len(escalation_calls), 1)
+        self.assertEqual(governor.usage("F", PaidPurpose.ESCALATION)["completed"], 1)
+
+    def test_paid_budget_exhaustion_blocks_until_explicit_approval_then_reuses_claim(self) -> None:
+        self._prepare_paid_checkpoint()
+        governor = UsageGovernor(self.ledger)
+        governor.configure("F", architecture=0, checkpoint=0, escalation=0)
+        calls: list[dict[str, object]] = []
+        adapter = InjectedPaidModelAdapter(self.ledger, governor, lambda packet: calls.append(packet) or {"decision": "approve", "rationale": "approved after operator budget grant"})
+        first = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="paid-a", lease_seconds=30, clock=lambda: 100,
+            paid_checkpoint_runner=lambda tranche_id: self.controller.execute_paid_stage_only(tranche_id, adapter=adapter, purpose=PaidPurpose.INTEGRATION_CHECKPOINT),
+            paid_checkpoint_route=(adapter.provider, adapter.model, adapter.profile),
+        )
+        with self.assertRaisesRegex(PaidInvocationError, "budget exhausted"):
+            first.process_next()
+        self.assertEqual(calls, [])
+        claim = self.ledger.connection.execute("SELECT * FROM scheduler_stage_claims WHERE stage='paid_checkpoint'").fetchone()
+        self.assertEqual(claim["status"], "claimed")
+        original_claim_id = str(claim["claim_id"])
+        governor.approve("F", PaidPurpose.INTEGRATION_CHECKPOINT, "operator", "one checkpoint retry", "approval-checkpoint")
+        resumed = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="paid-b", lease_seconds=30, clock=lambda: 131,
+            paid_checkpoint_runner=lambda tranche_id: self.controller.execute_paid_stage_only(tranche_id, adapter=adapter, purpose=PaidPurpose.INTEGRATION_CHECKPOINT),
+            paid_checkpoint_route=(adapter.provider, adapter.model, adapter.profile),
+        )
+        result = resumed.process_next()
+        self.assertEqual(result.claim_id, original_claim_id)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.ledger.paid_checkpoint("T")["decision"], "approve")
+
+    def test_unknown_paid_outcome_is_never_reinvoked(self) -> None:
+        self._prepare_paid_checkpoint()
+        governor = UsageGovernor(self.ledger)
+        governor.configure("F", architecture=0, checkpoint=1, escalation=0)
+        calls: list[dict[str, object]] = []
+        def fail(packet: dict[str, object]) -> dict[str, object]:
+            calls.append(packet)
+            raise RuntimeError("transport ambiguous")
+        adapter = InjectedPaidModelAdapter(self.ledger, governor, fail)
+        first = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="paid-a", lease_seconds=30, clock=lambda: 100,
+            paid_checkpoint_runner=lambda tranche_id: self.controller.execute_paid_stage_only(tranche_id, adapter=adapter, purpose=PaidPurpose.INTEGRATION_CHECKPOINT),
+            paid_checkpoint_route=(adapter.provider, adapter.model, adapter.profile),
+        )
+        with self.assertRaisesRegex(PaidInvocationError, "unknown"):
+            first.process_next()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(governor.usage("F", PaidPurpose.INTEGRATION_CHECKPOINT)["unknown_outcome"], 1)
+        resumed = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="paid-b", lease_seconds=30, clock=lambda: 131,
+            paid_checkpoint_runner=lambda tranche_id: self.controller.execute_paid_stage_only(tranche_id, adapter=adapter, purpose=PaidPurpose.INTEGRATION_CHECKPOINT),
+            paid_checkpoint_route=(adapter.provider, adapter.model, adapter.profile),
+        )
+        with self.assertRaisesRegex(PaidInvocationError, "unknown"):
+            resumed.process_next()
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(self.ledger.paid_checkpoint("T"))
+
+    def test_completed_paid_call_replays_after_crash_before_scheduler_apply_without_provider_repeat(self) -> None:
+        self._prepare_paid_checkpoint()
+        governor = UsageGovernor(self.ledger)
+        governor.configure("F", architecture=0, checkpoint=1, escalation=0)
+        calls: list[dict[str, object]] = []
+        adapter = InjectedPaidModelAdapter(
+            self.ledger,
+            governor,
+            lambda packet: calls.append(packet) or {"decision": "approve", "rationale": "durable completed response"},
+        )
+        claim = self.ledger.claim_next_scheduler_paid_stage(
+            "crashed",
+            lease_seconds=1,
+            purpose=PaidPurpose.INTEGRATION_CHECKPOINT.value,
+            provider=adapter.provider,
+            model=adapter.model,
+            profile=adapter.profile,
+            now=101,
+        )
+        self.assertIsNotNone(claim)
+        claim_id = str(claim["claim_id"])
+        self.ledger.begin_scheduler_claim_effect(claim_id, "crashed", now=101)
+        paid_result = self.controller.execute_paid_stage_only("T", adapter=adapter, purpose=PaidPurpose.INTEGRATION_CHECKPOINT)
+        self.assertEqual(paid_result["decision"], "approve")
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(self.ledger.paid_checkpoint("T"))
+
+        resumed = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="paid-recovery",
+            lease_seconds=30,
+            clock=lambda: 103,
+            paid_checkpoint_runner=lambda tranche_id: self.controller.execute_paid_stage_only(
+                tranche_id, adapter=adapter, purpose=PaidPurpose.INTEGRATION_CHECKPOINT
+            ),
+            paid_checkpoint_route=(adapter.provider, adapter.model, adapter.profile),
+        )
+        result = resumed.process_next()
+        self.assertEqual((result.stage, result.claim_id), ("paid_checkpoint", claim_id))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.ledger.paid_checkpoint("T")["decision"], "approve")
 
 
 if __name__ == "__main__":
