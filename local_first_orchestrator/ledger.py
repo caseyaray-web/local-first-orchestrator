@@ -409,6 +409,30 @@ CREATE TRIGGER IF NOT EXISTS git_commit_evidence_immutable_update
 BEFORE UPDATE ON git_commit_evidence BEGIN SELECT RAISE(ABORT, 'git commit evidence is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS git_commit_evidence_immutable_delete
 BEFORE DELETE ON git_commit_evidence BEGIN SELECT RAISE(ABORT, 'git commit evidence is append-only'); END;
+CREATE TABLE IF NOT EXISTS native_dependency_graphs (
+    ticket_id TEXT PRIMARY KEY REFERENCES tickets(id),
+    child_external_id TEXT NOT NULL,
+    local_dependency_ids_json TEXT NOT NULL,
+    parent_external_ids_json TEXT NOT NULL,
+    graph_hash TEXT NOT NULL,
+    verified_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS native_dependency_graphs_immutable_update
+BEFORE UPDATE ON native_dependency_graphs BEGIN SELECT RAISE(ABORT, 'native dependency graph evidence is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS native_dependency_graphs_immutable_delete
+BEFORE DELETE ON native_dependency_graphs BEGIN SELECT RAISE(ABORT, 'native dependency graph evidence is append-only'); END;
+CREATE TABLE IF NOT EXISTS native_dependency_releases (
+    ticket_id TEXT PRIMARY KEY REFERENCES tickets(id),
+    graph_hash TEXT NOT NULL,
+    child_external_id TEXT NOT NULL,
+    parent_completion_hash TEXT NOT NULL,
+    hermes_status TEXT NOT NULL,
+    observed_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS native_dependency_releases_immutable_update
+BEFORE UPDATE ON native_dependency_releases BEGIN SELECT RAISE(ABORT, 'native dependency release evidence is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS native_dependency_releases_immutable_delete
+BEFORE DELETE ON native_dependency_releases BEGIN SELECT RAISE(ABORT, 'native dependency release evidence is append-only'); END;
 CREATE TABLE IF NOT EXISTS tranche_completion_evidence (
     tranche_id TEXT PRIMARY KEY REFERENCES tranches(id), root_planning_sha TEXT NOT NULL,
     final_integration_sha TEXT NOT NULL, accepted_ticket_ids_json TEXT NOT NULL,
@@ -1823,6 +1847,283 @@ class Ledger:
         row = self.connection.execute("SELECT * FROM git_commit_evidence WHERE ticket_id=?", (ticket_id,)).fetchone()
         return dict(row) if row else None
 
+    def native_dependency_graph(self, ticket_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM native_dependency_graphs WHERE ticket_id=?", (ticket_id,)).fetchone()
+        return dict(row) if row else None
+
+    def native_dependency_release(self, ticket_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (ticket_id,)).fetchone()
+        return dict(row) if row else None
+
+    def _native_dependency_graph_identity(self, conn: sqlite3.Connection, ticket_id: str) -> dict[str, Any]:
+        ticket = conn.execute("SELECT id,dependencies_json FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+        if ticket is None:
+            raise KeyError(ticket_id)
+        try:
+            dependencies = tuple(sorted(set(json.loads(str(ticket["dependencies_json"])))))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("native_dependency_graph_reconciliation_required: invalid dependency contract") from exc
+        if not dependencies or ticket_id in dependencies or not all(isinstance(value, str) and value for value in dependencies):
+            raise RuntimeError("native_dependency_graph_reconciliation_required: invalid dependency contract")
+        child_external_id = self._resolve_external_task_id_in_transaction(conn, ticket_id)
+        parents: list[dict[str, str]] = []
+        for dependency_id in dependencies:
+            if conn.execute("SELECT 1 FROM tickets WHERE id=?", (dependency_id,)).fetchone() is None:
+                raise RuntimeError("native_dependency_graph_reconciliation_required: missing dependency ticket")
+            parents.append(
+                {
+                    "ticket_id": dependency_id,
+                    "external_task_id": self._resolve_external_task_id_in_transaction(conn, dependency_id),
+                }
+            )
+        parent_external_ids = [row["external_task_id"] for row in parents]
+        if child_external_id in parent_external_ids or len(set(parent_external_ids)) != len(parent_external_ids):
+            raise RuntimeError("native_dependency_graph_reconciliation_required: ambiguous external task identity")
+        core = {
+            "ticket_id": ticket_id,
+            "child_external_id": child_external_id,
+            "parents": parents,
+        }
+        encoded = json.dumps(core, sort_keys=True, separators=(",", ":"))
+        return {**core, "graph_hash": hashlib.sha256(encoded.encode()).hexdigest()}
+
+    def claim_next_scheduler_native_dependency_graph(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+        if not owner or lease_seconds < 1:
+            raise ValueError("native dependency graph claim requires owner and positive lease")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
+                return None
+            replay = conn.execute(
+                "SELECT * FROM scheduler_stage_claims WHERE stage='native_dependency_graph' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
+                (now,),
+            ).fetchone()
+            if replay is not None:
+                identity = self._native_dependency_graph_identity(conn, str(replay["ticket_id"]))
+                if json.loads(str(replay["candidate_identity_json"] or "{}")) != identity:
+                    raise RuntimeError("native_dependency_graph_reconciliation_required: claim identity drift")
+                changed = conn.execute(
+                    "UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?",
+                    (owner, now + lease_seconds, now, replay["claim_id"], now),
+                )
+                if changed.rowcount != 1:
+                    return None
+                self._append_event(conn, entity_type="ticket", entity_id=str(replay["ticket_id"]), event_type="scheduler_stage_reclaimed", actor_id=owner, payload={"claim_id": replay["claim_id"], "stage": "native_dependency_graph", "lease_expires_at": now + lease_seconds})
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
+
+            candidates = conn.execute("""
+                SELECT t.id FROM tickets t
+                JOIN runtime_bindings rb ON rb.ticket_id=t.id
+                WHERE t.state='draft'
+                  AND json_valid(t.dependencies_json)=1
+                  AND json_type(t.dependencies_json)='array'
+                  AND json_array_length(t.dependencies_json)>0
+                  AND NOT EXISTS (SELECT 1 FROM native_dependency_graphs g WHERE g.ticket_id=t.id)
+                  AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage='native_dependency_graph')
+                ORDER BY t.created_at,t.id LIMIT 100
+            """).fetchall()
+            for candidate in candidates:
+                ticket_id = str(candidate["id"])
+                try:
+                    identity = self._native_dependency_graph_identity(conn, ticket_id)
+                except (KeyError, RuntimeError):
+                    continue
+                encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+                claim_id = hashlib.sha256(("native_dependency_graph:" + encoded).encode()).hexdigest()[:32]
+                conn.execute(
+                    "INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,created_at,updated_at) VALUES (?,?,'native_dependency_graph','claimed',?,?,1,?,?,?)",
+                    (claim_id, ticket_id, owner, now + lease_seconds, encoded, now, now),
+                )
+                self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_claimed", actor_id=owner, payload={"claim_id": claim_id, "stage": "native_dependency_graph", "candidate_identity": identity})
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+            return None
+
+    def apply_scheduler_native_dependency_graph_effect(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        now = self._now() if now is None else now
+        encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if claim is None or claim["stage"] != "native_dependency_graph":
+                raise ValueError("scheduler claim is not native dependency graph")
+            if claim["side_effect_started_at"] is None:
+                raise RuntimeError("scheduler claim effect was not durably started")
+            if claim["lease_owner"] != owner or claim["lease_expires_at"] is None or int(claim["lease_expires_at"]) <= now:
+                raise PermissionError("scheduler claim lease is not owned")
+            if claim["side_effect_completed_at"] is not None:
+                if claim["result_json"] != encoded:
+                    raise RuntimeError("native dependency graph completed result conflicts")
+                return dict(claim)
+            identity = self._native_dependency_graph_identity(conn, str(claim["ticket_id"]))
+            if json.loads(str(claim["candidate_identity_json"] or "{}")) != identity or result.get("candidate_identity") != identity:
+                raise RuntimeError("native_dependency_graph_reconciliation_required: result identity drift")
+            ordered_parent_external_ids = [row["external_task_id"] for row in identity["parents"]]
+            expected_parents = sorted(ordered_parent_external_ids)
+            if sorted(result.get("actual_parent_external_ids") or []) != expected_parents:
+                raise RuntimeError("native_dependency_graph_reconciliation_required: Hermes graph mismatch")
+            existing = conn.execute("SELECT * FROM native_dependency_graphs WHERE ticket_id=?", (claim["ticket_id"],)).fetchone()
+            values = (
+                str(identity["child_external_id"]),
+                json.dumps([row["ticket_id"] for row in identity["parents"]], sort_keys=True, separators=(",", ":")),
+                json.dumps(ordered_parent_external_ids, sort_keys=True, separators=(",", ":")),
+                str(identity["graph_hash"]),
+            )
+            if existing is not None:
+                if tuple(existing[key] for key in ("child_external_id", "local_dependency_ids_json", "parent_external_ids_json", "graph_hash")) != values:
+                    raise RuntimeError("native_dependency_graph_reconciliation_required: graph evidence conflicts")
+            else:
+                conn.execute(
+                    "INSERT INTO native_dependency_graphs(ticket_id,child_external_id,local_dependency_ids_json,parent_external_ids_json,graph_hash,verified_at) VALUES (?,?,?,?,?,?)",
+                    (claim["ticket_id"], *values, now),
+                )
+            changed = conn.execute(
+                "UPDATE scheduler_stage_claims SET side_effect_completed_at=?,result_json=?,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_owner=? AND lease_expires_at>? AND side_effect_completed_at IS NULL",
+                (now, encoded, now, claim_id, owner, now),
+            )
+            if changed.rowcount != 1:
+                raise PermissionError("scheduler claim lease is not owned")
+            self._append_event(conn, entity_type="ticket", entity_id=str(claim["ticket_id"]), event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": "native_dependency_graph", "result": result})
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
+    def _native_dependency_release_identity(self, conn: sqlite3.Connection, ticket_id: str) -> dict[str, Any]:
+        graph = conn.execute("SELECT * FROM native_dependency_graphs WHERE ticket_id=?", (ticket_id,)).fetchone()
+        if graph is None:
+            raise RuntimeError("native_dependency_release_reconciliation_required: verified graph missing")
+        try:
+            dependencies = tuple(json.loads(str(graph["local_dependency_ids_json"])))
+            parent_external_ids = tuple(json.loads(str(graph["parent_external_ids_json"])))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("native_dependency_release_reconciliation_required: graph evidence malformed") from exc
+        if not dependencies or len(dependencies) != len(parent_external_ids):
+            raise RuntimeError("native_dependency_release_reconciliation_required: graph evidence malformed")
+        completions: list[dict[str, Any]] = []
+        for dependency_id, parent_external_id in zip(dependencies, parent_external_ids):
+            dependency = conn.execute("SELECT state FROM tickets WHERE id=?", (dependency_id,)).fetchone()
+            evidence = conn.execute("SELECT accepted_commit_sha FROM accepted_evidence WHERE ticket_id=?", (dependency_id,)).fetchone()
+            projected = conn.execute("""
+                SELECT e.id AS event_id,b.idempotency_key,b.external_task_id,b.acknowledged_at
+                FROM events e JOIN board_projection_outbox b ON b.ticket_id=e.entity_id AND b.event_id=e.id
+                WHERE e.entity_type='ticket' AND e.entity_id=? AND e.event_type='state_transition' AND e.to_state='done'
+                  AND b.operation='set_state' AND b.acknowledged_at IS NOT NULL
+                ORDER BY e.id DESC LIMIT 1
+            """, (dependency_id,)).fetchone()
+            if dependency is None or dependency["state"] != CanonicalState.DONE.value or evidence is None or projected is None:
+                raise RuntimeError("native_dependency_release_reconciliation_required: parent completion not remotely acknowledged")
+            if str(projected["external_task_id"] or "") != str(parent_external_id):
+                raise RuntimeError("native_dependency_release_reconciliation_required: parent external identity drift")
+            completions.append(
+                {
+                    "ticket_id": str(dependency_id),
+                    "external_task_id": str(parent_external_id),
+                    "accepted_commit_sha": str(evidence["accepted_commit_sha"]),
+                    "done_event_id": int(projected["event_id"]),
+                    "projection_idempotency_key": str(projected["idempotency_key"]),
+                }
+            )
+        core = {
+            "ticket_id": ticket_id,
+            "graph_hash": str(graph["graph_hash"]),
+            "child_external_id": str(graph["child_external_id"]),
+            "parent_completions": completions,
+        }
+        completion_hash = hashlib.sha256(json.dumps(completions, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return {**core, "parent_completion_hash": completion_hash}
+
+    def claim_next_scheduler_native_dependency_release(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+        if not owner or lease_seconds < 1:
+            raise ValueError("native dependency release claim requires owner and positive lease")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
+                return None
+            replay = conn.execute(
+                "SELECT * FROM scheduler_stage_claims WHERE stage='native_dependency_release' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
+                (now,),
+            ).fetchone()
+            if replay is not None:
+                identity = self._native_dependency_release_identity(conn, str(replay["ticket_id"]))
+                if json.loads(str(replay["candidate_identity_json"] or "{}")) != identity:
+                    raise RuntimeError("native_dependency_release_reconciliation_required: claim identity drift")
+                changed = conn.execute(
+                    "UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?",
+                    (owner, now + lease_seconds, now, replay["claim_id"], now),
+                )
+                if changed.rowcount != 1:
+                    return None
+                self._append_event(conn, entity_type="ticket", entity_id=str(replay["ticket_id"]), event_type="scheduler_stage_reclaimed", actor_id=owner, payload={"claim_id": replay["claim_id"], "stage": "native_dependency_release", "lease_expires_at": now + lease_seconds})
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
+
+            candidates = conn.execute("""
+                SELECT t.id FROM tickets t
+                JOIN native_dependency_graphs g ON g.ticket_id=t.id
+                WHERE t.state='draft'
+                  AND NOT EXISTS (SELECT 1 FROM native_dependency_releases r WHERE r.ticket_id=t.id)
+                  AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage='native_dependency_release')
+                ORDER BY t.created_at,t.id LIMIT 100
+            """).fetchall()
+            for candidate in candidates:
+                ticket_id = str(candidate["id"])
+                try:
+                    identity = self._native_dependency_release_identity(conn, ticket_id)
+                except RuntimeError:
+                    continue
+                encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+                claim_id = hashlib.sha256(("native_dependency_release:" + encoded).encode()).hexdigest()[:32]
+                conn.execute(
+                    "INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,created_at,updated_at) VALUES (?,?,'native_dependency_release','claimed',?,?,1,?,?,?)",
+                    (claim_id, ticket_id, owner, now + lease_seconds, encoded, now, now),
+                )
+                self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_claimed", actor_id=owner, payload={"claim_id": claim_id, "stage": "native_dependency_release", "candidate_identity": identity})
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+            return None
+
+    def apply_scheduler_native_dependency_release_effect(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        now = self._now() if now is None else now
+        encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if claim is None or claim["stage"] != "native_dependency_release":
+                raise ValueError("scheduler claim is not native dependency release")
+            if claim["side_effect_started_at"] is None:
+                raise RuntimeError("scheduler claim effect was not durably started")
+            if claim["lease_owner"] != owner or claim["lease_expires_at"] is None or int(claim["lease_expires_at"]) <= now:
+                raise PermissionError("scheduler claim lease is not owned")
+            if claim["side_effect_completed_at"] is not None:
+                if claim["result_json"] != encoded:
+                    raise RuntimeError("native dependency release completed result conflicts")
+                return dict(claim)
+            identity = self._native_dependency_release_identity(conn, str(claim["ticket_id"]))
+            if json.loads(str(claim["candidate_identity_json"] or "{}")) != identity or result.get("candidate_identity") != identity:
+                raise RuntimeError("native_dependency_release_reconciliation_required: result identity drift")
+            graph = conn.execute("SELECT * FROM native_dependency_graphs WHERE ticket_id=?", (claim["ticket_id"],)).fetchone()
+            expected_parents = sorted(json.loads(str(graph["parent_external_ids_json"])))
+            if sorted(result.get("actual_parent_external_ids") or []) != expected_parents:
+                raise RuntimeError("native_dependency_release_reconciliation_required: Hermes graph diverged")
+            if str(result.get("hermes_status") or "") != "ready":
+                raise RuntimeError("native_dependency_release_reconciliation_required: Hermes did not expose child as ready")
+            existing = conn.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (claim["ticket_id"],)).fetchone()
+            values = (
+                str(identity["graph_hash"]),
+                str(identity["child_external_id"]),
+                str(identity["parent_completion_hash"]),
+                "ready",
+            )
+            if existing is not None:
+                if tuple(existing[key] for key in ("graph_hash", "child_external_id", "parent_completion_hash", "hermes_status")) != values:
+                    raise RuntimeError("native_dependency_release_reconciliation_required: release evidence conflicts")
+            else:
+                conn.execute(
+                    "INSERT INTO native_dependency_releases(ticket_id,graph_hash,child_external_id,parent_completion_hash,hermes_status,observed_at) VALUES (?,?,?,?,?,?)",
+                    (claim["ticket_id"], *values, now),
+                )
+            changed = conn.execute(
+                "UPDATE scheduler_stage_claims SET side_effect_completed_at=?,result_json=?,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_owner=? AND lease_expires_at>? AND side_effect_completed_at IS NULL",
+                (now, encoded, now, claim_id, owner, now),
+            )
+            if changed.rowcount != 1:
+                raise PermissionError("scheduler claim lease is not owned")
+            self._append_event(conn, entity_type="ticket", entity_id=str(claim["ticket_id"]), event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": "native_dependency_release", "result": result})
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
     def claim_next_scheduler_completion(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
         """Claim one accepted, durably committed candidate for local completion."""
         if not owner or lease_seconds < 1:
@@ -2892,6 +3193,7 @@ class Ledger:
                 WHERE t.state=?
                   AND json_valid(t.dependencies_json)=1
                   AND json_type(t.dependencies_json)='array'
+                  AND json_array_length(t.dependencies_json)=0
                   AND NOT EXISTS (
                     SELECT 1 FROM json_each(CASE WHEN json_valid(t.dependencies_json) THEN t.dependencies_json ELSE '[]' END) requested
                     LEFT JOIN tickets dependency ON dependency.id=requested.value
@@ -2990,6 +3292,8 @@ class Ledger:
                     raise RuntimeError("claimed readiness stage became ineligible: invalid_ticket") from exc
                 if ticket_id in dependencies:
                     raise RuntimeError("claimed readiness stage became ineligible: invalid_ticket")
+                if dependencies:
+                    raise RuntimeError("claimed readiness stage became ineligible: native_dependency_release_required")
                 unresolved: list[str] = []
                 for dependency in dependencies:
                     dep = conn.execute("SELECT state FROM tickets WHERE id=?", (dependency,)).fetchone()

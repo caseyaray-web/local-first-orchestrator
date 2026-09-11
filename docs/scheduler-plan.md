@@ -89,6 +89,15 @@ Already complete or substantially complete:
    - post-effect restart finalizes without repeating completion
    - Hermes state/evidence delivery failures retry through existing outboxes without repeating model, validation, review, acceptance, or Git work
 
+10. **Native dependency release stage — Complete for the current scheduler slice**
+   - authoritative Hermes task IDs are resolved for every active dependent and parent
+   - missing native parent→child edges are projected with Hermes `link` and exact parent-set equivalence is verified afterward
+   - unexpected/ambiguous Hermes edges stop reconciliation rather than being silently changed
+   - dependent tickets no longer enter the legacy ledger-local readiness path
+   - release eligibility requires each parent’s Local First completion plus acknowledged Hermes `done` projection
+   - Hermes `ready` is observed as the authoritative readiness result and persisted without moving the dependent to `ready_local`
+   - graph-link and release-read restart paths re-read Hermes and avoid duplicate links or a second readiness truth source
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage — Complete
@@ -212,7 +221,7 @@ Completion condition: board-write failures are independently retryable and can n
 
 **Current status:** Complete for this scheduler milestone. Completion claims only `accepted` tickets whose immutable `accepted_candidates`, completed `git_commit_intents`, `git_commit_evidence`, and attempt commit identity all agree. The completion effect deterministically materializes the existing `accepted_evidence` compatibility record, records the exact commit/evidence provenance, transitions `accepted → done`, and enqueues the existing Hermes state-projection and evidence-comment intents in the same SQLite transaction. If that transaction commits but scheduler finalization is interrupted, replay resumes from `done` and finalizes without duplicating the terminal transition or evidence. Hermes state/comment delivery then proceeds through the existing independently retryable outboxes, so remote write failures cannot repeat implementation, validation, review, acceptance, or Git integration.
 
-## 10. Native dependency release stage
+## 10. Native dependency release stage — Complete
 
 Complete the Hermes-native dependency/readiness handoff required by v2.
 
@@ -224,6 +233,8 @@ Required slices:
 - Detect graph divergence and stop instead of silently advancing inconsistent dependencies.
 
 Completion condition: task completion releases dependent work through Hermes-native dependency semantics with graph equivalence verified and no second scheduler truth source.
+
+**Current status:** Complete for this scheduler milestone. Local First now resolves each dependent ticket and declared parent to authoritative Hermes task IDs, projects missing native parent→child links through `hermes kanban link`, and persists immutable graph evidence only after `show --json` reports the exact expected parent set. Extra or ambiguous native parents fail closed. Dependent tickets are excluded from the legacy scheduler-local readiness claimant. After every parent reaches Local First `done` and that `done` projection is acknowledged by Hermes, a separate release claim revalidates the stored graph and completion lineage, re-reads Hermes, requires Hermes itself to expose the child as `ready`, and persists immutable release evidence without transitioning the child to `ready_local`. Restart after a partially observed/link-applied graph or started release claim re-reads Hermes and resumes without duplicate links. This completes scheduler ownership of native graph projection/release; live operational proof against a real Hermes board remains tracked separately.
 
 ## 11. Tranche integration and checkpoint stage
 

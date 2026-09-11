@@ -207,6 +207,59 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     if completion is not None:
         return ProcessNextPreview(next_stage="completion", ticket_id=str(completion["id"]), would_execute=True)
 
+    native_graph_replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage='native_dependency_graph' AND status='claimed' "
+        "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+    ).fetchone()
+    if native_graph_replay is not None:
+        return ProcessNextPreview(next_stage="native_dependency_graph", ticket_id=str(native_graph_replay["ticket_id"]), would_execute=True, would_write_board=True)
+    native_graph = ledger.connection.execute("""
+        SELECT t.id FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id
+        WHERE t.state='draft'
+          AND json_valid(t.dependencies_json)=1
+          AND json_type(t.dependencies_json)='array'
+          AND json_array_length(t.dependencies_json)>0
+          AND (t.external_id IS NOT NULL OR EXISTS (
+              SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=t.id AND b.operation='create_microticket'
+                AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL))
+          AND NOT EXISTS (
+              SELECT 1 FROM json_each(t.dependencies_json) requested
+              LEFT JOIN tickets dependency ON dependency.id=requested.value
+              WHERE dependency.id IS NULL OR (
+                  dependency.external_id IS NULL AND NOT EXISTS (
+                      SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=dependency.id AND b.operation='create_microticket'
+                        AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL)))
+          AND NOT EXISTS (SELECT 1 FROM native_dependency_graphs g WHERE g.ticket_id=t.id)
+          AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage='native_dependency_graph')
+        ORDER BY t.created_at,t.id LIMIT 1
+    """).fetchone()
+    if native_graph is not None:
+        return ProcessNextPreview(next_stage="native_dependency_graph", ticket_id=str(native_graph["id"]), would_execute=True, would_write_board=True)
+
+    native_release_replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage='native_dependency_release' AND status='claimed' "
+        "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+    ).fetchone()
+    if native_release_replay is not None:
+        return ProcessNextPreview(next_stage="native_dependency_release", ticket_id=str(native_release_replay["ticket_id"]), would_execute=True)
+    native_release = ledger.connection.execute("""
+        SELECT t.id FROM tickets t JOIN native_dependency_graphs g ON g.ticket_id=t.id
+        WHERE t.state='draft'
+          AND NOT EXISTS (SELECT 1 FROM native_dependency_releases r WHERE r.ticket_id=t.id)
+          AND NOT EXISTS (
+              SELECT 1 FROM json_each(g.local_dependency_ids_json) requested
+              LEFT JOIN tickets dependency ON dependency.id=requested.value
+              LEFT JOIN accepted_evidence evidence ON evidence.ticket_id=dependency.id
+              WHERE dependency.id IS NULL OR dependency.state!='done' OR evidence.ticket_id IS NULL OR NOT EXISTS (
+                  SELECT 1 FROM events e JOIN board_projection_outbox b ON b.ticket_id=e.entity_id AND b.event_id=e.id
+                  WHERE e.entity_type='ticket' AND e.entity_id=dependency.id AND e.event_type='state_transition' AND e.to_state='done'
+                    AND b.operation='set_state' AND b.acknowledged_at IS NOT NULL))
+          AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage='native_dependency_release')
+        ORDER BY t.created_at,t.id LIMIT 1
+    """).fetchone()
+    if native_release is not None:
+        return ProcessNextPreview(next_stage="native_dependency_release", ticket_id=str(native_release["id"]), would_execute=True)
+
     implementation_replay = ledger.connection.execute(
         "SELECT ticket_id FROM scheduler_stage_claims WHERE (stage='implementation' OR stage LIKE 'implementation:%') AND status='claimed' "
         "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
@@ -233,6 +286,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     readiness = ledger.connection.execute("""
         SELECT t.id FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id
         WHERE t.state=? AND json_valid(t.dependencies_json)=1 AND json_type(t.dependencies_json)='array'
+          AND json_array_length(t.dependencies_json)=0
           AND NOT EXISTS (
             SELECT 1 FROM json_each(CASE WHEN json_valid(t.dependencies_json) THEN t.dependencies_json ELSE '[]' END) requested
             LEFT JOIN tickets dependency ON dependency.id=requested.value
@@ -544,6 +598,85 @@ class ProcessNextScheduler:
                 claim_id, execution_owner, completion_result, now=now
             )
             return ProcessNextResult("completed", "completion", ticket_id, claim_id)
+
+        if hasattr(self.board, "get_task") and hasattr(self.board, "link_dependency"):
+            graph_claim = self.ledger.claim_next_scheduler_native_dependency_graph(
+                execution_owner, lease_seconds=self.lease_seconds, now=now
+            )
+            if graph_claim is not None:
+                claim_id = str(graph_claim["claim_id"])
+                ticket_id = str(graph_claim["ticket_id"])
+                current = self.ledger.scheduler_claim(claim_id)
+                if current.get("side_effect_completed_at") is not None and current.get("result_json"):
+                    graph_result = json.loads(str(current["result_json"]))
+                else:
+                    if current.get("side_effect_started_at") is None:
+                        self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+                    identity = json.loads(str(current["candidate_identity_json"]))
+                    child_external_id = str(identity["child_external_id"])
+                    expected_parents = sorted(str(row["external_task_id"]) for row in identity["parents"])
+                    task = self.board.get_task(child_external_id)
+                    actual_parents = sorted(set(getattr(task, "parents", ())))
+                    extras = sorted(set(actual_parents) - set(expected_parents))
+                    if extras:
+                        raise RuntimeError("native_dependency_graph_reconciliation_required: Hermes graph has unexpected parents")
+                    for parent_external_id in sorted(set(expected_parents) - set(actual_parents)):
+                        self.board.link_dependency(parent_external_id, child_external_id)
+                    task = self.board.get_task(child_external_id)
+                    actual_parents = sorted(set(getattr(task, "parents", ())))
+                    if actual_parents != expected_parents:
+                        raise RuntimeError("native_dependency_graph_reconciliation_required: Hermes graph did not converge")
+                    graph_result = {
+                        "ticket_id": ticket_id,
+                        "candidate_identity": identity,
+                        "actual_parent_external_ids": actual_parents,
+                        "hermes_status": str(getattr(task, "status", "")),
+                    }
+                    current = self.ledger.apply_scheduler_native_dependency_graph_effect(
+                        claim_id, execution_owner, graph_result, now=now
+                    )
+                    graph_result = json.loads(str(current["result_json"]))
+                self.ledger.complete_scheduler_claim(
+                    claim_id, execution_owner, graph_result, now=now
+                )
+                return ProcessNextResult("completed", "native_dependency_graph", ticket_id, claim_id)
+
+            release_claim = self.ledger.claim_next_scheduler_native_dependency_release(
+                execution_owner, lease_seconds=self.lease_seconds, now=now
+            )
+            if release_claim is not None:
+                claim_id = str(release_claim["claim_id"])
+                ticket_id = str(release_claim["ticket_id"])
+                current = self.ledger.scheduler_claim(claim_id)
+                if current.get("side_effect_completed_at") is not None and current.get("result_json"):
+                    release_result = json.loads(str(current["result_json"]))
+                else:
+                    if current.get("side_effect_started_at") is None:
+                        self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+                    identity = json.loads(str(current["candidate_identity_json"]))
+                    graph = self.ledger.native_dependency_graph(ticket_id)
+                    expected_parents = sorted(json.loads(str(graph["parent_external_ids_json"])))
+                    task = self.board.get_task(str(identity["child_external_id"]))
+                    actual_parents = sorted(set(getattr(task, "parents", ())))
+                    if actual_parents != expected_parents:
+                        raise RuntimeError("native_dependency_release_reconciliation_required: Hermes graph diverged")
+                    hermes_status = str(getattr(task, "status", ""))
+                    if hermes_status != "ready":
+                        raise RuntimeError("native_dependency_release_reconciliation_required: Hermes did not expose child as ready")
+                    release_result = {
+                        "ticket_id": ticket_id,
+                        "candidate_identity": identity,
+                        "actual_parent_external_ids": actual_parents,
+                        "hermes_status": hermes_status,
+                    }
+                    current = self.ledger.apply_scheduler_native_dependency_release_effect(
+                        claim_id, execution_owner, release_result, now=now
+                    )
+                    release_result = json.loads(str(current["result_json"]))
+                self.ledger.complete_scheduler_claim(
+                    claim_id, execution_owner, release_result, now=now
+                )
+                return ProcessNextResult("completed", "native_dependency_release", ticket_id, claim_id)
 
         if self.implementation_runner is not None:
             implementation_claim = self.ledger.claim_next_scheduler_implementation(

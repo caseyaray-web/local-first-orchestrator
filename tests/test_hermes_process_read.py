@@ -41,4 +41,16 @@ class ProcessReadTests(unittest.TestCase):
  def test_create_fails_closed(self):
   a=HermesBoardAdapter(executable=str(self.exe),board='board',allow_writes=True,runner=lambda *_,**__:subprocess.CompletedProcess((),0,'{}',''))
   with self.assertRaises(RuntimeError):a.create_microticket('x','b',idempotency_key='K')
+ def test_native_graph_read_and_link_contract(self):
+  calls=[]
+  def runner(argv,**kwargs):
+   calls.append(list(argv))
+   if argv[-1]=='--json':
+    return subprocess.CompletedProcess(argv,0,json.dumps({'task':{'id':'child','title':'c','body':'','status':'todo','workspace_path':None},'parents':['parent-b','parent-a'],'children':['leaf']}),'')
+   return subprocess.CompletedProcess(argv,0,'Linked parent-a -> child\n','')
+  a=HermesBoardAdapter(executable=str(self.exe),board='board',allow_writes=True,runner=runner)
+  task=a.get_task('child')
+  self.assertEqual(task.parents,('parent-a','parent-b'));self.assertEqual(task.children,('leaf',))
+  a.link_dependency('parent-a','child')
+  self.assertIn([str(self.exe),'kanban','--board','board','link','parent-a','child'],calls)
 if __name__=='__main__':unittest.main()

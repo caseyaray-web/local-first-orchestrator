@@ -18,6 +18,8 @@ class ExternalTicket:
     body: str
     status: str
     workspace_path: str | None
+    parents: tuple[str, ...] = ()
+    children: tuple[str, ...] = ()
 
 
 class HermesBoardAdapter:
@@ -46,7 +48,21 @@ class HermesBoardAdapter:
         row = payload.get("task") if isinstance(payload, dict) else None
         if not isinstance(row, dict):
             raise KeyError(f"Hermes task not found: {task_id}")
-        return ExternalTicket(str(row["id"]), str(row.get("title") or ""), str(row.get("body") or ""), str(row.get("status") or ""), row.get("workspace_path"))
+        parents = payload.get("parents", []) if isinstance(payload, dict) else []
+        children = payload.get("children", []) if isinstance(payload, dict) else []
+        if not isinstance(parents, list) or not all(isinstance(value, str) and value for value in parents):
+            raise RuntimeError("Hermes Kanban malformed parent graph")
+        if not isinstance(children, list) or not all(isinstance(value, str) and value for value in children):
+            raise RuntimeError("Hermes Kanban malformed child graph")
+        return ExternalTicket(
+            str(row["id"]),
+            str(row.get("title") or ""),
+            str(row.get("body") or ""),
+            str(row.get("status") or ""),
+            row.get("workspace_path"),
+            tuple(sorted(set(parents))),
+            tuple(sorted(set(children))),
+        )
 
     def import_candidates(self) -> list[ExternalTicket]:
         rows = self._run("list", "--json", "--status", "scheduled")
@@ -85,6 +101,13 @@ class HermesBoardAdapter:
         if not isinstance(payload, dict) or not isinstance(payload.get("id"), str) or not payload["id"]:
             raise RuntimeError("Hermes create JSON missing task id")
         return payload["id"]
+
+    def link_dependency(self, parent_task_id: str, child_task_id: str) -> None:
+        if not self.allow_writes:
+            raise PermissionError("real board writes require --allow-board-writes")
+        if not parent_task_id or not child_task_id or parent_task_id == child_task_id:
+            raise ValueError("valid distinct dependency task ids required")
+        self._run("link", parent_task_id, child_task_id)
 
     def add_comment(self, ticket_id: str, comment: str) -> None:
         if not self.allow_writes:
