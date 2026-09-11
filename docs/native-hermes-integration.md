@@ -1,5 +1,18 @@
 # Native Hermes integration
 
+## Current project status — 2026-09-11
+
+Native plugin discovery, registered operator configuration, real Hermes board reads/writes, retry-safe state/comment projection, comment-marker reconciliation, native dependency links/readiness semantics, the restartable scheduler, observability, and the daemon are implemented. Milestone 20 drove a representative real Local First-owned feature through implementation, deterministic validation, independent review, acceptance, Git commit, Local First completion, and Hermes `done`; it also proved one live ambiguous external-effect restart without duplicate comment delivery.
+
+The native-integration work that remains is narrower than the original bootstrap scope:
+
+1. **Hermes-dispatched execution reconciliation (next):** detect dispatcher/worker runs, bind them to Local First ticket attempts and provenance, ingest their execution result safely, and require Local First validation/review before dependency advancement.
+2. **Full scheduler-generated tranche graph proof:** exercise generated cards plus exact native dependency projection/release across a real active tranche and successor activation.
+3. **Broader live operational proof:** exhaustively crash/restart real external boundaries and exercise the paid checkpoint/escalation route against a live paid provider.
+
+The historical installation/dashboard notes below remain valid where they describe Hermes plugin mechanics; `docs/design-v2.md` is authoritative for current full-project status.
+
+
 ## Implemented surface
 
 This repository is itself the Hermes user-plugin directory.  Native discovery

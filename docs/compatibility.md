@@ -1,5 +1,17 @@
 # Hermes Kanban compatibility plan — Phase 0
 
+> **Status note — 2026-09-11:** This file is the historical Phase-0 discovery/compatibility baseline, not the current implementation status. The architecture intentionally preserves the findings below, but many statements phrased as “future”, “later”, or “Phase 1” have since been implemented. Current status is tracked in `docs/design-v2.md`, the completed scheduler roadmap in `docs/scheduler-plan.md`, and real integration evidence in `docs/milestone-20-real-acceptance.md`.
+
+### Current disposition of the original compatibility risks
+
+- The separate Local First ledger remains authoritative for fine-grained lifecycle/provenance; Hermes remains the user-facing board.
+- A real `HermesBoardAdapter`, retry-safe board/comment outboxes, live state/comment completion projection, native dependency links, and marker-based comment reconciliation are implemented and were exercised against a real Hermes board in Milestone 20.
+- Isolated Git worktrees, base/diff provenance, dirty-tree refusal, deterministic validation, a real local implementation-model path, an independent review worker, paid-call governance, and the restartable scheduler/daemon now exist.
+- Bounded triage/decomposition and idempotent generated-card projection are implemented; existing Hermes auto-decomposition remains outside controller ownership.
+- The principal unresolved compatibility boundary is now Hermes-dispatched execution reconciliation: ordinary dispatcher-owned Hermes worker runs still need to be bound back into Local First attempts/provenance and forced through Local First deterministic validation/review before graph advancement.
+- Broader remaining operational proof includes a full scheduler-generated native tranche graph, exhaustive live external-boundary crash injection, and live paid-provider checkpoint/escalation operation.
+
+
 ## Inspected runtime and entry points
 
 This package is intentionally separate from `/home/ocadmin/.hermes/hermes-agent` and does not import it. The inventory below is based on the current source inspected on 2026-08-27.

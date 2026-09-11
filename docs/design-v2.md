@@ -2683,15 +2683,15 @@ Architecture packets, tranches, snapshot-bound activation, and checkpoint concep
 
 **Completion condition:** a multi-ticket tranche completes, integrates, validates against the expected repository state, checkpoints correctly, and activates the next tranche without bypassing trust policy.
 
-### 15. Same-ticket repair machinery — **Partial**
+### 15. Same-ticket repair machinery — **Partial (runtime path live-proven; failure-driven repair live proof pending)**
 
-Bounded repair logic, failure fingerprints, and same-ticket retry behavior are implemented structurally and covered by tests. It remains partial only because the real implementation/review/runtime path has not yet been proven end-to-end.
+Bounded repair logic, failure fingerprints, same-ticket retry continuity, retry limits, and repeated-failure routing are implemented and covered by deterministic scheduler/restart tests. Milestone 20 removed the earlier uncertainty about whether the implementation/review/runtime stack itself works under real configured integrations: the real local implementation model, deterministic validator, independent review worker, acceptance, Git, daemon restart, and Hermes projection path all completed successfully. What remains for this item is narrower and explicit: deliberately produce a real deterministic implementation or validation failure, prove a bounded same-ticket repair attempt preserves prior-attempt provenance, and demonstrate limit exhaustion routing once into triage/escalation without duplicate work.
 
 **Completion condition:** real deterministic failures trigger bounded same-ticket repair, preserve attempt history, stop at configured limits, and route repeated failure exactly once to triage/escalation.
 
-### 16. Fresh independent review contracts — **Partial**
+### 16. Fresh independent review contracts — **Complete for representative live review**
 
-The strict review schema, criterion mapping, blocking/nonblocking finding distinction, and fresh-review worker boundary are implemented. Operational independence still needs live proof.
+The strict review schema, criterion mapping, blocking/nonblocking finding distinction, fresh-review worker boundary, and operational independence are implemented and live-proven. Milestone 20 identified and fixed the remaining profile-root coupling before acceptance: registered review execution now receives a distinct `review_hermes_home`. A standalone tool-free review worker then ran under a separate review profile/process with `openai-codex` / `gpt-5.6-terra`, consumed the frozen review packet, emitted valid closed-schema output with verdict `pass`, produced durable review evidence, and drove acceptance without inheriting the implementation profile home or tool loop.
 
 **Completion condition:** real review execution is demonstrably fresh, independent, schema-valid, and authoritative only within the criterion/finding rules defined by this design.
 
@@ -2738,18 +2738,18 @@ Using the original implementation-phase grouping represented in the repository t
 | Phase | Current estimate |
 |---|---|
 | Phase 0 — Discovery and compatibility | **Complete** |
-| Phase 1 — Ledger and deterministic controller | **Partial** |
-| Phase 2 — Local implementation and validation | **Partial** |
-| Phase 3 — Local review and same-ticket repair | **Partial** |
-| Phase 4 — Bounded triage | **Partial overall; core policy mechanisms complete** |
-| Phase 5 — Architecture/checkpoint and paid governor | **Partial** |
-| Phase 6 — Symbol-aware context and metrics | **Partial** |
+| Phase 1 — Ledger and deterministic controller | **Complete for scheduler-owned lifecycle; broader operator/product integration still partial** |
+| Phase 2 — Local implementation and validation | **Complete for representative bounded live execution** |
+| Phase 3 — Local review and same-ticket repair | **Partial overall; independent live review complete, failure-driven repair live proof pending** |
+| Phase 4 — Bounded triage | **Partial overall; core policy mechanisms complete, real failure-triggered triage proof pending** |
+| Phase 5 — Architecture/checkpoint and paid governor | **Partial; scheduler/governor complete, full tranche and live paid-provider proof pending** |
+| Phase 6 — Symbol-aware context and metrics | **Partial; bounded context complete, production feedback loop pending** |
 | Hermes-native v2 execution/projection additions | **Partial overall; scheduler/daemon/representative live acceptance complete, Hermes-dispatched execution reconciliation and live paid-provider proof remain open** |
 
 ## Current overall assessment
 
 The repository is no longer in an early implementation phase. Most safety-critical primitives are present: durable state, isolated attempts, deterministic validation, bounded repair and triage, structured review, architecture contracts, context budgeting, paid-call governance, and retry-safe projection machinery.
 
-The dependency-ordered scheduler, daemon, and representative real low-risk Local First-owned acceptance path are now complete. The main unfinished work is concentrated in broader operational integration: Hermes-dispatched worker reconciliation into Local First attempts, a full scheduler-generated native tranche graph exercise, exhaustive live external-boundary crash injection, live paid-provider checkpoint/escalation operation, and the remaining operator/metrics/productization items.
+The dependency-ordered scheduler, daemon, and representative real low-risk Local First-owned acceptance path are now complete. The main unfinished work is concentrated in broader operational integration. The next dependency in the full v2 plan is **Hermes execution reconciliation**: dispatcher-owned Hermes worker runs must be detected, bound to the correct Local First attempt and provenance, and forced back through deterministic Local First validation/review before dependency advancement. After that, the remaining major proof sequence is a full scheduler-generated native tranche graph exercise, exhaustive live external-boundary crash injection, live paid-provider checkpoint/escalation operation, then the remaining operator/metrics/productization work.
 
-The scheduler roadmap is **acceptance-complete for the representative low-risk Local First-owned path** demonstrated in Milestone 20. The broader v2 design remains substantially implemented but not fully operationally complete until the separate Hermes-dispatched execution, live paid-provider, exhaustive external crash, and remaining operator/metrics items are demonstrated.
+The scheduler roadmap is **acceptance-complete for the representative low-risk Local First-owned path** demonstrated in Milestone 20. The broader v2 design remains substantially implemented but not fully operationally complete until Hermes-dispatched execution reconciliation, full-tranche live proof, live paid-provider proof, exhaustive external crash proof, and the remaining operator/metrics items are demonstrated.

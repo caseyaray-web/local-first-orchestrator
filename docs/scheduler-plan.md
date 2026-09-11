@@ -560,3 +560,18 @@ The intended implementation sequence is:
 `foundation → implementation → validation → review → repair routing → triage → acceptance → Git integration → completion projection → dependency release → tranche/checkpoint → paid stages → next-tranche activation → reconciliation hardening → deterministic ordering → concurrency proof → crash matrix → observability → daemon → real E2E acceptance`
 
 All twenty dependency-ordered scheduler milestones are complete for the representative v2 Local First scheduler acceptance scope. See `docs/milestone-20-real-acceptance.md` for the live integration evidence and the broader design items that remain intentionally separate.
+
+## Post-scheduler roadmap status and next full-plan work
+
+The twenty dependency-ordered scheduler milestones are complete for the representative Local First-owned low-risk path. Milestone 20 proved the scheduler/daemon against a real Hermes board, real configured local implementation model, independent review profile/model process, isolated Git worktree/commit flow, deterministic validation, live dependency semantics, and a real ambiguous comment-delivery crash/restart boundary. This document therefore no longer has a scheduler milestone 21.
+
+The next work comes from the broader v2 design, in this order:
+
+1. **Hermes execution reconciliation.** Detect ordinary Hermes dispatcher/worker runs, bind each run to the correct Local First ticket/attempt and execution provenance, reconcile resulting worktree/artifact/diff state into the ledger, and require deterministic Local First validation/review before graph advancement. This is the immediate next project.
+2. **Full scheduler-generated native tranche graph proof.** Exercise a real multi-ticket active tranche created/projected by Local First, verify exact native dependency equivalence, integrate the tranche, checkpoint it, and activate the successor tranche.
+3. **Exhaustive live external-boundary crash proof.** Extend the scheduler-wide crash matrix from deterministic/fake-runtime proof plus the Milestone 20 live comment crash to real model, review, Git, board, dependency, checkpoint, and paid boundaries.
+4. **Live paid checkpoint/escalation integration.** Demonstrate reservation-before-call, budget pause/approval, completed-call replay, escalation chaining, and unknown-outcome no-repeat against a real paid provider.
+5. **Operator lifecycle/recovery UX.** Consolidate initialization, inspect/status, pause/resume, retry/reject/reconcile, paid approval, daemon lifecycle, and diagnostics into a coherent documented operator surface.
+6. **Runtime metrics and adaptive sizing.** Persist real-run performance/outcome measurements and use them to adjust ticket/context sizing within explicit policy bounds.
+
+The authoritative implementation-status detail for these broader items remains `docs/design-v2.md`; the live scheduler acceptance evidence is `docs/milestone-20-real-acceptance.md`.
