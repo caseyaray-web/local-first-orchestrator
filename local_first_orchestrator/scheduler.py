@@ -5,12 +5,13 @@ import uuid
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Callable
 
 from .comment_delivery import CommentDeliveryWorker
 from .generated_projection import GeneratedProjectionWorker
 from .ledger import Ledger
+from .paid_model import PaidInvocationError
+from .reconciliation import ReconciliationAction
 from .state_projection import StateProjectionWorker
 
 
@@ -20,6 +21,7 @@ class ProcessNextResult:
     stage: str | None = None
     ticket_id: str | None = None
     claim_id: str | None = None
+    reconciliation_action: str | None = None
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,8 @@ class ProcessNextPreview:
     ticket_id: str | None = None
     would_execute: bool = False
     would_write_board: bool = False
+    claim_id: str | None = None
+    reconciliation_action: str | None = None
 
 
 def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPreview:
@@ -40,6 +44,15 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     tick = ledger.connection.execute("SELECT lease_expires_at FROM scheduler_tick_lease WHERE id=1").fetchone()
     if tick is not None and int(tick["lease_expires_at"]) > now:
         return ProcessNextPreview(next_stage="busy")
+
+    reconciliation = ledger.next_scheduler_reconciliation(now=now) if hasattr(ledger, "next_scheduler_reconciliation") else None
+    if reconciliation is not None and reconciliation.action == ReconciliationAction.STOP:
+        return ProcessNextPreview(
+            next_stage="reconciliation_required",
+            ticket_id=reconciliation.ticket_id,
+            claim_id=reconciliation.claim_id,
+            reconciliation_action=reconciliation.action.value,
+        )
 
     state = ledger.connection.execute(
         "SELECT ticket_id,event_id FROM board_projection_outbox WHERE operation='set_state' AND acknowledged_at IS NULL "
@@ -424,7 +437,9 @@ def preview_database(database: Path, *, now: int | None = None) -> ProcessNextPr
     try:
         connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
-        return preview_next(SimpleNamespace(connection=connection), now=now)  # type: ignore[arg-type]
+        readonly_ledger = object.__new__(Ledger)
+        readonly_ledger.connection = connection
+        return preview_next(readonly_ledger, now=now)
     except sqlite3.DatabaseError:
         return ProcessNextPreview(next_stage="no_work")
     finally:
@@ -507,6 +522,18 @@ class ProcessNextScheduler:
             self.ledger.release_scheduler_tick(self.worker_id, lease_token)
 
     def _process_claimed_tick(self, now: int, execution_owner: str) -> ProcessNextResult:
+        reconciliation = self.ledger.next_scheduler_reconciliation(now=now)
+        if reconciliation is not None and reconciliation.action == ReconciliationAction.STOP:
+            family = self.ledger._scheduler_stage_family(reconciliation.stage)
+            if family in {"paid_checkpoint", "paid_escalation"}:
+                raise PaidInvocationError(f"paid invocation unknown or terminal outcome requires reconciliation: {reconciliation.reason}")
+            prefix = {
+                "implementation": "execution_reconciliation_required",
+                "review": "review_reconciliation_required",
+                "triage": "triage_reconciliation_required",
+            }.get(family, f"{family}_reconciliation_required")
+            raise RuntimeError(f"{prefix}: {reconciliation.reason}")
+
         state = StateProjectionWorker(
             self.ledger, self.board, worker_id=execution_owner, lease_seconds=self.lease_seconds
         ).deliver_one(now=now)

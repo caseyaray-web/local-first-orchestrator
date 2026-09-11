@@ -132,6 +132,17 @@ Already complete or substantially complete:
    - immutable activation evidence freezes successor ticket IDs, Hermes task IDs, dependency graph hashes, and the re-snapshot identity
    - partial card/link projection recovers through the existing idempotent generated-projection/native-graph stages without duplicate cards or links
 
+14. **Scheduler-wide reconciliation model — Complete for the current scheduler slice**
+   - reconciliation is derived from existing durable claims/evidence rather than stored as a second scheduler state machine
+   - every scheduler claim is classified as not started, external outcome unknown, external effect completed/local incomplete, local completion/downstream incomplete, or fully finalized
+   - each classification produces one explicit action: `retry`, `replay`, `reconcile`, `resume`, or `stop`
+   - model invocations, paid reservations, Git intent/evidence, checkpoint/materialization evidence, scheduler effect timestamps, and existing outboxes remain authoritative
+   - ambiguous or terminal model/paid outcomes classify as `stop` and preserve the existing stage-specific reconciliation errors rather than silently retrying
+   - Git with a durable intent replays exact reconciliation; Git without an intent safely replays pre-mutation verification
+   - completed stage effects classify as `reconcile` so finalization can occur without repeating the external effect
+   - finalized stages with pending board/comment outboxes classify as downstream-incomplete `resume`
+   - live `process-next` and read-only dry-run consult the same reconciliation classifier before normal stage work
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage — Complete
@@ -320,7 +331,7 @@ Completion condition: the next tranche is activated exactly once against the exp
 
 **Current status:** Complete for this scheduler milestone. Activation is implemented as two bounded scheduler phases so no scheduler lease is held across Hermes projection. `next_tranche_materialize` is eligible only when the predecessor has immutable deterministic checkpoint evidence and an effective paid approval: a direct checkpoint `approve`, or an escalation-purpose `approve` following checkpoint `escalate`. The claim binds predecessor/successor ordinals, checkpoint/completion hashes, approval model-call provenance, final integration SHA, and repository identity. The registered standard decomposition route then invokes the existing `PlanningCoordinator.materialize_next_tranche(...)`, which re-snapshots and re-plans the successor at the predecessor's final integration SHA. The underlying ledger handoff still atomically completes the predecessor, activates exactly the next ordinal, creates the successor tickets, and queues idempotent generated-card projections. During this milestone a pre-existing bug was corrected so successor generated-card contracts now use the newly validated successor plan's repository/base/snapshot provenance instead of the original decomposition snapshot. Immutable materialization evidence freezes that re-snapshot hash and exact successor ticket set. If the process dies after the handoff transaction but before scheduler effect persistence, replay recognizes the completed-predecessor/active-successor state and the coordinator returns `already_materialized` without invoking the planner again. `next_tranche_activation` is a separate ledger-only verification phase and is not claimable until every successor card is acknowledged with an external Hermes task ID and every dependent successor ticket has immutable native dependency-graph evidence matching its Local First dependency contract and Hermes parent IDs. Only then is immutable activation evidence written for the exact successor ticket IDs, external task IDs, graph hashes, and snapshot identity. Existing generated-card and native-graph retry semantics handle partial projection without duplicate cards or links.
 
-## 14. Scheduler-wide reconciliation model
+## 14. Scheduler-wide reconciliation model — Complete
 
 Unify recovery semantics across all scheduler stages without creating a second state machine.
 
@@ -340,6 +351,8 @@ Required work:
 - Ensure terminal external failures do not silently become automatic retries.
 
 Completion condition: after process death at any supported boundary, the next scheduler invocation can deterministically decide the safe next action from durable state.
+
+**Current status:** Complete for this scheduler milestone. A shared derived reconciliation model now classifies durable scheduler claims into the five required states and returns one of `resume`, `replay`, `reconcile`, `retry`, or `stop`. The classifier does not persist a parallel recovery state: it reads the existing scheduler claim lifecycle plus the authoritative evidence already owned by each subsystem. Model-backed stages inspect durable `model_invocations`; paid stages inspect purpose/request-key-bound `paid_reservations`; Git integration inspects `git_commit_intents` and append-only commit evidence; native dependency, tranche checkpoint, and next-tranche stages inspect their existing immutable evidence; deterministic/local stages safely replay from their frozen claim identity; and completed claims inspect the existing board/comment outboxes for downstream projection work. A `stop` decision is applied before normal scheduler work and retains the established stage-specific reconciliation errors so ambiguous or terminal external outcomes cannot become automatic retries. Exact-recovery and deterministic stages continue into their existing replay/reconcile handlers. Read-only `preview_database()` now uses the same classifier through a read-only Ledger shell, so dry-run and live execution derive the same recovery decision without migrations or writes.
 
 ## 15. Scheduler-wide ordering policy
 

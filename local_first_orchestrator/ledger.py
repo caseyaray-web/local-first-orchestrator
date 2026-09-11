@@ -1587,6 +1587,160 @@ class Ledger:
             raise KeyError(claim_id)
         return dict(row)
 
+    @staticmethod
+    def _scheduler_stage_family(stage: str) -> str:
+        for prefix in ("implementation", "validation", "review", "repair_routing", "triage", "acceptance", "git_integration", "completion"):
+            if stage == prefix or stage.startswith(prefix + ":"):
+                return prefix
+        return stage
+
+    def scheduler_reconciliation(self, claim_id: str):
+        from .reconciliation import ReconciliationAction, ReconciliationState, SchedulerReconciliationDecision
+
+        claim = self.connection.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+        if claim is None:
+            raise KeyError(claim_id)
+        stage = str(claim["stage"])
+        family = self._scheduler_stage_family(stage)
+        ticket_id = str(claim["ticket_id"])
+        evidence: dict[str, Any] = {}
+
+        pending_projection = self.connection.execute(
+            """
+            SELECT
+              EXISTS(SELECT 1 FROM board_projection_outbox WHERE ticket_id=? AND acknowledged_at IS NULL AND superseded_at IS NULL) AS board_pending,
+              EXISTS(SELECT 1 FROM evidence_comment_outbox WHERE ticket_id=? AND status NOT IN ('delivered','reconciled_delivered')) AS comment_pending
+            """,
+            (ticket_id, ticket_id),
+        ).fetchone()
+
+        if claim["status"] == "completed":
+            if pending_projection and (int(pending_projection["board_pending"]) or int(pending_projection["comment_pending"])):
+                return SchedulerReconciliationDecision(
+                    claim_id, ticket_id, stage,
+                    ReconciliationState.LOCAL_STAGE_COMPLETION_RECORDED_DOWNSTREAM_INCOMPLETE,
+                    ReconciliationAction.RESUME,
+                    "outbox",
+                    "local stage is finalized; downstream projection remains durable and independently retryable",
+                    {"board_pending": bool(pending_projection["board_pending"]), "comment_pending": bool(pending_projection["comment_pending"])},
+                )
+            return SchedulerReconciliationDecision(
+                claim_id, ticket_id, stage,
+                ReconciliationState.FULLY_FINALIZED,
+                ReconciliationAction.RESUME,
+                "scheduler_stage_claims",
+                "scheduler claim is fully finalized",
+                {},
+            )
+
+        if claim["side_effect_completed_at"] is not None:
+            return SchedulerReconciliationDecision(
+                claim_id, ticket_id, stage,
+                ReconciliationState.EXTERNAL_EFFECT_COMPLETED_LOCAL_INCOMPLETE,
+                ReconciliationAction.RECONCILE,
+                "scheduler_stage_claims",
+                "stage effect is durably completed but scheduler finalization is incomplete",
+                {"result_json": claim["result_json"]},
+            )
+
+        if claim["side_effect_started_at"] is None:
+            return SchedulerReconciliationDecision(
+                claim_id, ticket_id, stage,
+                ReconciliationState.NOT_STARTED,
+                ReconciliationAction.RETRY,
+                "scheduler_stage_claims",
+                "claim exists but no side effect was durably started",
+                {},
+            )
+
+        identity = {}
+        if claim["candidate_identity_json"]:
+            try:
+                identity = json.loads(str(claim["candidate_identity_json"]))
+            except json.JSONDecodeError:
+                return SchedulerReconciliationDecision(
+                    claim_id, ticket_id, stage,
+                    ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN,
+                    ReconciliationAction.STOP,
+                    "scheduler_stage_claims",
+                    "claim identity is malformed and cannot be reconciled automatically",
+                    {},
+                )
+
+        if family in {"implementation", "review", "triage"}:
+            attempt = identity.get("attempt_number")
+            if isinstance(attempt, int):
+                invocation = self.connection.execute(
+                    "SELECT * FROM model_invocations WHERE ticket_id=? AND attempt_number=? AND stage=? ORDER BY started_at DESC,invocation_id DESC LIMIT 1",
+                    (ticket_id, attempt, family),
+                ).fetchone()
+            else:
+                invocation = self.connection.execute(
+                    "SELECT * FROM model_invocations WHERE ticket_id=? AND stage=? ORDER BY started_at DESC,invocation_id DESC LIMIT 1",
+                    (ticket_id, family),
+                ).fetchone()
+            if invocation is not None:
+                evidence = {"invocation_id": str(invocation["invocation_id"]), "status": str(invocation["status"])}
+                if invocation["status"] == "completed":
+                    return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.EXTERNAL_EFFECT_COMPLETED_LOCAL_INCOMPLETE, ReconciliationAction.RECONCILE, "model_invocations", "model invocation completed; reconcile durable artifact/result into the scheduler stage", evidence)
+                if invocation["status"] == "started":
+                    return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN, ReconciliationAction.STOP, "model_invocations", "model invocation outcome is unknown; automatic retry would risk duplicate inference", evidence)
+                return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN, ReconciliationAction.STOP, "model_invocations", "model invocation ended terminally and requires explicit recovery policy", evidence)
+
+        if family in {"paid_checkpoint", "paid_escalation"}:
+            reservation = self.connection.execute("SELECT * FROM paid_reservations WHERE request_key=? ORDER BY created_at DESC LIMIT 1", (claim_id,)).fetchone()
+            if reservation is not None:
+                evidence = {"reservation_id": str(reservation["id"]), "status": str(reservation["status"])}
+                if reservation["status"] == "completed":
+                    return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.EXTERNAL_EFFECT_COMPLETED_LOCAL_INCOMPLETE, ReconciliationAction.RECONCILE, "paid_reservations", "paid reservation completed; reconcile the durable model-call response without provider reinvocation", evidence)
+                if reservation["status"] in {"unknown_outcome", "in_flight"}:
+                    return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN, ReconciliationAction.STOP, "paid_reservations", "paid provider outcome is ambiguous; automatic retry is forbidden", evidence)
+                return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN, ReconciliationAction.STOP, "paid_reservations", "paid reservation is terminal and requires a new explicitly authorized request", evidence)
+            return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.NOT_STARTED, ReconciliationAction.RETRY, "paid_reservations", "no paid reservation exists, so no provider side effect was authorized", {})
+
+        if family == "git_integration":
+            commit = self.connection.execute("SELECT * FROM git_commit_evidence WHERE ticket_id=?", (ticket_id,)).fetchone()
+            intent = self.connection.execute("SELECT * FROM git_commit_intents WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if commit is not None:
+                return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.EXTERNAL_EFFECT_COMPLETED_LOCAL_INCOMPLETE, ReconciliationAction.RECONCILE, "git_commit_evidence", "accepted commit evidence already exists; finalize/reconcile without another commit", {"commit_sha": str(commit["commit_sha"])})
+            if intent is not None:
+                return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN, ReconciliationAction.REPLAY, "git_commit_intents", "Git mutation may have occurred; replay exact commit reconciliation from durable intent", {"intent_status": str(intent["status"]), "commit_sha": intent["commit_sha"]})
+            return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN, ReconciliationAction.REPLAY, "git_commit_intents", "no durable Git mutation intent exists; replay pre-mutation verification safely", {})
+
+        durable_stage_evidence = {
+            "tranche_checkpoint": ("tranche_checkpoint_evidence", "tranche_id", identity.get("tranche_id")),
+            "next_tranche_materialize": ("next_tranche_materializations", "predecessor_tranche_id", identity.get("predecessor_tranche_id")),
+            "next_tranche_activation": ("next_tranche_activation_evidence", "successor_tranche_id", identity.get("successor_tranche_id")),
+            "native_dependency_graph": ("native_dependency_graphs", "ticket_id", ticket_id),
+            "native_dependency_release": ("native_dependency_releases", "ticket_id", ticket_id),
+        }.get(family)
+        if durable_stage_evidence is not None and durable_stage_evidence[2]:
+            table, key, value = durable_stage_evidence
+            row = self.connection.execute(f"SELECT * FROM {table} WHERE {key}=?", (value,)).fetchone()
+            if row is not None:
+                return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.EXTERNAL_EFFECT_COMPLETED_LOCAL_INCOMPLETE, ReconciliationAction.RECONCILE, table, "authoritative stage evidence exists; reconcile scheduler completion from durable evidence", {"identity": value})
+            return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN, ReconciliationAction.REPLAY, table, "stage uses exact/idempotent reconciliation; replay against authoritative external/local evidence", {"identity": value})
+
+        if family in {"validation", "repair_routing", "acceptance", "completion"}:
+            return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN, ReconciliationAction.REPLAY, "scheduler_stage_claims", "stage is deterministic/local and can safely replay from frozen claim identity", {})
+
+        return SchedulerReconciliationDecision(
+            claim_id, ticket_id, stage,
+            ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN,
+            ReconciliationAction.STOP,
+            "scheduler_stage_claims",
+            "stage outcome cannot be classified safely from registered durable evidence",
+            {},
+        )
+
+    def next_scheduler_reconciliation(self, *, now: int | None = None):
+        now = self._now() if now is None else now
+        row = self.connection.execute(
+            "SELECT claim_id FROM scheduler_stage_claims WHERE status='claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
+            (now,),
+        ).fetchone()
+        return None if row is None else self.scheduler_reconciliation(str(row["claim_id"]))
+
     def _triage_claim_identity(self, row: sqlite3.Row | dict[str, Any], *, attempt_number: int, failure_evidence: str, triage_execution_policy_hash: str) -> dict[str, Any]:
         if not triage_execution_policy_hash:
             raise ValueError("triage execution policy hash is required")
