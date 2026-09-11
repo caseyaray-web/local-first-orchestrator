@@ -168,6 +168,14 @@ Already complete or substantially complete:
    - concurrent paid authorization through separate Ledger connections and one request key returns one reservation identity and creates one durable reservation row
    - the specialized comment/outbox, model-invocation, Git, and paid-governor race suites remain green alongside the scheduler-wide contention tests
 
+17. **Scheduler-wide crash matrix — Complete for the current scheduler slice**
+   - every scheduler-owned work class except the meta `recovery` slot now has an explicit declarative crash policy
+   - common durable boundaries are globally fixed as: claim/no effect → `retry`; durable external effect/local incomplete → `reconcile`; local stage complete/downstream incomplete → `resume`; fully finalized → `resume`
+   - started model stages (`implementation`, `review`, `triage`) and paid stages (`paid_checkpoint`, `paid_escalation`) are fail-closed `stop` unless their authoritative invocation/reservation records prove a completed result
+   - generated/state/comment projection, deterministic validation/routing/acceptance/completion/readiness, Git reconciliation, native dependency graph/release, tranche checkpoint, and next-tranche stages are explicitly replayable through their existing idempotent or immutable authorities
+   - the crash-policy registry is tested against `SCHEDULER_STAGE_ORDER`, so adding a new scheduler work class without a crash policy fails the suite
+   - injected-crash tests prove no duplicate model calls, validation evidence, review calls, repair/triage transitions, generated child/outbox rows, accepted candidates, Git commits, board effects, dependency/tranche activation, or paid calls/reservations
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage — Complete
@@ -430,7 +438,7 @@ Completion condition: concurrent scheduler processes cannot produce duplicate st
 
 **Current status:** Complete for this scheduler milestone. No new lock authority was required. The scheduler already combines a restartable global tick lease with stage/outbox leases and Ledger transactions that acquire SQLite's write lock via `BEGIN IMMEDIATE`; external-effect subsystems add their own exact authority boundaries such as model launch records, Git integration-head compare-and-swap, outbox row leases/idempotency keys, and paid request-key reservations. The new scheduler-wide contention suite opens independent Ledger connections against the same database and races real threads, proving: overlapping global ticks execute one model-launch path while the competitor returns `busy`; expired tick takeover has one winner; duplicate same-ticket implementation claims produce one durable owner; an expired implementation recovery claim excludes a competing validation stage for that ticket; deterministic cross-ticket selection still picks the canonical `created_at,id` candidate under overlap; state outbox retries lease one row once; paid authorization with one request key is cross-connection idempotent; and concurrent Git integration-head updates admit one CAS winner and one conflict. Existing comment-outbox/delivery, invocation-lifecycle, paid-governor, and Git suites were run with this proof and remain green. Because the scheduler lease horizon is required to exceed the bounded external-effect horizon, a live provider call is not expected to outlive its owning tick/stage lease; stale/expired recovery is therefore handled through the reconciliation model rather than overlapping a second bounded effect.
 
-## 17. Scheduler-wide crash matrix
+## 17. Scheduler-wide crash matrix — Complete
 
 Inject process death at every durable boundary for every scheduler-owned stage.
 
@@ -448,6 +456,8 @@ The matrix must prove no duplicate:
 - paid call/reservation.
 
 Completion condition: every injected crash either resumes safely, replays an already-durable result, or stops with an explicit reconciliation requirement. No boundary may produce an ambiguous automatic duplicate side effect.
+
+**Current status:** Complete for this scheduler milestone. `SCHEDULER_CRASH_POLICIES` now makes the safe started-effect action explicit for every scheduler-owned work class and is checked for exact coverage against the canonical scheduler stage order (excluding only the meta recovery slot). The shared durable-boundary actions are fixed as retry before an effect starts, reconcile when the external/durable effect is complete but scheduler-local completion is not, resume when local completion is recorded but downstream projection remains, and resume after full finalization. Model-backed implementation/review/triage and paid checkpoint/escalation remain fail-closed on a started-but-unknown outcome; deterministic/local stages and exact/idempotent external authorities replay instead. The matrix is paired with existing injected-failure tests covering completed and ambiguous model invocations, validation persistence, review replay, repair/triage restart, child materialization/outbox idempotency, acceptance finalization, Git commit/tranche-ref recovery, completion/outbox restart, native dependency link replay, tranche checkpoint artifact replay, next-tranche materialization replay, paid unknown-outcome no-repeat, and completed paid-call replay. The targeted matrix run passes 106 tests / 21 subtests, and the complete repository suite passes 720 tests / 179 subtests.
 
 ## 18. Scheduler observability
 
