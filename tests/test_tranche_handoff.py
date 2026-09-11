@@ -16,6 +16,7 @@ from local_first_orchestrator.tranche_completion import completion_evidence
 from local_first_orchestrator.corrections import CorrectionService
 from local_first_orchestrator.planning_coordinator import PlanningCoordinator
 from local_first_orchestrator.repository_snapshot import RepositoryPlanValidator, snapshot
+from local_first_orchestrator.scheduler import ProcessNextScheduler, preview_next
 from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
 
 
@@ -36,6 +37,14 @@ class NextPlanner:
     def propose(self, feature, snap, *, artifact_dir):
         self.calls.append((feature, snap))
         return self.proposal
+
+
+class SchedulerBoard:
+    timeout_seconds = 2
+    def create_microticket(self, title, body, *, idempotency_key): return f"ext-{title}"
+    def find_comment_marker(self, *args): return "not_found"
+    def set_state(self, *args, **kwargs): return None
+    def deliver_comment(self, *args, **kwargs): return None
 
 
 class TrancheHandoffTests(unittest.TestCase):
@@ -68,6 +77,117 @@ class TrancheHandoffTests(unittest.TestCase):
     def tearDown(self): self.ledger.close(); self.tmp.cleanup()
     def git(self, *args): return subprocess.run(("git", *args), cwd=self.repo, text=True, capture_output=True, check=True)
     def rev(self, ref): return self.git("rev-parse", ref).stdout.strip()
+
+    def prepare_scheduler_activation_authority(self, *, checkpoint_decision="approve", escalation_decision=None):
+        self.ledger.connection.execute("UPDATE board_projection_outbox SET external_task_id='ext-A',acknowledged_at=1 WHERE ticket_id='A' AND operation='create_microticket'")
+        completion = completion_evidence(self.ledger, self.repo, "T1")
+        self.ledger.record_tranche_completion(completion)
+        checkpoint_path = self.root / "checkpoint.json"
+        checkpoint_path.write_text("{}\n")
+        checkpoint_hash = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
+        self.ledger.connection.execute(
+            "INSERT INTO tranche_checkpoint_evidence(tranche_id,feature_id,completion_evidence_hash,final_integration_sha,repository_identity,planning_base_sha,planning_snapshot_hash,integration_commands_json,integration_results_json,checkpoint_artifact,checkpoint_artifact_sha256,decision,created_at) VALUES ('T1','F',?,?,?,?,?,'[]','[]',?,?,'ready_for_checkpoint',1)",
+            (completion["evidence_hash"], completion["final_integration_sha"], str(self.repo), self.base, self.s1.snapshot_hash, str(checkpoint_path), checkpoint_hash),
+        )
+        def add_paid(purpose, decision, model_call):
+            self.ledger.connection.execute(
+                "INSERT INTO paid_checkpoint_evidence(tranche_id,feature_id,checkpoint_artifact_sha256,checkpoint_completion_hash,scheduler_claim_id,request_key,purpose,provider,model,profile,reservation_id,model_call_id,response_json,decision,rationale,created_at) VALUES ('T1','F',?,?,?, ?,?,'p','m','profile','r',?, ?,?,'ok',1)",
+                (checkpoint_hash, completion["evidence_hash"], f"claim-{purpose}", f"claim-{purpose}", purpose, model_call, json.dumps({"decision":decision,"rationale":"ok"},sort_keys=True,separators=(",",":")), decision),
+            )
+        add_paid("integration_checkpoint", checkpoint_decision, "call-checkpoint")
+        if escalation_decision is not None:
+            add_paid("escalation", escalation_decision, "call-escalation")
+        return completion
+
+    def scheduler_materialize_runner(self, coordinator):
+        def run(identity):
+            outcome = coordinator.materialize_next_tranche(identity["feature_id"])
+            self.assertIn(outcome.status, {"activated", "already_materialized"})
+            rows = self.ledger.connection.execute("SELECT id FROM tickets WHERE tranche_id=? ORDER BY id", (identity["successor_tranche_id"],)).fetchall()
+            ids = [str(row["id"]) for row in rows]
+            snapshot_values = set()
+            for ticket_id in ids:
+                row = self.ledger.connection.execute("SELECT payload_json FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket' ORDER BY queued_at DESC LIMIT 1", (ticket_id,)).fetchone()
+                payload = json.loads(row["payload_json"])
+                contract = json.loads(payload["body"].split("```local-first-contract\\n",1)[1].split("\\n```",1)[0])
+                snapshot_values.add((contract["repository_identity"],contract["repo_base_sha"],contract["repo_snapshot_hash"]))
+            self.assertEqual(len(snapshot_values),1)
+            repository_identity, repo_base_sha, repo_snapshot_hash = snapshot_values.pop()
+            return {"candidate_identity":identity,"ticket_ids":ids,"repository_identity":repository_identity,"repo_base_sha":repo_base_sha,"repo_snapshot_hash":repo_snapshot_hash}
+        return run
+
+    def test_scheduler_next_tranche_requires_effective_paid_approval(self):
+        self.prepare_scheduler_activation_authority(checkpoint_decision="reject")
+        self.assertIsNone(self.ledger.claim_next_scheduler_next_tranche_materialize("x",lease_seconds=30,now=100))
+        self.assertNotEqual(preview_next(self.ledger,now=100).next_stage,"next_tranche_materialize")
+
+    def test_scheduler_next_tranche_accepts_escalation_approval_only_after_checkpoint_escalates(self):
+        self.prepare_scheduler_activation_authority(checkpoint_decision="escalate", escalation_decision="approve")
+        claim=self.ledger.claim_next_scheduler_next_tranche_materialize("x",lease_seconds=30,now=100)
+        self.assertIsNotNone(claim)
+        identity=json.loads(claim["candidate_identity_json"])
+        self.assertEqual((identity["approval_purpose"],identity["approval_model_call_id"]),("escalation","call-escalation"))
+
+    def test_scheduler_next_tranche_materializes_once_against_completed_snapshot(self):
+        self.prepare_scheduler_activation_authority()
+        proposal = DecompositionPlan(1,"F",self.feature.contract_hash,"wrong","wrong",(),{"next":("B",)},(Tranche("proposal",0,"beta",(),("B",),(self.b,)),))
+        planner = NextPlanner(proposal)
+        coordinator = PlanningCoordinator(self.ledger,self.config,planner)
+        scheduler = ProcessNextScheduler(self.ledger,SchedulerBoard(),worker_id="activation",lease_seconds=30,clock=lambda:100,next_tranche_materialize_runner=self.scheduler_materialize_runner(coordinator))
+        self.assertEqual(preview_next(self.ledger,now=100).next_stage,"next_tranche_materialize")
+        result = scheduler.process_next()
+        self.assertEqual((result.stage,result.status),("next_tranche_materialize","completed"))
+        evidence = self.ledger.next_tranche_materialization("T1")
+        self.assertEqual((evidence["successor_tranche_id"],evidence["repo_base_sha"]),("T2",self.a1))
+        self.assertEqual(json.loads(evidence["ticket_ids_json"]),["B"])
+        self.assertEqual(len(planner.calls),1)
+        self.assertEqual(planner.calls[0][1].base_sha,self.a1)
+        self.assertEqual(self.ledger.connection.execute("SELECT status FROM tranches WHERE id='T1'").fetchone()[0],"completed")
+        self.assertEqual(self.ledger.connection.execute("SELECT status FROM tranches WHERE id='T2'").fetchone()[0],"active")
+
+    def test_scheduler_next_tranche_recovers_materialized_before_effect_without_replanning(self):
+        self.prepare_scheduler_activation_authority()
+        proposal = DecompositionPlan(1,"F",self.feature.contract_hash,"wrong","wrong",(),{"next":("B",)},(Tranche("proposal",0,"beta",(),("B",),(self.b,)),))
+        planner = NextPlanner(proposal); coordinator = PlanningCoordinator(self.ledger,self.config,planner)
+        base_runner = self.scheduler_materialize_runner(coordinator)
+        def crash(identity):
+            base_runner(identity)
+            raise RuntimeError("simulated death after materialization")
+        first = ProcessNextScheduler(self.ledger,SchedulerBoard(),worker_id="a",lease_seconds=30,clock=lambda:100,next_tranche_materialize_runner=crash)
+        with self.assertRaisesRegex(RuntimeError,"simulated death"):
+            first.process_next()
+        self.assertEqual(len(planner.calls),1)
+        self.assertIsNone(self.ledger.next_tranche_materialization("T1"))
+        replay = ProcessNextScheduler(self.ledger,SchedulerBoard(),worker_id="b",lease_seconds=30,clock=lambda:131,next_tranche_materialize_runner=base_runner)
+        stages=[]
+        for _ in range(4):
+            current=replay.process_next(); stages.append(current.stage)
+            if current.stage=="next_tranche_materialize": break
+        self.assertIn("next_tranche_materialize",stages)
+        self.assertEqual(len(planner.calls),1)
+        self.assertIsNotNone(self.ledger.next_tranche_materialization("T1"))
+
+    def test_scheduler_activation_waits_for_cards_and_native_graph_then_freezes_exact_projection(self):
+        self.prepare_scheduler_activation_authority()
+        b1 = ticket("B1","Implement the first beta dependency change","B","beta","beta.py")
+        b2 = MicroTicket("B2","Implement the second beta dependency change",("B",),"beta.py::beta",("beta.py",),("Do not change public APIs.",),PatchBudget(1,20),VerificationProfile((("python","-c","pass"),)),"low",True,1,("B1",))
+        proposal = DecompositionPlan(1,"F",self.feature.contract_hash,"wrong","wrong",(),{"next":("B1","B2")},(Tranche("proposal",0,"beta",(),("B",),(b1,b2)),))
+        planner = NextPlanner(proposal); coordinator = PlanningCoordinator(self.ledger,self.config,planner)
+        scheduler = ProcessNextScheduler(self.ledger,SchedulerBoard(),worker_id="activation",lease_seconds=30,clock=lambda:100,next_tranche_materialize_runner=self.scheduler_materialize_runner(coordinator))
+        self.assertEqual(scheduler.process_next().stage,"next_tranche_materialize")
+        self.assertNotEqual(preview_next(self.ledger,now=100).next_stage,"next_tranche_activation")
+        for ticket_id,external_id in (("B1","ext-B1"),("B2","ext-B2")):
+            self.ledger.connection.execute("UPDATE board_projection_outbox SET external_task_id=?,acknowledged_at=100 WHERE ticket_id=? AND operation='create_microticket'",(external_id,ticket_id))
+        self.assertNotEqual(preview_next(self.ledger,now=100).next_stage,"next_tranche_activation")
+        graph_hash="g"*64
+        self.ledger.connection.execute("INSERT INTO native_dependency_graphs(ticket_id,child_external_id,local_dependency_ids_json,parent_external_ids_json,graph_hash,verified_at) VALUES ('B2','ext-B2','[\"B1\"]','[\"ext-B1\"]',?,100)",(graph_hash,))
+        self.assertEqual(preview_next(self.ledger,now=100).next_stage,"next_tranche_activation")
+        final = scheduler.process_next()
+        self.assertEqual(final.stage,"next_tranche_activation")
+        activation = self.ledger.next_tranche_activation("T2")
+        self.assertEqual(json.loads(activation["ticket_ids_json"]),["B1","B2"])
+        self.assertEqual(json.loads(activation["external_task_ids_json"]),["ext-B1","ext-B2"])
+        self.assertEqual(json.loads(activation["dependency_graph_hashes_json"]),[{"graph_hash":graph_hash,"ticket_id":"B2"}])
 
     def test_materializes_only_next_tranche_from_completed_head_and_replays(self):
         self.ledger.record_tranche_completion(completion_evidence(self.ledger, self.repo, "T1"))

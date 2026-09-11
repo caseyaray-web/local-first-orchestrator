@@ -120,6 +120,18 @@ Already complete or substantially complete:
    - ambiguous paid outcomes become durable `unknown_outcome` reservations and replay never calls the provider again
    - completed paid calls can be recovered after a crash before scheduler effect persistence without repeating the provider call
 
+13. **Next-tranche activation stage — Complete for the current scheduler slice**
+   - activation requires effective paid approval of the predecessor checkpoint; checkpoint `approve` or escalation `approve` after checkpoint `escalate`
+   - the materialization claim freezes predecessor/successor ordinal identity, completion/checkpoint lineage, approval model-call identity, and repository identity
+   - successor planning re-snapshots/re-plans at the predecessor's final integration SHA through the existing `PlanningCoordinator`
+   - generated successor cards now carry the re-snapshot successor plan's repository/base/snapshot provenance rather than stale original-plan provenance
+   - predecessor completion, successor activation, successor ticket creation, and generated-card outbox creation remain one existing ledger transaction
+   - materialization evidence freezes the exact successor ticket set and re-snapshot hash
+   - crash after local materialization but before scheduler effect persistence reuses the already-active successor and does not re-plan
+   - final activation evidence is withheld until every successor card has an acknowledged external task ID and every dependent successor has matching immutable Hermes-native graph evidence
+   - immutable activation evidence freezes successor ticket IDs, Hermes task IDs, dependency graph hashes, and the re-snapshot identity
+   - partial card/link projection recovers through the existing idempotent generated-projection/native-graph stages without duplicate cards or links
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage — Complete
@@ -292,7 +304,7 @@ Completion condition: restart or retry can never duplicate a paid call or spend 
 
 **Current status:** Complete for this scheduler milestone. Paid checkpoint claims are created only from immutable deterministic tranche checkpoints whose decision is `ready_for_checkpoint`. The claim freezes feature/tranche identity, checkpoint artifact and completion hashes, final integration SHA, purpose, and registered provider/model/profile provenance; its deterministic claim ID is reused as the `UsageGovernor` request key. The existing governor therefore reserves budget atomically before a `model_calls` row is marked in flight and before the provider side effect. Production registered routes use `HermesPaidModelAdapter`, which invokes packet-only Hermes `chat --toolsets safe` with explicit provider/model selectors; the registered profile is retained as route provenance because Hermes chat has no profile CLI flag. Responses must be exactly `{decision, rationale}` with `approve`, `escalate`, or `reject`. Immutable `paid_checkpoint_evidence` binds the checkpoint lineage, scheduler claim, governor reservation, model-call record, route identity, response, and decision. An `escalate` checkpoint result enables one separate escalation-purpose claim/call. Budget exhaustion performs no provider call and leaves the claim blocked; the `approve-paid` operator command grants exactly one additional purpose-scoped call, after which expired-lease replay reuses the same claim/request key. Ambiguous provider outcomes are marked `unknown_outcome` and cannot be re-invoked; a provider call that completed before a crash but whose scheduler effect was not yet applied is recovered from the completed durable model-call response without a second provider call. Next-tranche activation remains a distinct later stage.
 
-## 13. Next-tranche activation stage
+## 13. Next-tranche activation stage — Complete
 
 Make activation a durable graph-projection operation.
 
@@ -305,6 +317,8 @@ Required slices:
 - Recover from partial projection without duplicate cards or links.
 
 Completion condition: the next tranche is activated exactly once against the expected repository state and exact dependency graph.
+
+**Current status:** Complete for this scheduler milestone. Activation is implemented as two bounded scheduler phases so no scheduler lease is held across Hermes projection. `next_tranche_materialize` is eligible only when the predecessor has immutable deterministic checkpoint evidence and an effective paid approval: a direct checkpoint `approve`, or an escalation-purpose `approve` following checkpoint `escalate`. The claim binds predecessor/successor ordinals, checkpoint/completion hashes, approval model-call provenance, final integration SHA, and repository identity. The registered standard decomposition route then invokes the existing `PlanningCoordinator.materialize_next_tranche(...)`, which re-snapshots and re-plans the successor at the predecessor's final integration SHA. The underlying ledger handoff still atomically completes the predecessor, activates exactly the next ordinal, creates the successor tickets, and queues idempotent generated-card projections. During this milestone a pre-existing bug was corrected so successor generated-card contracts now use the newly validated successor plan's repository/base/snapshot provenance instead of the original decomposition snapshot. Immutable materialization evidence freezes that re-snapshot hash and exact successor ticket set. If the process dies after the handoff transaction but before scheduler effect persistence, replay recognizes the completed-predecessor/active-successor state and the coordinator returns `already_materialized` without invoking the planner again. `next_tranche_activation` is a separate ledger-only verification phase and is not claimable until every successor card is acknowledged with an external Hermes task ID and every dependent successor ticket has immutable native dependency-graph evidence matching its Local First dependency contract and Hermes parent IDs. Only then is immutable activation evidence written for the exact successor ticket IDs, external task IDs, graph hashes, and snapshot identity. Existing generated-card and native-graph retry semantics handle partial projection without duplicate cards or links.
 
 ## 14. Scheduler-wide reconciliation model
 

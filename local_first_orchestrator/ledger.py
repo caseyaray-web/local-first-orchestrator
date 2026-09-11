@@ -499,6 +499,37 @@ CREATE TRIGGER IF NOT EXISTS paid_checkpoint_evidence_immutable_update
 BEFORE UPDATE ON paid_checkpoint_evidence BEGIN SELECT RAISE(ABORT, 'paid checkpoint evidence is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS paid_checkpoint_evidence_immutable_delete
 BEFORE DELETE ON paid_checkpoint_evidence BEGIN SELECT RAISE(ABORT, 'paid checkpoint evidence is immutable'); END;
+CREATE TABLE IF NOT EXISTS next_tranche_materializations (
+    predecessor_tranche_id TEXT PRIMARY KEY REFERENCES tranches(id),
+    successor_tranche_id TEXT NOT NULL REFERENCES tranches(id),
+    feature_id TEXT NOT NULL REFERENCES features(id),
+    approval_purpose TEXT NOT NULL,
+    approval_model_call_id TEXT NOT NULL,
+    predecessor_completion_hash TEXT NOT NULL,
+    repository_identity TEXT NOT NULL,
+    repo_base_sha TEXT NOT NULL,
+    repo_snapshot_hash TEXT NOT NULL,
+    ticket_ids_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS next_tranche_materializations_immutable_update
+BEFORE UPDATE ON next_tranche_materializations BEGIN SELECT RAISE(ABORT, 'next tranche materialization is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS next_tranche_materializations_immutable_delete
+BEFORE DELETE ON next_tranche_materializations BEGIN SELECT RAISE(ABORT, 'next tranche materialization is immutable'); END;
+CREATE TABLE IF NOT EXISTS next_tranche_activation_evidence (
+    successor_tranche_id TEXT PRIMARY KEY REFERENCES tranches(id),
+    predecessor_tranche_id TEXT NOT NULL,
+    feature_id TEXT NOT NULL,
+    repo_snapshot_hash TEXT NOT NULL,
+    ticket_ids_json TEXT NOT NULL,
+    external_task_ids_json TEXT NOT NULL,
+    dependency_graph_hashes_json TEXT NOT NULL,
+    activated_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS next_tranche_activation_evidence_immutable_update
+BEFORE UPDATE ON next_tranche_activation_evidence BEGIN SELECT RAISE(ABORT, 'next tranche activation evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS next_tranche_activation_evidence_immutable_delete
+BEFORE DELETE ON next_tranche_activation_evidence BEGIN SELECT RAISE(ABORT, 'next tranche activation evidence is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS tranche_completion_rechecks_immutable_update
 BEFORE UPDATE ON tranche_completion_rechecks BEGIN SELECT RAISE(ABORT, 'tranche completion rechecks are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS tranche_completion_rechecks_immutable_delete
@@ -3422,7 +3453,7 @@ class Ledger:
             if changed.rowcount != 1:
                 raise PermissionError("scheduler claim lease is not owned")
             self._append_event(conn, entity_type="ticket", entity_id=str(row["ticket_id"]), event_type="scheduler_stage_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": row["stage"], "result": result})
-            if row["stage"] == "implementation" or str(row["stage"]).startswith("implementation:") or str(row["stage"]).startswith("validation:") or str(row["stage"]).startswith("review:") or str(row["stage"]).startswith("repair_routing:") or str(row["stage"]).startswith("triage:") or str(row["stage"]).startswith("acceptance:") or str(row["stage"]).startswith("git_integration:") or str(row["stage"]).startswith("completion:") or row["stage"] in {"tranche_checkpoint", "paid_checkpoint", "paid_escalation"}:
+            if row["stage"] == "implementation" or str(row["stage"]).startswith("implementation:") or str(row["stage"]).startswith("validation:") or str(row["stage"]).startswith("review:") or str(row["stage"]).startswith("repair_routing:") or str(row["stage"]).startswith("triage:") or str(row["stage"]).startswith("acceptance:") or str(row["stage"]).startswith("git_integration:") or str(row["stage"]).startswith("completion:") or row["stage"] in {"tranche_checkpoint", "paid_checkpoint", "paid_escalation", "next_tranche_materialize", "next_tranche_activation"}:
                 conn.execute(
                     "UPDATE tickets SET lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND lease_owner=?",
                     (now, row["ticket_id"], owner),
@@ -4469,6 +4500,229 @@ class Ledger:
         row = self.connection.execute("SELECT * FROM paid_checkpoint_evidence WHERE tranche_id=? AND purpose=?", (tranche_id, purpose)).fetchone()
         return dict(row) if row else None
 
+    def next_tranche_materialization(self, predecessor_tranche_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM next_tranche_materializations WHERE predecessor_tranche_id=?", (predecessor_tranche_id,)).fetchone()
+        return dict(row) if row else None
+
+    def next_tranche_activation(self, successor_tranche_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM next_tranche_activation_evidence WHERE successor_tranche_id=?", (successor_tranche_id,)).fetchone()
+        return dict(row) if row else None
+
+    def _effective_paid_approval(self, conn: sqlite3.Connection, tranche_id: str) -> sqlite3.Row:
+        checkpoint_authority = conn.execute("SELECT * FROM tranche_checkpoint_evidence WHERE tranche_id=?", (tranche_id,)).fetchone()
+        if checkpoint_authority is None:
+            raise RuntimeError("next_tranche_activation_reconciliation_required: checkpoint authority missing")
+        checkpoint = conn.execute("SELECT * FROM paid_checkpoint_evidence WHERE tranche_id=? AND purpose='integration_checkpoint'", (tranche_id,)).fetchone()
+        if checkpoint is None:
+            raise RuntimeError("next_tranche_activation_reconciliation_required: checkpoint approval missing")
+        if str(checkpoint["checkpoint_artifact_sha256"]) != str(checkpoint_authority["checkpoint_artifact_sha256"]) or str(checkpoint["checkpoint_completion_hash"]) != str(checkpoint_authority["completion_evidence_hash"]):
+            raise RuntimeError("next_tranche_activation_reconciliation_required: checkpoint approval lineage drift")
+        if checkpoint["decision"] == "approve":
+            return checkpoint
+        if checkpoint["decision"] != "escalate":
+            raise RuntimeError("next_tranche_activation_reconciliation_required: checkpoint was not approved")
+        escalation = conn.execute("SELECT * FROM paid_checkpoint_evidence WHERE tranche_id=? AND purpose='escalation'", (tranche_id,)).fetchone()
+        if escalation is None or escalation["decision"] != "approve":
+            raise RuntimeError("next_tranche_activation_reconciliation_required: escalation approval missing")
+        if str(escalation["checkpoint_artifact_sha256"]) != str(checkpoint_authority["checkpoint_artifact_sha256"]) or str(escalation["checkpoint_completion_hash"]) != str(checkpoint_authority["completion_evidence_hash"]):
+            raise RuntimeError("next_tranche_activation_reconciliation_required: escalation approval lineage drift")
+        return escalation
+
+    def _next_tranche_materialize_identity(self, conn: sqlite3.Connection, predecessor_tranche_id: str) -> dict[str, Any]:
+        predecessor = conn.execute("SELECT * FROM tranches WHERE id=?", (predecessor_tranche_id,)).fetchone()
+        checkpoint = conn.execute("SELECT * FROM tranche_checkpoint_evidence WHERE tranche_id=?", (predecessor_tranche_id,)).fetchone()
+        completion = conn.execute("SELECT * FROM tranche_completion_evidence WHERE tranche_id=?", (predecessor_tranche_id,)).fetchone()
+        if predecessor is None or checkpoint is None or completion is None or checkpoint["decision"] != "ready_for_checkpoint":
+            raise RuntimeError("next_tranche_activation_reconciliation_required: predecessor checkpoint authority missing")
+        approval = self._effective_paid_approval(conn, predecessor_tranche_id)
+        successor = conn.execute("SELECT * FROM tranches WHERE feature_id=? AND ordinal=?", (predecessor["feature_id"], int(predecessor["ordinal"]) + 1)).fetchone()
+        if successor is None or successor["status"] not in {"planned", "active"}:
+            raise RuntimeError("next_tranche_activation_reconciliation_required: successor tranche missing")
+        active = [str(row["id"]) for row in conn.execute("SELECT id FROM tranches WHERE feature_id=? AND status='active' ORDER BY ordinal,id", (predecessor["feature_id"],)).fetchall()]
+        if predecessor["status"] == "active":
+            if active != [predecessor_tranche_id]:
+                raise RuntimeError("next_tranche_activation_reconciliation_required: active tranche conflict")
+        elif predecessor["status"] == "completed" and successor["status"] == "active":
+            if active != [str(successor["id"])]:
+                raise RuntimeError("next_tranche_activation_reconciliation_required: recovered active tranche conflict")
+        else:
+            raise RuntimeError("next_tranche_activation_reconciliation_required: tranche handoff state invalid")
+        return {
+            "feature_id": str(predecessor["feature_id"]),
+            "predecessor_tranche_id": predecessor_tranche_id,
+            "predecessor_ordinal": int(predecessor["ordinal"]),
+            "successor_tranche_id": str(successor["id"]),
+            "successor_ordinal": int(successor["ordinal"]),
+            "checkpoint_artifact_sha256": str(checkpoint["checkpoint_artifact_sha256"]),
+            "completion_evidence_hash": str(completion["evidence_hash"]),
+            "final_integration_sha": str(completion["final_integration_sha"]),
+            "repository_identity": str(checkpoint["repository_identity"]),
+            "approval_purpose": str(approval["purpose"]),
+            "approval_model_call_id": str(approval["model_call_id"]),
+            "approval_response_sha256": hashlib.sha256(str(approval["response_json"]).encode()).hexdigest(),
+        }
+
+    def claim_next_scheduler_next_tranche_materialize(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+        if not owner or lease_seconds < 1:
+            raise ValueError("next tranche materialize claim requires owner and positive lease")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            replay = conn.execute("SELECT * FROM scheduler_stage_claims WHERE stage='next_tranche_materialize' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,)).fetchone()
+            if replay is not None:
+                identity = json.loads(str(replay["candidate_identity_json"] or "{}"))
+                if identity != self._next_tranche_materialize_identity(conn, str(identity.get("predecessor_tranche_id") or "")):
+                    raise RuntimeError("next_tranche_activation_reconciliation_required: materialize claim drift")
+                if conn.execute("UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?", (owner,now+lease_seconds,now,replay["claim_id"],now)).rowcount != 1:
+                    return None
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
+            rows = conn.execute("SELECT id FROM tranches WHERE status='active' AND NOT EXISTS (SELECT 1 FROM next_tranche_materializations m WHERE m.predecessor_tranche_id=tranches.id) ORDER BY feature_id,ordinal,id").fetchall()
+            for row in rows:
+                try:
+                    identity = self._next_tranche_materialize_identity(conn, str(row["id"]))
+                except RuntimeError:
+                    continue
+                encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+                claim_id = hashlib.sha256(("next_tranche_materialize:" + encoded).encode()).hexdigest()[:32]
+                ticket = conn.execute("SELECT id FROM tickets WHERE tranche_id=? ORDER BY created_at DESC,id DESC LIMIT 1", (row["id"],)).fetchone()
+                if ticket is None:
+                    continue
+                conn.execute("INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,created_at,updated_at) VALUES (?,?,'next_tranche_materialize','claimed',?,?,1,?,?,?)", (claim_id,ticket["id"],owner,now+lease_seconds,encoded,now,now))
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+            return None
+
+    def apply_scheduler_next_tranche_materialize_effect(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        now = self._now() if now is None else now
+        encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if claim is None or claim["stage"] != "next_tranche_materialize" or claim["side_effect_started_at"] is None:
+                raise RuntimeError("next tranche materialize claim is not active")
+            if claim["lease_owner"] != owner or int(claim["lease_expires_at"] or 0) <= now:
+                raise PermissionError("scheduler claim lease is not owned")
+            if claim["side_effect_completed_at"] is not None:
+                if claim["result_json"] != encoded: raise RuntimeError("next tranche materialize result conflicts")
+                return dict(claim)
+            identity = json.loads(str(claim["candidate_identity_json"] or "{}"))
+            if result.get("candidate_identity") != identity:
+                raise RuntimeError("next_tranche_activation_reconciliation_required: materialize result identity drift")
+            successor = conn.execute("SELECT * FROM tranches WHERE id=?", (identity["successor_tranche_id"],)).fetchone()
+            predecessor = conn.execute("SELECT * FROM tranches WHERE id=?", (identity["predecessor_tranche_id"],)).fetchone()
+            ticket_ids = result.get("ticket_ids")
+            if predecessor is None or successor is None or predecessor["status"] != "completed" or successor["status"] != "active" or not isinstance(ticket_ids,list) or not ticket_ids:
+                raise RuntimeError("next_tranche_activation_reconciliation_required: materialized tranche state invalid")
+            durable_ids = [str(row["id"]) for row in conn.execute("SELECT id FROM tickets WHERE tranche_id=? ORDER BY id", (successor["id"],)).fetchall()]
+            if sorted(ticket_ids) != durable_ids:
+                raise RuntimeError("next_tranche_activation_reconciliation_required: materialized ticket identity drift")
+            snapshot_hash = str(result.get("repo_snapshot_hash") or "")
+            repo_base_sha = str(result.get("repo_base_sha") or "")
+            repository_identity = str(result.get("repository_identity") or "")
+            if not snapshot_hash or repo_base_sha != identity["final_integration_sha"] or repository_identity != identity["repository_identity"]:
+                raise RuntimeError("next_tranche_activation_reconciliation_required: repository snapshot drift")
+            values=(identity["predecessor_tranche_id"],identity["successor_tranche_id"],identity["feature_id"],identity["approval_purpose"],identity["approval_model_call_id"],identity["completion_evidence_hash"],repository_identity,repo_base_sha,snapshot_hash,json.dumps(durable_ids,separators=(",",":")))
+            existing = conn.execute("SELECT * FROM next_tranche_materializations WHERE predecessor_tranche_id=?", (identity["predecessor_tranche_id"],)).fetchone()
+            keys=("predecessor_tranche_id","successor_tranche_id","feature_id","approval_purpose","approval_model_call_id","predecessor_completion_hash","repository_identity","repo_base_sha","repo_snapshot_hash","ticket_ids_json")
+            if existing is None:
+                conn.execute("INSERT INTO next_tranche_materializations(predecessor_tranche_id,successor_tranche_id,feature_id,approval_purpose,approval_model_call_id,predecessor_completion_hash,repository_identity,repo_base_sha,repo_snapshot_hash,ticket_ids_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (*values,now))
+            elif tuple(existing[k] for k in keys) != values:
+                raise RuntimeError("next_tranche_activation_reconciliation_required: materialization evidence conflicts")
+            conn.execute("UPDATE scheduler_stage_claims SET side_effect_completed_at=?,result_json=?,updated_at=? WHERE claim_id=?", (now,encoded,now,claim_id))
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
+    def _next_tranche_activation_identity(self, conn: sqlite3.Connection, successor_tranche_id: str) -> dict[str, Any]:
+        materialization = conn.execute("SELECT * FROM next_tranche_materializations WHERE successor_tranche_id=?", (successor_tranche_id,)).fetchone()
+        if materialization is None:
+            raise RuntimeError("next_tranche_activation_reconciliation_required: materialization evidence missing")
+        try:
+            ticket_ids = list(json.loads(str(materialization["ticket_ids_json"])))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("next_tranche_activation_reconciliation_required: materialization ticket identity malformed") from exc
+        if not ticket_ids or not all(isinstance(value,str) and value for value in ticket_ids):
+            raise RuntimeError("next_tranche_activation_reconciliation_required: materialization ticket identity malformed")
+        external_task_ids: list[str] = []
+        graph_hashes: list[dict[str,str]] = []
+        for ticket_id in ticket_ids:
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=? AND tranche_id=?", (ticket_id,successor_tranche_id)).fetchone()
+            if ticket is None:
+                raise RuntimeError("next_tranche_activation_reconciliation_required: successor ticket missing")
+            external_id = self._resolve_external_task_id_in_transaction(conn, ticket_id)
+            projection = conn.execute("SELECT acknowledged_at,external_task_id FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket' ORDER BY queued_at DESC LIMIT 1", (ticket_id,)).fetchone()
+            if projection is None or projection["acknowledged_at"] is None or str(projection["external_task_id"] or "") != external_id:
+                raise RuntimeError("next_tranche_activation_reconciliation_required: successor card projection not acknowledged")
+            external_task_ids.append(external_id)
+            dependencies = sorted(set(json.loads(str(ticket["dependencies_json"]))))
+            if dependencies:
+                graph = conn.execute("SELECT * FROM native_dependency_graphs WHERE ticket_id=?", (ticket_id,)).fetchone()
+                if graph is None:
+                    raise RuntimeError("next_tranche_activation_reconciliation_required: native dependency graph not verified")
+                if json.loads(str(graph["local_dependency_ids_json"])) != dependencies:
+                    raise RuntimeError("next_tranche_activation_reconciliation_required: native dependency contract drift")
+                expected_parent_external_ids = [self._resolve_external_task_id_in_transaction(conn, dep) for dep in dependencies]
+                if json.loads(str(graph["parent_external_ids_json"])) != expected_parent_external_ids or str(graph["child_external_id"]) != external_id:
+                    raise RuntimeError("next_tranche_activation_reconciliation_required: native dependency graph identity drift")
+                graph_hashes.append({"ticket_id":ticket_id,"graph_hash":str(graph["graph_hash"])})
+        return {
+            "feature_id": str(materialization["feature_id"]),
+            "predecessor_tranche_id": str(materialization["predecessor_tranche_id"]),
+            "successor_tranche_id": successor_tranche_id,
+            "repo_snapshot_hash": str(materialization["repo_snapshot_hash"]),
+            "ticket_ids": ticket_ids,
+            "external_task_ids": external_task_ids,
+            "dependency_graph_hashes": graph_hashes,
+        }
+
+    def claim_next_scheduler_next_tranche_activation(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+        if not owner or lease_seconds < 1:
+            raise ValueError("next tranche activation claim requires owner and positive lease")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            replay = conn.execute("SELECT * FROM scheduler_stage_claims WHERE stage='next_tranche_activation' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,)).fetchone()
+            if replay is not None:
+                identity = json.loads(str(replay["candidate_identity_json"] or "{}"))
+                if identity != self._next_tranche_activation_identity(conn, str(identity.get("successor_tranche_id") or "")):
+                    raise RuntimeError("next_tranche_activation_reconciliation_required: activation claim drift")
+                if conn.execute("UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?", (owner,now+lease_seconds,now,replay["claim_id"],now)).rowcount != 1:
+                    return None
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
+            rows = conn.execute("SELECT successor_tranche_id FROM next_tranche_materializations m WHERE NOT EXISTS (SELECT 1 FROM next_tranche_activation_evidence e WHERE e.successor_tranche_id=m.successor_tranche_id) ORDER BY created_at,successor_tranche_id").fetchall()
+            for row in rows:
+                successor_id = str(row["successor_tranche_id"])
+                try:
+                    identity = self._next_tranche_activation_identity(conn, successor_id)
+                except RuntimeError:
+                    continue
+                encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+                claim_id = hashlib.sha256(("next_tranche_activation:" + encoded).encode()).hexdigest()[:32]
+                ticket_id = str(identity["ticket_ids"][-1])
+                conn.execute("INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,created_at,updated_at) VALUES (?,?,'next_tranche_activation','claimed',?,?,1,?,?,?)", (claim_id,ticket_id,owner,now+lease_seconds,encoded,now,now))
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+            return None
+
+    def apply_scheduler_next_tranche_activation_effect(self, claim_id: str, owner: str, *, now: int | None = None) -> dict[str, Any]:
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if claim is None or claim["stage"] != "next_tranche_activation" or claim["side_effect_started_at"] is None:
+                raise RuntimeError("next tranche activation claim is not active")
+            if claim["lease_owner"] != owner or int(claim["lease_expires_at"] or 0) <= now:
+                raise PermissionError("scheduler claim lease is not owned")
+            identity = json.loads(str(claim["candidate_identity_json"] or "{}"))
+            if identity != self._next_tranche_activation_identity(conn, str(identity["successor_tranche_id"])):
+                raise RuntimeError("next_tranche_activation_reconciliation_required: activation identity drift")
+            values=(identity["successor_tranche_id"],identity["predecessor_tranche_id"],identity["feature_id"],identity["repo_snapshot_hash"],json.dumps(identity["ticket_ids"],separators=(",",":")),json.dumps(identity["external_task_ids"],separators=(",",":")),json.dumps(identity["dependency_graph_hashes"],sort_keys=True,separators=(",",":")))
+            existing = conn.execute("SELECT * FROM next_tranche_activation_evidence WHERE successor_tranche_id=?", (identity["successor_tranche_id"],)).fetchone()
+            keys=("successor_tranche_id","predecessor_tranche_id","feature_id","repo_snapshot_hash","ticket_ids_json","external_task_ids_json","dependency_graph_hashes_json")
+            if existing is None:
+                conn.execute("INSERT INTO next_tranche_activation_evidence(successor_tranche_id,predecessor_tranche_id,feature_id,repo_snapshot_hash,ticket_ids_json,external_task_ids_json,dependency_graph_hashes_json,activated_at) VALUES (?,?,?,?,?,?,?,?)", (*values,now))
+            elif tuple(existing[k] for k in keys) != values:
+                raise RuntimeError("next_tranche_activation_reconciliation_required: activation evidence conflicts")
+            result={"ticket_id":str(claim["ticket_id"]),"candidate_identity":identity,"successor_tranche_id":identity["successor_tranche_id"]}
+            encoded=json.dumps(result,sort_keys=True,separators=(",",":"))
+            if claim["side_effect_completed_at"] is None:
+                conn.execute("UPDATE scheduler_stage_claims SET side_effect_completed_at=?,result_json=?,updated_at=? WHERE claim_id=?", (now,encoded,now,claim_id))
+            elif claim["result_json"] != encoded:
+                raise RuntimeError("next tranche activation result conflicts")
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
     def _paid_stage_identity(self, conn: sqlite3.Connection, tranche_id: str, *, purpose: str, provider: str, model: str, profile: str) -> dict[str, Any]:
         if purpose not in {"integration_checkpoint", "escalation"}:
             raise ValueError("invalid paid scheduler purpose")
@@ -4796,9 +5050,8 @@ class Ledger:
             conn.execute("UPDATE tranches SET status='completed' WHERE id=?", (active[0]["id"],))
             target = conn.execute("SELECT * FROM tranches WHERE feature_id=? AND id=?", (feature.id, tranche.id)).fetchone()
             if target is None or int(target["ordinal"]) != int(active[0]["ordinal"]) + 1 or target["status"] not in {"planned", "active"}: raise ValueError("next tranche is missing or conflicting")
-            provenance = conn.execute("SELECT repository_identity, repo_base_sha, repo_snapshot_hash FROM decomposition_plans WHERE feature_id=? AND status='active'", (feature.id,)).fetchone()
-            if provenance is None or not all(isinstance(provenance[key], str) and provenance[key] for key in ("repository_identity", "repo_base_sha", "repo_snapshot_hash")):
-                raise ValueError("active plan repository provenance missing")
+            if not all(isinstance(value, str) and value for value in (plan.repository_identity, plan.repo_base_sha, plan.repo_snapshot_hash)):
+                raise ValueError("next tranche repository provenance missing")
             conn.execute("UPDATE tranches SET status='active', base_sha=? WHERE id=?", (plan.repo_base_sha, tranche.id))
             created = []
             for t in tranche.microtickets:
@@ -4807,7 +5060,7 @@ class Ledger:
                 q = t.contract()
                 conn.execute("INSERT INTO tickets(id,feature_id,tranche_id,title,objective,criterion_ids_json,primary_symbol,allowed_files_json,create_files_json,new_test_files_json,forbidden_changes_json,patch_budget_json,verification_json,risk,review_required,max_attempts,dependencies_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (t.ticket_id, feature.id, tranche.id, t.ticket_id, q["objective"], json.dumps(q["criterion_ids"]), q["primary_symbol"], json.dumps(q["allowed_files"]), json.dumps(q.get("create_files", [])), json.dumps(q.get("new_test_files", [])), json.dumps(q["forbidden_changes"]), json.dumps(q["patch_budget"]), json.dumps(q["verification"]), q["risk"], int(t.review_required), t.max_attempts, json.dumps(q["dependencies"]), "draft", now, now))
                 for cid in t.criterion_ids: conn.execute("INSERT INTO ticket_criteria VALUES (?,?)", (t.ticket_id, cid))
-                payload = generated_card_payload(feature, tranche, t, repository_identity=str(provenance["repository_identity"]), repo_base_sha=str(provenance["repo_base_sha"]), repo_snapshot_hash=str(provenance["repo_snapshot_hash"]))
+                payload = generated_card_payload(feature, tranche, t, repository_identity=str(plan.repository_identity), repo_base_sha=str(plan.repo_base_sha), repo_snapshot_hash=str(plan.repo_snapshot_hash))
                 event_id = self._append_event(conn, entity_type="ticket", entity_id=t.ticket_id, event_type="generated_microticket_created", actor_id="controller", to_state="draft", payload={"feature_id": feature.id, "tranche_id": tranche.id, "projection_key": payload["projection_key"]})
                 self._enqueue_generated_create_projection_in_transaction(conn, ticket_id=t.ticket_id, event_id=event_id, payload=payload, idempotency_key=payload["projection_key"])
                 created.append(t.ticket_id)

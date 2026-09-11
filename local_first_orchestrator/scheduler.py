@@ -316,6 +316,59 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     if paid_escalation is not None:
         return ProcessNextPreview(next_stage="paid_escalation", ticket_id=str(paid_escalation["ticket_id"]), would_execute=True)
 
+    next_materialize_replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage='next_tranche_materialize' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
+        (now,),
+    ).fetchone()
+    if next_materialize_replay is not None:
+        return ProcessNextPreview(next_stage="next_tranche_materialize", ticket_id=str(next_materialize_replay["ticket_id"]), would_execute=True)
+    next_materialize = ledger.connection.execute("""
+        SELECT t.id AS ticket_id FROM tranches tr
+        JOIN tickets t ON t.tranche_id=tr.id
+        JOIN tranche_checkpoint_evidence c ON c.tranche_id=tr.id AND c.decision='ready_for_checkpoint'
+        JOIN paid_checkpoint_evidence p ON p.tranche_id=tr.id AND p.purpose='integration_checkpoint'
+        WHERE tr.status='active'
+          AND p.checkpoint_artifact_sha256=c.checkpoint_artifact_sha256
+          AND p.checkpoint_completion_hash=c.completion_evidence_hash
+          AND (p.decision='approve' OR (p.decision='escalate' AND EXISTS (
+              SELECT 1 FROM paid_checkpoint_evidence e
+              WHERE e.tranche_id=tr.id AND e.purpose='escalation' AND e.decision='approve'
+                AND e.checkpoint_artifact_sha256=c.checkpoint_artifact_sha256
+                AND e.checkpoint_completion_hash=c.completion_evidence_hash)))
+          AND EXISTS (SELECT 1 FROM tranches nx WHERE nx.feature_id=tr.feature_id AND nx.ordinal=tr.ordinal+1 AND nx.status='planned')
+          AND NOT EXISTS (SELECT 1 FROM next_tranche_materializations m WHERE m.predecessor_tranche_id=tr.id)
+          AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims s WHERE s.stage='next_tranche_materialize' AND json_extract(s.candidate_identity_json,'$.predecessor_tranche_id')=tr.id)
+        ORDER BY tr.feature_id,tr.ordinal,t.created_at DESC,t.id DESC LIMIT 1
+    """).fetchone()
+    if next_materialize is not None:
+        return ProcessNextPreview(next_stage="next_tranche_materialize", ticket_id=str(next_materialize["ticket_id"]), would_execute=True)
+
+    next_activation_replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage='next_tranche_activation' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
+        (now,),
+    ).fetchone()
+    if next_activation_replay is not None:
+        return ProcessNextPreview(next_stage="next_tranche_activation", ticket_id=str(next_activation_replay["ticket_id"]), would_execute=True)
+    activation_candidate = ledger.connection.execute("""
+        SELECT t.id AS ticket_id FROM next_tranche_materializations m
+        JOIN tickets t ON t.tranche_id=m.successor_tranche_id
+        WHERE NOT EXISTS (SELECT 1 FROM next_tranche_activation_evidence e WHERE e.successor_tranche_id=m.successor_tranche_id)
+          AND NOT EXISTS (
+              SELECT 1 FROM tickets x
+              WHERE x.tranche_id=m.successor_tranche_id AND NOT EXISTS (
+                  SELECT 1 FROM board_projection_outbox b
+                  WHERE b.ticket_id=x.id AND b.operation='create_microticket'
+                    AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL))
+          AND NOT EXISTS (
+              SELECT 1 FROM tickets x
+              WHERE x.tranche_id=m.successor_tranche_id AND json_array_length(x.dependencies_json)>0
+                AND NOT EXISTS (SELECT 1 FROM native_dependency_graphs g WHERE g.ticket_id=x.id))
+          AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims s WHERE s.stage='next_tranche_activation' AND json_extract(s.candidate_identity_json,'$.successor_tranche_id')=m.successor_tranche_id)
+        ORDER BY m.created_at,m.successor_tranche_id,t.created_at DESC,t.id DESC LIMIT 1
+    """).fetchone()
+    if activation_candidate is not None:
+        return ProcessNextPreview(next_stage="next_tranche_activation", ticket_id=str(activation_candidate["ticket_id"]), would_execute=True)
+
     implementation_replay = ledger.connection.execute(
         "SELECT ticket_id FROM scheduler_stage_claims WHERE (stage='implementation' OR stage LIKE 'implementation:%') AND status='claimed' "
         "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
@@ -403,6 +456,7 @@ class ProcessNextScheduler:
         paid_checkpoint_route: tuple[str, str, str] | None = None,
         paid_escalation_runner: Callable[[str], dict[str, Any]] | None = None,
         paid_escalation_route: tuple[str, str, str] | None = None,
+        next_tranche_materialize_runner: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         if not worker_id or lease_seconds < 1:
             raise ValueError("process-next requires a worker id and positive lease")
@@ -429,6 +483,7 @@ class ProcessNextScheduler:
         self.paid_checkpoint_route = paid_checkpoint_route
         self.paid_escalation_runner = paid_escalation_runner
         self.paid_escalation_route = paid_escalation_route
+        self.next_tranche_materialize_runner = next_tranche_materialize_runner
         if self.review_runner is not None and not self.review_execution_policy_hash:
             raise ValueError("process-next review runner requires a review execution policy hash")
         if self.triage_runner is not None and not self.triage_execution_policy_hash:
@@ -804,6 +859,43 @@ class ProcessNextScheduler:
                 paid_result = json.loads(str(current["result_json"]))
             self.ledger.complete_scheduler_claim(claim_id, execution_owner, paid_result, now=now)
             return ProcessNextResult("completed", stage, ticket_id, claim_id)
+
+        if self.next_tranche_materialize_runner is not None:
+            materialize_claim = self.ledger.claim_next_scheduler_next_tranche_materialize(
+                execution_owner, lease_seconds=self.lease_seconds, now=now
+            )
+            if materialize_claim is not None:
+                claim_id = str(materialize_claim["claim_id"])
+                ticket_id = str(materialize_claim["ticket_id"])
+                current = self.ledger.scheduler_claim(claim_id)
+                if current.get("side_effect_completed_at") is not None and current.get("result_json"):
+                    materialize_result = json.loads(str(current["result_json"]))
+                else:
+                    if current.get("side_effect_started_at") is None:
+                        self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+                    identity = json.loads(str(current["candidate_identity_json"]))
+                    materialize_result = self.next_tranche_materialize_runner(identity)
+                    current = self.ledger.apply_scheduler_next_tranche_materialize_effect(
+                        claim_id, execution_owner, materialize_result, now=now
+                    )
+                    materialize_result = json.loads(str(current["result_json"]))
+                self.ledger.complete_scheduler_claim(claim_id, execution_owner, materialize_result, now=now)
+                return ProcessNextResult("completed", "next_tranche_materialize", ticket_id, claim_id)
+
+        activation_claim = self.ledger.claim_next_scheduler_next_tranche_activation(
+            execution_owner, lease_seconds=self.lease_seconds, now=now
+        )
+        if activation_claim is not None:
+            claim_id = str(activation_claim["claim_id"])
+            ticket_id = str(activation_claim["ticket_id"])
+            current = self.ledger.scheduler_claim(claim_id)
+            if current.get("side_effect_completed_at") is None:
+                if current.get("side_effect_started_at") is None:
+                    self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+                current = self.ledger.apply_scheduler_next_tranche_activation_effect(claim_id, execution_owner, now=now)
+            activation_result = json.loads(str(current["result_json"]))
+            self.ledger.complete_scheduler_claim(claim_id, execution_owner, activation_result, now=now)
+            return ProcessNextResult("completed", "next_tranche_activation", ticket_id, claim_id)
 
         if self.implementation_runner is not None:
             implementation_claim = self.ledger.claim_next_scheduler_implementation(

@@ -218,6 +218,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     process_next.add_argument("--execute", action="store_true")
     process_next.add_argument("--allow-board-writes", action="store_true")
     process_next.add_argument("--worker-id", default="local-first-process-next")
+    process_next.add_argument("--planner-executable", default="hermes")
     implementation=commands.add_parser("implementation-only", aliases=("implement-only",), help="run exactly implementation and deterministic validation; never review or accept")
     implementation.add_argument("--task-id",required=True)
     revalidate=commands.add_parser("revalidate-implementation", help="revalidate an existing implementation; never retry implementation or review")
@@ -344,6 +345,57 @@ def run_command(args: argparse.Namespace) -> int:
                 profile=registered.paid_escalation.profile,
                 timeout_seconds=ctl.config.review_timeout_seconds,
             )
+            successor_route = dict(registered.decomposition).get("standard")
+
+            def materialize_successor(identity: dict[str, Any]) -> dict[str, Any]:
+                if successor_route is None:
+                    raise RuntimeError("next tranche activation requires registered standard decomposition route")
+                row = ledger.connection.execute("SELECT contract_json FROM feature_contracts WHERE feature_id=?", (identity["feature_id"],)).fetchone()
+                if row is None:
+                    raise RuntimeError("next tranche activation feature contract is missing")
+                stored = json.loads(str(row["contract_json"]))
+                spec = FeatureAdmissionSpec.from_json(stored["spec"])
+                allowed_paths = tuple((item.path, item.disposition) for item in spec.files)
+                planner = LocalDecompositionPlanner(
+                    executable=args.planner_executable,
+                    cost_class="standard",
+                    provider=successor_route.provider,
+                    model=successor_route.model,
+                    profile=successor_route.profile,
+                    allowed_paths=allowed_paths,
+                    role="decomposition",
+                    routing_source="operator-config.decomposition",
+                )
+                outcome = PlanningCoordinator(ledger, ctl.config, planner).materialize_next_tranche(str(identity["feature_id"]))
+                if outcome.status not in {"activated", "already_materialized"}:
+                    raise RuntimeError(f"next tranche activation planning failed: {outcome.status}: {'; '.join(outcome.reasons)}")
+                ticket_rows = ledger.connection.execute("SELECT id FROM tickets WHERE tranche_id=? ORDER BY id", (identity["successor_tranche_id"],)).fetchall()
+                ticket_ids = [str(item["id"]) for item in ticket_rows]
+                if not ticket_ids:
+                    raise RuntimeError("next tranche activation produced no successor tickets")
+                snapshot_values: set[tuple[str, str, str]] = set()
+                for ticket_id in ticket_ids:
+                    projection = ledger.connection.execute("SELECT payload_json FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket' ORDER BY queued_at DESC LIMIT 1", (ticket_id,)).fetchone()
+                    if projection is None:
+                        raise RuntimeError("next tranche activation missing generated card projection")
+                    payload = json.loads(str(projection["payload_json"]))
+                    body = str(payload.get("body") or "")
+                    marker = "```local-first-contract\\n"
+                    if marker not in body:
+                        raise RuntimeError("next tranche activation projection contract missing")
+                    contract_json = body.split(marker,1)[1].split("\\n```",1)[0]
+                    contract = json.loads(contract_json)
+                    snapshot_values.add((str(contract["repository_identity"]), str(contract["repo_base_sha"]), str(contract["repo_snapshot_hash"])))
+                if len(snapshot_values) != 1:
+                    raise RuntimeError("next tranche activation successor snapshot identity diverged")
+                repository_identity, repo_base_sha, repo_snapshot_hash = snapshot_values.pop()
+                return {
+                    "candidate_identity": identity,
+                    "ticket_ids": ticket_ids,
+                    "repository_identity": repository_identity,
+                    "repo_base_sha": repo_base_sha,
+                    "repo_snapshot_hash": repo_snapshot_hash,
+                }
             result=ProcessNextScheduler(
                 ledger,
                 ctl.board,
@@ -382,6 +434,7 @@ def run_command(args: argparse.Namespace) -> int:
                 paid_escalation_route=None if registered.paid_escalation is None else (
                     registered.paid_escalation.provider, registered.paid_escalation.model, registered.paid_escalation.profile
                 ),
+                next_tranche_materialize_runner=None if successor_route is None else materialize_successor,
             ).process_next()
             print(json.dumps(asdict(result),sort_keys=True))
         elif args.command in {"implementation-only", "implement-only"}:
