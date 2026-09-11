@@ -567,7 +567,7 @@ The twenty dependency-ordered scheduler milestones are complete for the represen
 
 The next work comes from the broader v2 design, in this order:
 
-1. **Hermes execution reconciliation.** Detect ordinary Hermes dispatcher/worker runs, bind each run to the correct Local First ticket/attempt and execution provenance, reconcile resulting worktree/artifact/diff state into the ledger, and require deterministic Local First validation/review before graph advancement. This is the immediate next project.
+1. **Hermes execution reconciliation — in progress.** The explicit replay-safe Hermes run → Local First attempt/provenance handoff is implemented and produces the same implementation-stage evidence consumed by deterministic validation. Next: automatic dispatcher-run detection/ownership, Hermes non-final completion enforcement, and live proof against an actual dispatcher-owned worker run without a duplicate Local First implementation launch.
 2. **Full scheduler-generated native tranche graph proof.** Exercise a real multi-ticket active tranche created/projected by Local First, verify exact native dependency equivalence, integrate the tranche, checkpoint it, and activate the successor tranche.
 3. **Exhaustive live external-boundary crash proof.** Extend the scheduler-wide crash matrix from deterministic/fake-runtime proof plus the Milestone 20 live comment crash to real model, review, Git, board, dependency, checkpoint, and paid boundaries.
 4. **Live paid checkpoint/escalation integration.** Demonstrate reservation-before-call, budget pause/approval, completed-call replay, escalation chaining, and unknown-outcome no-repeat against a real paid provider.

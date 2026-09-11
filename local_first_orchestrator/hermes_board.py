@@ -22,6 +22,29 @@ class ExternalTicket:
     children: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class ExternalExecutionRun:
+    id: int
+    status: str
+    outcome: str | None
+    started_at: int | None
+    ended_at: int | None
+    summary: str | None
+    profile: str | None
+    worker_pid: int | None
+    metadata: Any = None
+
+
+@dataclass(frozen=True)
+class ExternalExecutionSnapshot:
+    task: ExternalTicket
+    session_id: str | None
+    branch_name: str | None
+    started_at: int | None
+    completed_at: int | None
+    runs: tuple[ExternalExecutionRun, ...]
+
+
 class HermesBoardAdapter:
     """Hermes CLI adapter. Writes require explicit opt-in; reads are always safe."""
     is_fake = False
@@ -62,6 +85,51 @@ class HermesBoardAdapter:
             row.get("workspace_path"),
             tuple(sorted(set(parents))),
             tuple(sorted(set(children))),
+        )
+
+    def execution_snapshot(self, task_id: str) -> ExternalExecutionSnapshot:
+        payload = self._run("show", task_id, "--json")
+        row = payload.get("task") if isinstance(payload, dict) else None
+        runs = payload.get("runs") if isinstance(payload, dict) else None
+        if not isinstance(row, dict) or not isinstance(runs, list):
+            raise RuntimeError("Hermes execution snapshot is malformed")
+        parents = payload.get("parents", [])
+        children = payload.get("children", [])
+        if not isinstance(parents, list) or not all(isinstance(value, str) and value for value in parents):
+            raise RuntimeError("Hermes execution snapshot parent graph is malformed")
+        if not isinstance(children, list) or not all(isinstance(value, str) and value for value in children):
+            raise RuntimeError("Hermes execution snapshot child graph is malformed")
+        task = ExternalTicket(
+            str(row["id"]),
+            str(row.get("title") or ""),
+            str(row.get("body") or ""),
+            str(row.get("status") or ""),
+            row.get("workspace_path"),
+            tuple(sorted(set(parents))),
+            tuple(sorted(set(children))),
+        )
+        parsed: list[ExternalExecutionRun] = []
+        for item in runs:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), int):
+                raise RuntimeError("Hermes execution run is malformed")
+            parsed.append(ExternalExecutionRun(
+                id=int(item["id"]),
+                status=str(item.get("status") or ""),
+                outcome=None if item.get("outcome") is None else str(item["outcome"]),
+                started_at=None if item.get("started_at") is None else int(item["started_at"]),
+                ended_at=None if item.get("ended_at") is None else int(item["ended_at"]),
+                summary=None if item.get("summary") is None else str(item["summary"]),
+                profile=None if item.get("profile") is None else str(item["profile"]),
+                worker_pid=None if item.get("worker_pid") is None else int(item["worker_pid"]),
+                metadata=item.get("metadata"),
+            ))
+        return ExternalExecutionSnapshot(
+            task=task,
+            session_id=None if row.get("session_id") is None else str(row["session_id"]),
+            branch_name=None if row.get("branch_name") is None else str(row["branch_name"]),
+            started_at=None if row.get("started_at") is None else int(row["started_at"]),
+            completed_at=None if row.get("completed_at") is None else int(row["completed_at"]),
+            runs=tuple(sorted(parsed, key=lambda run: run.id)),
         )
 
     def import_candidates(self) -> list[ExternalTicket]:

@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+import subprocess
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
+from local_first_orchestrator.hermes_board import ExternalExecutionRun, ExternalExecutionSnapshot, ExternalTicket
+from local_first_orchestrator.ledger import Ledger
+from local_first_orchestrator.states import CanonicalState
+
+
+class ExecutionBoard:
+    def __init__(self, snapshot: ExternalExecutionSnapshot) -> None:
+        self.snapshot = snapshot
+        self.calls = 0
+
+    def execution_snapshot(self, task_id: str) -> ExternalExecutionSnapshot:
+        self.calls += 1
+        if task_id != self.snapshot.task.id:
+            raise KeyError(task_id)
+        return self.snapshot
+
+
+class HermesExecutionReconciliationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        subprocess.run(("git", "init", "-q", str(self.repo)), check=True)
+        subprocess.run(("git", "config", "user.email", "test@example.com"), cwd=self.repo, check=True)
+        subprocess.run(("git", "config", "user.name", "Test"), cwd=self.repo, check=True)
+        (self.repo / "app.py").write_text('def value():\n    return "old"\n')
+        subprocess.run(("git", "add", "app.py"), cwd=self.repo, check=True)
+        subprocess.run(("git", "commit", "-qm", "base"), cwd=self.repo, check=True)
+        self.base = subprocess.run(("git", "rev-parse", "HEAD"), cwd=self.repo, text=True, capture_output=True, check=True).stdout.strip()
+        self.ledger = Ledger(self.root / "ledger.db")
+        self.ledger.migrate()
+        contract = {
+            "objective": "change value",
+            "criterion_ids": ["AC-1"],
+            "primary_symbol": "app.py::value",
+            "allowed_files": ["app.py"],
+            "forbidden_changes": [],
+            "patch_budget": {"max_files": 1, "max_changed_lines": 10},
+            "verification": {"commands": [["python", "-m", "py_compile", "app.py"]]},
+            "risk": "low",
+            "review_required": True,
+            "max_attempts": 2,
+            "dependencies": [],
+        }
+        self.ticket_id = self.ledger.create_ticket(title="external", external_id="H-1", state=CanonicalState.READY_LOCAL, contract=contract)
+        self.ledger.bind_runtime(self.ticket_id, str(self.repo), self.base)
+        (self.repo / "app.py").write_text('def value():\n    return "new"\n')
+        self.snapshot = ExternalExecutionSnapshot(
+            task=ExternalTicket("H-1", "external", "", "scheduled", str(self.repo)),
+            session_id="session-1",
+            branch_name="worker-branch",
+            started_at=10,
+            completed_at=20,
+            runs=(ExternalExecutionRun(7, "completed", "completed", 10, 20, "worker completed", "worker-code", 123, {"source": "dispatcher"}),),
+        )
+        self.board = ExecutionBoard(self.snapshot)
+        self.controller = LocalFirstController(
+            self.ledger,
+            self.board,
+            RuntimeConfig(self.repo, self.root / "worktrees", self.root / "artifacts", repository_allowlist=(self.repo,)),
+        )
+
+    def tearDown(self) -> None:
+        self.ledger.close()
+        self.temp.cleanup()
+
+    def test_completed_hermes_run_becomes_one_attempt_and_validation_candidate(self) -> None:
+        result = self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7)
+        self.assertEqual(result["status"], "reconciled")
+        self.assertEqual(result["attempt_number"], 1)
+        self.assertEqual(result["session_id"], "session-1")
+        self.assertEqual(result["branch_name"], "worker-branch")
+        self.assertEqual(self.ledger.attempt_count(self.ticket_id), 1)
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.IMPLEMENTING.value)
+        stage = self.ledger.model_stage(self.ticket_id, 1, "implementation")
+        self.assertIsNotNone(stage)
+        self.assertEqual(stage["adapter"], "hermes-dispatch")
+        self.assertEqual(stage["worktree_path"], str(self.repo.resolve()))
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM model_invocations WHERE ticket_id=?", (self.ticket_id,)).fetchone()[0], 0)
+        self.assertTrue(Path(stage["response_artifact"]).is_file())
+
+        claim = self.ledger.claim_next_scheduler_validation("validator", lease_seconds=30, now=100)
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim["ticket_id"], self.ticket_id)
+        self.assertEqual(claim["stage"], "validation:1")
+
+    def test_replay_returns_same_attempt_without_duplicate_stage(self) -> None:
+        first = self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7)
+        second = self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7)
+        self.assertEqual(first["attempt_number"], second["attempt_number"])
+        self.assertEqual(second["status"], "already_reconciled")
+        self.assertEqual(self.ledger.attempt_count(self.ticket_id), 1)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM model_stage_artifacts WHERE ticket_id=? AND stage='implementation'", (self.ticket_id,)).fetchone()[0], 1)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM hermes_execution_reconciliations WHERE ticket_id=?", (self.ticket_id,)).fetchone()[0], 1)
+
+    def test_local_first_projection_run_is_not_accepted_as_worker_execution(self) -> None:
+        self.board.snapshot = ExternalExecutionSnapshot(
+            task=self.snapshot.task,
+            session_id=None,
+            branch_name=None,
+            started_at=10,
+            completed_at=20,
+            runs=(ExternalExecutionRun(8, "completed", "completed", 10, 20, "local-first projection ticket-event:1", None, None, None),),
+        )
+        with self.assertRaisesRegex(RuntimeError, "no completed Hermes worker run"):
+            self.controller.reconcile_hermes_execution("H-1")
+        self.assertEqual(self.ledger.attempt_count(self.ticket_id), 0)
+
+    def test_premature_hermes_done_fails_closed_before_attempt_creation(self) -> None:
+        self.board.snapshot = ExternalExecutionSnapshot(
+            task=ExternalTicket("H-1", "external", "", "done", str(self.repo)),
+            session_id=self.snapshot.session_id,
+            branch_name=self.snapshot.branch_name,
+            started_at=self.snapshot.started_at,
+            completed_at=self.snapshot.completed_at,
+            runs=self.snapshot.runs,
+        )
+        with self.assertRaisesRegex(RuntimeError, "completion_authority_bypassed"):
+            self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7)
+        self.assertEqual(self.ledger.attempt_count(self.ticket_id), 0)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM hermes_execution_reconciliations").fetchone()[0], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

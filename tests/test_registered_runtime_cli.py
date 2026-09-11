@@ -69,6 +69,22 @@ class RegisteredRuntimeCliTests(unittest.TestCase):
                 "daemon", "--execute", "--allow-board-writes", "--max-iterations", "0",
             ])
 
+    def test_hermes_execution_reconciliation_cli_is_explicit_and_read_only(self) -> None:
+        parser = argparse.ArgumentParser(); register_cli(parser)
+        args = parser.parse_args([
+            "--database", str(self.database),
+            "reconcile-hermes-execution", "--task-id", "H-1", "--run-id", "7",
+        ])
+        self.assertEqual(args.command, "reconcile-hermes-execution")
+        self.assertEqual(args.task_id, "H-1")
+        self.assertEqual(args.run_id, 7)
+        self.assertFalse(hasattr(args, "allow_board_writes"))
+        with self.assertRaisesRegex(ValueError, "requires --hermes-executable and --board"):
+            cli_main([
+                "--database", str(self.database),
+                "reconcile-hermes-execution", "--task-id", "H-1", "--run-id", "7",
+            ])
+
     def test_approve_paid_cli_persists_one_purpose_scoped_call(self) -> None:
         self.assertEqual(
             cli_main([

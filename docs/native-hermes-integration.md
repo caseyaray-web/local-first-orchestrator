@@ -6,12 +6,25 @@ Native plugin discovery, registered operator configuration, real Hermes board re
 
 The native-integration work that remains is narrower than the original bootstrap scope:
 
-1. **Hermes-dispatched execution reconciliation (next):** detect dispatcher/worker runs, bind them to Local First ticket attempts and provenance, ingest their execution result safely, and require Local First validation/review before dependency advancement.
+1. **Hermes-dispatched execution reconciliation (in progress):** the explicit read-only Hermes run snapshot plus replay-safe durable handoff into one Local First attempt is implemented. The remaining work is automatic dispatcher-run detection/ownership, preventing premature Hermes `done`, and live proof that a dispatcher-owned worker candidate flows through Local First validation/review without spawning a second implementation worker.
 2. **Full scheduler-generated tranche graph proof:** exercise generated cards plus exact native dependency projection/release across a real active tranche and successor activation.
 3. **Broader live operational proof:** exhaustively crash/restart real external boundaries and exercise the paid checkpoint/escalation route against a live paid provider.
 
 The historical installation/dashboard notes below remain valid where they describe Hermes plugin mechanics; `docs/design-v2.md` is authoritative for current full-project status.
 
+
+
+### Hermes execution reconciliation — first implemented slice
+
+The command:
+
+```text
+hermes local-first-orchestrator ... reconcile-hermes-execution --task-id <Hermes task id> [--run-id <run id>]
+```
+
+reads Hermes only; it does not require board-write permission and never launches implementation. A completed non-projection Hermes run is accepted only when its task maps exactly to one Local First ticket, its workspace is attached to the configured Git repository, and its `HEAD` descends from the authoritative execution base. The exact base-relative binary diff is hashed, an immutable JSON execution artifact is persisted, and one atomic ledger transaction creates/reuses the Local First attempt, records `adapter=hermes-dispatch` implementation-stage evidence, and transitions `ready_local -> implementing`. Existing deterministic validation/review then owns the trust lifecycle.
+
+Replaying the same Hermes run returns the same attempt. Multiple unreconciled completed runs require an explicit run id. Local First projection-generated runs are excluded. If Hermes already reports the task final `done`, reconciliation stops because Local First completion authority may already have been bypassed.
 
 ## Implemented surface
 

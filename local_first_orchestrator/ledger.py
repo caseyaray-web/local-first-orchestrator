@@ -296,6 +296,26 @@ CREATE TABLE IF NOT EXISTS model_stage_artifacts (
     base_sha TEXT NOT NULL, diff_hash TEXT NOT NULL, completed_at INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'completed', UNIQUE(ticket_id, attempt_number, stage)
 );
+CREATE TABLE IF NOT EXISTS hermes_execution_reconciliations (
+    external_task_id TEXT NOT NULL,
+    hermes_run_id INTEGER NOT NULL,
+    ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    attempt_number INTEGER NOT NULL,
+    run_status TEXT NOT NULL,
+    run_outcome TEXT,
+    session_id TEXT,
+    branch_name TEXT,
+    workspace_path TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    head_sha TEXT NOT NULL,
+    diff_hash TEXT NOT NULL,
+    artifact_path TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(external_task_id, hermes_run_id),
+    UNIQUE(ticket_id, attempt_number),
+    UNIQUE(snapshot_hash)
+);
 CREATE TABLE IF NOT EXISTS model_invocations (
     invocation_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id),
     attempt_number INTEGER NOT NULL, stage TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
@@ -912,6 +932,12 @@ class Ledger:
             CREATE INDEX IF NOT EXISTS idx_model_invocations_attempt_stage ON model_invocations(ticket_id, attempt_number, stage, started_at);
             """)
         self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_model_invocations_one_started_review ON model_invocations(ticket_id, attempt_number, stage) WHERE stage='review' AND status='started'")
+        self.connection.executescript("""
+        CREATE TRIGGER IF NOT EXISTS hermes_execution_reconciliations_immutable_update
+        BEFORE UPDATE ON hermes_execution_reconciliations BEGIN SELECT RAISE(ABORT, 'Hermes execution reconciliations are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS hermes_execution_reconciliations_immutable_delete
+        BEFORE DELETE ON hermes_execution_reconciliations BEGIN SELECT RAISE(ABORT, 'Hermes execution reconciliations are immutable'); END;
+        """)
         # Phase 2 is additive: preserve Phase 1 ledgers already created.
         ticket_columns = {
             "criterion_ids_json": "TEXT NOT NULL DEFAULT '[]'",
@@ -1213,6 +1239,71 @@ class Ledger:
     def next_attempt_number(self, ticket_id: str) -> int:
         """Historical attempts, including retired failures, are never reused."""
         return int(self.connection.execute("SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM attempts WHERE ticket_id=?", (ticket_id,)).fetchone()[0])
+
+    def hermes_execution_reconciliation(self, external_task_id: str, hermes_run_id: int) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM hermes_execution_reconciliations WHERE external_task_id=? AND hermes_run_id=?",
+            (external_task_id, hermes_run_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def record_hermes_execution_reconciliation(
+        self, *, external_task_id: str, hermes_run_id: int, ticket_id: str, attempt_number: int,
+        run_status: str, run_outcome: str | None, session_id: str | None, branch_name: str | None,
+        workspace_path: str, base_sha: str, head_sha: str, diff_hash: str, artifact_path: str,
+        snapshot_hash: str,
+    ) -> dict[str, Any]:
+        requested = (
+            external_task_id, int(hermes_run_id), ticket_id, int(attempt_number), run_status,
+            run_outcome, session_id, branch_name, workspace_path, base_sha, head_sha, diff_hash,
+            artifact_path, snapshot_hash,
+        )
+        with self._transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM hermes_execution_reconciliations WHERE external_task_id=? AND hermes_run_id=?",
+                (external_task_id, hermes_run_id),
+            ).fetchone()
+            if existing is not None:
+                actual = tuple(existing[key] for key in (
+                    "external_task_id", "hermes_run_id", "ticket_id", "attempt_number", "run_status",
+                    "run_outcome", "session_id", "branch_name", "workspace_path", "base_sha", "head_sha",
+                    "diff_hash", "artifact_path", "snapshot_hash",
+                ))
+                if actual != requested:
+                    raise RuntimeError("hermes_execution_reconciliation_conflict")
+                return dict(existing)
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=? AND external_id=?", (ticket_id, external_task_id)).fetchone()
+            if ticket is None:
+                raise RuntimeError("hermes_execution_ticket_binding_conflict")
+            if ticket["state"] not in (CanonicalState.READY_LOCAL.value, CanonicalState.IMPLEMENTING.value):
+                raise RuntimeError("hermes_execution_ticket_state_conflict")
+            attempt = conn.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            empty_hash = hashlib.sha256(b"").hexdigest()
+            if attempt is None:
+                conn.execute(
+                    "INSERT INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,post_diff_hash,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (ticket_id, attempt_number, base_sha, branch_name or f"hermes-run-{hermes_run_id}", workspace_path, empty_hash, diff_hash, self._now()),
+                )
+            else:
+                actual_attempt = (attempt["base_sha"], attempt["worktree_path"], attempt["post_diff_hash"])
+                if actual_attempt != (base_sha, workspace_path, diff_hash):
+                    raise RuntimeError("hermes_execution_attempt_conflict")
+            stage = conn.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='implementation'", (ticket_id, attempt_number)).fetchone()
+            if stage is None:
+                conn.execute(
+                    "INSERT INTO model_stage_artifacts(ticket_id,attempt_number,stage,purpose,adapter,request_hash,response_artifact,worktree_path,base_sha,diff_hash,completed_at,status) VALUES (?,?,'implementation','implementation','hermes-dispatch',?,?,?,?,?,?,'completed')",
+                    (ticket_id, attempt_number, snapshot_hash, artifact_path, workspace_path, base_sha, diff_hash, self._now()),
+                )
+            elif (stage["adapter"], stage["request_hash"], stage["response_artifact"], stage["worktree_path"], stage["base_sha"], stage["diff_hash"]) != ("hermes-dispatch", snapshot_hash, artifact_path, workspace_path, base_sha, diff_hash):
+                raise RuntimeError("hermes_execution_implementation_stage_conflict")
+            if ticket["state"] == CanonicalState.READY_LOCAL.value:
+                conn.execute("UPDATE tickets SET state=?,updated_at=? WHERE id=?", (CanonicalState.IMPLEMENTING.value, self._now(), ticket_id))
+            conn.execute(
+                "INSERT INTO hermes_execution_reconciliations(external_task_id,hermes_run_id,ticket_id,attempt_number,run_status,run_outcome,session_id,branch_name,workspace_path,base_sha,head_sha,diff_hash,artifact_path,snapshot_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (*requested, self._now()),
+            )
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="hermes_execution_reconciled", actor_id="controller", payload={"external_task_id": external_task_id, "hermes_run_id": hermes_run_id, "attempt_number": attempt_number, "snapshot_hash": snapshot_hash, "diff_hash": diff_hash})
+            return dict(conn.execute("SELECT * FROM hermes_execution_reconciliations WHERE external_task_id=? AND hermes_run_id=?", (external_task_id, hermes_run_id)).fetchone())
 
     def failed_attempt_reconciliation(self, ticket_id: str, retired_attempt_number: int | None = None) -> dict[str, Any] | None:
         query = "SELECT * FROM failed_attempt_reconciliations WHERE ticket_id=?"

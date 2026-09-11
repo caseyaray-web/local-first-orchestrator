@@ -116,6 +116,121 @@ class LocalFirstController:
         return ticket_id
 
     def import_scheduled_cards(self) -> list[str]: return [self.import_card(c) for c in self.board.import_candidates()]
+
+    def reconcile_hermes_execution(self, external_task_id: str, *, hermes_run_id: int | None = None) -> dict[str, Any]:
+        """Bind one completed dispatcher-owned Hermes run into Local First.
+
+        This operation never launches an implementation model.  It turns a
+        verified external workspace candidate into the same durable
+        implementation-stage evidence consumed by deterministic validation.
+        """
+        if not hasattr(self.board, "execution_snapshot"):
+            raise RuntimeError("Hermes execution reconciliation requires execution snapshot support")
+        snapshot = self.board.execution_snapshot(external_task_id)
+        if snapshot.task.id != external_task_id:
+            raise RuntimeError("Hermes execution task identity conflict")
+        if snapshot.task.status == "done":
+            raise RuntimeError("hermes_completion_authority_bypassed_reconciliation_required")
+        ticket_row = self.ledger.connection.execute("SELECT * FROM tickets WHERE external_id=?", (external_task_id,)).fetchone()
+        if ticket_row is None:
+            raise KeyError(f"Local First ticket not found for Hermes task {external_task_id}")
+        ticket_id = str(ticket_row["id"])
+        candidates = [
+            run for run in snapshot.runs
+            if run.status == "completed"
+            and run.outcome in {"completed", "success", "succeeded"}
+            and not str(run.summary or "").startswith("local-first projection ")
+        ]
+        if hermes_run_id is not None:
+            candidates = [run for run in candidates if run.id == hermes_run_id]
+        if not candidates:
+            raise RuntimeError("no completed Hermes worker run available for reconciliation")
+        unreconciled = [run for run in candidates if self.ledger.hermes_execution_reconciliation(external_task_id, run.id) is None]
+        if hermes_run_id is None:
+            if len(unreconciled) > 1:
+                raise RuntimeError("multiple Hermes worker runs require explicit run id")
+            run = unreconciled[0] if unreconciled else candidates[-1]
+        else:
+            run = candidates[0]
+        existing = self.ledger.hermes_execution_reconciliation(external_task_id, run.id)
+        if existing is not None:
+            return {**existing, "status": "already_reconciled"}
+
+        repository, worktree_root, artifact_root = self.config.validate_execution_roots()
+        binding = self.ledger.runtime_binding(ticket_id)
+        workspace = Path(snapshot.task.workspace_path or "").expanduser().resolve(strict=True)
+        if not workspace.is_dir():
+            raise RuntimeError("Hermes execution workspace is not a directory")
+
+        def git(*args: str, cwd: Path = workspace, check: bool = True) -> subprocess.CompletedProcess[str]:
+            try:
+                return subprocess.run(("git", *args), cwd=cwd, text=True, capture_output=True, timeout=30, check=check)
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(exc.stderr.strip() or exc.stdout.strip() or "Hermes execution Git provenance check failed") from exc
+
+        workspace_root = Path(git("rev-parse", "--show-toplevel").stdout.strip()).resolve(strict=True)
+        if workspace_root != workspace:
+            raise RuntimeError("Hermes execution workspace must be the Git toplevel")
+        workspace_common_raw = git("rev-parse", "--git-common-dir").stdout.strip()
+        workspace_common = (workspace / workspace_common_raw).resolve(strict=True) if not Path(workspace_common_raw).is_absolute() else Path(workspace_common_raw).resolve(strict=True)
+        repo_common_raw = git("rev-parse", "--git-common-dir", cwd=repository).stdout.strip()
+        repo_common = (repository / repo_common_raw).resolve(strict=True) if not Path(repo_common_raw).is_absolute() else Path(repo_common_raw).resolve(strict=True)
+        if workspace_common != repo_common:
+            raise RuntimeError("Hermes execution workspace is not attached to the configured repository")
+
+        adapter = GitWorktreeAdapter(repository, worktree_root)
+        base_sha = adapter.existing_execution_base(ticket_row["tranche_id"] or None, str(binding["starting_sha"]))
+        head_sha = git("rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
+        if git("merge-base", "--is-ancestor", base_sha, head_sha, check=False).returncode != 0:
+            raise RuntimeError("Hermes execution HEAD does not descend from the authoritative execution base")
+        diff = git("diff", "--binary", "--no-ext-diff", base_sha, "--").stdout
+        diff_hash = hashlib.sha256(diff.encode()).hexdigest()
+        if not diff.strip():
+            raise RuntimeError("Hermes execution produced no candidate diff")
+
+        attempt_number = self.ledger.next_attempt_number(ticket_id)
+        artifact_dir = artifact_root / ticket_id / str(attempt_number)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "adapter": "hermes-dispatch",
+            "external_task_id": external_task_id,
+            "hermes_run": {
+                "id": run.id, "status": run.status, "outcome": run.outcome,
+                "started_at": run.started_at, "ended_at": run.ended_at,
+                "summary": run.summary, "profile": run.profile,
+                "worker_pid": run.worker_pid, "metadata": run.metadata,
+            },
+            "session_id": snapshot.session_id,
+            "branch_name": snapshot.branch_name,
+            "workspace_path": str(workspace),
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "diff_hash": diff_hash,
+        }
+        snapshot_hash = canonical_sha256(payload)
+        artifact_path = artifact_dir / f"hermes-execution-{run.id}.json"
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+        if artifact_path.exists() and artifact_path.read_text() != encoded:
+            raise RuntimeError("Hermes execution artifact conflict")
+        artifact_path.write_text(encoded)
+        row = self.ledger.record_hermes_execution_reconciliation(
+            external_task_id=external_task_id,
+            hermes_run_id=run.id,
+            ticket_id=ticket_id,
+            attempt_number=attempt_number,
+            run_status=run.status,
+            run_outcome=run.outcome,
+            session_id=snapshot.session_id,
+            branch_name=snapshot.branch_name,
+            workspace_path=str(workspace),
+            base_sha=base_sha,
+            head_sha=head_sha,
+            diff_hash=diff_hash,
+            artifact_path=str(artifact_path),
+            snapshot_hash=snapshot_hash,
+        )
+        return {**row, "status": "reconciled"}
+
     def dry_run(self, task_id: str) -> dict[str, object]:
         row=self.ledger.get_ticket(task_id); binding=self.ledger.runtime_binding(task_id)
         return {"ticket_id":task_id,"state":row["state"],"repository":binding["repository_path"],"starting_sha":binding["starting_sha"],"would_invoke_model":False,"would_write_board":False,"would_modify_repository":False}
