@@ -196,6 +196,19 @@ Already complete or substantially complete:
    - CLI execution remains fail-closed: `daemon` requires registered runtime, `--execute`, `--allow-board-writes`, explicit Hermes executable/board access, and exposes bounded sleep/backoff/max-iteration controls
    - restart tests prove a fresh daemon over the same ledger simply continues the next durable board effect left by the previous daemon, with no daemon-specific recovery path
 
+20. **Real end-to-end acceptance — Complete for the representative low-risk scheduler scope**
+   - a dedicated real Hermes board/task was imported through the supported Local First CLI and driven by the production daemon/scheduler, not by direct lifecycle-row mutation
+   - real local implementation used `custom:lm-studio` / `qwen3.8-27b@iq3_s` in an isolated Git worktree and produced exactly one completed implementation invocation
+   - deterministic validation passed and persisted before review
+   - real fresh review used a separate review profile/process with `openai-codex` / `gpt-5.6-terra`, produced exactly one structured `pass` verdict, and did not reuse the implementation profile home/tool loop
+   - acceptance froze immutable candidate evidence before one real Git commit/integration-head advance
+   - Hermes state/comment completion projection reached `done`, all workflow outboxes drained, and the final scheduler state was `no_work`
+   - a real post-Hermes/pre-ledger comment-delivery crash was injected; restart reconciled the persisted marker with one remote delivery and no duplicate comment
+   - a separate live Hermes parent/child probe verified exact native parent linkage and child `todo -> ready` advancement after parent completion
+   - the representative low-risk path created zero paid reservations and zero paid checkpoint evidence
+   - the real run exposed and fixed current-Hermes integration gaps in independent review profile wiring, comment marker reads, idempotent scheduled-state projection, and scheduled completion transition handling
+   - detailed evidence is recorded in `docs/milestone-20-real-acceptance.md`; final repository validation is 735 tests / 179 subtests passing
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage — Complete
@@ -520,7 +533,7 @@ Completion condition: killing and restarting the daemon is operationally equival
 
 **Current status:** Complete for this scheduler milestone. `SchedulerDaemon` repeatedly instantiates the exact same registered `ProcessNextScheduler` composition used by `process-next --execute` and invokes one bounded tick per iteration. It adds only operational concerns: idle/busy/paused sleep, bounded exponential error backoff, graceful SIGINT/SIGTERM stop requests, health counters/timestamps, and final health plus scheduler-observability reporting. It does not inspect or mutate lifecycle state independently of the one-tick scheduler. The CLI remains fail-closed and requires registered runtime, `--execute`, `--allow-board-writes`, and explicit Hermes executable/board access; polling/backoff and optional `--max-iterations` are operator controls only. Pause handling remains scheduler-owned, so already-durable projection work can finish while paused and new lifecycle claims remain blocked. Tests prove idle/busy/paused sleep behavior, backoff/reset semantics, graceful stop between ticks, health/status output, parser/permission gates, and restart equivalence across a durable state-projection → evidence-comment boundary using a brand-new Ledger/daemon instance. Focused daemon/CLI/scheduler tests pass 38 tests, and the full repository suite passes 732 tests / 179 subtests.
 
-## 20. Real end-to-end acceptance
+## 20. Real end-to-end acceptance — Complete
 
 Prove the finished scheduler against real configured integrations.
 
@@ -538,10 +551,12 @@ Required proof:
 
 Completion condition: one representative low-risk feature proceeds from eligible Hermes work through implementation, validation, review, accepted commit, completion projection, and dependency advancement under the v2 ownership model, including restart proof, without hidden manual lifecycle substitutions.
 
+**Current status:** Complete for the representative low-risk scheduler acceptance scope. A dedicated real Hermes task (`t_cc72b17f`) on board `lfo-m20-acceptance` was imported through the supported CLI and driven by the production daemon against an isolated Git repository and Local First ledger. The configured local implementation model completed one bounded worktree edit; deterministic validation passed; an independent review profile/process produced one schema-valid `pass` verdict; acceptance froze candidate evidence; Git produced commit `a90f1515801ee75314a829d0fc79d00a43fc3703`; Local First and Hermes both reached `done`; all workflow state/comment outboxes drained; and the completed commit independently re-passed the acceptance validation commands. A real crash was injected after Hermes accepted an evidence comment but before local acknowledgment; restart reconciled the existing marker with exactly one remote comment. A separate real Hermes dependency probe verified native parent linkage and child readiness advancement after the parent reached `done`. The low-risk path created zero paid reservations/calls. The live exercise also drove production fixes for separate review `HERMES_HOME`, current Hermes comment-marker reads, idempotent already-scheduled projections, and the supported `scheduled -> unblock -> complete` terminal transition. See `docs/milestone-20-real-acceptance.md` for exact IDs, hashes, commands, restart evidence, and remaining broader design boundaries.
+
 ## Scheduler milestone sequence
 
 The intended implementation sequence is:
 
 `foundation → implementation → validation → review → repair routing → triage → acceptance → Git integration → completion projection → dependency release → tranche/checkpoint → paid stages → next-tranche activation → reconciliation hardening → deterministic ordering → concurrency proof → crash matrix → observability → daemon → real E2E acceptance`
 
-The current implementation has completed the first two scheduler milestones. The next milestone is **deterministic validation**.
+All twenty dependency-ordered scheduler milestones are complete for the representative v2 Local First scheduler acceptance scope. See `docs/milestone-20-real-acceptance.md` for the live integration evidence and the broader design items that remain intentionally separate.

@@ -372,9 +372,10 @@ class GeneratedProjectionDeliveryTests(unittest.TestCase):
         self.ledger.transition(ticket_id, CanonicalState.BLOCKED)
         self.assertTrue(self.ledger.project_ticket(ticket_id, adapter))
         calls = self.calls()
-        self.assertEqual([call[3] for call in calls], ["create", "show", "schedule", "block"])
-        self.assertEqual([calls[2][4], calls[3][4]], ["1", "1"])
-        self.assertNotIn(ticket_id, [calls[2][4], calls[3][4]])
+        self.assertEqual([call[3] for call in calls], ["create", "show", "show", "schedule", "show"])
+        external_targets = [calls[index][4] for index in (2, 3, 4)]
+        self.assertEqual(external_targets, ["1", "1", "1"])
+        self.assertNotIn(ticket_id, external_targets)
         rows = self.ledger.connection.execute("SELECT external_task_id FROM board_projection_outbox WHERE ticket_id=? AND operation='set_state' ORDER BY event_id", (ticket_id,)).fetchall()
         self.assertEqual([row["external_task_id"] for row in rows], [None, "1"])
         self.assertIsNone(self.ledger.get_ticket(ticket_id)["external_id"])

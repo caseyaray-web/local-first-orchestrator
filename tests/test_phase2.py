@@ -197,14 +197,16 @@ class Phase2Tests(unittest.TestCase):
         def runner(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
             calls.append((argv, dict(kwargs)))
             return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"content_type": "json", "parsed": {"verdict": "pass", "criterion_results": [], "findings": [], "suggestions": []}}), stderr="")
-        worker_home = self.root / "worker-code-local"
-        result = LocalQwenAdapter(runner=runner, hermes_home=worker_home).invoke("review", "packet", artifact_dir=self.root / "review-worker", workdir=self.root / "must-not-pass")
+        implementation_home = self.root / "worker-code-local"
+        review_home = self.root / "worker-review-terra"
+        result = LocalQwenAdapter(runner=runner, hermes_home=implementation_home, review_hermes_home=review_home).invoke("review", "packet", artifact_dir=self.root / "review-worker", workdir=self.root / "must-not-pass")
         self.assertEqual(result.payload["verdict"], "pass")
         self.assertEqual(len(calls), 1)
         argv, kwargs = calls[0]
         self.assertEqual(argv, (sys.executable, "-m", "local_first_orchestrator.review_worker"))
         self.assertEqual(json.loads(kwargs["input"]), {"packet": "packet", "provider": "custom:lm-studio", "model": "qwen3.8-27b@iq3_s", "timeout_seconds": 300})
-        self.assertEqual(kwargs["env"]["HERMES_HOME"], str(worker_home.resolve()))
+        self.assertEqual(kwargs["env"]["HERMES_HOME"], str(review_home.resolve()))
+        self.assertNotEqual(kwargs["env"]["HERMES_HOME"], str(implementation_home.resolve()))
         self.assertNotIn("TERMINAL_CWD", kwargs["env"])
         self.assertEqual(os.environ.get("HERMES_HOME"), old_home)
 

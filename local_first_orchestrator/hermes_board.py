@@ -79,19 +79,34 @@ class HermesBoardAdapter:
         return candidates
 
     def find_comment_marker(self, external_task_id: str, marker: str) -> MarkerLookup:
-        """Current machine-readable Hermes reads do not expose comment bodies."""
-        return MarkerLookup.UNSUPPORTED
+        payload = self._run("show", external_task_id, "--json")
+        comments = payload.get("comments", []) if isinstance(payload, dict) else []
+        if not isinstance(comments, list):
+            return MarkerLookup.UNAVAILABLE
+        for row in comments:
+            if isinstance(row, dict) and marker in str(row.get("body") or ""):
+                return MarkerLookup.FOUND
+        return MarkerLookup.NOT_FOUND
 
     def set_state(self, ticket_id: str, state: CanonicalState, *, idempotency_key: str) -> None:
         if not self.allow_writes:
             raise PermissionError("real board writes require --allow-board-writes")
+        current = self.get_task(ticket_id).status
         if state == CanonicalState.DONE:
+            if current == "done":
+                return
+            if current == "scheduled":
+                self._run("unblock", ticket_id, "--reason", f"local-first completion {idempotency_key}")
             self._run("complete", ticket_id, "--result", f"local-first projection {idempotency_key}")
         elif state in {CanonicalState.BLOCKED, CanonicalState.NEEDS_TRIAGE, CanonicalState.NEEDS_CHECKPOINT, CanonicalState.NEEDS_HUMAN_TEST}:
+            if current == "blocked":
+                return
             self._run("block", ticket_id, f"local-first projection {state.value} ({idempotency_key})", "--kind", "needs_input")
         else:
             # Scheduled is deliberately non-dispatchable by Hermes; the local-first
             # controller owns execution and avoids racing the gateway dispatcher.
+            if current == "scheduled":
+                return
             self._run("schedule", ticket_id, f"local-first projection {state.value} ({idempotency_key})")
 
     def create_microticket(self, title: str, body: str, *, idempotency_key: str) -> str:

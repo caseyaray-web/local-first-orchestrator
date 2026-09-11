@@ -3,6 +3,7 @@ import json,os,stat,subprocess,unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from local_first_orchestrator.hermes_board import HermesBoardAdapter
+from local_first_orchestrator.comment_delivery import MarkerLookup
 from local_first_orchestrator.states import CanonicalState
 _FAKE='''#!/usr/bin/env python3
 import json,os,sys
@@ -53,4 +54,35 @@ class ProcessReadTests(unittest.TestCase):
   self.assertEqual(task.parents,('parent-a','parent-b'));self.assertEqual(task.children,('leaf',))
   a.link_dependency('parent-a','child')
   self.assertIn([str(self.exe),'kanban','--board','board','link','parent-a','child'],calls)
+ def test_comment_marker_lookup_uses_show_json_comments(self):
+  def runner(argv,**kwargs):
+   payload={'task':{'id':'1','title':'x','body':'','status':'scheduled','workspace_path':None},'comments':[{'author':'local-first-orchestrator','body':'hello <!-- local-first-comment:abc -->','created_at':1}], 'parents':[], 'children':[]}
+   return subprocess.CompletedProcess(argv,0,json.dumps(payload),'')
+  a=HermesBoardAdapter(executable=str(self.exe),board='board',runner=runner)
+  self.assertEqual(a.find_comment_marker('1','<!-- local-first-comment:abc -->'),MarkerLookup.FOUND)
+  self.assertEqual(a.find_comment_marker('1','<!-- local-first-comment:missing -->'),MarkerLookup.NOT_FOUND)
+ def test_nonterminal_state_projection_is_idempotent_when_already_scheduled(self):
+  calls=[]
+  def runner(argv,**kwargs):
+   calls.append(list(argv))
+   if argv[-1]=='--json':
+    return subprocess.CompletedProcess(argv,0,json.dumps({'task':{'id':'1','title':'x','body':'','status':'scheduled','workspace_path':None},'parents':[],'children':[],'comments':[]}), '')
+   return subprocess.CompletedProcess(argv,0,'','')
+  a=HermesBoardAdapter(executable=str(self.exe),board='board',allow_writes=True,runner=runner)
+  a.set_state('1',CanonicalState.LOCAL_REVIEW,idempotency_key='K')
+  self.assertEqual(calls,[[str(self.exe),'kanban','--board','board','show','1','--json']])
+ def test_done_projection_promotes_scheduled_task_before_complete(self):
+  calls=[]
+  def runner(argv,**kwargs):
+   calls.append(list(argv))
+   if argv[-1]=='--json':
+    return subprocess.CompletedProcess(argv,0,json.dumps({'task':{'id':'1','title':'x','body':'','status':'scheduled','workspace_path':None},'parents':[],'children':[],'comments':[]}), '')
+   return subprocess.CompletedProcess(argv,0,'','')
+  a=HermesBoardAdapter(executable=str(self.exe),board='board',allow_writes=True,runner=runner)
+  a.set_state('1',CanonicalState.DONE,idempotency_key='K')
+  self.assertEqual(calls,[
+   [str(self.exe),'kanban','--board','board','show','1','--json'],
+   [str(self.exe),'kanban','--board','board','unblock','1','--reason','local-first completion K'],
+   [str(self.exe),'kanban','--board','board','complete','1','--result','local-first projection K'],
+  ])
 if __name__=='__main__':unittest.main()

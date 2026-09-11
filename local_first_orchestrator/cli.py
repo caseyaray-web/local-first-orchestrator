@@ -167,7 +167,14 @@ def _registered_controller(ledger: Ledger, args: argparse.Namespace, *, allow_bo
     if requested != config.canonical_repository:
         raise ValueError("registered execution repository does not match operator registration")
     runtime = config.runtime_config()
-    model = LocalQwenAdapter(provider=config.implementation.provider, model=config.implementation.model, hermes_home=Path.home()/".hermes"/"profiles"/config.implementation.profile, implementation_timeout_seconds=runtime.implementation_timeout_seconds, review_timeout_seconds=runtime.review_timeout_seconds)
+    model = LocalQwenAdapter(
+        provider=config.implementation.provider,
+        model=config.implementation.model,
+        hermes_home=Path.home()/".hermes"/"profiles"/config.implementation.profile,
+        review_hermes_home=Path.home()/".hermes"/"profiles"/config.review.profile,
+        implementation_timeout_seconds=runtime.implementation_timeout_seconds,
+        review_timeout_seconds=runtime.review_timeout_seconds,
+    )
     model.review_provider, model.review_model = config.review.provider, config.review.model
     return LocalFirstController(ledger,_board_for_cli(args,allow_board_writes),runtime,local_model=model), config
 
