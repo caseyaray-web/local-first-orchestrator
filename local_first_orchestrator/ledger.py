@@ -457,6 +457,25 @@ CREATE TRIGGER IF NOT EXISTS tranche_completion_evidence_hash_integrity
 BEFORE INSERT ON tranche_completion_evidence
 WHEN NEW.evidence_hash != canonical_completion_hash(NEW.tranche_id,NEW.root_planning_sha,NEW.final_integration_sha,NEW.accepted_ticket_ids_json,NEW.accepted_commit_shas_json)
 BEGIN SELECT RAISE(ABORT, 'tranche completion evidence hash mismatch'); END;
+CREATE TABLE IF NOT EXISTS tranche_checkpoint_evidence (
+    tranche_id TEXT PRIMARY KEY REFERENCES tranches(id),
+    feature_id TEXT NOT NULL REFERENCES features(id),
+    completion_evidence_hash TEXT NOT NULL,
+    final_integration_sha TEXT NOT NULL,
+    repository_identity TEXT NOT NULL,
+    planning_base_sha TEXT NOT NULL,
+    planning_snapshot_hash TEXT NOT NULL,
+    integration_commands_json TEXT NOT NULL,
+    integration_results_json TEXT NOT NULL,
+    checkpoint_artifact TEXT NOT NULL,
+    checkpoint_artifact_sha256 TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK(decision IN ('ready_for_checkpoint','integration_failed')),
+    created_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS tranche_checkpoint_evidence_immutable_update
+BEFORE UPDATE ON tranche_checkpoint_evidence BEGIN SELECT RAISE(ABORT, 'tranche checkpoint evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS tranche_checkpoint_evidence_immutable_delete
+BEFORE DELETE ON tranche_checkpoint_evidence BEGIN SELECT RAISE(ABORT, 'tranche checkpoint evidence is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS tranche_completion_rechecks_immutable_update
 BEFORE UPDATE ON tranche_completion_rechecks BEGIN SELECT RAISE(ABORT, 'tranche completion rechecks are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS tranche_completion_rechecks_immutable_delete
@@ -3380,7 +3399,7 @@ class Ledger:
             if changed.rowcount != 1:
                 raise PermissionError("scheduler claim lease is not owned")
             self._append_event(conn, entity_type="ticket", entity_id=str(row["ticket_id"]), event_type="scheduler_stage_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": row["stage"], "result": result})
-            if row["stage"] == "implementation" or str(row["stage"]).startswith("implementation:") or str(row["stage"]).startswith("validation:") or str(row["stage"]).startswith("review:") or str(row["stage"]).startswith("repair_routing:") or str(row["stage"]).startswith("triage:") or str(row["stage"]).startswith("acceptance:") or str(row["stage"]).startswith("git_integration:") or str(row["stage"]).startswith("completion:"):
+            if row["stage"] == "implementation" or str(row["stage"]).startswith("implementation:") or str(row["stage"]).startswith("validation:") or str(row["stage"]).startswith("review:") or str(row["stage"]).startswith("repair_routing:") or str(row["stage"]).startswith("triage:") or str(row["stage"]).startswith("acceptance:") or str(row["stage"]).startswith("git_integration:") or str(row["stage"]).startswith("completion:") or row["stage"] == "tranche_checkpoint":
                 conn.execute(
                     "UPDATE tickets SET lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND lease_owner=?",
                     (now, row["ticket_id"], owner),
@@ -4418,6 +4437,109 @@ class Ledger:
     def tranche_completion(self, tranche_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT * FROM tranche_completion_evidence WHERE tranche_id=?", (tranche_id,)).fetchone()
         return dict(row) if row else None
+
+    def tranche_checkpoint(self, tranche_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM tranche_checkpoint_evidence WHERE tranche_id=?", (tranche_id,)).fetchone()
+        return dict(row) if row else None
+
+    def claim_next_scheduler_tranche_checkpoint(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+        if not owner or lease_seconds < 1:
+            raise ValueError("tranche checkpoint claim requires owner and positive lease")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
+                return None
+            replay = conn.execute("SELECT * FROM scheduler_stage_claims WHERE stage='tranche_checkpoint' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,)).fetchone()
+            if replay is not None:
+                identity = json.loads(str(replay["candidate_identity_json"] or "{}"))
+                current = self._tranche_checkpoint_identity(conn, str(identity.get("tranche_id") or ""))
+                if identity != current:
+                    raise RuntimeError("tranche_checkpoint_reconciliation_required: claim identity drift")
+                if conn.execute("UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?", (owner,now+lease_seconds,now,replay["claim_id"],now)).rowcount != 1:
+                    return None
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
+            rows = conn.execute("SELECT id FROM tranches WHERE status='active' AND NOT EXISTS (SELECT 1 FROM tranche_checkpoint_evidence c WHERE c.tranche_id=tranches.id) ORDER BY feature_id,ordinal,id").fetchall()
+            for row in rows:
+                try:
+                    identity = self._tranche_checkpoint_identity(conn, str(row["id"]))
+                except RuntimeError:
+                    continue
+                claim_ticket_id = str(identity["ticket_ids"][-1])
+                if conn.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND stage='tranche_checkpoint'", (claim_ticket_id,)).fetchone():
+                    continue
+                encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+                claim_id = hashlib.sha256(("tranche_checkpoint:" + encoded).encode()).hexdigest()[:32]
+                conn.execute("INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,created_at,updated_at) VALUES (?,?,'tranche_checkpoint','claimed',?,?,1,?,?,?)", (claim_id,claim_ticket_id,owner,now+lease_seconds,encoded,now,now))
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+            return None
+
+    def _tranche_checkpoint_identity(self, conn: sqlite3.Connection, tranche_id: str) -> dict[str, Any]:
+        tranche = conn.execute("SELECT * FROM tranches WHERE id=?", (tranche_id,)).fetchone()
+        if tranche is None or tranche["status"] != "active" or not tranche["base_sha"]:
+            raise RuntimeError("tranche_checkpoint_reconciliation_required: tranche is not active")
+        plan = conn.execute("SELECT repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json FROM decomposition_plans WHERE feature_id=? AND status='active' ORDER BY activated_at DESC LIMIT 1", (tranche["feature_id"],)).fetchone()
+        if plan is None or not all(isinstance(plan[k], str) and plan[k] for k in ("repository_identity","repo_base_sha","repo_snapshot_hash","repo_snapshot_manifest_json")):
+            raise RuntimeError("tranche_checkpoint_reconciliation_required: planning snapshot authority missing")
+        tickets = conn.execute("SELECT t.id,t.state,ae.accepted_commit_sha FROM tickets t LEFT JOIN accepted_evidence ae ON ae.ticket_id=t.id WHERE t.tranche_id=? AND t.id NOT LIKE 'tranche:%' ORDER BY t.created_at,t.id", (tranche_id,)).fetchall()
+        if not tickets or any(row["state"] != CanonicalState.DONE.value or not row["accepted_commit_sha"] for row in tickets):
+            raise RuntimeError("tranche_checkpoint_reconciliation_required: tranche work incomplete")
+        commands = json.loads(str(tranche["integration_commands_json"] or "[]"))
+        if not isinstance(commands, list) or any(not isinstance(c, list) or not c or not all(isinstance(x,str) and x for x in c) for c in commands):
+            raise RuntimeError("tranche_checkpoint_reconciliation_required: integration commands malformed")
+        return {"tranche_id":tranche_id,"feature_id":str(tranche["feature_id"]),"tranche_base_sha":str(tranche["base_sha"]),"repository_identity":str(plan["repository_identity"]),"planning_base_sha":str(plan["repo_base_sha"]),"planning_snapshot_hash":str(plan["repo_snapshot_hash"]),"planning_snapshot_manifest_json":str(plan["repo_snapshot_manifest_json"]),"integration_commands":commands,"ticket_ids":[str(r["id"]) for r in tickets],"accepted_commit_shas":[str(r["accepted_commit_sha"]) for r in tickets]}
+
+    def apply_scheduler_tranche_checkpoint_effect(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        now = self._now() if now is None else now
+        encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if claim is None or claim["stage"] != "tranche_checkpoint" or claim["side_effect_started_at"] is None:
+                raise RuntimeError("tranche checkpoint claim is not active")
+            if claim["lease_owner"] != owner or int(claim["lease_expires_at"] or 0) <= now:
+                raise PermissionError("scheduler claim lease is not owned")
+            if claim["side_effect_completed_at"] is not None:
+                if claim["result_json"] != encoded: raise RuntimeError("tranche checkpoint result conflicts")
+                return dict(claim)
+            identity = json.loads(str(claim["candidate_identity_json"]))
+            if result.get("candidate_identity") != identity or self._tranche_checkpoint_identity(conn, str(identity["tranche_id"])) != identity:
+                raise RuntimeError("tranche_checkpoint_reconciliation_required: result identity drift")
+            completion = result.get("completion") or {}
+            if completion.get("tranche_id") != identity["tranche_id"] or completion.get("accepted_ticket_ids") != identity["ticket_ids"] or completion.get("accepted_commit_shas") != identity["accepted_commit_shas"]:
+                raise RuntimeError("tranche_checkpoint_reconciliation_required: completion evidence drift")
+            completion = dict(completion); completion["accepted_ticket_ids_json"] = json.dumps(completion["accepted_ticket_ids"],separators=(",",":")); completion["accepted_commit_shas_json"] = json.dumps(completion["accepted_commit_shas"],separators=(",",":")); expected_hash = _completion_evidence_hash(completion)
+            if completion.get("evidence_hash") != expected_hash: raise RuntimeError("tranche_checkpoint_reconciliation_required: completion hash invalid")
+            integration_results = result.get("integration_results")
+            if not isinstance(integration_results, list) or len(integration_results) > len(identity["integration_commands"]):
+                raise RuntimeError("tranche_checkpoint_reconciliation_required: integration results malformed")
+            for index, entry in enumerate(integration_results):
+                if not isinstance(entry, dict) or entry.get("index") != index or entry.get("command") != identity["integration_commands"][index] or not isinstance(entry.get("returncode"), int):
+                    raise RuntimeError("tranche_checkpoint_reconciliation_required: integration result identity drift")
+            failed = next((entry for entry in integration_results if int(entry["returncode"]) != 0), None)
+            expected_decision = "integration_failed" if failed is not None else "ready_for_checkpoint"
+            if failed is None and len(integration_results) != len(identity["integration_commands"]):
+                raise RuntimeError("tranche_checkpoint_reconciliation_required: integration results incomplete")
+            if result.get("decision") != expected_decision:
+                raise RuntimeError("tranche_checkpoint_reconciliation_required: checkpoint decision drift")
+            artifact = Path(str(result.get("checkpoint_artifact") or ""))
+            if not artifact.is_file() or hashlib.sha256(artifact.read_bytes()).hexdigest() != result.get("checkpoint_artifact_sha256"):
+                raise RuntimeError("tranche_checkpoint_reconciliation_required: checkpoint artifact drift")
+            try:
+                artifact_payload = json.loads(artifact.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError("tranche_checkpoint_reconciliation_required: checkpoint artifact malformed") from exc
+            if artifact_payload.get("tranche_id") != identity["tranche_id"] or artifact_payload.get("feature_id") != identity["feature_id"] or artifact_payload.get("candidate_identity") != identity or artifact_payload.get("integration_commands") != identity["integration_commands"] or artifact_payload.get("completion") != completion or artifact_payload.get("integration_results") != integration_results or artifact_payload.get("decision") != expected_decision:
+                raise RuntimeError("tranche_checkpoint_reconciliation_required: checkpoint artifact identity drift")
+            existing = conn.execute("SELECT * FROM tranche_completion_evidence WHERE tranche_id=?", (identity["tranche_id"],)).fetchone()
+            values=(identity["tranche_id"],completion["root_planning_sha"],completion["final_integration_sha"],completion["accepted_ticket_ids_json"],completion["accepted_commit_shas_json"],completion["evidence_hash"])
+            if existing is None: conn.execute("INSERT INTO tranche_completion_evidence(tranche_id,root_planning_sha,final_integration_sha,accepted_ticket_ids_json,accepted_commit_shas_json,evidence_hash,completed_at) VALUES (?,?,?,?,?,?,?)", (*values,now))
+            elif tuple(existing[k] for k in ("tranche_id","root_planning_sha","final_integration_sha","accepted_ticket_ids_json","accepted_commit_shas_json","evidence_hash")) != values: raise RuntimeError("tranche_checkpoint_reconciliation_required: completion evidence conflicts")
+            row = conn.execute("SELECT * FROM tranche_checkpoint_evidence WHERE tranche_id=?", (identity["tranche_id"],)).fetchone()
+            cp=(identity["tranche_id"],identity["feature_id"],completion["evidence_hash"],completion["final_integration_sha"],identity["repository_identity"],identity["planning_base_sha"],identity["planning_snapshot_hash"],json.dumps(identity["integration_commands"],separators=(",",":")),json.dumps(integration_results,sort_keys=True,separators=(",",":")),str(artifact),str(result["checkpoint_artifact_sha256"]),expected_decision)
+            if row is None: conn.execute("INSERT INTO tranche_checkpoint_evidence(tranche_id,feature_id,completion_evidence_hash,final_integration_sha,repository_identity,planning_base_sha,planning_snapshot_hash,integration_commands_json,integration_results_json,checkpoint_artifact,checkpoint_artifact_sha256,decision,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (*cp,now))
+            elif tuple(row[k] for k in ("tranche_id","feature_id","completion_evidence_hash","final_integration_sha","repository_identity","planning_base_sha","planning_snapshot_hash","integration_commands_json","integration_results_json","checkpoint_artifact","checkpoint_artifact_sha256","decision")) != cp: raise RuntimeError("tranche_checkpoint_reconciliation_required: checkpoint evidence conflicts")
+            conn.execute("UPDATE scheduler_stage_claims SET side_effect_completed_at=?,result_json=?,updated_at=? WHERE claim_id=?", (now,encoded,now,claim_id))
+            self._append_event(conn, entity_type="tranche", entity_id=str(identity["tranche_id"]), event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id":claim_id,"stage":"tranche_checkpoint","decision":expected_decision,"completion_evidence_hash":completion["evidence_hash"],"checkpoint_artifact_sha256":result["checkpoint_artifact_sha256"]})
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
     def record_tranche_completion(self, completion: dict[str, Any]) -> None:
         now = self._now()

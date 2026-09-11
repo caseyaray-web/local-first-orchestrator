@@ -260,6 +260,28 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     if native_release is not None:
         return ProcessNextPreview(next_stage="native_dependency_release", ticket_id=str(native_release["id"]), would_execute=True)
 
+    tranche_checkpoint_replay = ledger.connection.execute(
+        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage='tranche_checkpoint' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
+        (now,),
+    ).fetchone()
+    if tranche_checkpoint_replay is not None:
+        return ProcessNextPreview(next_stage="tranche_checkpoint", ticket_id=str(tranche_checkpoint_replay["ticket_id"]), would_execute=True)
+    tranche_checkpoint = ledger.connection.execute("""
+        SELECT t.id AS ticket_id FROM tranches tr
+        JOIN tickets t ON t.tranche_id=tr.id
+        JOIN decomposition_plans p ON p.feature_id=tr.feature_id AND p.status='active'
+        WHERE tr.status='active'
+          AND p.repository_identity IS NOT NULL AND p.repo_base_sha IS NOT NULL
+          AND p.repo_snapshot_hash IS NOT NULL AND p.repo_snapshot_manifest_json IS NOT NULL
+          AND json_valid(tr.integration_commands_json)=1 AND json_type(tr.integration_commands_json)='array'
+          AND NOT EXISTS (SELECT 1 FROM tranche_checkpoint_evidence c WHERE c.tranche_id=tr.id)
+          AND NOT EXISTS (SELECT 1 FROM tickets x LEFT JOIN accepted_evidence ae ON ae.ticket_id=x.id WHERE x.tranche_id=tr.id AND (x.state!='done' OR ae.ticket_id IS NULL))
+          AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.stage='tranche_checkpoint' AND json_extract(c.candidate_identity_json,'$.tranche_id')=tr.id)
+        ORDER BY tr.feature_id,tr.ordinal,tr.id,t.created_at DESC,t.id DESC LIMIT 1
+    """).fetchone()
+    if tranche_checkpoint is not None:
+        return ProcessNextPreview(next_stage="tranche_checkpoint", ticket_id=str(tranche_checkpoint["ticket_id"]), would_execute=True)
+
     implementation_replay = ledger.connection.execute(
         "SELECT ticket_id FROM scheduler_stage_claims WHERE (stage='implementation' OR stage LIKE 'implementation:%') AND status='claimed' "
         "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
@@ -342,6 +364,7 @@ class ProcessNextScheduler:
         triage_execution_policy_hash: str | None = None,
         acceptance_runner: Callable[[str], dict[str, Any]] | None = None,
         git_integration_runner: Callable[[str], dict[str, Any]] | None = None,
+        tranche_checkpoint_runner: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         if not worker_id or lease_seconds < 1:
             raise ValueError("process-next requires a worker id and positive lease")
@@ -363,6 +386,7 @@ class ProcessNextScheduler:
         self.triage_execution_policy_hash = triage_execution_policy_hash
         self.acceptance_runner = acceptance_runner
         self.git_integration_runner = git_integration_runner
+        self.tranche_checkpoint_runner = tranche_checkpoint_runner
         if self.review_runner is not None and not self.review_execution_policy_hash:
             raise ValueError("process-next review runner requires a review execution policy hash")
         if self.triage_runner is not None and not self.triage_execution_policy_hash:
@@ -677,6 +701,30 @@ class ProcessNextScheduler:
                     claim_id, execution_owner, release_result, now=now
                 )
                 return ProcessNextResult("completed", "native_dependency_release", ticket_id, claim_id)
+
+        if self.tranche_checkpoint_runner is not None:
+            checkpoint_claim = self.ledger.claim_next_scheduler_tranche_checkpoint(
+                execution_owner, lease_seconds=self.lease_seconds, now=now
+            )
+            if checkpoint_claim is not None:
+                claim_id = str(checkpoint_claim["claim_id"])
+                ticket_id = str(checkpoint_claim["ticket_id"])
+                current = self.ledger.scheduler_claim(claim_id)
+                if current.get("side_effect_completed_at") is not None and current.get("result_json"):
+                    checkpoint_result = json.loads(str(current["result_json"]))
+                else:
+                    if current.get("side_effect_started_at") is None:
+                        self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
+                    identity = json.loads(str(current["candidate_identity_json"]))
+                    checkpoint_result = self.tranche_checkpoint_runner(str(identity["tranche_id"]))
+                    current = self.ledger.apply_scheduler_tranche_checkpoint_effect(
+                        claim_id, execution_owner, checkpoint_result, now=now
+                    )
+                    checkpoint_result = json.loads(str(current["result_json"]))
+                self.ledger.complete_scheduler_claim(
+                    claim_id, execution_owner, checkpoint_result, now=now
+                )
+                return ProcessNextResult("completed", "tranche_checkpoint", ticket_id, claim_id)
 
         if self.implementation_runner is not None:
             implementation_claim = self.ledger.claim_next_scheduler_implementation(

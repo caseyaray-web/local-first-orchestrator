@@ -334,6 +334,9 @@ def run_command(args: argparse.Namespace) -> int:
                 git_integration_runner=lambda ticket_id: ctl.execute_git_integration_only(
                     ticket_id, repository=registered.canonical_repository
                 ),
+                tranche_checkpoint_runner=lambda tranche_id: ctl.execute_tranche_checkpoint_only(
+                    tranche_id, repository=registered.canonical_repository
+                ),
             ).process_next()
             print(json.dumps(asdict(result),sort_keys=True))
         elif args.command in {"implementation-only", "implement-only"}:

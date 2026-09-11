@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import json
 import subprocess
 import shutil
@@ -1438,6 +1439,136 @@ class LocalFirstController:
             "commit_sha": commit_sha,
             "integration_head_before": base,
             "integration_head_after": after,
+        }
+
+    def execute_tranche_checkpoint_only(self, tranche_id: str, *, repository: Path) -> dict[str, object]:
+        """Deterministically revalidate and checkpoint one completed tranche without activation or paid calls."""
+        claim = self.ledger.connection.execute(
+            "SELECT * FROM scheduler_stage_claims WHERE stage='tranche_checkpoint' AND status='claimed' AND json_extract(candidate_identity_json,'$.tranche_id')=? ORDER BY created_at DESC LIMIT 1",
+            (tranche_id,),
+        ).fetchone()
+        if claim is None or not claim["candidate_identity_json"]:
+            raise RuntimeError("tranche_checkpoint_reconciliation_required: scheduler claim missing")
+        try:
+            identity = json.loads(str(claim["candidate_identity_json"]))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("tranche_checkpoint_reconciliation_required: claim identity malformed") from exc
+        if identity.get("tranche_id") != tranche_id:
+            raise RuntimeError("tranche_checkpoint_reconciliation_required: tranche identity drift")
+        repo = Path(repository).resolve(strict=True)
+        configured_repo, _, artifact_root = self.config.validate_execution_roots()
+        if configured_repo != repo or str(identity["repository_identity"]) != str(repo):
+            raise RuntimeError("tranche_checkpoint_reconciliation_required: repository identity drift")
+        manifest_json = str(identity["planning_snapshot_manifest_json"])
+        if hashlib.sha256(manifest_json.encode()).hexdigest() != str(identity["planning_snapshot_hash"]):
+            raise RuntimeError("tranche_checkpoint_reconciliation_required: planning snapshot hash drift")
+        try:
+            manifest = json.loads(manifest_json)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("tranche_checkpoint_reconciliation_required: planning snapshot malformed") from exc
+        planning_base = subprocess.run(("git", "rev-parse", "--verify", f"{identity['planning_base_sha']}^{{commit}}"), cwd=repo, text=True, capture_output=True, check=True, timeout=30).stdout.strip()
+        if planning_base != identity["planning_base_sha"]:
+            raise RuntimeError("tranche_checkpoint_reconciliation_required: planning base drift")
+        for entry in manifest.get("evidence", []):
+            path = str(entry.get("path") or "")
+            content_hash = str(entry.get("content_hash") or "")
+            if not path or not re.fullmatch(r"[0-9a-f]{64}", content_hash):
+                raise RuntimeError("tranche_checkpoint_reconciliation_required: planning evidence malformed")
+            blob = subprocess.run(("git", "show", f"{planning_base}:{path}"), cwd=repo, capture_output=True, check=True, timeout=30).stdout
+            if hashlib.sha256(blob).hexdigest() != content_hash:
+                raise RuntimeError("tranche_checkpoint_reconciliation_required: planning snapshot content drift")
+
+        from .tranche_completion import completion_evidence
+        completion = completion_evidence(self.ledger, repo, tranche_id)
+        if completion["accepted_ticket_ids"] != identity["ticket_ids"] or completion["accepted_commit_shas"] != identity["accepted_commit_shas"]:
+            raise RuntimeError("tranche_checkpoint_reconciliation_required: serialized integration identity drift")
+        final_ticket = str(identity["ticket_ids"][-1])
+        final_commit = str(completion["final_integration_sha"])
+        attempt = self.ledger.connection.execute(
+            "SELECT * FROM attempts WHERE ticket_id=? AND accepted_commit_sha=? ORDER BY attempt_number DESC LIMIT 1",
+            (final_ticket, final_commit),
+        ).fetchone()
+        if attempt is None or not attempt["worktree_path"]:
+            raise RuntimeError("tranche_checkpoint_reconciliation_required: final integration worktree missing")
+        worktree = Path(str(attempt["worktree_path"])).resolve(strict=True)
+        head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True, timeout=30).stdout.strip()
+        status = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True, timeout=30).stdout.strip()
+        if head != final_commit or status:
+            raise RuntimeError("tranche_checkpoint_reconciliation_required: final worktree drift")
+
+        target = artifact_root / "tranches" / tranche_id
+        target.mkdir(parents=True, exist_ok=True)
+        artifact = target / "checkpoint.json"
+        if artifact.exists():
+            try:
+                recovered = json.loads(artifact.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError("tranche_checkpoint_reconciliation_required: checkpoint artifact malformed") from exc
+            if (
+                recovered.get("version") != 1
+                or recovered.get("feature_id") != identity["feature_id"]
+                or recovered.get("tranche_id") != tranche_id
+                or recovered.get("candidate_identity") != identity
+                or recovered.get("integration_commands") != identity["integration_commands"]
+                or recovered.get("completion") != completion
+                or recovered.get("decision") not in {"ready_for_checkpoint", "integration_failed"}
+                or not isinstance(recovered.get("integration_results"), list)
+            ):
+                raise RuntimeError("tranche_checkpoint_reconciliation_required: checkpoint artifact conflicts")
+            return {
+                "tranche_id": tranche_id,
+                "candidate_identity": identity,
+                "completion": completion,
+                "integration_results": recovered["integration_results"],
+                "decision": recovered["decision"],
+                "checkpoint_artifact": str(artifact),
+                "checkpoint_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+
+        integration_results: list[dict[str, object]] = []
+        passed = True
+        for index, command in enumerate(identity["integration_commands"]):
+            try:
+                proc = subprocess.run(tuple(command), cwd=worktree, text=True, capture_output=True, timeout=300)
+                result = {
+                    "index": index,
+                    "command": command,
+                    "returncode": int(proc.returncode),
+                    "stdout": proc.stdout[-20000:],
+                    "stderr": proc.stderr[-20000:],
+                }
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                result = {"index": index, "command": command, "returncode": -1, "stdout": "", "stderr": str(exc)[:20000]}
+            integration_results.append(result)
+            if int(result["returncode"]) != 0:
+                passed = False
+                break
+
+        checkpoint_packet = {
+            "version": 1,
+            "feature_id": identity["feature_id"],
+            "tranche_id": tranche_id,
+            "candidate_identity": identity,
+            "integration_commands": identity["integration_commands"],
+            "planning_snapshot": {
+                "repository_identity": identity["repository_identity"],
+                "base_sha": identity["planning_base_sha"],
+                "snapshot_hash": identity["planning_snapshot_hash"],
+            },
+            "completion": completion,
+            "integration_results": integration_results,
+            "decision": "ready_for_checkpoint" if passed else "integration_failed",
+        }
+        content = json.dumps(checkpoint_packet, sort_keys=True, indent=2) + "\n"
+        artifact.write_text(content, encoding="utf-8")
+        return {
+            "tranche_id": tranche_id,
+            "candidate_identity": identity,
+            "completion": completion,
+            "integration_results": integration_results,
+            "decision": checkpoint_packet["decision"],
+            "checkpoint_artifact": str(artifact),
+            "checkpoint_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
         }
 
     def review_historical_candidate(self, ticket_id: str, attempt_number: int, *, repository: Path, owner: str="local-first-reviewer") -> dict[str, object]:

@@ -98,6 +98,16 @@ Already complete or substantially complete:
    - Hermes `ready` is observed as the authoritative readiness result and persisted without moving the dependent to `ready_local`
    - graph-link and release-read restart paths re-read Hermes and avoid duplicate links or a second readiness truth source
 
+11. **Tranche integration / checkpoint stage — Complete for the current scheduler slice**
+   - all materialized tranche tickets must be `done` with accepted commit evidence
+   - claim identity freezes ticket/commit membership, planning repository/base/snapshot provenance, and configured integration commands
+   - the original planning snapshot hash and selected evidence blobs are revalidated before checkpointing
+   - existing tranche completion evidence proves the serialized commit chain and current integration-head identity
+   - integration commands run only against the clean final accepted worktree at the final integration commit
+   - immutable checkpoint evidence records command results, completion hash, repository provenance, artifact hash, and deterministic decision
+   - checkpoint effect replay finalizes without rerunning integration commands
+   - no paid call and no next-tranche activation occurs in this stage
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage — Complete
@@ -236,7 +246,7 @@ Completion condition: task completion releases dependent work through Hermes-nat
 
 **Current status:** Complete for this scheduler milestone. Local First now resolves each dependent ticket and declared parent to authoritative Hermes task IDs, projects missing native parent→child links through `hermes kanban link`, and persists immutable graph evidence only after `show --json` reports the exact expected parent set. Extra or ambiguous native parents fail closed. Dependent tickets are excluded from the legacy scheduler-local readiness claimant. After every parent reaches Local First `done` and that `done` projection is acknowledged by Hermes, a separate release claim revalidates the stored graph and completion lineage, re-reads Hermes, requires Hermes itself to expose the child as `ready`, and persists immutable release evidence without transitioning the child to `ready_local`. Restart after a partially observed/link-applied graph or started release claim re-reads Hermes and resumes without duplicate links. This completes scheduler ownership of native graph projection/release; live operational proof against a real Hermes board remains tracked separately.
 
-## 11. Tranche integration and checkpoint stage
+## 11. Tranche integration and checkpoint stage — Complete
 
 Bring tranche boundaries into the same one-stage-per-tick scheduler model.
 
@@ -250,6 +260,8 @@ Required slices:
 - Do not activate the next tranche in the same durable stage unless the design explicitly allows the transition to be atomic.
 
 Completion condition: a tranche can finish, integrate, checkpoint, and become eligible for next-tranche activation without bypassing repository-snapshot or evidence requirements.
+
+**Current status:** Complete for this scheduler milestone. The scheduler now detects active tranches whose materialized tickets are all `done` with accepted commit evidence, binds the exact ticket/commit set plus active planning snapshot provenance and configured integration commands into a durable tranche-checkpoint claim, and executes deterministic checkpoint work against the canonical repository and final integrated worktree. The controller revalidates the stored planning snapshot hash/content at its original base, reuses `completion_evidence(...)` to prove the serialized integration chain and integration-head identity, requires the final accepted worktree to be clean at the final integration commit, and runs the tranche's configured integration commands with bounded captured output. The ledger independently validates command/result pairing and the derived decision, persists immutable `tranche_completion_evidence` plus immutable `tranche_checkpoint_evidence`, and binds both to a hashed checkpoint artifact. `ready_for_checkpoint` and `integration_failed` are durable decisions; neither paid checkpoint review nor next-tranche activation occurs in this stage. A completed effect can be finalized after restart without re-running integration commands.
 
 ## 12. Paid checkpoint / escalation stage
 
