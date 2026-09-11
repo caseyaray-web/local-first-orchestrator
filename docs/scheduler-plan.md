@@ -185,6 +185,17 @@ Already complete or substantially complete:
    - the lightweight default `status` output remains unchanged; `status --scheduler-detail` opts into the deeper lifecycle snapshot
    - observability tests verify the snapshot performs zero SQLite writes and pinpoints both normal next-stage work and fail-closed model reconciliation
 
+19. **Daemon wrapper — Complete for the current scheduler slice**
+   - `SchedulerDaemon` is a thin operational loop over `ProcessNextScheduler.process_next()`; it owns no lifecycle transition, claim, recovery, ordering, or reconciliation semantics
+   - one shared registered scheduler factory now constructs both `process-next --execute` and daemon ticks, so one-shot and continuous execution use the same runners, routes, leases, paid adapters, checkpoint logic, and next-tranche materialization path
+   - each daemon iteration executes at most one proven scheduler tick, then sleeps on `no_work`/`idle`, `busy`, or `paused` according to bounded configurable delays
+   - transient iteration failures use bounded exponential backoff; successful ticks reset the consecutive-error backoff counter
+   - SIGINT/SIGTERM request graceful shutdown between bounded ticks; the daemon never aborts or rewrites an in-flight durable stage on its own
+   - pause behavior is inherited from the existing scheduler: durable external effects may drain while new lifecycle claims remain blocked by ledger pause checks
+   - daemon health reports iteration/success/idle/busy/paused/error counts, consecutive errors, last stage/ticket/status/error, and tick timestamps; status combines this with the Milestone 18 scheduler snapshot
+   - CLI execution remains fail-closed: `daemon` requires registered runtime, `--execute`, `--allow-board-writes`, explicit Hermes executable/board access, and exposes bounded sleep/backoff/max-iteration controls
+   - restart tests prove a fresh daemon over the same ledger simply continues the next durable board effect left by the previous daemon, with no daemon-specific recovery path
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage — Complete
@@ -490,7 +501,7 @@ Completion condition: an operator can inspect the system and identify the exact 
 
 **Current status:** Complete for this scheduler milestone. The scheduler now exposes a single bounded `scheduler_observability()` read model that composes the same durable sources used for execution/reconciliation rather than introducing a parallel metrics database. It reports the selected current/next stage and ticket, current claim identity/status, lease owner/expiry, claim attempt count, lifecycle attempt number, side-effect start/completion/finalization timestamps, and any expired-claim reconciliation classification/action/reason. It also reports pending generated-card/state/comment effects and bounded active board-effect leases; latest durable runtime-stage artifact identity (path/SHA/base); latest model invocation provider/model/status/artifact/error identity; review result identity; accepted-candidate artifact hashes/evidence hash; Git intent/evidence/commit/integration-head identity; and paid reservation request/status when the selected claim owns one. Claim selection follows `preview_next()` where possible so operator inspection matches the next scheduler decision. The existing lightweight `status` response remains the default; `status --scheduler-detail` adds this deeper snapshot. Focused observability/scheduler tests pass 37 tests, and the full repository suite passes 725 tests / 179 subtests.
 
-## 19. Daemon wrapper
+## 19. Daemon wrapper — Complete
 
 Build the daemon only after one-shot `process-next` is safe across the full lifecycle.
 
@@ -506,6 +517,8 @@ Required slices:
 The daemon should not own lifecycle semantics that are absent from `process-next`.
 
 Completion condition: killing and restarting the daemon is operationally equivalent to stopping and later calling the already-safe one-tick scheduler again.
+
+**Current status:** Complete for this scheduler milestone. `SchedulerDaemon` repeatedly instantiates the exact same registered `ProcessNextScheduler` composition used by `process-next --execute` and invokes one bounded tick per iteration. It adds only operational concerns: idle/busy/paused sleep, bounded exponential error backoff, graceful SIGINT/SIGTERM stop requests, health counters/timestamps, and final health plus scheduler-observability reporting. It does not inspect or mutate lifecycle state independently of the one-tick scheduler. The CLI remains fail-closed and requires registered runtime, `--execute`, `--allow-board-writes`, and explicit Hermes executable/board access; polling/backoff and optional `--max-iterations` are operator controls only. Pause handling remains scheduler-owned, so already-durable projection work can finish while paused and new lifecycle claims remain blocked. Tests prove idle/busy/paused sleep behavior, backoff/reset semantics, graceful stop between ticks, health/status output, parser/permission gates, and restart equivalence across a durable state-projection → evidence-comment boundary using a brand-new Ledger/daemon instance. Focused daemon/CLI/scheduler tests pass 38 tests, and the full repository suite passes 732 tests / 179 subtests.
 
 ## 20. Real end-to-end acceptance
 

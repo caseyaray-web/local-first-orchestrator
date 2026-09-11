@@ -9,6 +9,7 @@ from typing import Any
 from .controller import LocalFirstController, RuntimeConfig
 from .admission import FeatureAdmissionSpec
 from .decomposition_planner import LocalDecompositionPlanner, resolve_hermes_identity
+from .daemon import SchedulerDaemon
 from .planning_coordinator import PlanningCoordinator
 from .corrections import AcceptedPredecessor, CorrectionService, CorrectionTicketSpec, SupplementalCorrectionPlan
 from .generated_activation import GeneratedActivationError, activate_generated_ticket
@@ -191,6 +192,128 @@ def _board_for_cli(args: argparse.Namespace, allow_board_writes: bool):
     return _OfflineBoard()
 
 
+
+def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace) -> ProcessNextScheduler:
+    ctl, registered = _registered_controller(ledger,args,allow_board_writes=True)
+    triage_route = dict(registered.decomposition).get("local")
+    triage_planner = None if triage_route is None else LocalTriagePlanner(
+        executable=args.hermes_executable,
+        provider=triage_route.provider,
+        model=triage_route.model,
+        profile=triage_route.profile,
+        timeout_seconds=ctl.config.review_timeout_seconds,
+    )
+    governor = UsageGovernor(ledger)
+    paid_checkpoint = None if registered.paid_checkpoint is None else HermesPaidModelAdapter(
+        ledger,
+        governor,
+        executable=args.hermes_executable,
+        provider=registered.paid_checkpoint.provider,
+        model=registered.paid_checkpoint.model,
+        profile=registered.paid_checkpoint.profile,
+        timeout_seconds=ctl.config.review_timeout_seconds,
+    )
+    paid_escalation = None if registered.paid_escalation is None else HermesPaidModelAdapter(
+        ledger,
+        governor,
+        executable=args.hermes_executable,
+        provider=registered.paid_escalation.provider,
+        model=registered.paid_escalation.model,
+        profile=registered.paid_escalation.profile,
+        timeout_seconds=ctl.config.review_timeout_seconds,
+    )
+    successor_route = dict(registered.decomposition).get("standard")
+
+    def materialize_successor(identity: dict[str, Any]) -> dict[str, Any]:
+        if successor_route is None:
+            raise RuntimeError("next tranche activation requires registered standard decomposition route")
+        row = ledger.connection.execute("SELECT contract_json FROM feature_contracts WHERE feature_id=?", (identity["feature_id"],)).fetchone()
+        if row is None:
+            raise RuntimeError("next tranche activation feature contract is missing")
+        stored = json.loads(str(row["contract_json"]))
+        spec = FeatureAdmissionSpec.from_json(stored["spec"])
+        allowed_paths = tuple((item.path, item.disposition) for item in spec.files)
+        planner = LocalDecompositionPlanner(
+            executable=args.planner_executable,
+            cost_class="standard",
+            provider=successor_route.provider,
+            model=successor_route.model,
+            profile=successor_route.profile,
+            allowed_paths=allowed_paths,
+            role="decomposition",
+            routing_source="operator-config.decomposition",
+        )
+        outcome = PlanningCoordinator(ledger, ctl.config, planner).materialize_next_tranche(str(identity["feature_id"]))
+        if outcome.status not in {"activated", "already_materialized"}:
+            raise RuntimeError(f"next tranche activation planning failed: {outcome.status}: {'; '.join(outcome.reasons)}")
+        ticket_rows = ledger.connection.execute("SELECT id FROM tickets WHERE tranche_id=? ORDER BY id", (identity["successor_tranche_id"],)).fetchall()
+        ticket_ids = [str(item["id"]) for item in ticket_rows]
+        if not ticket_ids:
+            raise RuntimeError("next tranche activation produced no successor tickets")
+        snapshot_values: set[tuple[str, str, str]] = set()
+        for ticket_id in ticket_ids:
+            projection = ledger.connection.execute("SELECT payload_json FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket' ORDER BY queued_at DESC LIMIT 1", (ticket_id,)).fetchone()
+            if projection is None:
+                raise RuntimeError("next tranche activation missing generated card projection")
+            payload = json.loads(str(projection["payload_json"]))
+            body = str(payload.get("body") or "")
+            marker = "```local-first-contract\\n"
+            if marker not in body:
+                raise RuntimeError("next tranche activation projection contract missing")
+            contract_json = body.split(marker,1)[1].split("\\n```",1)[0]
+            contract = json.loads(contract_json)
+            snapshot_values.add((str(contract["repository_identity"]), str(contract["repo_base_sha"]), str(contract["repo_snapshot_hash"])))
+        if len(snapshot_values) != 1:
+            raise RuntimeError("next tranche activation successor snapshot identity diverged")
+        repository_identity, repo_base_sha, repo_snapshot_hash = snapshot_values.pop()
+        return {
+            "candidate_identity": identity,
+            "ticket_ids": ticket_ids,
+            "repository_identity": repository_identity,
+            "repo_base_sha": repo_base_sha,
+            "repo_snapshot_hash": repo_snapshot_hash,
+        }
+    return ProcessNextScheduler(
+        ledger,
+        ctl.board,
+        worker_id=args.worker_id,
+        lease_seconds=ctl.config.lease_seconds,
+        implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(
+            ticket_id, repository=registered.canonical_repository
+        ),
+        validation_runner=lambda ticket_id: ctl.execute_deterministic_validation_only(
+            ticket_id, repository=registered.canonical_repository
+        ),
+        review_runner=lambda ticket_id: ctl.execute_fresh_review_only(
+            ticket_id, repository=registered.canonical_repository
+        ),
+        review_execution_policy_hash=ctl.review_execution_policy_hash(),
+        triage_runner=None if triage_planner is None else lambda ticket_id: ctl.execute_triage_only(ticket_id, planner=triage_planner),
+        triage_execution_policy_hash=None if triage_planner is None else triage_planner.execution_policy_hash(),
+        acceptance_runner=lambda ticket_id: ctl.inspect_acceptance_candidate_only(
+            ticket_id, repository=registered.canonical_repository
+        ),
+        git_integration_runner=lambda ticket_id: ctl.execute_git_integration_only(
+            ticket_id, repository=registered.canonical_repository
+        ),
+        tranche_checkpoint_runner=lambda tranche_id: ctl.execute_tranche_checkpoint_only(
+            tranche_id, repository=registered.canonical_repository
+        ),
+        paid_checkpoint_runner=None if paid_checkpoint is None else lambda tranche_id: ctl.execute_paid_stage_only(
+            tranche_id, adapter=paid_checkpoint, purpose=PaidPurpose.INTEGRATION_CHECKPOINT
+        ),
+        paid_checkpoint_route=None if registered.paid_checkpoint is None else (
+            registered.paid_checkpoint.provider, registered.paid_checkpoint.model, registered.paid_checkpoint.profile
+        ),
+        paid_escalation_runner=None if paid_escalation is None else lambda tranche_id: ctl.execute_paid_stage_only(
+            tranche_id, adapter=paid_escalation, purpose=PaidPurpose.ESCALATION
+        ),
+        paid_escalation_route=None if registered.paid_escalation is None else (
+            registered.paid_escalation.provider, registered.paid_escalation.model, registered.paid_escalation.profile
+        ),
+        next_tranche_materialize_runner=None if successor_route is None else materialize_successor,
+    )
+
 def register_cli(parser: argparse.ArgumentParser) -> None:
     """Add the standalone CLI's arguments to *parser*.
 
@@ -219,6 +342,16 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     process_next.add_argument("--allow-board-writes", action="store_true")
     process_next.add_argument("--worker-id", default="local-first-process-next")
     process_next.add_argument("--planner-executable", default="hermes")
+    daemon=commands.add_parser("daemon", help="repeatedly invoke the proven one-tick scheduler primitive")
+    daemon.add_argument("--execute", action="store_true")
+    daemon.add_argument("--allow-board-writes", action="store_true")
+    daemon.add_argument("--worker-id", default="local-first-daemon")
+    daemon.add_argument("--planner-executable", default="hermes")
+    daemon.add_argument("--idle-sleep-seconds", type=float, default=1.0)
+    daemon.add_argument("--busy-sleep-seconds", type=float, default=0.25)
+    daemon.add_argument("--error-backoff-seconds", type=float, default=1.0)
+    daemon.add_argument("--max-error-backoff-seconds", type=float, default=30.0)
+    daemon.add_argument("--max-iterations", type=int)
     implementation=commands.add_parser("implementation-only", aliases=("implement-only",), help="run exactly implementation and deterministic validation; never review or accept")
     implementation.add_argument("--task-id",required=True)
     revalidate=commands.add_parser("revalidate-implementation", help="revalidate an existing implementation; never retry implementation or review")
@@ -318,126 +451,28 @@ def run_command(args: argparse.Namespace) -> int:
             if args.ad_hoc_runtime: raise ValueError("process-next requires registered operator runtime")
             if not args.allow_board_writes: raise PermissionError("process-next --execute requires --allow-board-writes")
             if not args.hermes_executable or not args.board: raise ValueError("process-next execution requires --hermes-executable and --board")
-            ctl, registered = _registered_controller(ledger,args,allow_board_writes=True)
-            triage_route = dict(registered.decomposition).get("local")
-            triage_planner = None if triage_route is None else LocalTriagePlanner(
-                executable=args.hermes_executable,
-                provider=triage_route.provider,
-                model=triage_route.model,
-                profile=triage_route.profile,
-                timeout_seconds=ctl.config.review_timeout_seconds,
-            )
-            governor = UsageGovernor(ledger)
-            paid_checkpoint = None if registered.paid_checkpoint is None else HermesPaidModelAdapter(
-                ledger,
-                governor,
-                executable=args.hermes_executable,
-                provider=registered.paid_checkpoint.provider,
-                model=registered.paid_checkpoint.model,
-                profile=registered.paid_checkpoint.profile,
-                timeout_seconds=ctl.config.review_timeout_seconds,
-            )
-            paid_escalation = None if registered.paid_escalation is None else HermesPaidModelAdapter(
-                ledger,
-                governor,
-                executable=args.hermes_executable,
-                provider=registered.paid_escalation.provider,
-                model=registered.paid_escalation.model,
-                profile=registered.paid_escalation.profile,
-                timeout_seconds=ctl.config.review_timeout_seconds,
-            )
-            successor_route = dict(registered.decomposition).get("standard")
-
-            def materialize_successor(identity: dict[str, Any]) -> dict[str, Any]:
-                if successor_route is None:
-                    raise RuntimeError("next tranche activation requires registered standard decomposition route")
-                row = ledger.connection.execute("SELECT contract_json FROM feature_contracts WHERE feature_id=?", (identity["feature_id"],)).fetchone()
-                if row is None:
-                    raise RuntimeError("next tranche activation feature contract is missing")
-                stored = json.loads(str(row["contract_json"]))
-                spec = FeatureAdmissionSpec.from_json(stored["spec"])
-                allowed_paths = tuple((item.path, item.disposition) for item in spec.files)
-                planner = LocalDecompositionPlanner(
-                    executable=args.planner_executable,
-                    cost_class="standard",
-                    provider=successor_route.provider,
-                    model=successor_route.model,
-                    profile=successor_route.profile,
-                    allowed_paths=allowed_paths,
-                    role="decomposition",
-                    routing_source="operator-config.decomposition",
-                )
-                outcome = PlanningCoordinator(ledger, ctl.config, planner).materialize_next_tranche(str(identity["feature_id"]))
-                if outcome.status not in {"activated", "already_materialized"}:
-                    raise RuntimeError(f"next tranche activation planning failed: {outcome.status}: {'; '.join(outcome.reasons)}")
-                ticket_rows = ledger.connection.execute("SELECT id FROM tickets WHERE tranche_id=? ORDER BY id", (identity["successor_tranche_id"],)).fetchall()
-                ticket_ids = [str(item["id"]) for item in ticket_rows]
-                if not ticket_ids:
-                    raise RuntimeError("next tranche activation produced no successor tickets")
-                snapshot_values: set[tuple[str, str, str]] = set()
-                for ticket_id in ticket_ids:
-                    projection = ledger.connection.execute("SELECT payload_json FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket' ORDER BY queued_at DESC LIMIT 1", (ticket_id,)).fetchone()
-                    if projection is None:
-                        raise RuntimeError("next tranche activation missing generated card projection")
-                    payload = json.loads(str(projection["payload_json"]))
-                    body = str(payload.get("body") or "")
-                    marker = "```local-first-contract\\n"
-                    if marker not in body:
-                        raise RuntimeError("next tranche activation projection contract missing")
-                    contract_json = body.split(marker,1)[1].split("\\n```",1)[0]
-                    contract = json.loads(contract_json)
-                    snapshot_values.add((str(contract["repository_identity"]), str(contract["repo_base_sha"]), str(contract["repo_snapshot_hash"])))
-                if len(snapshot_values) != 1:
-                    raise RuntimeError("next tranche activation successor snapshot identity diverged")
-                repository_identity, repo_base_sha, repo_snapshot_hash = snapshot_values.pop()
-                return {
-                    "candidate_identity": identity,
-                    "ticket_ids": ticket_ids,
-                    "repository_identity": repository_identity,
-                    "repo_base_sha": repo_base_sha,
-                    "repo_snapshot_hash": repo_snapshot_hash,
-                }
-            result=ProcessNextScheduler(
-                ledger,
-                ctl.board,
-                worker_id=args.worker_id,
-                lease_seconds=ctl.config.lease_seconds,
-                implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(
-                    ticket_id, repository=registered.canonical_repository
-                ),
-                validation_runner=lambda ticket_id: ctl.execute_deterministic_validation_only(
-                    ticket_id, repository=registered.canonical_repository
-                ),
-                review_runner=lambda ticket_id: ctl.execute_fresh_review_only(
-                    ticket_id, repository=registered.canonical_repository
-                ),
-                review_execution_policy_hash=ctl.review_execution_policy_hash(),
-                triage_runner=None if triage_planner is None else lambda ticket_id: ctl.execute_triage_only(ticket_id, planner=triage_planner),
-                triage_execution_policy_hash=None if triage_planner is None else triage_planner.execution_policy_hash(),
-                acceptance_runner=lambda ticket_id: ctl.inspect_acceptance_candidate_only(
-                    ticket_id, repository=registered.canonical_repository
-                ),
-                git_integration_runner=lambda ticket_id: ctl.execute_git_integration_only(
-                    ticket_id, repository=registered.canonical_repository
-                ),
-                tranche_checkpoint_runner=lambda tranche_id: ctl.execute_tranche_checkpoint_only(
-                    tranche_id, repository=registered.canonical_repository
-                ),
-                paid_checkpoint_runner=None if paid_checkpoint is None else lambda tranche_id: ctl.execute_paid_stage_only(
-                    tranche_id, adapter=paid_checkpoint, purpose=PaidPurpose.INTEGRATION_CHECKPOINT
-                ),
-                paid_checkpoint_route=None if registered.paid_checkpoint is None else (
-                    registered.paid_checkpoint.provider, registered.paid_checkpoint.model, registered.paid_checkpoint.profile
-                ),
-                paid_escalation_runner=None if paid_escalation is None else lambda tranche_id: ctl.execute_paid_stage_only(
-                    tranche_id, adapter=paid_escalation, purpose=PaidPurpose.ESCALATION
-                ),
-                paid_escalation_route=None if registered.paid_escalation is None else (
-                    registered.paid_escalation.provider, registered.paid_escalation.model, registered.paid_escalation.profile
-                ),
-                next_tranche_materialize_runner=None if successor_route is None else materialize_successor,
-            ).process_next()
+            result=_registered_process_next_scheduler(ledger,args).process_next()
             print(json.dumps(asdict(result),sort_keys=True))
+        elif args.command=="daemon":
+            if args.ad_hoc_runtime: raise ValueError("daemon requires registered operator runtime")
+            if not args.execute: raise PermissionError("daemon requires --execute")
+            if not args.allow_board_writes: raise PermissionError("daemon --execute requires --allow-board-writes")
+            if not args.hermes_executable or not args.board: raise ValueError("daemon execution requires --hermes-executable and --board")
+            daemon=SchedulerDaemon(
+                ledger,
+                lambda: _registered_process_next_scheduler(ledger,args),
+                worker_id=args.worker_id,
+                idle_sleep_seconds=args.idle_sleep_seconds,
+                busy_sleep_seconds=args.busy_sleep_seconds,
+                error_backoff_seconds=args.error_backoff_seconds,
+                max_error_backoff_seconds=args.max_error_backoff_seconds,
+            )
+            previous=daemon.install_signal_handlers()
+            try:
+                health=daemon.run(max_iterations=args.max_iterations,continue_on_error=True)
+            finally:
+                daemon.restore_signal_handlers(previous)
+            print(json.dumps({"health":asdict(health),"scheduler":scheduler_observability(ledger)},sort_keys=True))
         elif args.command in {"implementation-only", "implement-only"}:
             if args.ad_hoc_runtime: raise ValueError("implementation-only execution requires registered operator runtime")
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)

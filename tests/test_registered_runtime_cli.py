@@ -39,6 +39,36 @@ class RegisteredRuntimeCliTests(unittest.TestCase):
             args = parser.parse_args(["--database", str(self.database), "--board", "board", "--hermes-executable", "hermes", command, *tail])
             self.assertEqual(args.board, "board"); self.assertEqual(args.hermes_executable, "hermes")
 
+    def test_daemon_cli_is_explicit_bounded_and_fail_closed(self) -> None:
+        parser = argparse.ArgumentParser(); register_cli(parser)
+        args = parser.parse_args([
+            "--database", str(self.database),
+            "daemon",
+            "--max-iterations", "3",
+            "--idle-sleep-seconds", "2",
+            "--busy-sleep-seconds", "0.5",
+            "--error-backoff-seconds", "1.5",
+            "--max-error-backoff-seconds", "9",
+        ])
+        self.assertEqual(args.command, "daemon")
+        self.assertFalse(args.execute)
+        self.assertFalse(args.allow_board_writes)
+        self.assertEqual(args.max_iterations, 3)
+        self.assertEqual(args.idle_sleep_seconds, 2.0)
+        self.assertEqual(args.busy_sleep_seconds, 0.5)
+        self.assertEqual(args.error_backoff_seconds, 1.5)
+        self.assertEqual(args.max_error_backoff_seconds, 9.0)
+
+        with self.assertRaisesRegex(PermissionError, "daemon requires --execute"):
+            cli_main(["--database", str(self.database), "daemon", "--max-iterations", "0"])
+        with self.assertRaisesRegex(PermissionError, "requires --allow-board-writes"):
+            cli_main(["--database", str(self.database), "daemon", "--execute", "--max-iterations", "0"])
+        with self.assertRaisesRegex(ValueError, "requires --hermes-executable and --board"):
+            cli_main([
+                "--database", str(self.database),
+                "daemon", "--execute", "--allow-board-writes", "--max-iterations", "0",
+            ])
+
     def test_approve_paid_cli_persists_one_purpose_scoped_call(self) -> None:
         self.assertEqual(
             cli_main([
