@@ -155,6 +155,19 @@ Already complete or substantially complete:
    - new root readiness admission is last so the scheduler drains existing owned work before admitting additional implementation work
    - dry-run and live execution use the same recovery selector and fresh-stage order; per-stage candidate SQL retains deterministic `created_at`/identity ordering
 
+16. **Scheduler-wide concurrency proof — Complete for the current scheduler slice**
+   - the proof uses independent Ledger connections and real threads so SQLite write contention is exercised instead of being hidden by a single Ledger object's in-process lock
+   - all scheduler claim mutations run inside `BEGIN IMMEDIATE` transactions; the global tick lease serializes bounded `process-next` execution before any stage/provider side effect can start
+   - overlapping live ticks prove one worker reaches implementation/model-launch while the competing scheduler returns `busy`; the winner selects the same deterministic `created_at,id` candidate as the ordering policy
+   - concurrent expired tick takeover produces exactly one new lease owner/token
+   - duplicate implementation-stage claims for one ticket produce exactly one durable claim/lease owner across separate connections
+   - an expired implementation recovery claim wins over a simultaneously eligible validation stage for that same ticket, preserving lifecycle order
+   - concurrent state-projection claims lease one outbox row exactly once; existing comment/generated outbox tests prove the same lease/idempotency pattern for those workers
+   - the winning implementation runner persists exactly one model invocation before provider execution; overlapping scheduler workers cannot reach a second launch boundary
+   - concurrent tranche integration-head updates use Git compare-and-swap so exactly one expected-old-head update wins and the loser fails closed
+   - concurrent paid authorization through separate Ledger connections and one request key returns one reservation identity and creates one durable reservation row
+   - the specialized comment/outbox, model-invocation, Git, and paid-governor race suites remain green alongside the scheduler-wide contention tests
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage — Complete
@@ -396,7 +409,7 @@ Completion condition: two schedulers presented with the same durable state choos
 
 **Current status:** Complete for this scheduler milestone. The scheduler now exports a canonical `SCHEDULER_STAGE_ORDER` and rank mapping covering every required work class. A terminal or ambiguous reconciliation decision remains a fail-closed safety fence before normal work; among eligible work, the order is: generated-card projection, state projection, evidence comment, recoverable expired lifecycle claim, implementation, validation, review, repair routing, triage, acceptance, Git integration, completion, native dependency graph, native dependency release, tranche checkpoint, paid checkpoint, paid escalation, next-tranche materialization, next-tranche activation, then root dependency-readiness admission. The first three positions reflect board ownership dependencies: generated child cards establish external task identity, authoritative state is then projected, and evidence comments follow. The global recovery slot is selected from the Milestone 14 reconciliation model; when present, live execution gates every non-matching lifecycle class for that tick, so newly eligible implementation or later work cannot bypass an incomplete recoverable claim. Only after external projection and recovery work is exhausted does fresh lifecycle admission follow the canonical stage order. Root readiness remains last so new implementation work cannot starve already-owned lifecycle work. Dry-run was reordered to the same policy, and tests prove generated→state→comment precedence, external projection before recovery, recovery before fresh implementation, implementation before fresh validation, explicit rank uniqueness, and identical stage/ticket choice from independent scheduler views of the same durable state.
 
-## 16. Scheduler-wide concurrency proof
+## 16. Scheduler-wide concurrency proof — Complete
 
 Exercise competing scheduler processes and leases across the complete lifecycle.
 
@@ -414,6 +427,8 @@ Required cases:
 - paid reservation race prevention.
 
 Completion condition: concurrent scheduler processes cannot produce duplicate stage effects or violate ticket lifecycle ordering.
+
+**Current status:** Complete for this scheduler milestone. No new lock authority was required. The scheduler already combines a restartable global tick lease with stage/outbox leases and Ledger transactions that acquire SQLite's write lock via `BEGIN IMMEDIATE`; external-effect subsystems add their own exact authority boundaries such as model launch records, Git integration-head compare-and-swap, outbox row leases/idempotency keys, and paid request-key reservations. The new scheduler-wide contention suite opens independent Ledger connections against the same database and races real threads, proving: overlapping global ticks execute one model-launch path while the competitor returns `busy`; expired tick takeover has one winner; duplicate same-ticket implementation claims produce one durable owner; an expired implementation recovery claim excludes a competing validation stage for that ticket; deterministic cross-ticket selection still picks the canonical `created_at,id` candidate under overlap; state outbox retries lease one row once; paid authorization with one request key is cross-connection idempotent; and concurrent Git integration-head updates admit one CAS winner and one conflict. Existing comment-outbox/delivery, invocation-lifecycle, paid-governor, and Git suites were run with this proof and remain green. Because the scheduler lease horizon is required to exceed the bounded external-effect horizon, a live provider call is not expected to outlive its owning tick/stage lease; stale/expired recovery is therefore handled through the reconciliation model rather than overlapping a second bounded effect.
 
 ## 17. Scheduler-wide crash matrix
 
