@@ -6,12 +6,16 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
+from local_first_orchestrator.execution_handoff import HANDOFF_SENTINEL
 from local_first_orchestrator.hermes_board import ExternalExecutionRun, ExternalExecutionSnapshot, ExternalTicket
 from local_first_orchestrator.ledger import Ledger
+from local_first_orchestrator.scheduler import ProcessNextScheduler
 from local_first_orchestrator.states import CanonicalState
 
 
 class ExecutionBoard:
+    timeout_seconds = 1
+
     def __init__(self, snapshot: ExternalExecutionSnapshot) -> None:
         self.snapshot = snapshot
         self.calls = 0
@@ -21,6 +25,12 @@ class ExecutionBoard:
         if task_id != self.snapshot.task.id:
             raise KeyError(task_id)
         return self.snapshot
+
+    def find_comment_marker(self, *args, **kwargs): return "not_found"
+    def deliver_comment(self, *args, **kwargs): return None
+    def create_microticket(self, *args, **kwargs): return "H-generated"
+    def set_state(self, *args, **kwargs): return None
+    def get_task(self, task_id: str): return self.snapshot.task
 
 
 class HermesExecutionReconciliationTests(unittest.TestCase):
@@ -128,6 +138,99 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
             self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7)
         self.assertEqual(self.ledger.attempt_count(self.ticket_id), 0)
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM hermes_execution_reconciliations").fetchone()[0], 0)
+
+    def _make_generated_owned(self) -> None:
+        self.ledger.connection.execute("UPDATE tickets SET external_id=NULL WHERE id=?", (self.ticket_id,))
+        event_id = self.ledger.connection.execute(
+            "INSERT INTO events(entity_type,entity_id,event_type,actor_type,actor_id,payload_json,created_at) VALUES ('ticket',?,'generated_microticket_created','controller','test','{}',1) RETURNING id",
+            (self.ticket_id,),
+        ).fetchone()[0]
+        self.ledger.connection.execute(
+            "INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,operation,external_task_id,acknowledged_at) VALUES (?,?,'draft','{}','generated-owned',1,'create_microticket','H-1',1)",
+            (self.ticket_id, event_id),
+        )
+
+    def test_generated_hermes_owned_ticket_is_never_locally_claimable(self) -> None:
+        self._make_generated_owned()
+        self.assertIsNone(self.ledger.claim_next_scheduler_implementation("local-worker", lease_seconds=30, now=100))
+
+    def test_scheduler_auto_reconciles_blocked_handoff_then_validation_wins_next_tick(self) -> None:
+        self._make_generated_owned()
+        self.board.snapshot = ExternalExecutionSnapshot(
+            task=ExternalTicket("H-1", "external", "", "blocked", str(self.repo)),
+            session_id="session-7",
+            branch_name="worker-branch",
+            started_at=10,
+            completed_at=20,
+            runs=(ExternalExecutionRun(7, "blocked", "blocked", 10, 20, HANDOFF_SENTINEL, "worker-code", 123, {"source": "dispatcher"}),),
+        )
+        implementation_calls: list[str] = []
+
+        def reconcile_one():
+            for candidate in self.ledger.hermes_execution_candidates():
+                try:
+                    return self.controller.reconcile_hermes_execution(str(candidate["external_task_id"]), require_handoff=True)
+                except RuntimeError as exc:
+                    if str(exc) == "no unreconciled Hermes worker run available for reconciliation":
+                        continue
+                    raise
+            return None
+
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            self.board,
+            worker_id="scheduler",
+            lease_seconds=30,
+            clock=lambda: 100,
+            hermes_execution_runner=reconcile_one,
+            implementation_runner=lambda ticket_id: implementation_calls.append(ticket_id) or (_ for _ in ()).throw(AssertionError("local implementation must not run")),
+            validation_runner=lambda ticket_id: self.controller.execute_deterministic_validation_only(ticket_id, repository=self.repo),
+        )
+        first = scheduler.process_next()
+        self.assertEqual((first.status, first.stage, first.ticket_id), ("reconciled_external", "implementation", self.ticket_id))
+        self.assertEqual(implementation_calls, [])
+        self.assertEqual(self.ledger.attempt_count(self.ticket_id), 1)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM model_invocations WHERE ticket_id=?", (self.ticket_id,)).fetchone()[0], 0)
+
+        second = scheduler.process_next()
+        self.assertEqual((second.status, second.stage, second.ticket_id), ("completed", "validation", self.ticket_id))
+        self.assertEqual(implementation_calls, [])
+        self.assertEqual(self.ledger.attempt_count(self.ticket_id), 1)
+
+    def test_second_blocked_handoff_becomes_second_attempt_for_hermes_owned_repair(self) -> None:
+        self._make_generated_owned()
+        first_run = ExternalExecutionRun(7, "blocked", "blocked", 10, 20, HANDOFF_SENTINEL, "worker-code", 123, {"source": "dispatcher"})
+        self.board.snapshot = ExternalExecutionSnapshot(
+            task=ExternalTicket("H-1", "external", "", "blocked", str(self.repo)),
+            session_id="session-7",
+            branch_name="worker-branch",
+            started_at=10,
+            completed_at=20,
+            runs=(first_run,),
+        )
+        first = self.controller.reconcile_hermes_execution("H-1", require_handoff=True)
+        self.assertEqual(first["attempt_number"], 1)
+        with self.assertRaisesRegex(RuntimeError, "no unreconciled Hermes worker run"):
+            self.controller.reconcile_hermes_execution("H-1", require_handoff=True)
+
+        self.ledger.connection.execute("UPDATE tickets SET state=? WHERE id=?", (CanonicalState.REPAIRING.value, self.ticket_id))
+        (self.repo / "app.py").write_text('def value():\n    return "repaired"\n')
+        second_run = ExternalExecutionRun(8, "blocked", "blocked", 21, 30, HANDOFF_SENTINEL, "worker-code", 456, {"source": "dispatcher"})
+        self.board.snapshot = ExternalExecutionSnapshot(
+            task=ExternalTicket("H-1", "external", "", "blocked", str(self.repo)),
+            session_id="session-8",
+            branch_name="worker-branch",
+            started_at=21,
+            completed_at=30,
+            runs=(first_run, second_run),
+        )
+        second = self.controller.reconcile_hermes_execution("H-1", require_handoff=True)
+        self.assertEqual(second["attempt_number"], 2)
+        self.assertEqual(second["hermes_run_id"], 8)
+        self.assertEqual(self.ledger.attempt_count(self.ticket_id), 2)
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.IMPLEMENTING.value)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM hermes_execution_reconciliations WHERE ticket_id=?", (self.ticket_id,)).fetchone()[0], 2)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM model_invocations WHERE ticket_id=? AND stage='implementation'", (self.ticket_id,)).fetchone()[0], 0)
 
 
 if __name__ == "__main__":

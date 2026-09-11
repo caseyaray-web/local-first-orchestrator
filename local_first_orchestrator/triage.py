@@ -11,6 +11,7 @@ from .ledger import Ledger
 from .readiness import ReadinessError, validate_ticket
 from .states import CanonicalState
 from .ticket import MicroTicket, PatchBudget, VerificationProfile
+from .execution_handoff import attach_execution_handoff
 
 
 class TriageError(ValueError):
@@ -42,7 +43,7 @@ def triage_child_payload(parent_ticket_id: str, orchestrator_ticket_id: str, tit
         **ticket.contract(),
     }
     encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"))
-    body = f"{_LOCAL_FIRST_MARKER}\n```{_LOCAL_FIRST_CONTRACT}\n{encoded}\n```"
+    body = attach_execution_handoff(f"{_LOCAL_FIRST_MARKER}\n```{_LOCAL_FIRST_CONTRACT}\n{encoded}\n```")
     return {
         "title": title,
         "body": body,

@@ -231,6 +231,22 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
     )
     successor_route = dict(registered.decomposition).get("standard")
 
+    def reconcile_hermes_owned_execution() -> dict[str, Any] | None:
+        for candidate in ledger.hermes_execution_candidates():
+            external_task_id = str(candidate["external_task_id"])
+            try:
+                return ctl.reconcile_hermes_execution(external_task_id, require_handoff=True)
+            except RuntimeError as exc:
+                message = str(exc)
+                if message in {
+                    "Hermes execution handoff is not blocked for reconciliation",
+                    "no completed Hermes worker run available for reconciliation",
+                    "no unreconciled Hermes worker run available for reconciliation",
+                }:
+                    continue
+                raise
+        return None
+
     def materialize_successor(identity: dict[str, Any]) -> dict[str, Any]:
         if successor_route is None:
             raise RuntimeError("next tranche activation requires registered standard decomposition route")
@@ -285,6 +301,7 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         ctl.board,
         worker_id=args.worker_id,
         lease_seconds=ctl.config.lease_seconds,
+        hermes_execution_runner=reconcile_hermes_owned_execution,
         implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(
             ticket_id, repository=registered.canonical_repository
         ),

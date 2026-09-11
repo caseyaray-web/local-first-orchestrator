@@ -51,7 +51,7 @@ data = load()
 if command and command[0] == "create":
     if mode == "create_failure":
         sys.exit(5)
-    if not (len(command) == 11 and command[2] == "--body" and command[4:6] == ["--workspace", "scratch"] and command[6] == "--idempotency-key" and command[8:] == ["--initial-status", "blocked", "--json"]):
+    if not (len(command) == 11 and command[2] == "--body" and command[4:6] == ["--workspace", "worktree"] and command[6] == "--idempotency-key" and command[8:] == ["--initial-status", "blocked", "--json"]):
         sys.exit(9)
     key = command[7]
     task = data["tasks"].get(data["keys"].get(key, ""))
@@ -83,7 +83,7 @@ elif len(command) == 3 and command[0] == "show" and command[2] == "--json":
         contract[field] = value
         shown["body"] = prefix + marker + json.dumps(contract, sort_keys=True, separators=(",", ":")) + "\\n```" + suffix
     print(json.dumps({"task": shown}))
-elif command and command[0] in {"schedule", "block", "complete"}:
+elif command and command[0] in {"schedule", "unblock", "block", "complete"}:
     if len(command) < 2 or command[1] not in data["tasks"]:
         sys.exit(3)
     print("ok")
@@ -372,7 +372,7 @@ class GeneratedProjectionDeliveryTests(unittest.TestCase):
         self.ledger.transition(ticket_id, CanonicalState.BLOCKED)
         self.assertTrue(self.ledger.project_ticket(ticket_id, adapter))
         calls = self.calls()
-        self.assertEqual([call[3] for call in calls], ["create", "show", "show", "schedule", "show"])
+        self.assertEqual([call[3] for call in calls], ["create", "show", "show", "unblock", "show"])
         external_targets = [calls[index][4] for index in (2, 3, 4)]
         self.assertEqual(external_targets, ["1", "1", "1"])
         self.assertNotIn(ticket_id, external_targets)

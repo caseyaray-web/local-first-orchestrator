@@ -288,7 +288,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
         "SELECT t.id FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id "
         "WHERE t.state IN (?,?) AND (t.lease_expires_at IS NULL OR t.lease_expires_at<=?) "
         "AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND (c.stage='implementation' OR c.stage LIKE 'implementation:%') AND c.status='claimed') "
-        "AND NOT EXISTS (SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=t.id AND b.operation='create_microticket' AND b.acknowledged_at IS NULL) "
+        "AND NOT EXISTS (SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=t.id AND b.operation='create_microticket') "
         "ORDER BY t.created_at,t.id LIMIT 1",
         ("ready_local", "repairing", now),
     ).fetchone()
@@ -651,6 +651,7 @@ class ProcessNextScheduler:
         worker_id: str,
         lease_seconds: int = 60,
         clock: Callable[[], int] | None = None,
+        hermes_execution_runner: Callable[[], dict[str, Any] | None] | None = None,
         implementation_runner: Callable[[str], dict[str, Any]] | None = None,
         validation_runner: Callable[[str], dict[str, Any]] | None = None,
         review_runner: Callable[[str], dict[str, Any]] | None = None,
@@ -678,6 +679,7 @@ class ProcessNextScheduler:
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
         self.clock = clock or Ledger._now
+        self.hermes_execution_runner = hermes_execution_runner
         self.implementation_runner = implementation_runner
         self.validation_runner = validation_runner
         self.review_runner = review_runner
@@ -754,6 +756,15 @@ class ProcessNextScheduler:
                 "evidence_comment",
                 str(row["ticket_id"]) if row else None,
             )
+
+        if stage_allowed("implementation") and self.hermes_execution_runner is not None:
+            external_result = self.hermes_execution_runner()
+            if external_result is not None:
+                return ProcessNextResult(
+                    "reconciled_external",
+                    "implementation",
+                    str(external_result["ticket_id"]),
+                )
 
         if stage_allowed("implementation") and self.implementation_runner is not None:
             implementation_claim = self.ledger.claim_next_scheduler_implementation(

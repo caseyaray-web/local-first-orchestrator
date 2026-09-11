@@ -1272,10 +1272,12 @@ class Ledger:
                 if actual != requested:
                     raise RuntimeError("hermes_execution_reconciliation_conflict")
                 return dict(existing)
-            ticket = conn.execute("SELECT * FROM tickets WHERE id=? AND external_id=?", (ticket_id, external_task_id)).fetchone()
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
             if ticket is None:
                 raise RuntimeError("hermes_execution_ticket_binding_conflict")
-            if ticket["state"] not in (CanonicalState.READY_LOCAL.value, CanonicalState.IMPLEMENTING.value):
+            if self._resolve_external_task_id_in_transaction(conn, ticket_id) != external_task_id:
+                raise RuntimeError("hermes_execution_ticket_binding_conflict")
+            if ticket["state"] not in (CanonicalState.READY_LOCAL.value, CanonicalState.IMPLEMENTING.value, CanonicalState.REPAIRING.value):
                 raise RuntimeError("hermes_execution_ticket_state_conflict")
             attempt = conn.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
             empty_hash = hashlib.sha256(b"").hexdigest()
@@ -1296,7 +1298,7 @@ class Ledger:
                 )
             elif (stage["adapter"], stage["request_hash"], stage["response_artifact"], stage["worktree_path"], stage["base_sha"], stage["diff_hash"]) != ("hermes-dispatch", snapshot_hash, artifact_path, workspace_path, base_sha, diff_hash):
                 raise RuntimeError("hermes_execution_implementation_stage_conflict")
-            if ticket["state"] == CanonicalState.READY_LOCAL.value:
+            if ticket["state"] != CanonicalState.IMPLEMENTING.value:
                 conn.execute("UPDATE tickets SET state=?,updated_at=? WHERE id=?", (CanonicalState.IMPLEMENTING.value, self._now(), ticket_id))
             conn.execute(
                 "INSERT INTO hermes_execution_reconciliations(external_task_id,hermes_run_id,ticket_id,attempt_number,run_status,run_outcome,session_id,branch_name,workspace_path,base_sha,head_sha,diff_hash,artifact_path,snapshot_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -3185,7 +3187,7 @@ class Ledger:
                 "SELECT t.id,t.state FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id "
                 "WHERE t.state IN (?,?) AND (t.lease_expires_at IS NULL OR t.lease_expires_at<=?) "
                 "AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND (c.stage='implementation' OR c.stage LIKE 'implementation:%') AND c.status='claimed') "
-                "AND NOT EXISTS (SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=t.id AND b.operation='create_microticket' AND b.acknowledged_at IS NULL) "
+                "AND NOT EXISTS (SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=t.id AND b.operation='create_microticket') "
                 "ORDER BY t.created_at,t.id LIMIT 1",
                 (CanonicalState.READY_LOCAL.value, CanonicalState.REPAIRING.value, now),
             ).fetchone()
@@ -3215,6 +3217,17 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="lease_claimed", actor_id=owner, from_state=source_state.value, to_state=CanonicalState.IMPLEMENTING.value, payload={"lease_expires_at": now + lease_seconds, "scheduler_claim_id": claim_id})
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_claimed", actor_id=owner, payload={"claim_id": claim_id, "stage": stage_name, "lease_expires_at": now + lease_seconds})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
+    def hermes_execution_candidates(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT DISTINCT t.id AS ticket_id,t.state,b.external_task_id,t.created_at "
+            "FROM tickets t JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket' "
+            "WHERE b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL "
+            "AND t.state IN (?,?,?) "
+            "ORDER BY t.created_at,t.id,b.external_task_id",
+            (CanonicalState.READY_LOCAL.value, CanonicalState.IMPLEMENTING.value, CanonicalState.REPAIRING.value),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def complete_scheduler_implementation_effect(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
         """Persist model-stage completion before scheduler-claim finalization."""
@@ -3418,11 +3431,20 @@ class Ledger:
                 return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
             row = conn.execute("""
                 SELECT t.*, r.detail, r.artifact_path, r.artifact_sha256, m.response_artifact, m.diff_hash,
-                       mi.invocation_id FROM tickets t
+                       mi.invocation_id,
+                       he.external_task_id AS hermes_external_task_id,
+                       he.hermes_run_id,
+                       CASE
+                         WHEN mi.invocation_id IS NOT NULL THEN mi.invocation_id
+                         WHEN he.hermes_run_id IS NOT NULL THEN ('hermes-run:' || he.external_task_id || ':' || he.hermes_run_id)
+                       END AS implementation_execution_id
+                FROM tickets t
                 JOIN runtime_stages r ON r.ticket_id=t.id AND r.stage='validation_completed'
                 JOIN model_stage_artifacts m ON m.ticket_id=t.id AND m.attempt_number=r.attempt_number AND m.stage='implementation'
-                JOIN model_invocations mi ON mi.ticket_id=t.id AND mi.attempt_number=r.attempt_number AND mi.stage='implementation' AND mi.status='completed'
+                LEFT JOIN model_invocations mi ON mi.ticket_id=t.id AND mi.attempt_number=r.attempt_number AND mi.stage='implementation' AND mi.status='completed'
+                LEFT JOIN hermes_execution_reconciliations he ON he.ticket_id=t.id AND he.attempt_number=r.attempt_number
                 WHERE t.state=? AND EXISTS (SELECT 1 FROM scheduler_stage_claims v WHERE v.ticket_id=t.id AND v.stage=('validation:' || r.attempt_number) AND v.side_effect_completed_at IS NOT NULL)
+                AND ((mi.invocation_id IS NOT NULL AND he.hermes_run_id IS NULL) OR (mi.invocation_id IS NULL AND he.hermes_run_id IS NOT NULL))
                 AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('review:' || r.attempt_number))
                 ORDER BY t.created_at,t.id LIMIT 1
             """, (CanonicalState.LOCAL_REVIEW.value,)).fetchone()
@@ -3444,7 +3466,7 @@ class Ledger:
             candidate = conn.execute("SELECT * FROM review_candidates WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
             encoded_identity = json.dumps(identity, sort_keys=True, separators=(",", ":"))
             if candidate is None:
-                conn.execute("INSERT INTO review_candidates(ticket_id,attempt_number,candidate_fingerprint,validation_evidence,implementation_invocation_id,runtime_identity_json,status,historical_review_attempted,historical_provenance_json,created_at,updated_at) VALUES (?,?,?,?,?,?, 'review_pending',0,'{}',?,?)", (ticket_id,attempt_number,str(row["diff_hash"]),str(validation["compact_evidence"]),str(row["invocation_id"]),encoded_identity,now,now))
+                conn.execute("INSERT INTO review_candidates(ticket_id,attempt_number,candidate_fingerprint,validation_evidence,implementation_invocation_id,runtime_identity_json,status,historical_review_attempted,historical_provenance_json,created_at,updated_at) VALUES (?,?,?,?,?,?, 'review_pending',0,'{}',?,?)", (ticket_id,attempt_number,str(row["diff_hash"]),str(validation["compact_evidence"]),str(row["implementation_execution_id"]),encoded_identity,now,now))
                 self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="validated_review_candidate_frozen", actor_id="scheduler", payload={"attempt_number":attempt_number,"candidate_fingerprint":str(row["diff_hash"])})
             elif candidate["candidate_fingerprint"] != str(row["diff_hash"]) or candidate["validation_evidence"] != str(validation["compact_evidence"]) or candidate["runtime_identity_json"] != encoded_identity:
                 raise RuntimeError("review_reconciliation_required: review candidate identity drift")

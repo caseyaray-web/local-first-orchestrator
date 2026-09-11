@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from .readiness import validate_ticket
 from .ticket import MicroTicket
 from .ledger import Ledger
+from .execution_handoff import attach_execution_handoff
 import time
 @dataclass(frozen=True)
 class Criterion: id:str; statement:str; verification_hint:str=""
@@ -108,7 +109,7 @@ def generated_card_payload(feature: FeatureContract, tranche: Tranche, ticket: M
   **ticket.contract(),
  }
  encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"))
- body = f"{_LOCAL_FIRST_MARKER}\\n```{_LOCAL_FIRST_CONTRACT}\\n{encoded}\\n```"
+ body = attach_execution_handoff(f"{_LOCAL_FIRST_MARKER}\\n```{_LOCAL_FIRST_CONTRACT}\\n{encoded}\\n```")
  return {
   "title": ticket.ticket_id,
   "body": body,

@@ -8,8 +8,8 @@
 - A real `HermesBoardAdapter`, retry-safe board/comment outboxes, live state/comment completion projection, native dependency links, and marker-based comment reconciliation are implemented and were exercised against a real Hermes board in Milestone 20.
 - Isolated Git worktrees, base/diff provenance, dirty-tree refusal, deterministic validation, a real local implementation-model path, an independent review worker, paid-call governance, and the restartable scheduler/daemon now exist.
 - Bounded triage/decomposition and idempotent generated-card projection are implemented; existing Hermes auto-decomposition remains outside controller ownership.
-- The principal unresolved compatibility boundary is now Hermes-dispatched execution reconciliation: ordinary dispatcher-owned Hermes worker runs still need to be bound back into Local First attempts/provenance and forced through Local First deterministic validation/review before graph advancement.
-- Broader remaining operational proof includes a full scheduler-generated native tranche graph, exhaustive live external-boundary crash injection, and live paid-provider checkpoint/escalation operation.
+- Hermes-dispatched execution reconciliation is now implemented and live-proven for the representative generated-ticket path: generated tickets stay Hermes-owned for implementation, blocked handoff runs are automatically reconciled into Local First attempts, Local First does not launch a duplicate implementation model, and Hermes remains non-final until Local First validation/review/integration authorizes `done`.
+- The principal unresolved compatibility boundary is now the **full multi-ticket scheduler-generated native tranche graph**: prove multiple generated dispatcher-owned tickets and dependencies end-to-end through native readiness release, tranche integration/checkpoint, and successor activation. Broader remaining operational proof also includes exhaustive live external-boundary crash injection and live paid-provider checkpoint/escalation operation.
 
 
 ## Inspected runtime and entry points

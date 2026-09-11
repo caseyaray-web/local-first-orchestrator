@@ -17,6 +17,7 @@ from .context_packet import ContextPacketBuilder
 from .evidence_hash import canonical_sha256
 from .git_adapter import AttemptWorktree, GitWorktreeAdapter
 from .historical_revalidation import attestation_hash_from_row, authorization_hash_from_row, classify_obsolete_validation_failure, derive_obsolete_validation_failure, historical_validation_result_hash
+from .execution_handoff import HANDOFF_SENTINEL
 from .ledger import Ledger, _completion_evidence_hash, _recheck_evidence_hash
 from .local_qwen import LocalQwenAdapter, REVIEW_JSON_SCHEMA
 from .paid_model import PaidModelAdapter
@@ -117,7 +118,7 @@ class LocalFirstController:
 
     def import_scheduled_cards(self) -> list[str]: return [self.import_card(c) for c in self.board.import_candidates()]
 
-    def reconcile_hermes_execution(self, external_task_id: str, *, hermes_run_id: int | None = None) -> dict[str, Any]:
+    def reconcile_hermes_execution(self, external_task_id: str, *, hermes_run_id: int | None = None, require_handoff: bool = False) -> dict[str, Any]:
         """Bind one completed dispatcher-owned Hermes run into Local First.
 
         This operation never launches an implementation model.  It turns a
@@ -131,21 +132,45 @@ class LocalFirstController:
             raise RuntimeError("Hermes execution task identity conflict")
         if snapshot.task.status == "done":
             raise RuntimeError("hermes_completion_authority_bypassed_reconciliation_required")
-        ticket_row = self.ledger.connection.execute("SELECT * FROM tickets WHERE external_id=?", (external_task_id,)).fetchone()
+        if require_handoff and snapshot.task.status != "blocked":
+            raise RuntimeError("Hermes execution handoff is not blocked for reconciliation")
+        rows = self.ledger.connection.execute(
+            "SELECT DISTINCT t.* FROM tickets t LEFT JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL "
+            "WHERE t.external_id=? OR b.external_task_id=? ORDER BY t.created_at,t.id LIMIT 2",
+            (external_task_id, external_task_id),
+        ).fetchall()
+        if len(rows) > 1:
+            raise RuntimeError("Hermes execution task identity is ambiguous")
+        ticket_row = rows[0] if rows else None
         if ticket_row is None:
             raise KeyError(f"Local First ticket not found for Hermes task {external_task_id}")
         ticket_id = str(ticket_row["id"])
-        candidates = [
-            run for run in snapshot.runs
-            if run.status == "completed"
-            and run.outcome in {"completed", "success", "succeeded"}
-            and not str(run.summary or "").startswith("local-first projection ")
-        ]
+        if self.ledger.resolve_external_task_id(ticket_id) != external_task_id:
+            raise RuntimeError("Hermes execution external identity conflict")
+        if require_handoff:
+            candidates = [
+                run for run in snapshot.runs
+                if run.status == "blocked"
+                and run.outcome == "blocked"
+                and str(run.summary or "") == HANDOFF_SENTINEL
+            ]
+        else:
+            candidates = [
+                run for run in snapshot.runs
+                if run.status in {"completed", "blocked"}
+                and (
+                    run.outcome in {"completed", "success", "succeeded"}
+                    or (run.outcome == "blocked" and str(run.summary or "") == HANDOFF_SENTINEL)
+                )
+                and not str(run.summary or "").startswith("local-first projection ")
+            ]
         if hermes_run_id is not None:
             candidates = [run for run in candidates if run.id == hermes_run_id]
         if not candidates:
             raise RuntimeError("no completed Hermes worker run available for reconciliation")
         unreconciled = [run for run in candidates if self.ledger.hermes_execution_reconciliation(external_task_id, run.id) is None]
+        if require_handoff and not unreconciled:
+            raise RuntimeError("no unreconciled Hermes worker run available for reconciliation")
         if hermes_run_id is None:
             if len(unreconciled) > 1:
                 raise RuntimeError("multiple Hermes worker runs require explicit run id")
@@ -179,7 +204,7 @@ class LocalFirstController:
             raise RuntimeError("Hermes execution workspace is not attached to the configured repository")
 
         adapter = GitWorktreeAdapter(repository, worktree_root)
-        base_sha = adapter.existing_execution_base(ticket_row["tranche_id"] or None, str(binding["starting_sha"]))
+        base_sha = adapter.resolve_execution_base(ticket_row["tranche_id"] or None, str(binding["starting_sha"]))
         head_sha = git("rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
         if git("merge-base", "--is-ancestor", base_sha, head_sha, check=False).returncode != 0:
             raise RuntimeError("Hermes execution HEAD does not descend from the authoritative execution base")
@@ -571,7 +596,17 @@ class LocalFirstController:
         attempt = self.ledger.connection.execute(
             "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)
         ).fetchone()
-        if implementation is None or invocation is None or attempt is None or invocation["status"] != "completed":
+        if implementation is None or attempt is None:
+            raise RuntimeError("validation_reconciliation_required: implementation provenance is incomplete")
+        hermes_execution = None
+        if str(implementation["adapter"]) == "hermes-dispatch":
+            hermes_execution = self.ledger.connection.execute(
+                "SELECT * FROM hermes_execution_reconciliations WHERE ticket_id=? AND attempt_number=?",
+                (ticket_id, attempt_number),
+            ).fetchone()
+            if hermes_execution is None or invocation is not None:
+                raise RuntimeError("validation_reconciliation_required: Hermes execution provenance is incomplete")
+        elif invocation is None or invocation["status"] != "completed":
             raise RuntimeError("validation_reconciliation_required: implementation provenance is incomplete")
         expected = {
             "ticket_id": ticket_id,
@@ -583,8 +618,18 @@ class LocalFirstController:
             "implementation_diff_hash": str(implementation["diff_hash"]),
             "validation_policy_hash": self.ledger._validation_policy_hash(ticket_row),
         }
-        if identity != expected or str(invocation["model_artifact"] or "") != expected["implementation_artifact"]:
+        if identity != expected:
             raise RuntimeError("validation_reconciliation_required: durable candidate identity drift")
+        if hermes_execution is None:
+            if str(invocation["model_artifact"] or "") != expected["implementation_artifact"]:
+                raise RuntimeError("validation_reconciliation_required: durable candidate identity drift")
+        elif (
+            str(hermes_execution["artifact_path"]) != expected["implementation_artifact"]
+            or str(hermes_execution["base_sha"]) != expected["base_sha"]
+            or str(hermes_execution["diff_hash"]) != expected["implementation_diff_hash"]
+            or str(implementation["request_hash"]) != str(hermes_execution["snapshot_hash"])
+        ):
+            raise RuntimeError("validation_reconciliation_required: Hermes execution identity drift")
         path = Path(expected["worktree_path"]).resolve()
         artifact = Path(expected["implementation_artifact"])
         if not path.is_dir() or not artifact.is_file() or str(attempt["worktree_path"] or "") != expected["worktree_path"]:
@@ -593,10 +638,15 @@ class LocalFirstController:
         try:
             live_root = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
             live_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
-            live_diff_hash = worktrees.diff_hash(path)
+            if hermes_execution is None:
+                live_diff_hash = worktrees.diff_hash(path)
+            else:
+                live_diff = subprocess.run(("git", "diff", "--binary", "--no-ext-diff", expected["base_sha"], "--"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout
+                live_diff_hash = hashlib.sha256(live_diff.encode()).hexdigest()
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeError("validation_reconciliation_required: live worktree inspection failed") from exc
-        if live_root != str(path) or live_head != expected["base_sha"] or live_diff_hash != expected["implementation_diff_hash"]:
+        expected_head = expected["base_sha"] if hermes_execution is None else str(hermes_execution["head_sha"])
+        if live_root != str(path) or live_head != expected_head or live_diff_hash != expected["implementation_diff_hash"]:
             raise RuntimeError("validation_reconciliation_required: live candidate identity drift")
         existing = self.ledger.runtime_stage(ticket_id, f"validation-{attempt_number}")
         if existing is not None:
@@ -626,7 +676,11 @@ class LocalFirstController:
             try:
                 post_root = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
                 post_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
-                post_diff_hash = worktrees.diff_hash(path)
+                if hermes_execution is None:
+                    post_diff_hash = worktrees.diff_hash(path)
+                else:
+                    post_diff = subprocess.run(("git", "diff", "--binary", "--no-ext-diff", expected["base_sha"], "--"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout
+                    post_diff_hash = hashlib.sha256(post_diff.encode()).hexdigest()
             except (OSError, subprocess.SubprocessError) as exc:
                 raise RuntimeError("validation_reconciliation_required: post-validation worktree inspection failed") from exc
             if (
@@ -634,7 +688,7 @@ class LocalFirstController:
                 or not artifact.is_file()
                 or hashlib.sha256(artifact.read_bytes()).hexdigest() != expected["implementation_artifact_sha256"]
                 or post_root != str(path)
-                or post_head != expected["base_sha"]
+                or post_head != expected_head
                 or post_diff_hash != expected["implementation_diff_hash"]
             ):
                 raise RuntimeError("validation_reconciliation_required: live candidate changed during validation")
@@ -1452,10 +1506,20 @@ class LocalFirstController:
         if configured_repo != repo or str(binding["repository_path"]) != str(repo):
             raise RuntimeError("git_integration_reconciliation_required: repository binding drift")
         worktree = Path(str(identity["worktree_path"])).resolve(strict=True)
+        hermes_execution = self.ledger.connection.execute(
+            "SELECT * FROM hermes_execution_reconciliations WHERE ticket_id=? AND attempt_number=?",
+            (ticket_id, attempt_number),
+        ).fetchone()
         try:
             worktree.relative_to(worktree_root.resolve())
         except ValueError as exc:
-            raise RuntimeError("git_integration_reconciliation_required: worktree outside configured root") from exc
+            if (
+                hermes_execution is None
+                or str(hermes_execution["workspace_path"]) != str(worktree)
+                or str(hermes_execution["base_sha"]) != str(identity["base_sha"])
+                or str(hermes_execution["diff_hash"]) != str(identity["candidate_fingerprint"])
+            ):
+                raise RuntimeError("git_integration_reconciliation_required: worktree outside configured root") from exc
         base = str(identity["base_sha"])
         candidate_fingerprint = str(identity["candidate_fingerprint"])
         commit_message = str(identity["commit_message"])
@@ -1601,22 +1665,20 @@ class LocalFirstController:
             raise RuntimeError("tranche_checkpoint_reconciliation_required: serialized integration identity drift")
         final_ticket = str(identity["ticket_ids"][-1])
         final_commit = str(completion["final_integration_sha"])
-        attempt = self.ledger.connection.execute(
-            "SELECT * FROM attempts WHERE ticket_id=? AND accepted_commit_sha=? ORDER BY attempt_number DESC LIMIT 1",
-            (final_ticket, final_commit),
-        ).fetchone()
-        if attempt is None or not attempt["worktree_path"]:
-            raise RuntimeError("tranche_checkpoint_reconciliation_required: final integration worktree missing")
-        worktree = Path(str(attempt["worktree_path"])).resolve(strict=True)
-        head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True, timeout=30).stdout.strip()
-        status = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True, timeout=30).stdout.strip()
-        if head != final_commit or status:
-            raise RuntimeError("tranche_checkpoint_reconciliation_required: final worktree drift")
-
         target = artifact_root / "tranches" / tranche_id
         target.mkdir(parents=True, exist_ok=True)
         artifact = target / "checkpoint.json"
+        checkpoint_worktree = target / "integration-worktree"
+
+        def cleanup_checkpoint_worktree() -> None:
+            if checkpoint_worktree.exists():
+                subprocess.run(("git", "worktree", "remove", "--force", str(checkpoint_worktree)), cwd=repo, text=True, capture_output=True, check=False, timeout=30)
+            if checkpoint_worktree.exists():
+                shutil.rmtree(checkpoint_worktree, ignore_errors=True)
+            subprocess.run(("git", "worktree", "prune"), cwd=repo, text=True, capture_output=True, check=False, timeout=30)
+
         if artifact.exists():
+            cleanup_checkpoint_worktree()
             try:
                 recovered = json.loads(artifact.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
@@ -1642,51 +1704,77 @@ class LocalFirstController:
                 "checkpoint_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
             }
 
-        integration_results: list[dict[str, object]] = []
-        passed = True
-        for index, command in enumerate(identity["integration_commands"]):
-            try:
-                proc = subprocess.run(tuple(command), cwd=worktree, text=True, capture_output=True, timeout=300)
-                result = {
-                    "index": index,
-                    "command": command,
-                    "returncode": int(proc.returncode),
-                    "stdout": proc.stdout[-20000:],
-                    "stderr": proc.stderr[-20000:],
-                }
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                result = {"index": index, "command": command, "returncode": -1, "stdout": "", "stderr": str(exc)[:20000]}
-            integration_results.append(result)
-            if int(result["returncode"]) != 0:
-                passed = False
-                break
+        attempt = self.ledger.connection.execute(
+            "SELECT * FROM attempts WHERE ticket_id=? AND accepted_commit_sha=? ORDER BY attempt_number DESC LIMIT 1",
+            (final_ticket, final_commit),
+        ).fetchone()
+        if attempt is None or not attempt["worktree_path"]:
+            raise RuntimeError("tranche_checkpoint_reconciliation_required: final integration attempt missing")
+        attempt_worktree = Path(str(attempt["worktree_path"]))
+        ephemeral_worktree = False
+        if attempt_worktree.is_dir():
+            worktree = attempt_worktree.resolve(strict=True)
+            head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True, timeout=30).stdout.strip()
+            status = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True, timeout=30).stdout.strip()
+            if head != final_commit or status:
+                raise RuntimeError("tranche_checkpoint_reconciliation_required: final worktree drift")
+        else:
+            cleanup_checkpoint_worktree()
+            created = subprocess.run(("git", "worktree", "add", "--detach", "-q", str(checkpoint_worktree), final_commit), cwd=repo, text=True, capture_output=True, check=False, timeout=30)
+            if created.returncode != 0:
+                raise RuntimeError("tranche_checkpoint_reconciliation_required: unable to materialize final integration commit")
+            worktree = checkpoint_worktree.resolve(strict=True)
+            ephemeral_worktree = True
 
-        checkpoint_packet = {
-            "version": 1,
-            "feature_id": identity["feature_id"],
-            "tranche_id": tranche_id,
-            "candidate_identity": identity,
-            "integration_commands": identity["integration_commands"],
-            "planning_snapshot": {
-                "repository_identity": identity["repository_identity"],
-                "base_sha": identity["planning_base_sha"],
-                "snapshot_hash": identity["planning_snapshot_hash"],
-            },
-            "completion": completion,
-            "integration_results": integration_results,
-            "decision": "ready_for_checkpoint" if passed else "integration_failed",
-        }
-        content = json.dumps(checkpoint_packet, sort_keys=True, indent=2) + "\n"
-        artifact.write_text(content, encoding="utf-8")
-        return {
-            "tranche_id": tranche_id,
-            "candidate_identity": identity,
-            "completion": completion,
-            "integration_results": integration_results,
-            "decision": checkpoint_packet["decision"],
-            "checkpoint_artifact": str(artifact),
-            "checkpoint_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-        }
+        try:
+            integration_results: list[dict[str, object]] = []
+            passed = True
+            for index, command in enumerate(identity["integration_commands"]):
+                try:
+                    proc = subprocess.run(tuple(command), cwd=worktree, text=True, capture_output=True, timeout=300)
+                    result = {
+                        "index": index,
+                        "command": command,
+                        "returncode": int(proc.returncode),
+                        "stdout": proc.stdout[-20000:],
+                        "stderr": proc.stderr[-20000:],
+                    }
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    result = {"index": index, "command": command, "returncode": -1, "stdout": "", "stderr": str(exc)[:20000]}
+                integration_results.append(result)
+                if int(result["returncode"]) != 0:
+                    passed = False
+                    break
+
+            checkpoint_packet = {
+                "version": 1,
+                "feature_id": identity["feature_id"],
+                "tranche_id": tranche_id,
+                "candidate_identity": identity,
+                "integration_commands": identity["integration_commands"],
+                "planning_snapshot": {
+                    "repository_identity": identity["repository_identity"],
+                    "base_sha": identity["planning_base_sha"],
+                    "snapshot_hash": identity["planning_snapshot_hash"],
+                },
+                "completion": completion,
+                "integration_results": integration_results,
+                "decision": "ready_for_checkpoint" if passed else "integration_failed",
+            }
+            content = json.dumps(checkpoint_packet, sort_keys=True, indent=2) + "\n"
+            artifact.write_text(content, encoding="utf-8")
+            return {
+                "tranche_id": tranche_id,
+                "candidate_identity": identity,
+                "completion": completion,
+                "integration_results": integration_results,
+                "decision": checkpoint_packet["decision"],
+                "checkpoint_artifact": str(artifact),
+                "checkpoint_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+        finally:
+            if ephemeral_worktree:
+                cleanup_checkpoint_worktree()
 
     def execute_paid_stage_only(self, tranche_id: str, *, adapter: PaidModelAdapter, purpose: PaidPurpose) -> dict[str, object]:
         stage = "paid_checkpoint" if purpose == PaidPurpose.INTEGRATION_CHECKPOINT else "paid_escalation"

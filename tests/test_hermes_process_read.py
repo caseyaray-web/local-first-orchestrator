@@ -23,7 +23,7 @@ elif len(a)==3 and a[0]=='show' and a[2]=='--json':
  if not task:sys.exit(3)
  print(json.dumps({'task':task}))
 elif a and a[0]=='schedule':print('')
-elif len(a)==11 and a[0]=='create' and a[2]=='--body' and a[4:]==['--workspace','scratch','--idempotency-key',a[7],'--initial-status','blocked','--json']:
+elif len(a)==11 and a[0]=='create' and a[2]=='--body' and a[4:]==['--workspace','worktree','--idempotency-key',a[7],'--initial-status','blocked','--json']:
  key=a[7]; task=data['tasks'].get(data['keys'].get(key,''))
  if not task:
   ident=str(data['next_id']);data['next_id']+=1;task={'id':ident,'title':a[1],'body':a[3],'status':'blocked','workspace_path':None,'idempotency_key':key};data['tasks'][ident]=task;data['keys'][key]=ident;save(data)
@@ -38,7 +38,7 @@ class ProcessReadTests(unittest.TestCase):
   self.t.cleanup()
  def adapter(self,**kw):return HermesBoardAdapter(executable=str(self.exe),board='board',**kw)
  def test_read_and_create_contract(self):
-  a=self.adapter(allow_writes=True);self.assertEqual(len(a.import_candidates()),1);self.assertEqual(a.get_task('1').id,'1');self.assertEqual(a.create_microticket('new','body',idempotency_key='K'),'2');self.assertEqual(a.create_microticket('new','body',idempotency_key='K'),'2');calls=[json.loads(x) for x in self.log.read_text().splitlines()];self.assertIn(['kanban','--board','board','create','new','--body','body','--workspace','scratch','--idempotency-key','K','--initial-status','blocked','--json'],calls)
+  a=self.adapter(allow_writes=True);self.assertEqual(len(a.import_candidates()),1);self.assertEqual(a.get_task('1').id,'1');self.assertEqual(a.create_microticket('new','body',idempotency_key='K'),'2');self.assertEqual(a.create_microticket('new','body',idempotency_key='K'),'2');calls=[json.loads(x) for x in self.log.read_text().splitlines()];self.assertIn(['kanban','--board','board','create','new','--body','body','--workspace','worktree','--idempotency-key','K','--initial-status','blocked','--json'],calls)
  def test_create_fails_closed(self):
   a=HermesBoardAdapter(executable=str(self.exe),board='board',allow_writes=True,runner=lambda *_,**__:subprocess.CompletedProcess((),0,'{}',''))
   with self.assertRaises(RuntimeError):a.create_microticket('x','b',idempotency_key='K')

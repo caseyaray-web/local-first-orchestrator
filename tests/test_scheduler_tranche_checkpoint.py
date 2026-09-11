@@ -128,6 +128,17 @@ class SchedulerTrancheCheckpointTests(unittest.TestCase):
         self.assertEqual(self.ledger.connection.execute("SELECT status FROM tranches WHERE id='T'").fetchone()[0], "active")
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM tickets WHERE tranche_id='T'").fetchone()[0], 1)
 
+    def test_checkpoint_materializes_final_commit_when_attempt_worktree_is_gone(self) -> None:
+        self.git("worktree", "remove", "--force", str(self.worktree))
+        self.assertFalse(self.worktree.exists())
+        result = self.scheduler().process_next()
+        self.assertEqual((result.stage, result.status), ("tranche_checkpoint", "completed"))
+        checkpoint = self.ledger.tranche_checkpoint("T")
+        self.assertEqual(checkpoint["decision"], "ready_for_checkpoint")
+        integration = json.loads(checkpoint["integration_results_json"])
+        self.assertEqual(integration[0]["returncode"], 0)
+        self.assertFalse((self.root / "artifacts" / "tranches" / "T" / "integration-worktree").exists())
+
     def test_checkpoint_fails_closed_on_planning_snapshot_corruption(self) -> None:
         self.ledger.connection.execute("UPDATE decomposition_plans SET repo_snapshot_hash=? WHERE id='P'", ("0" * 64,))
         with self.assertRaisesRegex(RuntimeError, "planning snapshot hash drift"):

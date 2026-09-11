@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .comment_delivery import MarkerLookup
+from .execution_handoff import HANDOFF_MARKER
 from .states import CanonicalState
 
 
@@ -159,13 +160,32 @@ class HermesBoardAdapter:
     def set_state(self, ticket_id: str, state: CanonicalState, *, idempotency_key: str) -> None:
         if not self.allow_writes:
             raise PermissionError("real board writes require --allow-board-writes")
-        current = self.get_task(ticket_id).status
+        task = self.get_task(ticket_id)
+        current = task.status
+        handoff = HANDOFF_MARKER in task.body
         if state == CanonicalState.DONE:
             if current == "done":
                 return
             if current == "scheduled":
                 self._run("unblock", ticket_id, "--reason", f"local-first completion {idempotency_key}")
             self._run("complete", ticket_id, "--result", f"local-first projection {idempotency_key}")
+        elif handoff and state in {CanonicalState.READY_LOCAL, CanonicalState.REPAIRING}:
+            if current == "ready":
+                return
+            if current in {"blocked", "scheduled", "todo"}:
+                self._run("unblock", ticket_id, "--reason", f"local-first execution released {idempotency_key}")
+                return
+            if current == "running":
+                return
+            raise RuntimeError(f"Hermes execution handoff release has incompatible state: {current}")
+        elif handoff:
+            if current == "blocked":
+                return
+            if current == "done":
+                raise RuntimeError("Hermes execution handoff became final before Local First completion")
+            if current in {"running", "ready", "todo", "scheduled"}:
+                raise RuntimeError(f"Hermes execution handoff is not parked for Local First trust stage: {current}")
+            return
         elif state in {CanonicalState.BLOCKED, CanonicalState.NEEDS_TRIAGE, CanonicalState.NEEDS_CHECKPOINT, CanonicalState.NEEDS_HUMAN_TEST}:
             if current == "blocked":
                 return
@@ -180,7 +200,7 @@ class HermesBoardAdapter:
     def create_microticket(self, title: str, body: str, *, idempotency_key: str) -> str:
         if not self.allow_writes:
             raise PermissionError("real board writes require --allow-board-writes")
-        payload = self._run("create", title, "--body", body, "--workspace", "scratch", "--idempotency-key", idempotency_key, "--initial-status", "blocked", "--json")
+        payload = self._run("create", title, "--body", body, "--workspace", "worktree", "--idempotency-key", idempotency_key, "--initial-status", "blocked", "--json")
         if not isinstance(payload, dict) or not isinstance(payload.get("id"), str) or not payload["id"]:
             raise RuntimeError("Hermes create JSON missing task id")
         return payload["id"]
