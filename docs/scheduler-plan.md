@@ -143,6 +143,18 @@ Already complete or substantially complete:
    - finalized stages with pending board/comment outboxes classify as downstream-incomplete `resume`
    - live `process-next` and read-only dry-run consult the same reconciliation classifier before normal stage work
 
+15. **Scheduler-wide ordering policy — Complete for the current scheduler slice**
+   - one explicit `SCHEDULER_STAGE_ORDER` / rank table defines the cross-class priority instead of relying on incidental branch placement
+   - terminal/ambiguous reconciliation `stop` remains a safety fence before eligible work is considered
+   - eligible work order is generated-card projection → state projection → evidence comment → recoverable expired claim → implementation → validation → review → repair routing → triage → acceptance → Git integration → completion → native dependency graph → native dependency release → tranche checkpoint → paid checkpoint → paid escalation → next-tranche materialization → next-tranche activation → root dependency-readiness admission
+   - generated-card creation precedes state/comment projection because Local First must first establish the external Hermes task identity that later board effects target
+   - state projection precedes evidence comments so authoritative state is projected before explanatory evidence for the same lifecycle progression
+   - an expired recoverable lifecycle claim globally owns the lifecycle slot after external projection work; every non-matching lifecycle class is ineligible for that tick
+   - recovery therefore cannot be starved by fresh implementation/validation/etc., while already-durable external effects are still drained first
+   - fresh implementation precedes fresh validation across tickets, and the remaining fresh lifecycle stages follow the dependency-ordered roadmap
+   - new root readiness admission is last so the scheduler drains existing owned work before admitting additional implementation work
+   - dry-run and live execution use the same recovery selector and fresh-stage order; per-stage candidate SQL retains deterministic `created_at`/identity ordering
+
 The remaining work should proceed in the following order.
 
 ## 3. Deterministic validation stage — Complete
@@ -354,7 +366,7 @@ Completion condition: after process death at any supported boundary, the next sc
 
 **Current status:** Complete for this scheduler milestone. A shared derived reconciliation model now classifies durable scheduler claims into the five required states and returns one of `resume`, `replay`, `reconcile`, `retry`, or `stop`. The classifier does not persist a parallel recovery state: it reads the existing scheduler claim lifecycle plus the authoritative evidence already owned by each subsystem. Model-backed stages inspect durable `model_invocations`; paid stages inspect purpose/request-key-bound `paid_reservations`; Git integration inspects `git_commit_intents` and append-only commit evidence; native dependency, tranche checkpoint, and next-tranche stages inspect their existing immutable evidence; deterministic/local stages safely replay from their frozen claim identity; and completed claims inspect the existing board/comment outboxes for downstream projection work. A `stop` decision is applied before normal scheduler work and retains the established stage-specific reconciliation errors so ambiguous or terminal external outcomes cannot become automatic retries. Exact-recovery and deterministic stages continue into their existing replay/reconcile handlers. Read-only `preview_database()` now uses the same classifier through a read-only Ledger shell, so dry-run and live execution derive the same recovery decision without migrations or writes.
 
-## 15. Scheduler-wide ordering policy
+## 15. Scheduler-wide ordering policy — Complete
 
 Define and test one canonical ordering when multiple classes of work are eligible.
 
@@ -381,6 +393,8 @@ The final order should explicitly cover at least:
 The exact order may be refined as implementation progresses, but it must be deterministic and justified by durability/ownership dependencies.
 
 Completion condition: two schedulers presented with the same durable state choose the same next eligible stage, and pending recovery/external effects are not starved by newly admitted work.
+
+**Current status:** Complete for this scheduler milestone. The scheduler now exports a canonical `SCHEDULER_STAGE_ORDER` and rank mapping covering every required work class. A terminal or ambiguous reconciliation decision remains a fail-closed safety fence before normal work; among eligible work, the order is: generated-card projection, state projection, evidence comment, recoverable expired lifecycle claim, implementation, validation, review, repair routing, triage, acceptance, Git integration, completion, native dependency graph, native dependency release, tranche checkpoint, paid checkpoint, paid escalation, next-tranche materialization, next-tranche activation, then root dependency-readiness admission. The first three positions reflect board ownership dependencies: generated child cards establish external task identity, authoritative state is then projected, and evidence comments follow. The global recovery slot is selected from the Milestone 14 reconciliation model; when present, live execution gates every non-matching lifecycle class for that tick, so newly eligible implementation or later work cannot bypass an incomplete recoverable claim. Only after external projection and recovery work is exhausted does fresh lifecycle admission follow the canonical stage order. Root readiness remains last so new implementation work cannot starve already-owned lifecycle work. Dry-run was reordered to the same policy, and tests prove generated→state→comment precedence, external projection before recovery, recovery before fresh implementation, implementation before fresh validation, explicit rank uniqueness, and identical stage/ticket choice from independent scheduler views of the same durable state.
 
 ## 16. Scheduler-wide concurrency proof
 
