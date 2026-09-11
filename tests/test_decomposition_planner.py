@@ -57,6 +57,61 @@ class Planner(unittest.TestCase):
                     f, s, coarse_tranche=coarse, completion_evidence={}, artifact_dir=Path(d)
                 )
 
+    def test_successor_completed_response_replays_without_second_model_call(self):
+        f, s, raw = self.raw_plan(); coarse = Plans().plan().tranches[1]; value = json.loads(raw)
+        value['criterion_coverage'] = {'B': ['two']}
+        value['tranches'] = [value['tranches'][1]]
+        value['tranches'][0]['criterion_ids'] = ['B']
+        calls = []
+        def run(argv, **kw):
+            calls.append(tuple(argv)); return subprocess.CompletedProcess(argv, 0, json.dumps(value), '')
+        with TemporaryDirectory() as d:
+            artifacts = Path(d)
+            first = LocalDecompositionPlanner(run, cost_class='standard', provider='p', model='m').propose_next(
+                f, s, coarse_tranche=coarse, completion_evidence={'final_integration_sha': s.base_sha}, artifact_dir=artifacts
+            )
+            second = LocalDecompositionPlanner(run, cost_class='standard', provider='p', model='m').propose_next(
+                f, s, coarse_tranche=coarse, completion_evidence={'final_integration_sha': s.base_sha}, artifact_dir=artifacts
+            )
+            self.assertEqual(first, second)
+            self.assertEqual(len(calls), 1)
+            journal = json.loads((artifacts / 'planner-result.json').read_text())
+            self.assertEqual((journal['status'], journal['returncode']), ('completed', 0))
+
+    def test_successor_prior_request_without_result_fails_closed_without_model_retry(self):
+        f, s, _ = self.raw_plan(); coarse = Plans().plan().tranches[1]
+        with TemporaryDirectory() as d:
+            artifacts = Path(d)
+            planner = LocalDecompositionPlanner(lambda *a, **k: (_ for _ in ()).throw(AssertionError('runner must not be called')), cost_class='standard', provider='p', model='m')
+            base = json.loads(packet(f, s, allowed_paths=planner.allowed_paths))
+            base['successor_scope'] = {
+                'coarse_tranche_id': coarse.id,
+                'coarse_tranche_objective': coarse.objective,
+                'coarse_tranche_capabilities': list(coarse.capabilities),
+                'allowed_criterion_ids': list(coarse.criterion_ids),
+                'completed_criterion_ids': ['A'],
+                'predecessor_completion': {},
+                'required_repo_base_sha': s.base_sha,
+            }
+            base['rules'] = [
+                *base['rules'],
+                'successor planning only: return exactly one tranche and only the criteria listed in successor_scope.allowed_criterion_ids',
+                'do not include, rematerialize, cover, or create tickets for successor_scope.completed_criterion_ids',
+                'criterion_coverage keys must equal successor_scope.allowed_criterion_ids exactly',
+                'the single output tranche criterion_ids must equal successor_scope.allowed_criterion_ids exactly',
+                'the single output tranche must implement only successor_scope.coarse_tranche_objective and capabilities',
+                'repo_base_sha must equal successor_scope.required_repo_base_sha exactly',
+                'scope_change_proposals must be empty for successor materialization; never broaden the coarse tranche',
+            ]
+            payload = json.dumps(base, sort_keys=True, separators=(',', ':'))
+            artifacts.mkdir(exist_ok=True)
+            scratch = artifacts / 'planner-scratch'; scratch.mkdir()
+            provenance = {'role': planner.role, 'routing_source': planner.routing_source, 'planner_contract_hash': planner.planner_contract_hash, 'provider': planner.provider, 'model': planner.model, 'profile': planner.profile, 'cost_class': planner.cost_class, 'mechanism': 'hermes-chat', 'tool_mode': 'safe-no-mutation-tools', 'toolsets': ['safe'], 'cwd': str(scratch), 'successor_scope': True}
+            (artifacts / 'planner-request.json').write_text(payload)
+            (artifacts / 'planner-provenance.json').write_text(json.dumps(provenance, sort_keys=True, separators=(',', ':')))
+            with self.assertRaisesRegex(PlannerError, 'prior invocation outcome unknown'):
+                planner.propose_next(f, s, coarse_tranche=coarse, completion_evidence={}, artifact_dir=artifacts)
+
     def test_mutation_tripwire_fails_closed_and_retains_evidence(self):
         f, s, raw = self.raw_plan()
         with TemporaryDirectory() as d:

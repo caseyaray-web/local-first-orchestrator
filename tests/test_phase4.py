@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -7,7 +8,7 @@ from tempfile import TemporaryDirectory
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.states import CanonicalState
 from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
-from local_first_orchestrator.triage import TriageCoordinator, TriageError, normalize_triage
+from local_first_orchestrator.triage import LocalTriagePlanner, TriageCoordinator, TriageError, normalize_triage
 
 
 class Phase4Tests(unittest.TestCase):
@@ -52,6 +53,31 @@ class Phase4Tests(unittest.TestCase):
 
     def child(self, ticket_id: str = "CHILD-1", criteria: tuple[str, ...] = ("AC-1",)) -> dict[str, object]:
         return {"id": ticket_id, "resolves_criteria": list(criteria), "ticket": self.contract(ticket_id, criteria).contract()}
+
+    def test_local_triage_planner_packet_exposes_closed_v2_contract(self) -> None:
+        planner = LocalTriagePlanner(provider="provider", model="model", timeout_seconds=23)
+        payload = json.loads(
+            planner.packet(
+                self.parent_contract,
+                parent_depth=1,
+                unresolved_criteria={"AC-2", "AC-1"},
+                failure_evidence="validation failed twice",
+            )
+        )
+        contract = payload["output_contract"]
+        self.assertFalse(contract["additionalProperties"])
+        self.assertEqual(
+            contract["required"],
+            ["classification", "root_cause_evidence", "recommended_action", "children"],
+        )
+        self.assertEqual(contract["children"]["maxItems"], 3)
+        self.assertFalse(contract["children"]["items"]["additionalProperties"])
+        self.assertIn("ticket", contract["children"]["items"]["required"])
+        self.assertEqual(payload["unresolved_criteria"], ["AC-1", "AC-2"])
+        self.assertEqual(
+            planner.execution_policy_hash(),
+            LocalTriagePlanner(provider="provider", model="model", timeout_seconds=23).execution_policy_hash(),
+        )
 
     def test_classification_first_rejects_environment_and_invalid_action(self) -> None:
         with self.assertRaisesRegex(TriageError, "must not create children"):

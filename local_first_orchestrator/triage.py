@@ -170,7 +170,7 @@ class LocalTriagePlanner:
             "profile": self.profile,
             "timeout_seconds": self.timeout_seconds,
             "mode": "safe-planning-only",
-            "schema": "triage-v1",
+            "schema": "triage-v2",
         }
         return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -183,14 +183,33 @@ class LocalTriagePlanner:
                 "unresolved_criteria": sorted(unresolved_criteria),
                 "failure_evidence": failure_evidence,
                 "output_contract": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["classification", "root_cause_evidence", "recommended_action", "children"],
                     "classification": sorted(_CLASSIFICATIONS),
+                    "root_cause_evidence": "non-empty string grounded in the supplied failure evidence",
                     "recommended_action": ["decompose", "block", "checkpoint"],
-                    "max_children": 3,
-                    "max_depth": 2,
+                    "children": {
+                        "type": "array",
+                        "maxItems": 3,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["id", "resolves_criteria", "ticket"],
+                            "id": "stable descriptive child id",
+                            "resolves_criteria": "non-empty array containing only unresolved parent criterion ids",
+                            "ticket": {
+                                "type": "MicroTicket contract",
+                                "required": ["ticket_id", "objective", "criterion_ids", "primary_symbol", "allowed_files", "forbidden_changes", "patch_budget", "verification", "risk", "review_required", "max_attempts", "dependencies"],
+                                "rules": ["criterion_ids must be a subset of resolves_criteria", "keep allowed_files and patch_budget bounded", "dependencies must be an array"],
+                            },
+                        },
+                    },
                     "rules": [
                         "Return one JSON object only.",
                         "Only oversized_ticket may decompose into children.",
                         "Children must map only unresolved parent criteria and must be executable MicroTicket contracts.",
+                        "For block or checkpoint, children must be an empty array.",
                         "Do not edit files, run implementation commands, or broaden scope.",
                     ],
                 },

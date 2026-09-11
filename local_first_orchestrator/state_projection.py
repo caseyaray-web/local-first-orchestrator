@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Literal
 
 from .adapters import BoardAdapter
@@ -22,11 +23,16 @@ class StateProjectionWorker:
     transition observed before that call makes an old row historical only.
     """
 
-    def __init__(self, ledger: Ledger, board: BoardAdapter, *, worker_id: str, lease_seconds: int = 60) -> None:
+    def __init__(self, ledger: Ledger, board: BoardAdapter, *, worker_id: str, lease_seconds: int = 60, fault_injector: Callable[[str], None] | None = None) -> None:
         self.ledger = ledger
         self.board = board
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
+        self.fault_injector = fault_injector
+
+    def _fault(self, stage: str) -> None:
+        if self.fault_injector:
+            self.fault_injector(stage)
 
     def deliver_one(self, *, now: int | None = None) -> StateProjectionDeliveryResult:
         row = self.ledger.claim_next_state_projection(self.worker_id, lease_seconds=self.lease_seconds, now=now)
@@ -48,6 +54,8 @@ class StateProjectionWorker:
         except Exception as exc:
             self.ledger.release_state_projection(ticket_id, event_id, self.worker_id, str(exc), now=now)
             raise
+        self._fault("after_adapter_success")
         if not self.ledger.acknowledge_state_projection(ticket_id, event_id, self.worker_id, now=now):
             raise RuntimeError("state projection acknowledgement lost")
+        self._fault("after_local_ack")
         return StateProjectionDeliveryResult("delivered", ticket_id, event_id)

@@ -253,8 +253,63 @@ class LocalDecompositionPlanner:
         scratch = artifact_dir / 'planner-scratch'
         scratch.mkdir(exist_ok=True)
         provenance = {'role': self.role, 'routing_source': self.routing_source, 'planner_contract_hash': self.planner_contract_hash, 'provider': self.provider, 'model': self.model, 'profile': self.profile, 'cost_class': self.cost_class, 'mechanism': 'hermes-chat', 'tool_mode': 'safe-no-mutation-tools', 'toolsets': ['safe'], 'cwd': str(scratch), 'successor_scope': True}
-        (artifact_dir / 'planner-request.json').write_text(payload, encoding='utf-8')
-        (artifact_dir / 'planner-provenance.json').write_text(json.dumps(provenance, sort_keys=True, separators=(',', ':')), encoding='utf-8')
+        request_path = artifact_dir / 'planner-request.json'
+        provenance_path = artifact_dir / 'planner-provenance.json'
+        response_path = artifact_dir / 'planner-response.json'
+        result_path = artifact_dir / 'planner-result.json'
+        expected_provenance = json.dumps(provenance, sort_keys=True, separators=(',', ':'))
+
+        def validate_response(raw: str) -> DecompositionPlan:
+            plan = parse(raw)
+            if len(plan.tranches) != 1:
+                raise PlannerError('successor planner returned multiple tranches')
+            if set(plan.criterion_coverage) != set(target_criteria):
+                raise PlannerError('successor planner criterion scope expanded')
+            if set(plan.tranches[0].criterion_ids) != set(target_criteria):
+                raise PlannerError('successor planner tranche criterion scope expanded')
+            if plan.scope_change_proposals:
+                raise PlannerError('successor planner proposed scope expansion')
+            return plan
+
+        prior = any(path.exists() for path in (request_path, provenance_path, response_path, result_path))
+        if prior:
+            if not request_path.is_file() or request_path.read_text(encoding='utf-8') != payload:
+                raise PlannerError('successor planner reconciliation required: persisted request conflicts')
+            if not provenance_path.is_file() or provenance_path.read_text(encoding='utf-8') != expected_provenance:
+                raise PlannerError('successor planner reconciliation required: persisted provenance conflicts')
+            if not response_path.is_file() or not result_path.is_file():
+                raise PlannerError('successor planner reconciliation required: prior invocation outcome unknown')
+            raw = response_path.read_text(encoding='utf-8')
+            try:
+                completed = json.loads(result_path.read_text(encoding='utf-8'))
+            except json.JSONDecodeError as exc:
+                raise PlannerError('successor planner reconciliation required: persisted result is malformed') from exc
+            if (
+                type(completed) is not dict
+                or completed.get('status') != 'completed'
+                or completed.get('returncode') != 0
+                or completed.get('response_sha256') != hashlib.sha256(raw.encode()).hexdigest()
+            ):
+                raise PlannerError('successor planner reconciliation required: prior invocation did not complete successfully')
+            if not raw.strip():
+                raise PlannerError('successor planner reconciliation required: persisted response is empty')
+            plan = validate_response(raw)
+            if repository is not None:
+                protected_before = artifact_dir / 'protected-before.json'
+                if not protected_before.is_file():
+                    raise PlannerError('successor planner reconciliation required: protected repository baseline is missing')
+                try:
+                    before = json.loads(protected_before.read_text(encoding='utf-8'))
+                except json.JSONDecodeError as exc:
+                    raise PlannerError('successor planner reconciliation required: protected repository baseline is malformed') from exc
+                after = _protected_fingerprint(repository)
+                (artifact_dir / 'protected-after.json').write_text(json.dumps(after, sort_keys=True, separators=(',', ':')), encoding='utf-8')
+                if before != after:
+                    raise PlannerError('protected repository mutated: ' + json.dumps({'before': before, 'after': after}, sort_keys=True, separators=(',', ':')))
+            return plan
+
+        request_path.write_text(payload, encoding='utf-8')
+        provenance_path.write_text(expected_provenance, encoding='utf-8')
         before = _protected_fingerprint(repository) if repository is not None else None
         if before is not None:
             (artifact_dir / 'protected-before.json').write_text(json.dumps(before, sort_keys=True, separators=(',', ':')), encoding='utf-8')
@@ -266,21 +321,17 @@ class LocalDecompositionPlanner:
             argv.extend(('--query', payload, '--quiet'))
             result = self.runner(tuple(argv), text=True, capture_output=True, timeout=300, check=False, cwd=str(scratch))
             raw = result.stdout or ''
-            (artifact_dir / 'planner-response.json').write_text(raw, encoding='utf-8')
+            response_path.write_text(raw, encoding='utf-8')
+            result_path.write_text(json.dumps({'status':'completed','returncode':int(result.returncode),'response_sha256':hashlib.sha256(raw.encode()).hexdigest()}, sort_keys=True, separators=(',', ':')), encoding='utf-8')
             if result.returncode:
                 failure = PlannerError('planner failure')
             elif not raw.strip():
                 failure = PlannerError('empty planner response')
             else:
-                plan = parse(raw)
-                if len(plan.tranches) != 1:
-                    failure = PlannerError('successor planner returned multiple tranches')
-                elif set(plan.criterion_coverage) != set(target_criteria):
-                    failure = PlannerError('successor planner criterion scope expanded')
-                elif set(plan.tranches[0].criterion_ids) != set(target_criteria):
-                    failure = PlannerError('successor planner tranche criterion scope expanded')
-                elif plan.scope_change_proposals:
-                    failure = PlannerError('successor planner proposed scope expansion')
+                try:
+                    plan = validate_response(raw)
+                except PlannerError as exc:
+                    failure = exc
                 if failure is None and before is not None:
                     after = _protected_fingerprint(repository)
                     (artifact_dir / 'protected-after.json').write_text(json.dumps(after, sort_keys=True, separators=(',', ':')), encoding='utf-8')

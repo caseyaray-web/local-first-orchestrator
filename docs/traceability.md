@@ -1,83 +1,123 @@
 # Local-first orchestrator requirements traceability
 
-**Audit basis:** design `doc_d1a46f29ef86_hermes-kanban-local-first-orchestrator-design.md`; package state before operational-runtime implementation.
+**Audit basis:** `docs/design-v2.md`, `docs/scheduler-plan.md`, `docs/milestone-20-real-acceptance.md`, `docs/hermes-dispatch-execution-acceptance.md`, and `docs/multi-ticket-native-tranche-acceptance.md`.
 
-Status labels: **PASS** means demonstrated operationally; **PARTIAL** means isolated implementation/fake-only evidence; **MISSING** means no implementation. A fake, interface, schema, or unit test alone is never PASS for board/model integration.
+**Current re-audit: 2026-09-11.** This file supersedes the 2026-09-08 pre-scheduler snapshot. The scheduler/daemon, representative real Local First-owned acceptance path, representative Hermes-dispatch reconciliation path, and full scheduler-generated multi-ticket native tranche graph proof are complete. Remaining gaps are now concentrated in exhaustive live external-boundary crash proof, live paid-provider checkpoint/escalation proof, deliberate real failure-driven repair/triage proof, operator lifecycle/recovery UX, and runtime metrics/adaptive sizing.
 
-## Sections 7, 18, 23, and 27
+Status labels:
 
-| Requirement | Status | Implementation / test | Adapter | Remaining work |
-|---|---|---|---|---|
-| §7 import/create feature and architecture packet | PARTIAL | `architecture.import_architecture_packet`; `tests.test_phase5` | ledger only | Import real board card/feature mapping |
-| §7 dependency-ready tranche selection | PARTIAL | `ImportedArchitecture.activate_next`; `test_phase5` | ledger only | Runtime scheduler and dependency-aware claim |
-| §7 isolated worktree/context/local implementation/validation | PARTIAL | `GitWorktreeAdapter`, `ContextPacketBuilder`, `LocalQwenAdapter`, `DeterministicValidator`; `test_phase2` | fake model | Controller wiring and configured real call |
-| §7 fresh review, bounded repair, commit | PARTIAL | `LocalReviewAdapter`, `SameTicketRepairCoordinator`; `test_phase3` | fake model | Runtime wiring/commit evidence |
-| §7 tranche integration/checkpoint or automatic completion | PARTIAL | `checkpoint_packet`, `UsageGovernor`; `test_phase5` | fake paid adapter | Runtime policy and invocation |
-| §7 failure fingerprint/triage bounds | PARTIAL | `failure_fingerprint`, `TriageCoordinator`; phase3/4 tests | ledger only | Runtime transitions/projection |
-| §18 BoardAdapter/model/git/validation/governor boundaries | PARTIAL | protocols/adapters; phase1–5 tests | FakeBoardAdapter/fake runners | Real HermesBoardAdapter |
-| §18 existing-script compatibility wrapping | PARTIAL | `docs/compatibility.md` | none | Real CLI integration wrapper |
-| §23 restartable process-next algorithm | MISSING | none | none | Controller/scheduler implementation |
-| §27 init/run-once/daemon/status/inspect/retry/reject/metrics commands | PARTIAL | `cli.py` supports migrate/status/pause/resume/recover only | ledger only | Full operator CLI |
-| §27 pause/status/manual intervention audit invariants | PARTIAL | `Ledger.pause/resume/status`; `test_ledger` | ledger only | Runtime active-stage status and intervention commands |
+- **PASS** — implementation exists and the relevant completion condition has been demonstrated at the level required by the current design.
+- **PARTIAL** — the mechanism exists, but a broader or explicitly required live proof/product surface remains open.
+- **MISSING** — no meaningful implementation exists.
 
-## Section 29 phases and exit conditions
+A fake/unit-only boundary is not promoted to live integration PASS unless the design item itself is implementation-only.
 
-| Phase / exit condition | Status | Implementation / test | Adapter | Remaining work |
-|---|---|---|---|---|
-| 0 discovery/compatibility classification, preserve changes | PASS | `docs/compatibility.md`; core `git diff --check` | read-only source | Keep compatibility doc current |
-| 1 ledger/controller exit: fake ticket restart-safe projection | PARTIAL | `Ledger`, `FakeBoardAdapter`; `test_ledger` | fake board | Real-board projection |
-| 2 local implementation/validation exit | PARTIAL | git/context/validator/Qwen boundary; `test_phase2` | fake local runner | Operational controller call |
-| 3 same-ticket repair exit | PARTIAL | review/convergence; `test_phase3` | fake local runner | Runtime repair loop |
-| 4 bounded triage exit | PARTIAL | triage; `test_phase4` | ledger only | Runtime import/projection |
-| 5 paid budget/ambiguous-outcome exit | PARTIAL | governor/paid adapter; `test_phase5` | injected fake paid runner | Configured paid CLI path |
-| 6 symbol context/metrics exit | PARTIAL | symbols/metrics; `test_phase6` | fixture repo | Persisted runtime metrics |
+## Design-v2 implementation status
 
-## Section 30 acceptance criteria
-
-| # | Status | Implementation / test | Adapter | Remaining work |
-|---|---|---|---|---|
-| 1 low-risk end-to-end local feature | MISSING | phase pieces only | fake | Full runtime E2E |
-| 2 controller sole authority | PARTIAL | ledger/governor boundaries | fake/ledger | Real board adapter/controller |
-| 3 same-ticket deterministic repair | PARTIAL | `SameTicketRepairCoordinator`; `test_phase3` | fake | Runtime E2E |
-| 4 configured attempt limit | PARTIAL | review coordinator; `test_phase3` | ledger | Runtime loop |
-| 5 repeated failure one triage | PARTIAL | phase3 test | ledger | Runtime projection |
-| 6 triage count/depth | PASS | `TriageCoordinator`; `test_phase4` | ledger | Integrate runtime |
-| 7 child unresolved-criterion mapping | PASS | `normalize_triage`; `test_phase4` | ledger | Integrate runtime |
-| 8 out-of-scope suggestions nonblocking | PASS | `normalize_review`; `test_phase3` | fake review | Integrate runtime |
-| 9 allowlist scope validation | PASS | validator; phase2/6 tests | fixture git | Runtime evidence |
-| 10 fresh implementation/review contexts | PARTIAL | context/review builders; tests phase2/3 | fake local | Actual configured Qwen process |
-| 11 packet budget | PASS | context builder; phase2 tests | none | Runtime metric recording |
-| 12 audit all stages | PARTIAL | events/artifacts/model calls | fake/ledger | Runtime stage audit |
-| 13 no duplicate crash work | PARTIAL | ledger/outbox/paid tests | fake board/model | Runtime restart E2E |
-| 14 paid reservation/purpose | PASS | governor; phase5 tests | injected runner | Configure production adapter |
-| 15 exhaustion pauses work | PARTIAL | governor denial | fake | Controller transition needs_checkpoint |
-| 16 pause/active CLI inspection | PARTIAL | ledger CLI | ledger | Runtime active-stage CLI |
-| 17 ticket branch commit/no default merge | PARTIAL | git adapter; phase2 test | fixture git | Runtime E2E |
-| 18 compatibility replacement | PARTIAL | compatibility note | none | Operational wrapper |
-
-## Operational Runtime Milestone 1
-
-| Requirement | Status | Implementation / test | Adapter | Remaining work |
-|---|---|---|---|---|
-| Read-only Hermes scheduled-card discovery | PASS | `HermesBoardAdapter.import_candidates/get_task`; `test_runtime_milestone1` | fake Hermes CLI fixture | Live read-only smoke only |
-| Selected import, idempotency, restart safety | PASS | `LocalFirstController.import_card`; runtime tests | fake Hermes CLI + real temp ledger | Live dry-run smoke |
-| Dry-run forbids model, board, repository effects | PASS | `LocalFirstController.dry_run`, CLI `run-once --dry-run`; runtime test | fake Hermes CLI | Keep write mode absent |
-| Malformed JSON/CLI failure fail closed | PASS | `HermesBoardAdapter._run`; runtime test | fake Hermes CLI | Add error UX later |
-| Scheduled ownership rule | PASS | Hermes `hermes_cli/kanban_db.py::has_spawnable_ready` lines 9554–9558 and dispatch query lines 10036–10040 select only `status = 'ready'`; scheduled cards are absent from both selections. | actual Hermes source inspected | Recheck on Hermes upgrades |
-| write-enabled execution / daemon | MISSING | intentionally unavailable | none | Later milestone only |
-
-## Operational Runtime Milestone 2
-
-| Requirement | Status | Evidence | Remaining limitation |
+| Design item | Status | Current evidence | Remaining work |
 |---|---|---|---|
-| Exact allowlisted repository binding + recorded SHA | PASS | `RuntimeConfig.canonical_repository`, `runtime_bindings`, Milestone 2 tests | CLI configuration must be supplied per invocation |
-| Explicit `--execute` + `--allow-board-writes` gate | PASS | CLI and `LocalFirstController.execute` | no daemon |
-| Single low-risk card vertical slice | PASS (fake) | temp Git repo: worktree, implementation, validation, fresh review, commit, outbox | live smoke deliberately not run |
-| Non-ready projection | PASS | adapter maps active local states to `schedule`, terminal to `complete`/`block`; test asserts no `ready` projection | re-audit against Hermes changes |
-| Outbox retry after commit | PASS | `Ledger.project_ticket`, `board_projection_outbox`, `evidence_comments`; `test_board_failure_after_commit_does_not_repeat_model_or_commit`, `test_projection_outbox_retries_post_effect_failure_with_one_board_projection` | evidence comment is bounded/idempotent |
-| Repair/restart coverage | PASS | `LocalFirstController.execute`, `InjectedCrash`, `model_stage_artifacts`, `tests/test_runtime_milestone2.py` and `tests/test_runtime_milestone2_operational.py` | live smoke deliberately not run |
-| Exhaustion/verification failure | PASS | `DeterministicValidator` launch/timeout handling, bounded attempts and triage transitions; operational integration tests | no automatic decomposition |
-| Crash-safe stage replay | PARTIAL | persisted implementation/review provenance and worktree/diff reconciliation in `Ledger`/`LocalFirstController`; operational replay tests pass | restart coverage is fake-only; no live smoke |
-| Evidence-comment projection | PARTIAL | `Ledger.project_ticket`, `HermesBoardAdapter.add_comment`, `evidence_comments` | comment delivery bypasses a dedicated outbox row; no failure/idempotence integration test |
-| Process-level Hermes fixture | MISSING | no `tests/fixtures/fake_hermes.py` exists in the current package | add only in a later milestone |
-| daemon mode | MISSING | deliberately excluded | later milestone |
+| Scheduler / restartable `process-next` lifecycle | PASS | `ProcessNextScheduler`; canonical stage ordering; durable claims/reconciliation; scheduler crash/concurrency suites; `docs/scheduler-plan.md` milestones 1–18 | Broader live crash matrix is tracked separately below |
+| Daemon wrapper | PASS | `SchedulerDaemon`; shared registered scheduler factory; health/status; pause/restart tests; scheduler milestone 19 | Operator lifecycle polish only |
+| Real low-risk Local First-owned E2E | PASS | Real Hermes task through implementation, validation, fresh review, acceptance, Git integration, completion projection, restart reconciliation; `docs/milestone-20-real-acceptance.md` | No broader-path claim implied |
+| Hermes dispatcher-owned execution reconciliation | PASS | Generated-card handoff marker, Hermes run polling/reconciliation, source-aware validation/review/Git/checkpoint, real dispatcher-owned worker proof; `docs/hermes-dispatch-execution-acceptance.md` | Exhaustive crash/failure variants remain under crash matrix |
+| Multi-ticket native tranche graph / successor activation | PASS | Real generated T1 dependency chain, Hermes-native readiness, two dispatcher workers, rolling integration head, checkpoint, successor re-plan/materialize/project/activate; `docs/multi-ticket-native-tranche-acceptance.md` | No gap for representative acceptance scope |
+| Live Hermes board integration | PARTIAL | Real task reads, card projection, state/comment delivery, marker lookup, terminal completion, native links/readiness, generated multi-ticket graph | Exhaustive live external-boundary crash/restart proof |
+| Real local implementation model | PASS | Milestone 20 configured local implementation route; one bounded real implementation with durable invocation/diff/evidence | Deliberate real repair-failure proof is separate |
+| Fresh independent review model | PASS | Separate review profile/process, schema-valid closed output, durable review evidence, live acceptance path | Deliberate failure/review-repair path remains separate |
+| Crash/restart exactly-once behavior | PARTIAL | Full deterministic/fake scheduler crash matrix plus live ambiguous comment delivery recovery and live Git/checkpoint recovery evidence | Inject/recover every material real external model/board/dependency/checkpoint/paid boundary |
+| Evidence-comment reconciliation | PASS | Dedicated comment outbox + marker lookup; live post-Hermes/pre-ledger crash recovered without duplicate comment | Keep compatible with Hermes read contract changes |
+| Paid checkpoint / escalation mechanism | PARTIAL | Governor, reservation-before-call, purpose-scoped claims, one-call approval, unknown-outcome no-repeat, production adapter, scheduler stages | Live paid-provider checkpoint/escalation proof |
+| Operator lifecycle / recovery UX | PARTIAL | `status --scheduler-detail`, `process-next`, `daemon`, inspect/reconciliation commands, `approve-paid`, dashboard pause/resume, registered runtime | Coherent documented init/pause/resume/retry/reject/reconcile/daemon/metrics surface |
+| Runtime metrics / adaptive sizing | PARTIAL | Context/token bounds and some metrics infrastructure | Persist real-run outcome/cost/runtime measurements and feed sizing policy |
+| Tranche integration / checkpoint | PASS | Immutable tranche evidence, deterministic integration commands, real multi-ticket checkpoint and successor activation | Live paid-provider decision remains separate |
+| Same-ticket repair | PARTIAL | Bounded retry/fingerprint/attempt machinery and deterministic restart tests | Deliberately trigger a real failure, prove same-ticket repair, then limit exhaustion → triage exactly once |
+| Bounded triage/decomposition | PASS for policy/runtime implementation | Child-count/depth/scope/criterion/duplicate enforcement; scheduler-owned triage and replay; generated child projection | Real failure-triggered triage acceptance proof remains desirable but is not an implementation gap |
+| Deterministic validation / allowlists | PASS | Trusted verification commands, allowlist enforcement, durable stage evidence, live validation proof | None for current design scope |
+| Context packet / token budget | PASS | Bounded packet construction and explicit budgeting | Runtime sizing feedback is tracked separately |
+| Architecture packets / snapshot-bound activation | PASS | Feature/tranche/microticket contracts, snapshot binding/revalidation, successor re-snapshot at accepted integration SHA | None for current design scope |
+| Paid-call reservation / budget governor | PASS for core mechanism | Atomic purpose-bound reservation and budget enforcement with replay-safe request keys | Live provider operation tracked separately |
+| Ledger / state / provenance / audit | PASS | Attempts, bindings, invocations, artifacts, review/acceptance/Git evidence, outboxes, scheduler claims, reconciliation | None for current design scope |
+| Git worktree isolation / reconciliation | PASS | Exact repository/base/worktree/diff checks, accepted-candidate freeze, commit intent/evidence, restart recovery | Exhaustive live crash matrix tracked separately |
+| Board projection outbox / retry-safe effects | PASS | State/comment/generated-card outboxes, leases, idempotency/supersession, crash/retry coverage, live comment reconciliation | Exhaustive real-boundary matrix tracked separately |
+| Discovery / compatibility | PASS | `docs/compatibility.md`; plugin architecture wraps Hermes-native surfaces | Keep current as Hermes evolves |
+
+## Original phase grouping
+
+| Phase | Current status | Notes |
+|---|---|---|
+| Phase 0 — discovery / compatibility | PASS | Discovery and compatibility work complete |
+| Phase 1 — ledger / deterministic controller | PASS for scheduler-owned lifecycle | Operator/product integration remains partial |
+| Phase 2 — local implementation / validation | PASS | Representative bounded live execution demonstrated |
+| Phase 3 — review / same-ticket repair | PARTIAL | Independent live review complete; real failure-driven repair proof pending |
+| Phase 4 — bounded triage | PARTIAL overall | Core implementation complete; deliberate real failure-triggered triage proof pending |
+| Phase 5 — architecture / checkpoint / paid governor | PARTIAL overall | Architecture, checkpoint, governor complete; live paid-provider proof pending |
+| Phase 6 — symbol/context / metrics | PARTIAL | Bounded context complete; production metrics/adaptive loop pending |
+| Hermes-native v2 execution/projection additions | PARTIAL overall | Scheduler, daemon, representative Local First E2E, dispatcher reconciliation, and multi-ticket graph proof complete; exhaustive live crash + paid proof remain |
+
+## Original acceptance criteria reconciliation
+
+| Criterion | Status | Evidence / note |
+|---|---|---|
+| Low-risk end-to-end feature | PASS | Real Milestone 20 acceptance |
+| Controller / Local First sole trust authority | PASS for accepted path | Hermes may execute implementation, but Local First retains validation/review/acceptance/Git/checkpoint/finality authority |
+| Same-ticket deterministic repair | PARTIAL | Mechanism and restart proof exist; deliberate real failing-path acceptance proof pending |
+| Configured attempt limit | PASS | Repair routing enforces bounded attempts and repeated-fingerprint policy |
+| Repeated failure routes once to triage | PASS for deterministic runtime | Durable repair-routing/triage transition and replay tests |
+| Triage count/depth bounds | PASS | Enforced by triage/decomposition contracts |
+| Child unresolved-criterion mapping | PASS | Criterion linkage enforced and persisted |
+| Out-of-scope review suggestions nonblocking | PASS | Review normalization/routing policy |
+| Allowlist scope validation | PASS | Deterministic validator + accepted-candidate identity checks |
+| Fresh implementation/review contexts | PASS | Real implementation and separate fresh review process demonstrated |
+| Packet budget | PASS | Context builder and policy bounds |
+| Audit all lifecycle stages | PASS for current scheduler scope | Durable claims, artifacts, invocation/effect/Git/paid evidence and operator observability |
+| No duplicate crash work | PARTIAL | Deterministic crash matrix complete; exhaustive live external-boundary matrix pending |
+| Paid reservation / purpose | PASS | Governor and scheduler claim/request-key binding |
+| Budget exhaustion stops rather than overspends | PASS for mechanism | No provider call until explicit one-call approval; live paid-provider proof pending |
+| Pause / active inspection | PASS for scheduler operation | Ledger/dashboard pause plus scheduler-detail status; broader UX polish pending |
+| Ticket branch commit / no unsafe default merge | PASS | Isolated worktrees and exact accepted Git integration evidence |
+| Compatibility replacement | PASS | Hermes-native surfaces wrapped rather than replaced |
+
+## Scheduler milestone reconciliation
+
+All twenty scheduler milestones in `docs/scheduler-plan.md` are complete for their stated representative acceptance scope:
+
+1. foundation;
+2. implementation;
+3. deterministic validation;
+4. fresh review;
+5. repair routing;
+6. bounded triage/decomposition;
+7. candidate freeze;
+8. Git integration;
+9. completion projection;
+10. native dependency release;
+11. tranche checkpoint;
+12. paid checkpoint/escalation mechanism;
+13. next-tranche activation;
+14. scheduler-wide reconciliation;
+15. deterministic ordering;
+16. concurrency proof;
+17. deterministic crash matrix;
+18. observability;
+19. daemon wrapper;
+20. real representative end-to-end acceptance.
+
+The older traceability entries that marked restartable `process-next`, daemon mode, live board projection, configured real implementation/review, and runtime E2E as missing are therefore obsolete.
+
+## Post-scheduler acceptance proofs
+
+| Proof | Status | Evidence |
+|---|---|---|
+| Representative Local First-owned real scheduler path | PASS | `docs/milestone-20-real-acceptance.md` |
+| Representative Hermes dispatcher-owned execution path | PASS | `docs/hermes-dispatch-execution-acceptance.md` |
+| Full generated multi-ticket native tranche graph and successor activation | PASS | `docs/multi-ticket-native-tranche-acceptance.md` |
+
+## Remaining dependency-ordered work
+
+1. **Exhaustive live external-boundary crash proof.** Extend the deterministic crash matrix across real implementation/review model calls, board state/card/comment effects, native dependency operations, Git/checkpoint boundaries, and paid calls where applicable.
+2. **Live paid checkpoint/escalation integration.** Demonstrate reservation-before-call, budget pause/one-call approval, completed-call replay, escalation chaining, and unknown-outcome no-repeat with the configured paid provider.
+3. **Real failure-driven repair/triage acceptance proof.** Deliberately induce a deterministic failure, prove bounded same-ticket repair preserves provenance, then prove repeated/exhausted failure routes exactly once to triage/escalation.
+4. **Operator lifecycle/recovery UX.** Consolidate and document initialization, inspection, pause/resume, retry/reject/reconcile, paid approval, daemon lifecycle, and diagnostics.
+5. **Runtime metrics and adaptive sizing.** Persist real outcome/runtime/cost measurements and apply them to bounded ticket/context sizing policy.
+
+This list is the current reconciliation target. It intentionally does not reopen scheduler milestones already completed and acceptance-proven.

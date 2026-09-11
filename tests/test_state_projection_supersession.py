@@ -97,6 +97,41 @@ class StateProjectionSupersessionTests(unittest.TestCase):
         worker = StateProjectionWorker(self.ledger, self.board, worker_id="restart")
         self.assertEqual(worker.deliver_one().event_id, current["event_id"])
 
+    def test_crash_after_adapter_success_replays_idempotently_after_lease_expiry(self) -> None:
+        ticket = self.ledger.create_ticket(title="ambiguous state", external_id="external-42")
+        self.ledger.transition(ticket, CanonicalState.READY_LOCAL)
+        event_id = int(self.ledger.events_for(ticket)[-1]["id"])
+
+        crashing = StateProjectionWorker(
+            self.ledger,
+            self.board,
+            worker_id="crasher",
+            lease_seconds=2,
+            fault_injector=lambda stage: (_ for _ in ()).throw(RuntimeError("simulated death")) if stage == "after_adapter_success" else None,
+        )
+        with self.assertRaisesRegex(RuntimeError, "simulated death"):
+            crashing.deliver_one(now=100)
+
+        row = self.ledger.connection.execute(
+            "SELECT acknowledged_at,lease_owner,lease_expires_at FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",
+            (ticket,event_id),
+        ).fetchone()
+        self.assertIsNone(row["acknowledged_at"])
+        self.assertEqual(row["lease_owner"], "crasher")
+        self.assertEqual(self.board.states["external-42"], CanonicalState.READY_LOCAL)
+
+        restarted = StateProjectionWorker(self.ledger, self.board, worker_id="restart", lease_seconds=2)
+        self.assertEqual(restarted.deliver_one(now=101).status, "no_work")
+        result = restarted.deliver_one(now=103)
+        self.assertEqual((result.status,result.ticket_id,result.event_id), ("delivered",ticket,event_id))
+        final = self.ledger.connection.execute(
+            "SELECT acknowledged_at,lease_owner FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",
+            (ticket,event_id),
+        ).fetchone()
+        self.assertIsNotNone(final["acknowledged_at"])
+        self.assertIsNone(final["lease_owner"])
+        self.assertEqual(self.board.states["external-42"], CanonicalState.READY_LOCAL)
+
     def test_reconciliation_repairs_legacy_pending_rows_and_is_idempotent_without_mutating_events(self) -> None:
         ticket = self._history_to_local_review()
         self.ledger.connection.execute("UPDATE board_projection_outbox SET superseded_at=NULL,superseded_by_event_id=NULL,supersession_reason=NULL WHERE ticket_id=?", (ticket,))
