@@ -31,6 +31,6 @@ This tranche strengthens the scheduler crash matrix at production adapter bounda
 4. Scheduler leases must cover the bounded external-effect horizon; production adapter tests use the same timeout/lease invariant as runtime.
 5. A recovered remote effect is not considered locally complete until the corresponding ledger evidence is durably recorded.
 
-## Remaining live-service proof
+## Follow-on live-service acceptance
 
-The remaining gap is environmental rather than a missing recovery mechanism: repeat this matrix against the configured live Hermes board/provider with controlled process termination at the same boundaries. Paid-provider live proof remains separately tracked because external billing/unknown-outcome behavior requires an explicitly authorized real call.
+The representative live-service proof is now complete. `docs/live-external-boundary-crash-acceptance.md` adds real configured local-model ambiguity/replay, fresh-review replay, actual Git/checkpoint crash recovery, and incorporates the existing real Hermes ambiguous-comment proof. `docs/live-paid-provider-acceptance.md` separately proves completed-response replay and real-provider unknown-outcome no-repeat. Future adapter/provider changes should add equivalent probes as maintenance acceptance rather than reopening the v2 implementation dependency.

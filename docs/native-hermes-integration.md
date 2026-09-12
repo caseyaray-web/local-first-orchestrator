@@ -1,14 +1,14 @@
 # Native Hermes integration
 
-## Current project status — 2026-09-11
+## Current project status — 2026-09-12
 
 Native plugin discovery, registered operator configuration, real Hermes board reads/writes, retry-safe state/comment projection, comment-marker reconciliation, native dependency links/readiness semantics, the restartable scheduler, observability, and the daemon are implemented. Milestone 20 drove a representative real Local First-owned feature through implementation, deterministic validation, independent review, acceptance, Git commit, Local First completion, and Hermes `done`; it also proved one live ambiguous external-effect restart without duplicate comment delivery.
 
-The native-integration work that remains is narrower than the original bootstrap scope:
+The major native-integration acceptance items are now complete for representative configured paths:
 
 1. **Hermes-dispatched execution reconciliation — complete for representative dispatcher-owned execution:** generated Local First cards are Hermes-owned for implementation, automatically polled for blocked handoff runs, excluded from the Local First implementation launcher, reconciled into deterministic Local First attempts, and kept non-final until Local First acceptance/integration projects `done`. The real dispatcher proof completed with zero Local First implementation model calls; see `docs/hermes-dispatch-execution-acceptance.md`.
 2. **Full scheduler-generated tranche graph proof — complete:** a real generated two-ticket tranche with exact Hermes-native dependency readiness was executed ticket-by-ticket by dispatcher workers, reconciled and integrated through a rolling Local First integration head, checkpointed, and followed by real standard-model successor materialization plus exact `next_tranche_activation`. Successor runtime binding/worktree preparation at the predecessor final integration SHA was separately re-verified after the final provenance fix. See `docs/multi-ticket-native-tranche-acceptance.md`.
-3. **Broader live operational proof — next:** exhaustively crash/restart real external boundaries and exercise the paid checkpoint/escalation route against a live paid provider.
+3. **Representative live operational crash proof — complete:** a real Hermes ambiguous write, real local implementation ambiguity/replay, real fresh-review replay, actual Git commit/ref recovery, checkpoint artifact/integration-command replay, and live paid-provider replay/unknown-outcome stop behavior are now acceptance-proven. See `docs/live-external-boundary-crash-acceptance.md` and `docs/live-paid-provider-acceptance.md`.
 
 The historical installation/dashboard notes below remain valid where they describe Hermes plugin mechanics; `docs/design-v2.md` is authoritative for current full-project status.
 
