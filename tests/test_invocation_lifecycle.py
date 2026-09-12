@@ -919,6 +919,107 @@ class InvocationLifecycleTests(unittest.TestCase):
         self.assertEqual(len(triage_events), 1)
         self.assertIsNone(self.ledger.claim_next_scheduler_repair_routing("other", lease_seconds=30, now=100))
 
+    def test_failure_driven_repair_then_restart_triages_exactly_once_with_provenance(self) -> None:
+        model = SequencedLifecycleModel(["still-bad", "still-bad"])
+        ctl, ticket = self.controller(model)
+        triage_calls: list[tuple[str, ...]] = []
+        planner = self.triage_planner(self.triage_child_payload(), triage_calls)
+        first = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="failure-proof-a",
+            lease_seconds=30,
+            clock=lambda: 100,
+            implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo),
+            validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo),
+            triage_runner=lambda value: ctl.execute_triage_only(value, planner=planner),
+            triage_execution_policy_hash=planner.execution_policy_hash(),
+        )
+
+        for expected in ("implementation", "validation", "repair_routing"):
+            result = first.process_next()
+            self.assertEqual((result.stage, result.ticket_id), (expected, ticket))
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "repairing")
+        attempt1 = self.ledger.connection.execute(
+            "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (ticket,)
+        ).fetchone()
+        attempt2 = self.ledger.connection.execute(
+            "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=2", (ticket,)
+        ).fetchone()
+        self.assertIsNotNone(attempt1)
+        self.assertIsNotNone(attempt2)
+        self.assertEqual(
+            (attempt2["worktree_path"], attempt2["branch"]),
+            (attempt1["worktree_path"], attempt1["branch"]),
+        )
+        first_decision = json.loads(str(self.ledger.runtime_stage(ticket, "repair-routing-1")["detail"]))
+        self.assertEqual((first_decision["action"], first_decision["next_attempt_number"]), ("repair", 2))
+
+        self.assertEqual(first.process_next().stage, "implementation")
+        self.assertEqual(model.implementation_calls, 2)
+        self.assertIn("## failure_evidence: compact", model.implementation_packets[1])
+        self.assertEqual(first.process_next().stage, "validation")
+        routed = first.process_next()
+        self.assertEqual((routed.stage, routed.ticket_id), ("repair_routing", ticket))
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "needs_triage")
+        second_decision = json.loads(str(self.ledger.runtime_stage(ticket, "repair-routing-2")["detail"]))
+        self.assertEqual(second_decision["action"], "triage")
+        self.assertTrue(second_decision["repeated_fingerprint"])
+        self.assertEqual(triage_calls, [])
+        triage_events = [
+            event for event in self.ledger.events_for(ticket)
+            if event["event_type"] == "state_transition" and event["to_state"] == "needs_triage"
+        ]
+        self.assertEqual(len(triage_events), 1)
+
+        resumed_ctl = LocalFirstController(self.ledger, Board(), self.config, local_model=model)
+        resumed = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="failure-proof-b",
+            lease_seconds=30,
+            clock=lambda: 131,
+            triage_runner=lambda value: resumed_ctl.execute_triage_only(value, planner=planner),
+            triage_execution_policy_hash=planner.execution_policy_hash(),
+        )
+        projected = resumed.process_next()
+        self.assertEqual((projected.stage, projected.ticket_id), ("state_projection", ticket))
+        triaged = self.run_until_stage(resumed, "triage")
+        self.assertEqual((triaged.ticket_id, triaged.status), (ticket, "completed"))
+        self.assertEqual(len(triage_calls), 1)
+        self.assertEqual(
+            self.ledger.connection.execute(
+                "SELECT COUNT(*) FROM model_invocations WHERE ticket_id=? AND stage='triage'", (ticket,)
+            ).fetchone()[0],
+            1,
+        )
+        children = self.ledger.connection.execute(
+            "SELECT * FROM tickets WHERE parent_ticket_id=?", (ticket,)
+        ).fetchall()
+        self.assertEqual(len(children), 1)
+        child_id = str(children[0]["id"])
+        self.assertEqual(children[0]["state"], "ready_local")
+        self.assertEqual(
+            self.ledger.connection.execute(
+                "SELECT COUNT(*) FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket'",
+                (child_id,),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertIsNone(
+            self.ledger.claim_next_scheduler_triage(
+                "failure-proof-c",
+                lease_seconds=30,
+                triage_execution_policy_hash=planner.execution_policy_hash(),
+                now=132,
+            )
+        )
+        triage_events_after = [
+            event for event in self.ledger.events_for(ticket)
+            if event["event_type"] == "state_transition" and event["to_state"] == "needs_triage"
+        ]
+        self.assertEqual(len(triage_events_after), 1)
+
     def test_scheduler_validation_failure_respects_max_attempts_without_repeat(self) -> None:
         model = SequencedLifecycleModel(["still-bad"]); ctl, ticket = self.controller(model)
         self.ledger.connection.execute("UPDATE tickets SET max_attempts=1 WHERE id=?", (ticket,))
