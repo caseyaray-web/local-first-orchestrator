@@ -5,13 +5,14 @@ import contextlib
 import io
 import json
 import sqlite3
+import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.cli import main as cli_main, register_cli
 from local_first_orchestrator.execution_handoff import HANDOFF_MARKER
-from local_first_orchestrator.hermes_board import ExternalTicket
+from local_first_orchestrator.hermes_board import ExternalTicket, HermesBoardAdapter
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.scheduler import ProcessNextScheduler, preview_next
 from local_first_orchestrator.states import CanonicalState
@@ -237,6 +238,59 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         result = replay.process_next()
         self.assertEqual((result.stage, result.ticket_id), ("native_dependency_graph", child))
         self.assertEqual(board.link_calls, [("external-parent", "external-child")])
+        self.assertIsNotNone(self.ledger.native_dependency_graph(child))
+
+    def test_native_dependency_graph_recovers_real_adapter_link_transport_loss_without_duplicate_edge(self) -> None:
+        parent = self.ticket("parent", state=CanonicalState.ACCEPTED)
+        child = self.ticket("child", dependencies=(parent,))
+        tasks = {
+            "external-parent": {"status": "ready", "parents": set(), "children": set()},
+            "external-child": {"status": "ready", "parents": set(), "children": set()},
+        }
+        link_calls: list[tuple[str, str]] = []
+        fail_after_link = {"value": True}
+
+        def runner(argv, **kwargs):
+            args = list(argv)
+            command = args[4]
+            if command == "show":
+                task_id = args[5]
+                row = tasks[task_id]
+                payload = {
+                    "task": {"id": task_id, "title": task_id, "body": "", "status": row["status"], "workspace_path": None},
+                    "parents": sorted(row["parents"]),
+                    "children": sorted(row["children"]),
+                }
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            if command == "link":
+                parent_id, child_id = args[5], args[6]
+                link_calls.append((parent_id, child_id))
+                tasks[parent_id]["children"].add(child_id)
+                tasks[child_id]["parents"].add(parent_id)
+                if fail_after_link["value"]:
+                    fail_after_link["value"] = False
+                    raise OSError("transport lost after remote link")
+                return subprocess.CompletedProcess(argv, 0, "linked", "")
+            raise AssertionError(args)
+
+        board = HermesBoardAdapter(
+            executable="/bin/true",
+            board="board",
+            allow_writes=True,
+            runner=runner,
+            timeout_seconds=2,
+        )
+        first = ProcessNextScheduler(self.ledger, board, worker_id="native-a", lease_seconds=30, clock=lambda: 100)
+        with self.assertRaisesRegex(RuntimeError, "read unavailable"):
+            first.process_next()
+        self.assertEqual(tasks["external-child"]["parents"], {"external-parent"})
+        self.assertEqual(link_calls, [("external-parent", "external-child")])
+        self.assertIsNone(self.ledger.native_dependency_graph(child))
+
+        resumed = ProcessNextScheduler(self.ledger, board, worker_id="native-b", lease_seconds=30, clock=lambda: 131)
+        result = resumed.process_next()
+        self.assertEqual((result.stage, result.ticket_id), ("native_dependency_graph", child))
+        self.assertEqual(link_calls, [("external-parent", "external-child")])
         self.assertIsNotNone(self.ledger.native_dependency_graph(child))
 
     def test_native_dependency_release_reclaims_started_read_and_rechecks_hermes(self) -> None:
