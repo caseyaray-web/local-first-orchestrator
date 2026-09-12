@@ -378,6 +378,74 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         next_tranche_materialize_runner=None if successor_route is None else materialize_successor,
     )
 
+def _recovery_status(ledger: Ledger, *, limit: int = 25) -> dict[str, Any]:
+    if not 1 <= limit <= 100:
+        raise ValueError("recovery status limit must be between 1 and 100")
+    incomplete_invocations = [dict(row) for row in ledger.connection.execute(
+        "SELECT ticket_id,attempt_number,stage,provider,model,started_at FROM model_invocations "
+        "WHERE status='started' ORDER BY started_at,ticket_id LIMIT ?", (limit,)
+    )]
+    failed_reviews = [dict(row) for row in ledger.connection.execute(
+        "SELECT ticket_id,attempt_number,status,last_outcome FROM review_candidates "
+        "WHERE status='review_infrastructure_failed' ORDER BY updated_at,ticket_id LIMIT ?", (limit,)
+    )]
+    terminal_state_projections = [dict(row) for row in ledger.connection.execute(
+        "SELECT ticket_id,event_id,operation,external_task_id,terminal_error FROM board_projection_outbox "
+        "WHERE acknowledged_at IS NULL AND superseded_at IS NULL AND terminal_error IS NOT NULL "
+        "ORDER BY queued_at,event_id LIMIT ?", (limit,)
+    )]
+    terminal_comments = [dict(row) for row in ledger.connection.execute(
+        "SELECT ticket_id,event_id,operation_id,status,last_error FROM evidence_comment_outbox "
+        "WHERE status='terminal' ORDER BY updated_at,operation_id LIMIT ?", (limit,)
+    )]
+    reconciliations = ledger.cleanup_prerequisites()[:limit]
+    claimed = [dict(row) for row in ledger.connection.execute(
+        "SELECT claim_id,ticket_id,stage,lease_owner,lease_expires_at,attempt_count,last_error FROM scheduler_stage_claims "
+        "WHERE status='claimed' ORDER BY updated_at,claim_id LIMIT ?", (limit,)
+    )]
+    actions: list[dict[str, Any]] = []
+    for row in incomplete_invocations:
+        actions.append({
+            "kind": "incomplete_model_invocation",
+            "ticket_id": row["ticket_id"],
+            "stage": row["stage"],
+            "action": "inspect before any retry; incomplete model outcomes fail closed",
+            "command": f"inspect --task-id {row['ticket_id']}",
+        })
+    for row in failed_reviews:
+        actions.append({
+            "kind": "review_infrastructure_failure",
+            "ticket_id": row["ticket_id"],
+            "action": "pause, inspect candidate provenance, then authorize one review-only resume if unchanged",
+            "command": f"resume-failed-review --task-id {row['ticket_id']}",
+        })
+    for row in terminal_state_projections:
+        actions.append({
+            "kind": "terminal_state_projection",
+            "ticket_id": row["ticket_id"],
+            "action": "reconcile ledger state projection intent before delivery retry",
+            "command": f"reconcile-state-projections --task-id {row['ticket_id']}",
+        })
+    for row in reconciliations:
+        if row.get("cleanup_required") and not row.get("cleanup_confirmed"):
+            actions.append({
+                "kind": "retired_attempt_cleanup_required",
+                "ticket_id": row["ticket_id"],
+                "action": "remove separately-authorized forensic residue, then record cleanup confirmation while paused",
+                "command": f"confirm-retired-attempt-cleanup --task-id {row['ticket_id']}",
+            })
+    return {
+        "paused": ledger.status()["paused"],
+        "incomplete_model_invocations": incomplete_invocations,
+        "failed_reviews": failed_reviews,
+        "terminal_state_projections": terminal_state_projections,
+        "terminal_comments": terminal_comments,
+        "cleanup_prerequisites": reconciliations,
+        "claimed_scheduler_stages": claimed,
+        "recommended_actions": actions[:limit],
+    }
+
+
 def register_cli(parser: argparse.ArgumentParser) -> None:
     """Add the standalone CLI's arguments to *parser*.
 
@@ -398,6 +466,16 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--board", help="Hermes board name for explicit board access")
     commands=parser.add_subparsers(dest="command",required=True)
     commands.add_parser("migrate")
+    operator_status=commands.add_parser("operator-status", help="bounded lifecycle/status summary for operators")
+    operator_status.add_argument("--limit", type=int, default=25)
+    recovery_status=commands.add_parser("recovery-status", aliases=("doctor",), help="read-only recovery blockers and exact next-action hints")
+    recovery_status.add_argument("--limit", type=int, default=25)
+    pause=commands.add_parser("pause", help="durably pause scheduler work before recovery/maintenance")
+    pause.add_argument("--reason", required=True)
+    pause.add_argument("--operator-id", default="local-first-cli")
+    resume=commands.add_parser("resume", help="durably resume scheduler work after recovery/maintenance")
+    resume.add_argument("--reason", required=True)
+    resume.add_argument("--operator-id", default="local-first-cli")
     status=commands.add_parser("status"); status.add_argument("--active",action="store_true"); status.add_argument("--scheduler-detail",action="store_true",help="include one read-only scheduler lifecycle boundary snapshot")
     imported=commands.add_parser("import"); imported.add_argument("--task-id",required=True)
     run=commands.add_parser("run-once"); run.add_argument("--task-id",required=True); run.add_argument("--dry-run",action="store_true",default=True); run.add_argument("--execute",action="store_true"); run.add_argument("--allow-board-writes",action="store_true")
@@ -457,7 +535,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     confirm_cleanup.add_argument("--task-id", required=True)
     confirm_cleanup.add_argument("--operator-id", default="local-first-cli")
     status.add_argument("--show-cleanup-prerequisites", action="store_true", help="read-only: tickets with retired attempts whose forensic residue must be removed before the next attempt")
-    register=commands.add_parser("register-dashboard", help="persist the dashboard's one safe ledger/runtime registration")
+    register=commands.add_parser("register-dashboard", aliases=("init",), help="persist the operator's one safe ledger/runtime registration")
     register.add_argument("--config-path", help="operator registration path (default: ~/.hermes/local-first-orchestrator/operator-config.json)")
     register.add_argument("--implementation-profile", default="worker-code-local")
     register.add_argument("--implementation-provider", default=LOCAL_QWEN_PROVIDER)
@@ -501,6 +579,18 @@ def run_command(args: argparse.Namespace) -> int:
     ledger=_ledger(args.database)
     try:
         if args.command=="migrate": pass
+        elif args.command=="operator-status":
+            data=ledger.operator_status(active_limit=args.limit)
+            data["scheduler_detail"]=scheduler_observability(ledger)
+            print(json.dumps(data,sort_keys=True))
+        elif args.command in {"recovery-status", "doctor"}:
+            print(json.dumps(_recovery_status(ledger,limit=args.limit),sort_keys=True))
+        elif args.command=="pause":
+            ledger.pause(args.operator_id,reason=args.reason)
+            print(json.dumps({"paused":True,"operator_id":args.operator_id,"reason":args.reason},sort_keys=True))
+        elif args.command=="resume":
+            ledger.resume(args.operator_id,reason=args.reason)
+            print(json.dumps({"paused":False,"operator_id":args.operator_id,"reason":args.reason},sort_keys=True))
         elif args.command=="status":
             data=ledger.status()
             if args.active: data["active"]=[dict(r) for r in ledger.connection.execute("SELECT id, external_id, state, lease_owner, lease_expires_at FROM tickets WHERE state IN ('implementing','verifying','local_review','repairing') ORDER BY updated_at")]
@@ -601,7 +691,7 @@ def run_command(args: argparse.Namespace) -> int:
             planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class="standard",provider=route.provider,model=route.model,profile=route.profile,allowed_paths=(),role="decomposition",routing_source="operator-config.decomposition")
             coordinator=PlanningCoordinator(ledger, ctl.config, planner)
             print(json.dumps(coordinator.revalidate_feature_repository_snapshot(args.feature_id),sort_keys=True,default=str))
-        elif args.command=="register-dashboard":
+        elif args.command in {"register-dashboard", "init"}:
             root=Path(args.repository).resolve(strict=True)
             allowlist=tuple(Path(item).resolve(strict=True) for item in args.allow_repository) or (root,)
             worktree_root, artifact_root = default_execution_roots(root)

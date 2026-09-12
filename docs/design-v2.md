@@ -1798,7 +1798,7 @@ projects:
     allowed_verification_profiles:
       - python
       - node
-    architecture_profile: architect
+    decomposition_standard_profile: planner
     review_profile: reviewer
 ```
 
@@ -2671,11 +2671,11 @@ The scheduler routes deterministic `ready_for_checkpoint` evidence into purpose-
 
 **Completion condition:** every paid invocation is atomically reserved before execution, purpose-scoped, auditable, budget-limited, proven to pause rather than overspend when the budget is exhausted, and demonstrated against the live paid-provider integration.
 
-### 12. Operator lifecycle commands and recovery UX — **Partial**
+### 12. Operator lifecycle commands and recovery UX — **Complete**
 
-The CLI already exposes substantial functionality for running, inspecting, admitting/planning, and reconciling work. The designed operator surface is not yet fully represented by coherent `init`, generic retry/reject, approval, metrics, and daemon lifecycle commands.
+The CLI now exposes a coherent lifecycle surface over the existing durable controller authority: `init` persists the one registered runtime; `operator-status` provides bounded lifecycle and scheduler detail; `pause` / `resume` are durable and audited; and `doctor` / `recovery-status` reports bounded recovery blockers plus safe stage-specific next-action hints. The Hermes dashboard plugin now also exposes the persisted registration as an editable profile-routing surface: while paused, operators can select Hermes profiles for local implementation, review, decomposition (`local` / `standard` cost classes), paid checkpoint, and paid escalation, with provider/model provenance resolved from Hermes when configuration is saved. Repository/allowlist/worktree/artifact roots remain browser read-only trust boundaries. Existing explicit recovery commands remain authoritative for failed attempts, review-infrastructure resumes, historical revalidation, state/generated projection repair, Hermes execution reconciliation, bounded manual review/accept/integrate continuation, and one-call paid approval. The UX intentionally does not provide a generic retry or generic reject mutation because ambiguous model/paid/board effects and evidence-backed rejection have different trust requirements. Daemon execution remains explicit, registered-runtime-bound, board-write-gated, signal-aware, and observable. The supported workflow is documented in `docs/operator-lifecycle-recovery.md`.
 
-**Completion condition:** the operator can initialize, inspect, pause/resume, retry/reject/reconcile, approve paid work, inspect metrics, and run/stop the daemon through documented stable commands or equivalent Hermes-native UI actions.
+**Completion condition:** the operator can initialize, inspect, durably pause/resume, diagnose blockers, choose the safe stage-specific recovery/reconciliation action, approve one paid call, and run/observe the daemon through documented stable commands. Runtime metrics are tracked separately by §13.
 
 ### 13. Runtime metrics and adaptive sizing feedback loop — **Partial**
 

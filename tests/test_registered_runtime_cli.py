@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
+import json
 import subprocess
 import unittest
 from pathlib import Path
@@ -84,6 +87,82 @@ class RegisteredRuntimeCliTests(unittest.TestCase):
                 "--database", str(self.database),
                 "reconcile-hermes-execution", "--task-id", "H-1", "--run-id", "7",
             ])
+
+    def test_operator_lifecycle_cli_pause_resume_and_status_are_durable(self) -> None:
+        paused = io.StringIO()
+        with contextlib.redirect_stdout(paused):
+            self.assertEqual(cli_main([
+                "--database", str(self.database),
+                "pause", "--reason", "operator maintenance", "--operator-id", "operator",
+            ]), 0)
+        self.assertTrue(json.loads(paused.getvalue())["paused"])
+        self.assertTrue(self.ledger.status()["paused"])
+
+        status = io.StringIO()
+        with contextlib.redirect_stdout(status):
+            self.assertEqual(cli_main([
+                "--database", str(self.database),
+                "operator-status", "--limit", "10",
+            ]), 0)
+        payload = json.loads(status.getvalue())
+        self.assertTrue(payload["paused"])
+        self.assertIn("scheduler_detail", payload)
+        self.assertIn("outbox_pending", payload)
+
+        resumed = io.StringIO()
+        with contextlib.redirect_stdout(resumed):
+            self.assertEqual(cli_main([
+                "--database", str(self.database),
+                "resume", "--reason", "maintenance complete", "--operator-id", "operator",
+            ]), 0)
+        self.assertFalse(json.loads(resumed.getvalue())["paused"])
+        self.assertFalse(self.ledger.status()["paused"])
+        events = [row["event_type"] for row in self.ledger.connection.execute(
+            "SELECT event_type FROM events WHERE entity_type='controller' ORDER BY id"
+        )]
+        self.assertEqual(events[-2:], ["paused", "resumed"])
+
+    def test_recovery_status_surfaces_incomplete_invocation_and_exact_inspection_hint(self) -> None:
+        ticket = self.ledger.create_ticket(title="recovery")
+        self.ledger.start_model_invocation(
+            invocation_id="inv-recovery-1",
+            ticket_id=ticket,
+            attempt_number=1,
+            stage="implementation",
+            provider="provider",
+            model="model",
+            packet_hash="packet",
+            worktree_path=str(self.root / "worktree"),
+            timeout_seconds=60,
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(cli_main([
+                "--database", str(self.database),
+                "recovery-status", "--limit", "10",
+            ]), 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(len(payload["incomplete_model_invocations"]), 1)
+        action = payload["recommended_actions"][0]
+        self.assertEqual(action["kind"], "incomplete_model_invocation")
+        self.assertEqual(action["ticket_id"], ticket)
+        self.assertEqual(action["command"], f"inspect --task-id {ticket}")
+        self.assertIn("fail closed", action["action"])
+
+    def test_operator_aliases_are_discoverable_and_route_to_same_handlers(self) -> None:
+        parser = argparse.ArgumentParser(); register_cli(parser)
+        doctor = parser.parse_args(["--database", str(self.database), "doctor"])
+        self.assertEqual(doctor.command, "doctor")
+        init = parser.parse_args([
+            "--database", str(self.database),
+            "--repository", str(self.repo),
+            "init", "--config-path", str(self.root / "alias-operator.json"),
+        ])
+        self.assertEqual(init.command, "init")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(cli_main(["--database", str(self.database), "doctor"]), 0)
+        self.assertIn("recommended_actions", json.loads(output.getvalue()))
 
     def test_approve_paid_cli_persists_one_purpose_scoped_call(self) -> None:
         self.assertEqual(
