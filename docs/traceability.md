@@ -2,7 +2,7 @@
 
 **Audit basis:** `docs/design-v2.md`, `docs/scheduler-plan.md`, `docs/milestone-20-real-acceptance.md`, `docs/hermes-dispatch-execution-acceptance.md`, and `docs/multi-ticket-native-tranche-acceptance.md`.
 
-**Current re-audit: 2026-09-11.** This file supersedes the 2026-09-08 pre-scheduler snapshot. The scheduler/daemon, representative real Local First-owned acceptance path, representative Hermes-dispatch reconciliation path, and full scheduler-generated multi-ticket native tranche graph proof are complete. Remaining gaps are now concentrated in exhaustive live external-boundary crash proof, live paid-provider checkpoint/escalation proof, deliberate real failure-driven repair/triage proof, operator lifecycle/recovery UX, and runtime metrics/adaptive sizing.
+**Current re-audit: 2026-09-11.** This file supersedes the 2026-09-08 pre-scheduler snapshot. The scheduler/daemon, representative real Local First-owned acceptance path, representative Hermes-dispatch reconciliation path, full scheduler-generated multi-ticket native tranche graph proof, deliberate failure-driven repair/triage proof, and live paid-provider checkpoint/escalation proof are complete. Remaining gaps are concentrated in broader live external-boundary crash coverage, operator lifecycle/recovery UX, and runtime metrics/adaptive sizing.
 
 Status labels:
 
@@ -24,18 +24,18 @@ A fake/unit-only boundary is not promoted to live integration PASS unless the de
 | Live Hermes board integration | PARTIAL | Real task reads, card projection, state/comment delivery, marker lookup, terminal completion, native links/readiness, generated multi-ticket graph | Exhaustive live external-boundary crash/restart proof |
 | Real local implementation model | PASS | Milestone 20 configured local implementation route; one bounded real implementation with durable invocation/diff/evidence | Deliberate real repair-failure proof is separate |
 | Fresh independent review model | PASS | Separate review profile/process, schema-valid closed output, durable review evidence, live acceptance path | Deliberate failure/review-repair path remains separate |
-| Crash/restart exactly-once behavior | PARTIAL | Full deterministic scheduler crash matrix; production `HermesBoardAdapter` ambiguity proofs for state, comment, and native dependency effects; generated-create, model, Git, checkpoint/materialization, and paid replay/stop proofs; see `docs/crash-matrix-hardening.md` | Repeat controlled termination against configured live Hermes/provider boundaries; paid live calls remain separately authorized |
+| Crash/restart exactly-once behavior | PARTIAL | Full deterministic scheduler crash matrix; production `HermesBoardAdapter` ambiguity proofs for state, comment, and native dependency effects; generated-create, model, Git, checkpoint/materialization replay; live paid-provider completed-response replay and unknown-outcome no-repeat; see `docs/crash-matrix-hardening.md` and `docs/live-paid-provider-acceptance.md` | Repeat controlled termination against remaining configured live Hermes/model/Git/checkpoint boundaries where operationally safe |
 | Evidence-comment reconciliation | PASS | Dedicated comment outbox + marker lookup; live post-Hermes/pre-ledger crash recovered without duplicate comment | Keep compatible with Hermes read contract changes |
-| Paid checkpoint / escalation mechanism | PARTIAL | Governor, reservation-before-call, purpose-scoped claims, one-call approval, unknown-outcome no-repeat, production adapter, scheduler stages | Live paid-provider checkpoint/escalation proof |
+| Paid checkpoint / escalation mechanism | PASS | Governor, reservation-before-call, purpose-scoped claims, one-call approval, production adapter, scheduler chaining, real checkpoint and escalation calls, completed-call replay, and real-provider unknown-outcome no-repeat; see `docs/live-paid-provider-acceptance.md` | None for representative configured route |
 | Operator lifecycle / recovery UX | PARTIAL | `status --scheduler-detail`, `process-next`, `daemon`, inspect/reconciliation commands, `approve-paid`, dashboard pause/resume, registered runtime | Coherent documented init/pause/resume/retry/reject/reconcile/daemon/metrics surface |
 | Runtime metrics / adaptive sizing | PARTIAL | Context/token bounds and some metrics infrastructure | Persist real-run outcome/cost/runtime measurements and feed sizing policy |
-| Tranche integration / checkpoint | PASS | Immutable tranche evidence, deterministic integration commands, real multi-ticket checkpoint and successor activation | Live paid-provider decision remains separate |
+| Tranche integration / checkpoint | PASS | Immutable tranche evidence, deterministic integration commands, real multi-ticket checkpoint/successor activation, and separate real paid checkpoint operational proof | None for current design scope |
 | Same-ticket repair | PASS | Bounded retry/fingerprint/attempt machinery, restart safety, and deliberate deterministic failure acceptance proof preserving ticket/worktree/branch provenance; see `docs/failure-driven-repair-triage-acceptance.md` | None for current design scope |
 | Bounded triage/decomposition | PASS | Child-count/depth/scope/criterion/duplicate enforcement; scheduler-owned triage and replay; generated child projection; deliberate repeated-failure acceptance proof invokes triage exactly once after restart | None for current design scope |
 | Deterministic validation / allowlists | PASS | Trusted verification commands, allowlist enforcement, durable stage evidence, live validation proof | None for current design scope |
 | Context packet / token budget | PASS | Bounded packet construction and explicit budgeting | Runtime sizing feedback is tracked separately |
 | Architecture packets / snapshot-bound activation | PASS | Feature/tranche/microticket contracts, snapshot binding/revalidation, successor re-snapshot at accepted integration SHA | None for current design scope |
-| Paid-call reservation / budget governor | PASS for core mechanism | Atomic purpose-bound reservation and budget enforcement with replay-safe request keys | Live provider operation tracked separately |
+| Paid-call reservation / budget governor | PASS | Atomic purpose-bound reservation and budget enforcement with replay-safe request keys; zero-budget live checkpoint stopped before provider execution and one-call approval authorized exactly one real call | None for current design scope |
 | Ledger / state / provenance / audit | PASS | Attempts, bindings, invocations, artifacts, review/acceptance/Git evidence, outboxes, scheduler claims, reconciliation | None for current design scope |
 | Git worktree isolation / reconciliation | PASS | Exact repository/base/worktree/diff checks, accepted-candidate freeze, commit intent/evidence, restart recovery | Exhaustive live crash matrix tracked separately |
 | Board projection outbox / retry-safe effects | PASS | State/comment/generated-card outboxes, leases, idempotency/supersession, crash/retry coverage, live comment reconciliation | Exhaustive real-boundary matrix tracked separately |
@@ -50,7 +50,7 @@ A fake/unit-only boundary is not promoted to live integration PASS unless the de
 | Phase 2 — local implementation / validation | PASS | Representative bounded live execution demonstrated |
 | Phase 3 — review / same-ticket repair | PASS | Independent live review plus deliberate deterministic failure-driven same-ticket repair acceptance proof |
 | Phase 4 — bounded triage | PASS | Bounded triage implementation plus repeated-failure → restart → exactly-once triage acceptance proof |
-| Phase 5 — architecture / checkpoint / paid governor | PARTIAL overall | Architecture, checkpoint, governor complete; live paid-provider proof pending |
+| Phase 5 — architecture / checkpoint / paid governor | PASS | Architecture, checkpoint, governor, real paid checkpoint, escalation chaining, replay, and unknown-outcome stop proof complete |
 | Phase 6 — symbol/context / metrics | PARTIAL | Bounded context complete; production metrics/adaptive loop pending |
 | Hermes-native v2 execution/projection additions | PARTIAL overall | Scheduler, daemon, representative Local First E2E, dispatcher reconciliation, and multi-ticket graph proof complete; exhaustive live crash + paid proof remain |
 
@@ -72,7 +72,7 @@ A fake/unit-only boundary is not promoted to live integration PASS unless the de
 | Audit all lifecycle stages | PASS for current scheduler scope | Durable claims, artifacts, invocation/effect/Git/paid evidence and operator observability |
 | No duplicate crash work | PARTIAL | Deterministic crash matrix complete; exhaustive live external-boundary matrix pending |
 | Paid reservation / purpose | PASS | Governor and scheduler claim/request-key binding |
-| Budget exhaustion stops rather than overspends | PASS for mechanism | No provider call until explicit one-call approval; live paid-provider proof pending |
+| Budget exhaustion stops rather than overspends | PASS | Live paid checkpoint started at zero budget, made no provider call, then executed exactly one call after explicit one-call approval |
 | Pause / active inspection | PASS for scheduler operation | Ledger/dashboard pause plus scheduler-detail status; broader UX polish pending |
 | Ticket branch commit / no unsafe default merge | PASS | Isolated worktrees and exact accepted Git integration evidence |
 | Compatibility replacement | PASS | Hermes-native surfaces wrapped rather than replaced |
@@ -112,12 +112,12 @@ The older traceability entries that marked restartable `process-next`, daemon mo
 | Representative Hermes dispatcher-owned execution path | PASS | `docs/hermes-dispatch-execution-acceptance.md` |
 | Full generated multi-ticket native tranche graph and successor activation | PASS | `docs/multi-ticket-native-tranche-acceptance.md` |
 | Deliberate failure-driven same-ticket repair and exactly-once triage | PASS | `docs/failure-driven-repair-triage-acceptance.md` |
+| Live paid checkpoint/escalation integration and unknown-outcome no-repeat | PASS | `docs/live-paid-provider-acceptance.md` |
 
 ## Remaining dependency-ordered work
 
-1. **Exhaustive live external-boundary crash proof.** Repeat the hardened production-adapter matrix with controlled termination against configured live Hermes/provider boundaries where operationally safe.
-2. **Live paid checkpoint/escalation integration.** Demonstrate reservation-before-call, budget pause/one-call approval, completed-call replay, escalation chaining, and unknown-outcome no-repeat with the configured paid provider.
-3. **Operator lifecycle/recovery UX.** Consolidate and document initialization, inspection, pause/resume, retry/reject/reconcile, paid approval, daemon lifecycle, and diagnostics.
-4. **Runtime metrics and adaptive sizing.** Persist real outcome/runtime/cost measurements and apply them to bounded ticket/context sizing policy.
+1. **Broader live external-boundary crash proof.** Repeat the hardened production-adapter matrix with controlled termination against the remaining configured live Hermes/model/Git/checkpoint boundaries where operationally safe. The paid-provider ambiguity boundary is now live-proven.
+2. **Operator lifecycle/recovery UX.** Consolidate and document initialization, inspection, pause/resume, retry/reject/reconcile, paid approval, daemon lifecycle, and diagnostics.
+3. **Runtime metrics and adaptive sizing.** Persist real outcome/runtime/cost measurements and apply them to bounded ticket/context sizing policy.
 
 This list is the current reconciliation target. It intentionally does not reopen scheduler milestones already completed and acceptance-proven.
