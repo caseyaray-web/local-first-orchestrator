@@ -1,29 +1,96 @@
 # Local First Orchestrator
 
-Local First Orchestrator is a Hermes-native orchestration layer for reliable, restartable software-engineering work.
+Local First Orchestrator is a Hermes-native hybrid coding workflow designed to make **quantized local models practical for real software-engineering work without paying frontier-model prices for every implementation step**.
 
-It combines Hermes for board ownership, dependency scheduling, worker dispatch, and model/profile execution with a separate Local First ledger that owns contracts, deterministic validation, review evidence, integration, recovery, checkpoints, paid-call governance, metrics, and completion authority.
+In one sentence: **use stronger paid models to decide what should be built and whether it was built correctly, while using quantized local models to perform as much bounded implementation work as possible under deterministic supervision.**
 
-The project is intentionally **local-first**: the durable source of truth for orchestration state is a separate SQLite ledger and local Git repositories/worktrees. Hermes remains authoritative for Hermes-native board state and worker dispatch; Local First remains authoritative for whether work is actually accepted and complete.
+## Why this exists
 
-## What this project is for
+Quantized local coding models can be remarkably capable and inexpensive to run, but they generally require more supervision than larger paid models.
 
-Use Local First Orchestrator when you want autonomous or semi-autonomous coding work to have stronger guarantees than “run an agent and hope the process stays alive.” It is designed for workflows that need:
+A local model may produce useful code while still:
 
-- durable, restartable orchestration;
-- explicit feature and microticket contracts;
-- Hermes-native dependency scheduling and worker dispatch;
+- claiming the work is complete before the repository actually satisfies the task;
+- repeatedly failing the same validation or correction;
+- misunderstanding review feedback;
+- making partial fixes without resolving the underlying failure;
+- drifting after several repair attempts; or
+- becoming stuck in a loop that a stronger model could resolve quickly.
+
+The problem is often not that the local model cannot write the code. It can. The harder problem is that the model should not be trusted to decide, by itself, whether the work is actually finished.
+
+Local First Orchestrator exists to provide that accountability layer.
+
+## The hybrid workflow
+
+The reference workflow deliberately assigns work according to both **model capability** and **cost**.
+
+**Paid, higher-capability models are best used for:**
+
+- feature planning;
+- task decomposition;
+- difficult architectural reasoning when needed;
+- independent review; and
+- escalation when a local implementation stops converging.
+
+**Quantized local models are best used for:**
+
+- bounded implementation tasks;
+- deterministic-validation-driven corrections;
+- review-driven corrections; and
+- other repository work constrained by an explicit contract.
+
+**Local First Orchestrator sits between them and enforces:**
+
+- durable feature and microticket contracts;
 - deterministic validation before acceptance;
-- independent review;
-- retry-safe external effects;
-- controlled repair and triage;
-- Git-backed integration and tranche checkpoints;
-- fail-closed handling of ambiguous model/provider outcomes;
-- explicit paid-model budgets and one-call approvals;
-- operator pause/recovery controls;
-- runtime metrics and bounded adaptive decomposition sizing.
+- independent review requirements;
+- attempt and failure tracking;
+- bounded repair routing;
+- repeated-failure detection and triage;
+- escalation to stronger paid models when local work stops converging;
+- Git integration and tranche checkpoints;
+- crash/restart recovery;
+- paid-call governance; and
+- final completion authority.
 
-It is **not** a replacement for Hermes. The two systems have deliberately different responsibilities.
+Hermes continues to own native task dependencies, readiness, worker dispatch, board projection, and model profiles. Local First does not replace Hermes; it adds the durable acceptance and recovery layer that makes cheaper local implementation safer to automate.
+
+## The economic goal
+
+The goal is not to make a quantized local model behave like a frontier model.
+
+The goal is to build a workflow in which it **does not need to**.
+
+Implementation is usually the most repetitive and token-heavy part of a coding workflow. By giving that work to a local model inside a tightly bounded contract, the system can avoid consuming large amounts of subscription usage or API spend. Paid-model intelligence is reserved for places where higher-quality reasoning has the most leverage: planning, decomposition, review, and escalation.
+
+When the local model succeeds, the workflow moves forward without spending paid-model capacity on the implementation itself. When it repeatedly fails, Local First does not let it loop indefinitely or accept its own claim of success; it routes the failure into triage or escalation so a stronger model can intervene.
+
+> **Use paid intelligence to decide what should be done and whether it was done correctly. Use local compute to do as much of the bounded implementation as possible.**
+
+The model-role configuration remains flexible, so operators can choose different Hermes profiles for any role. The split above is the intended reference architecture and the reason the plugin exists.
+
+## A concrete example
+
+Suppose a paid model decomposes a feature into three bounded implementation tickets.
+
+Hermes schedules those tickets and dispatches a quantized local coding model to implement them.
+
+The local model finishes the first ticket and says it is done. Local First does not treat that statement as completion evidence. It validates the repository deterministically and then requires an independent review before acceptance.
+
+The second ticket fails validation. The local model receives compact failure evidence and gets a bounded correction attempt. If the correction succeeds, the workflow continues normally.
+
+The third ticket repeatedly produces the same failure. Instead of issuing another identical local retry, Local First recognizes that the work is no longer converging and moves it into triage or escalation. A stronger paid model can then diagnose the issue, revise the plan, or provide higher-quality reasoning.
+
+The local model still performed most of the implementation work. Paid-model usage was concentrated on the points where stronger reasoning provided the greatest value.
+
+## Central design rule
+
+> **A model's claim that work is complete is not completion evidence.**
+
+Completion comes from durable state, deterministic validation, independent review, successful integration, and the explicit acceptance rules of the workflow.
+
+That distinction is especially important when using smaller or quantized models, and it is the reason the orchestration layer exists.
 
 ## Current status
 
