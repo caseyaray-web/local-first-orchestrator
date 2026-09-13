@@ -5,7 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "local-first-orchestrator"
 version = "0.1.0"
-description = "Standalone Phase 1 local-first orchestration ledger."
+description = "Hermes-native, local-first orchestration with durable validation, recovery, integration, and operator controls."
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 

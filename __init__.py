@@ -11,11 +11,12 @@ def register(ctx) -> None:
     """Register the operator CLI without adding model tools or hooks."""
     ctx.register_cli_command(
         name="local-first-orchestrator",
-        help="Operate the local-first orchestration ledger",
+        help="Operate the Local First Hermes-native orchestration runtime",
         setup_fn=register_cli,
         handler_fn=run_command,
         description=(
-            "Operator CLI for the separate local-first orchestration ledger. "
-            "Dry-run is the default; board writes require explicit flags."
+            "Operator CLI for durable Local First orchestration, recovery, planning, "
+            "validation, integration, and metrics. Dry-run is the default; board "
+            "writes require explicit flags."
         ),
     )

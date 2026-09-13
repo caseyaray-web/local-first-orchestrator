@@ -106,9 +106,9 @@ dashboard/
 
 The `Local First` tab uses the published dashboard IIFE SDK and calls the
 authenticated, plugin-scoped API at `/api/plugins/local-first-orchestrator/`.
-It has no database-path input and accepts no `database`, repository, provider,
-or model request parameter. Before it is available, an operator registers the
-one separate ledger and its runtime identity locally, for example:
+It has no database-path input and never accepts an arbitrary ledger or repository
+trust root from browser request data. Before it is available, an operator
+registers the one separate ledger and its runtime identity locally, for example:
 
 ```bash
 hermes local-first-orchestrator --database /path/ledger.db \
@@ -119,20 +119,34 @@ hermes local-first-orchestrator --database /path/ledger.db \
 That writes `~/.hermes/local-first-orchestrator/operator-config.json` (or the
 explicit `--config-path`). The dashboard backend validates the registered
 ledger, exact canonical Git repository, and exact allowlist before opening it.
-The read model exposes only:
+The current dashboard surface exposes:
 
-- bounded counters: `ready_local`, active `running`, `needs_triage`, `done`,
-  and `outbox_pending`;
-- at most 25 active `{ticket_id, state, feature_id, tranche_id}` records;
-- the registered canonical repository/allowlist and implementation/review
-  `{profile, provider, model}` identities; and
-- `POST /pause` and `POST /resume`, which persist the admission flag with a
-  bounded operator reason.
+- bounded lifecycle counters and active-ticket status;
+- durable pause/resume controls;
+- the registered canonical repository, allowlist, worktree root, and artifact
+  root as read-only trust-boundary information;
+- Hermes-profile-backed role selectors for implementation, review,
+  decomposition `local`, decomposition `standard`, paid checkpoint, and paid
+  escalation;
+- implementation/review timeout editing while paused; and
+- runtime metrics plus the current bounded adaptive decomposition-sizing
+  recommendation.
+
+Configuration saves require the controller to be paused. The backend resolves
+the selected Hermes profiles to current provider/model provenance and atomically
+rewrites the registered operator config; repository/ledger trust roots remain
+browser read-only. Successful writes are audited in the Local First ledger.
 
 Pause denies new `ready_local` claims, including the generic controller
-`execute()` admission path.  It does not interrupt tickets already in an
-active execution state.  The API never opens or mutates Hermes' Kanban
-database, writes a board, registers an LLM tool, or invokes a model.
+`execute()` admission path. It does not interrupt tickets already in an active
+execution state. The API never opens or mutates Hermes' Kanban database,
+registers an LLM tool, or performs an implicit board write. Profile discovery
+uses Hermes profile inspection, while model execution remains owned by the
+normal orchestration stages.
+
+For the complete operator/runtime configuration reference see
+`docs/configuration.md`; for the full command surface see
+`docs/command-reference.md`.
 
 Dashboard assets and backend routes are loaded only after this user plugin is
 enabled; restart/rescan the dashboard after enabling it.
