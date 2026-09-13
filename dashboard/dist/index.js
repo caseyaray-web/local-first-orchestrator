@@ -112,6 +112,20 @@
             React.createElement("div", { className: "space-y-1" }, React.createElement("h3", { className: "text-sm font-medium" }, "Active tickets"), status.active.map(function (item) { return React.createElement("div", { key: item.ticket_id, className: "rounded border p-2 text-xs" }, item.ticket_id + " — " + item.state + " — feature " + (item.feature_id || "-") + " — tranche " + (item.tranche_id || "-")); }), status.active_truncated ? React.createElement("div", { className: "text-xs text-muted-foreground" }, "Showing the first 25 active tickets.") : null)
           ) : null)),
       React.createElement(Card, null,
+        React.createElement(CardHeader, null, React.createElement(CardTitle, null, "Runtime metrics & adaptive sizing")),
+        React.createElement(CardContent, { className: "space-y-3" },
+          status && status.runtime_metrics && status.adaptive_sizing ? React.createElement(React.Fragment, null,
+            React.createElement("div", { className: "grid grid-cols-2 gap-3 sm:grid-cols-4" },
+              metric("Metric samples", status.runtime_metrics.ticket_count),
+              metric("1st-attempt accept", Math.round(status.runtime_metrics.first_attempt_acceptance_rate * 100) + "%"),
+              metric("Avg attempts", Number(status.runtime_metrics.average_attempts).toFixed(2)),
+              metric("Target context", status.adaptive_sizing.target_context_tokens)
+            ),
+            React.createElement("div", { className: "text-xs text-muted-foreground" },
+              "Planner recommendation: up to " + status.adaptive_sizing.max_active_tickets + " active tickets · " + status.adaptive_sizing.reason + " · sample count " + status.adaptive_sizing.sample_count + ". Context tokens are deterministic estimates, not provider billing telemetry."
+            )
+          ) : React.createElement("p", { className: "text-sm text-muted-foreground" }, "Runtime metrics unavailable."))),
+      React.createElement(Card, null,
         React.createElement(CardHeader, null, React.createElement(CardTitle, null, "Configuration")),
         React.createElement(CardContent, { className: "space-y-4" },
           config && draft ? React.createElement(React.Fragment, null,

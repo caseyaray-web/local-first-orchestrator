@@ -135,6 +135,18 @@ The daemon reuses the same one-tick scheduler primitive and registered runtime. 
 
 It supports bounded `--max-iterations` plus explicit idle/busy/error-backoff controls. On exit it prints daemon health and scheduler observability. `operator-status` can be used independently to inspect lifecycle state.
 
+## Runtime metrics and adaptive sizing
+
+`runtime-metrics` materializes any completed-ticket observations missed by a crash and prints the bounded runtime/outcome summary plus the current decomposition sizing recommendation:
+
+```text
+... runtime-metrics
+```
+
+The Hermes dashboard exposes the same summary and recommendation. Context-token values are deterministic ticket-contract estimates, not provider billing telemetry. Paid-call input/output tokens are shown where the provider persisted them; monetary cost is explicitly marked unavailable when no authoritative currency cost is supplied.
+
+Adaptive sizing changes only decomposition planning hints after a minimum sample threshold. It does not relax patch budgets, deterministic validation, review, Git, checkpoint, or completion authority.
+
 ## Recovery principles
 
 1. **Pause before invasive/manual recovery.** Commands whose invariants require pause enforce it in the controller/ledger, not merely in documentation.

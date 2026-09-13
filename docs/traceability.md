@@ -2,7 +2,7 @@
 
 **Audit basis:** `docs/design-v2.md`, `docs/scheduler-plan.md`, `docs/milestone-20-real-acceptance.md`, `docs/hermes-dispatch-execution-acceptance.md`, and `docs/multi-ticket-native-tranche-acceptance.md`.
 
-**Current re-audit: 2026-09-12.** This file supersedes the 2026-09-08 pre-scheduler snapshot. The scheduler/daemon, representative real Local First-owned acceptance path, representative Hermes-dispatch reconciliation path, full scheduler-generated multi-ticket native tranche graph proof, deliberate failure-driven repair/triage proof, live paid-provider checkpoint/escalation proof, representative live external-boundary crash proof, and operator lifecycle/recovery UX are complete. The remaining gap is runtime metrics/adaptive sizing.
+**Current re-audit: 2026-09-12.** This file supersedes the 2026-09-08 pre-scheduler snapshot. The scheduler/daemon, representative real Local First-owned acceptance path, representative Hermes-dispatch reconciliation path, full scheduler-generated multi-ticket native tranche graph proof, deliberate failure-driven repair/triage proof, live paid-provider checkpoint/escalation proof, representative live external-boundary crash proof, operator lifecycle/recovery UX, and bounded runtime metrics/adaptive sizing loop are complete for the current design scope. No substantive v2 implementation tranche remains; follow-on work is release/readiness maintenance rather than an open roadmap dependency.
 
 Status labels:
 
@@ -28,12 +28,12 @@ A fake/unit-only boundary is not promoted to live integration PASS unless the de
 | Evidence-comment reconciliation | PASS | Dedicated comment outbox + marker lookup; live post-Hermes/pre-ledger crash recovered without duplicate comment | Keep compatible with Hermes read contract changes |
 | Paid checkpoint / escalation mechanism | PASS | Governor, reservation-before-call, purpose-scoped claims, one-call approval, production adapter, scheduler chaining, real checkpoint and escalation calls, completed-call replay, and real-provider unknown-outcome no-repeat; see `docs/live-paid-provider-acceptance.md` | None for representative configured route |
 | Operator lifecycle / recovery UX | PASS | `init`, `operator-status`, durable/audited `pause`/`resume`, `doctor`/`recovery-status`, explicit stage-specific recovery commands, `approve-paid`, `process-next`, daemon health/diagnostics, and dashboard Hermes-profile role configuration while paused; see `docs/operator-lifecycle-recovery.md` | Metrics remain separate under runtime metrics/adaptive sizing |
-| Runtime metrics / adaptive sizing | PARTIAL | Context/token bounds and some metrics infrastructure | Persist real-run outcome/cost/runtime measurements and feed sizing policy |
+| Runtime metrics / adaptive sizing | PASS | Append-only completed-ticket runtime observations, paid call/token aggregates, `runtime-metrics`, dashboard visibility, bounded first-attempt/rework-driven planner sizing, and frozen adaptive planner provenance; see `docs/runtime-metrics-adaptive-sizing-acceptance.md` | None for current bounded policy |
 | Tranche integration / checkpoint | PASS | Immutable tranche evidence, deterministic integration commands, real multi-ticket checkpoint/successor activation, and separate real paid checkpoint operational proof | None for current design scope |
 | Same-ticket repair | PASS | Bounded retry/fingerprint/attempt machinery, restart safety, and deliberate deterministic failure acceptance proof preserving ticket/worktree/branch provenance; see `docs/failure-driven-repair-triage-acceptance.md` | None for current design scope |
 | Bounded triage/decomposition | PASS | Child-count/depth/scope/criterion/duplicate enforcement; scheduler-owned triage and replay; generated child projection; deliberate repeated-failure acceptance proof invokes triage exactly once after restart | None for current design scope |
 | Deterministic validation / allowlists | PASS | Trusted verification commands, allowlist enforcement, durable stage evidence, live validation proof | None for current design scope |
-| Context packet / token budget | PASS | Bounded packet construction and explicit budgeting | Runtime sizing feedback is tracked separately |
+| Context packet / token budget | PASS | Bounded packet construction, explicit budgeting, and adaptive target-context hints constrained to hard policy bounds | None for current design scope |
 | Architecture packets / snapshot-bound activation | PASS | Feature/tranche/microticket contracts, snapshot binding/revalidation, successor re-snapshot at accepted integration SHA | None for current design scope |
 | Paid-call reservation / budget governor | PASS | Atomic purpose-bound reservation and budget enforcement with replay-safe request keys; zero-budget live checkpoint stopped before provider execution and one-call approval authorized exactly one real call | None for current design scope |
 | Ledger / state / provenance / audit | PASS | Attempts, bindings, invocations, artifacts, review/acceptance/Git evidence, outboxes, scheduler claims, reconciliation | None for current design scope |
@@ -51,7 +51,7 @@ A fake/unit-only boundary is not promoted to live integration PASS unless the de
 | Phase 3 — review / same-ticket repair | PASS | Independent live review plus deliberate deterministic failure-driven same-ticket repair acceptance proof |
 | Phase 4 — bounded triage | PASS | Bounded triage implementation plus repeated-failure → restart → exactly-once triage acceptance proof |
 | Phase 5 — architecture / checkpoint / paid governor | PASS | Architecture, checkpoint, governor, real paid checkpoint, escalation chaining, replay, and unknown-outcome stop proof complete |
-| Phase 6 — symbol/context / metrics | PARTIAL | Bounded context complete; production metrics/adaptive loop pending |
+| Phase 6 — symbol/context / metrics | PASS | Bounded context plus append-only runtime metrics and bounded adaptive decomposition sizing complete |
 | Hermes-native v2 execution/projection additions | PASS for representative configured paths | Scheduler, daemon, Local First E2E, dispatcher reconciliation, multi-ticket graph, live paid proof, and representative external-boundary crash proof complete |
 
 ## Original acceptance criteria reconciliation
@@ -114,9 +114,8 @@ The older traceability entries that marked restartable `process-next`, daemon mo
 | Deliberate failure-driven same-ticket repair and exactly-once triage | PASS | `docs/failure-driven-repair-triage-acceptance.md` |
 | Live paid checkpoint/escalation integration and unknown-outcome no-repeat | PASS | `docs/live-paid-provider-acceptance.md` |
 | Representative live external-boundary crash/restart proof | PASS | `docs/live-external-boundary-crash-acceptance.md` |
+| Runtime metrics and bounded adaptive decomposition sizing | PASS | `docs/runtime-metrics-adaptive-sizing-acceptance.md` |
 
 ## Remaining dependency-ordered work
 
-1. **Runtime metrics and adaptive sizing.** Persist real outcome/runtime/cost measurements and apply them to bounded ticket/context sizing policy.
-
-This list is the current reconciliation target. It intentionally does not reopen scheduler milestones already completed and acceptance-proven.
+No substantive design-v2 implementation tranche remains. The next activity is a release-readiness/final reconciliation pass: versioning, packaging/install verification, operator smoke tests, and documentation consistency. Those are release/maintenance activities rather than missing orchestrator capabilities.

@@ -18,6 +18,7 @@ from .hermes_board import HermesBoardAdapter
 from .ledger import Ledger
 from .local_qwen import LOCAL_QWEN_MODEL, LOCAL_QWEN_PROVIDER, LocalQwenAdapter
 from .operator_config import ModelRegistration, OperatorConfig, default_execution_roots, load_operator_config, save_operator_config
+from .runtime_metrics import RuntimeMetricsStore
 from .paid_model import HermesPaidModelAdapter
 from .scheduler import ProcessNextScheduler, preview_database, scheduler_observability
 from .states import CanonicalState
@@ -303,6 +304,7 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
             allowed_paths=allowed_paths,
             role="decomposition",
             routing_source="operator-config.decomposition",
+            sizing_provider=RuntimeMetricsStore(ledger).recommendation,
         )
         outcome = PlanningCoordinator(ledger, ctl.config, planner).materialize_next_tranche(str(identity["feature_id"]))
         if outcome.status not in {"activated", "already_materialized"}:
@@ -468,6 +470,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     commands.add_parser("migrate")
     operator_status=commands.add_parser("operator-status", help="bounded lifecycle/status summary for operators")
     operator_status.add_argument("--limit", type=int, default=25)
+    runtime_metrics=commands.add_parser("runtime-metrics", help="materialize and inspect bounded runtime metrics plus adaptive planner sizing")
+    runtime_metrics.add_argument("--limit", type=int, default=500)
     recovery_status=commands.add_parser("recovery-status", aliases=("doctor",), help="read-only recovery blockers and exact next-action hints")
     recovery_status.add_argument("--limit", type=int, default=25)
     pause=commands.add_parser("pause", help="durably pause scheduler work before recovery/maintenance")
@@ -583,6 +587,10 @@ def run_command(args: argparse.Namespace) -> int:
             data=ledger.operator_status(active_limit=args.limit)
             data["scheduler_detail"]=scheduler_observability(ledger)
             print(json.dumps(data,sort_keys=True))
+        elif args.command=="runtime-metrics":
+            store=RuntimeMetricsStore(ledger)
+            materialized=store.materialize_completed(limit=args.limit)
+            print(json.dumps({"materialized":materialized,"summary":store.summary(limit=args.limit),"adaptive_sizing":store.recommendation().as_json()},sort_keys=True))
         elif args.command in {"recovery-status", "doctor"}:
             print(json.dumps(_recovery_status(ledger,limit=args.limit),sort_keys=True))
         elif args.command=="pause":
@@ -678,7 +686,7 @@ def run_command(args: argparse.Namespace) -> int:
             if feature.id != args.feature_id: raise ValueError("feature contract identity mismatch")
             route=registered.decomposition_route(args.planner_cost_class)
             allowed_paths=tuple((item["path"], item["disposition"]) for item in stored["spec"]["files"])
-            planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class=args.planner_cost_class,provider=route.provider,model=route.model,profile=route.profile,allowed_paths=allowed_paths,role="decomposition",routing_source="operator-config.decomposition")
+            planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class=args.planner_cost_class,provider=route.provider,model=route.model,profile=route.profile,allowed_paths=allowed_paths,role="decomposition",routing_source="operator-config.decomposition",sizing_provider=RuntimeMetricsStore(ledger).recommendation)
             coordinator=PlanningCoordinator(ledger, ctl.config, planner)
             print(json.dumps(coordinator.generate_plan_only(feature,repository=registered.canonical_repository).__dict__,sort_keys=True,default=str))
         elif args.command=="revalidate-feature-snapshot":
@@ -688,7 +696,7 @@ def run_command(args: argparse.Namespace) -> int:
             if row is None: raise ValueError("authoritative feature contract is missing")
             feature=FeatureAdmissionSpec.from_json(json.loads(row["contract_json"])["spec"]).contract
             route=registered.decomposition_route("standard")
-            planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class="standard",provider=route.provider,model=route.model,profile=route.profile,allowed_paths=(),role="decomposition",routing_source="operator-config.decomposition")
+            planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class="standard",provider=route.provider,model=route.model,profile=route.profile,allowed_paths=(),role="decomposition",routing_source="operator-config.decomposition",sizing_provider=RuntimeMetricsStore(ledger).recommendation)
             coordinator=PlanningCoordinator(ledger, ctl.config, planner)
             print(json.dumps(coordinator.revalidate_feature_repository_snapshot(args.feature_id),sort_keys=True,default=str))
         elif args.command in {"register-dashboard", "init"}:

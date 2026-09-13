@@ -2677,11 +2677,13 @@ The CLI now exposes a coherent lifecycle surface over the existing durable contr
 
 **Completion condition:** the operator can initialize, inspect, durably pause/resume, diagnose blockers, choose the safe stage-specific recovery/reconciliation action, approve one paid call, and run/observe the daemon through documented stable commands. Runtime metrics are tracked separately by §13.
 
-### 13. Runtime metrics and adaptive sizing feedback loop — **Partial**
+### 13. Runtime metrics and adaptive sizing feedback loop — **Complete for bounded current-route policy**
 
-Symbol/metrics-related infrastructure exists, but the design's outcome-driven sizing loop depends on durable production measurements across real tickets, attempts, review outcomes, reverts, and token/runtime costs.
+Completed tickets now produce idempotent append-only runtime observations derived from authoritative ledger evidence: attempt count, acceptance outcome, deterministic ticket-context token estimate, declared scope, implementation duration, review duration, and completion time. Paid-call summaries additionally expose call counts, unknown outcomes, and provider input/output token telemetry where available; monetary cost is explicitly reported unavailable rather than estimated when the provider does not supply authoritative currency cost. `runtime-metrics` can backfill observations after crashes, and the Hermes dashboard exposes both aggregates and the current adaptive recommendation.
 
-**Completion condition:** metrics are persisted from real runs, surfaced to operators, and used to adjust ticket/context sizing within explicit policy bounds.
+Adaptive sizing remains deliberately outside validation/finality authority. After a minimum sample threshold, first-attempt acceptance and average attempts adjust only decomposition planning hints for active-tranche ticket count and target context size, within hard bounds. Initial and successor decomposition packets both consume the recommendation and persist it in planner provenance; hard patch budgets, deterministic validation, review, Git, checkpoint, and finality policies remain unchanged. Detailed evidence is in `docs/runtime-metrics-adaptive-sizing-acceptance.md`.
+
+**Completion condition:** metrics are persisted from real runs, surfaced to operators, and used to adjust ticket/context sizing within explicit policy bounds. **Satisfied for the current bounded policy.**
 
 ### 14. Tranche integration and checkpoint flow — **Complete for representative multi-ticket live path**
 

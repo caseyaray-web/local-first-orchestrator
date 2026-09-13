@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json, hashlib, subprocess
 from pathlib import Path
+from typing import Callable
 from .decomposition import FeatureContract, DecompositionPlan, Tranche
 from .ticket import MicroTicket, PatchBudget, VerificationProfile, PATCH_BUDGET_POLICY
 from .repository_snapshot import RepositorySnapshot
@@ -60,9 +61,9 @@ def minimal_plan_example(feature: FeatureContract, snapshot: RepositorySnapshot,
     ticket = {'ticket_id': 'TK-1', 'objective': 'Implement and verify the bounded concern.', 'criterion_ids': [criterion], 'primary_symbol': f'{existing}::bounded_change', 'allowed_files': [existing], 'create_files': [create_file] if create_file else [], 'new_test_files': [test_file] if test_file else [], 'forbidden_changes': ['Do not change unrelated behavior.'], 'patch_budget': {'max_files': 2, 'max_changed_lines': 40}, 'verification': {'commands': [['python', '-m', 'unittest']], 'working_directory': '.', 'timeout_seconds': 60, 'output_limit': 20000}, 'risk': 'low', 'review_required': True, 'max_attempts': 2, 'dependencies': []}
     return {'plan_version': 1, 'feature_id': feature.id, 'feature_contract_hash': feature.contract_hash, 'repo_base_sha': snapshot.base_sha, 'repo_snapshot_hash': snapshot.snapshot_hash, 'architecture_decisions': ['Keep the bounded change at one architectural seam.'], 'criterion_coverage': {criterion: ['TK-1']}, 'tranches': [{'id': 'T-0', 'ordinal': 0, 'objective': 'Implement the bounded architectural concern.', 'capabilities': ['bounded-change'], 'criterion_ids': [criterion], 'microtickets': [ticket]}]}
 
-def packet(feature: FeatureContract, snapshot: RepositorySnapshot, *, max_active: int = 4, max_files: int = 3, max_lines: int = 200, prior_decisions: tuple[str, ...] = (), allowed_paths=DEFAULT_ALLOWED_PATHS, budget_policy=PATCH_BUDGET_POLICY) -> str:
+def packet(feature: FeatureContract, snapshot: RepositorySnapshot, *, max_active: int = 4, target_context_tokens: int = 20_000, max_files: int = 3, max_lines: int = 200, prior_decisions: tuple[str, ...] = (), allowed_paths=DEFAULT_ALLOWED_PATHS, budget_policy=PATCH_BUDGET_POLICY) -> str:
     rules = [*planner_contract(budget_policy=budget_policy)['output_rules']]
-    return json.dumps({'planner_contract_hash': planner_contract_hash(budget_policy=budget_policy), 'feature': {**feature.__dict__, 'contract_hash': feature.contract_hash}, 'repository': {'id': snapshot.repository_id, 'base_sha': snapshot.base_sha, 'snapshot_hash': snapshot.snapshot_hash, 'manifest': [x.__dict__ for x in snapshot.manifest], 'evidence': [x.__dict__ for x in snapshot.entries], 'omitted_count': snapshot.omitted_count}, 'limits': {'active_tranche_max_tickets': max_active, 'absolute_max_files': max_files, 'absolute_max_changed_lines': max_lines}, 'patch_budget_policy': budget_policy.as_json(), 'prior_decisions': prior_decisions, 'output_contract': {'schema': planner_schema(), 'allowed_paths': list(_normalized_allowed_paths(allowed_paths)), 'context_to_output': planner_contract(budget_policy=budget_policy)['context_to_output'], 'minimal_example': minimal_plan_example(feature, snapshot, allowed_paths)}, 'rules': rules}, sort_keys=True, separators=(',', ':'), default=lambda x: x.__dict__ if hasattr(x,'__dict__') else list(x))
+    return json.dumps({'planner_contract_hash': planner_contract_hash(budget_policy=budget_policy), 'feature': {**feature.__dict__, 'contract_hash': feature.contract_hash}, 'repository': {'id': snapshot.repository_id, 'base_sha': snapshot.base_sha, 'snapshot_hash': snapshot.snapshot_hash, 'manifest': [x.__dict__ for x in snapshot.manifest], 'evidence': [x.__dict__ for x in snapshot.entries], 'omitted_count': snapshot.omitted_count}, 'limits': {'active_tranche_max_tickets': max_active, 'target_context_tokens': target_context_tokens, 'absolute_max_files': max_files, 'absolute_max_changed_lines': max_lines}, 'patch_budget_policy': budget_policy.as_json(), 'prior_decisions': prior_decisions, 'output_contract': {'schema': planner_schema(), 'allowed_paths': list(_normalized_allowed_paths(allowed_paths)), 'context_to_output': planner_contract(budget_policy=budget_policy)['context_to_output'], 'minimal_example': minimal_plan_example(feature, snapshot, allowed_paths)}, 'rules': rules}, sort_keys=True, separators=(',', ':'), default=lambda x: x.__dict__ if hasattr(x,'__dict__') else list(x))
 
 def _strict_object(value: object, *, path: str, required: set[str], optional: set[str] = set()) -> dict:
     if type(value) is not dict:
@@ -163,7 +164,7 @@ def resolve_hermes_identity(executable='hermes') -> dict[str,str]:
     return {'provider': match.group(2), 'model': match.group(1), 'profile': 'default'}
 
 class LocalDecompositionPlanner:
-    def __init__(self, runner=subprocess.run, executable='hermes', cost_class: str = 'unknown', provider='unresolved', model='unresolved', profile='unresolved', allowed_paths=DEFAULT_ALLOWED_PATHS, role='decomposition', routing_source='operator-config'):
+    def __init__(self, runner=subprocess.run, executable='hermes', cost_class: str = 'unknown', provider='unresolved', model='unresolved', profile='unresolved', allowed_paths=DEFAULT_ALLOWED_PATHS, role='decomposition', routing_source='operator-config', sizing_provider: Callable[[], object] | None = None):
 
         if cost_class not in {'local', 'standard', 'paid', 'unknown'}:
             raise ValueError('invalid planner cost class')
@@ -172,6 +173,17 @@ class LocalDecompositionPlanner:
         self.role, self.routing_source = role, routing_source
         self.planner_contract_hash = planner_contract_hash()
         self.allowed_paths = tuple(allowed_paths)
+        self.sizing_provider = sizing_provider
+
+    def _sizing_limits(self) -> tuple[int, int, dict]:
+        if self.sizing_provider is None:
+            return 4, 20_000, {'max_active_tickets': 4, 'target_context_tokens': 20_000, 'sample_count': 0, 'reason': 'baseline'}
+        value = self.sizing_provider()
+        active = int(getattr(value, 'max_active_tickets', 4))
+        context = int(getattr(value, 'target_context_tokens', 20_000))
+        active = min(6, max(2, active)); context = min(28_000, max(12_000, context))
+        detail = value.as_json() if callable(getattr(value, 'as_json', None)) else {'max_active_tickets': active, 'target_context_tokens': context}
+        return active, context, detail
     @property
     def is_paid(self):
         return self.cost_class == 'paid'
@@ -179,11 +191,12 @@ class LocalDecompositionPlanner:
     def propose(self, feature, snapshot, *, artifact_dir: Path, prior_decisions=(), repository: Path | None = None):
         if self.cost_class == 'unknown':
             raise PlannerError('unknown planner cost class')
-        payload = packet(feature, snapshot, prior_decisions=prior_decisions, allowed_paths=self.allowed_paths)
+        max_active, target_context_tokens, sizing = self._sizing_limits()
+        payload = packet(feature, snapshot, max_active=max_active, target_context_tokens=target_context_tokens, prior_decisions=prior_decisions, allowed_paths=self.allowed_paths)
         artifact_dir.mkdir(parents=True, exist_ok=True)
         scratch = artifact_dir / 'planner-scratch'
         scratch.mkdir(exist_ok=True)
-        provenance = {'role': self.role, 'routing_source': self.routing_source, 'planner_contract_hash': self.planner_contract_hash, 'provider': self.provider, 'model': self.model, 'profile': self.profile, 'cost_class': self.cost_class, 'mechanism': 'hermes-chat', 'tool_mode': 'safe-no-mutation-tools', 'toolsets': ['safe'], 'cwd': str(scratch)}
+        provenance = {'role': self.role, 'routing_source': self.routing_source, 'planner_contract_hash': self.planner_contract_hash, 'provider': self.provider, 'model': self.model, 'profile': self.profile, 'cost_class': self.cost_class, 'mechanism': 'hermes-chat', 'tool_mode': 'safe-no-mutation-tools', 'toolsets': ['safe'], 'cwd': str(scratch), 'adaptive_sizing': sizing}
         (artifact_dir / 'planner-request.json').write_text(payload, encoding='utf-8')
         (artifact_dir / 'planner-provenance.json').write_text(json.dumps(provenance, sort_keys=True, separators=(',', ':')), encoding='utf-8')
         before = _protected_fingerprint(repository) if repository is not None else None
@@ -226,7 +239,8 @@ class LocalDecompositionPlanner:
     def propose_next(self, feature, snapshot, *, coarse_tranche, completion_evidence, artifact_dir: Path, repository: Path | None = None):
         if self.cost_class == 'unknown':
             raise PlannerError('unknown planner cost class')
-        base = json.loads(packet(feature, snapshot, allowed_paths=self.allowed_paths))
+        max_active, target_context_tokens, sizing = self._sizing_limits()
+        base = json.loads(packet(feature, snapshot, max_active=max_active, target_context_tokens=target_context_tokens, allowed_paths=self.allowed_paths))
         target_criteria = list(coarse_tranche.criterion_ids)
         completed_criteria = sorted({c.id for c in feature.acceptance_criteria if c.id not in set(target_criteria)})
         base['successor_scope'] = {
@@ -252,7 +266,7 @@ class LocalDecompositionPlanner:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         scratch = artifact_dir / 'planner-scratch'
         scratch.mkdir(exist_ok=True)
-        provenance = {'role': self.role, 'routing_source': self.routing_source, 'planner_contract_hash': self.planner_contract_hash, 'provider': self.provider, 'model': self.model, 'profile': self.profile, 'cost_class': self.cost_class, 'mechanism': 'hermes-chat', 'tool_mode': 'safe-no-mutation-tools', 'toolsets': ['safe'], 'cwd': str(scratch), 'successor_scope': True}
+        provenance = {'role': self.role, 'routing_source': self.routing_source, 'planner_contract_hash': self.planner_contract_hash, 'provider': self.provider, 'model': self.model, 'profile': self.profile, 'cost_class': self.cost_class, 'mechanism': 'hermes-chat', 'tool_mode': 'safe-no-mutation-tools', 'toolsets': ['safe'], 'cwd': str(scratch), 'successor_scope': True, 'adaptive_sizing': sizing}
         request_path = artifact_dir / 'planner-request.json'
         provenance_path = artifact_dir / 'planner-provenance.json'
         response_path = artifact_dir / 'planner-response.json'
@@ -275,7 +289,17 @@ class LocalDecompositionPlanner:
         if prior:
             if not request_path.is_file() or request_path.read_text(encoding='utf-8') != payload:
                 raise PlannerError('successor planner reconciliation required: persisted request conflicts')
-            if not provenance_path.is_file() or provenance_path.read_text(encoding='utf-8') != expected_provenance:
+            if not provenance_path.is_file():
+                raise PlannerError('successor planner reconciliation required: persisted provenance conflicts')
+            try:
+                persisted_provenance = json.loads(provenance_path.read_text(encoding='utf-8'))
+            except json.JSONDecodeError as exc:
+                raise PlannerError('successor planner reconciliation required: persisted provenance conflicts') from exc
+            expected_compare = dict(provenance); persisted_compare = dict(persisted_provenance) if type(persisted_provenance) is dict else {}
+            # adaptive_sizing is observational provenance added after the original
+            # successor journal contract; request bytes already bind the actual limits.
+            expected_compare.pop('adaptive_sizing', None); persisted_compare.pop('adaptive_sizing', None)
+            if persisted_compare != expected_compare:
                 raise PlannerError('successor planner reconciliation required: persisted provenance conflicts')
             if not response_path.is_file() or not result_path.is_file():
                 raise PlannerError('successor planner reconciliation required: prior invocation outcome unknown')

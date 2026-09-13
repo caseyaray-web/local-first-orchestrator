@@ -23,6 +23,7 @@ from local_first_orchestrator.controller import LocalFirstController
 from local_first_orchestrator.local_qwen import LocalQwenAdapter
 from local_first_orchestrator.hermes_profiles import discover_profiles, resolve_registration
 from local_first_orchestrator.operator_config import OperatorConfig, default_config_path, load_operator_config, save_operator_config
+from local_first_orchestrator.runtime_metrics import RuntimeMetricsStore
 
 router = APIRouter()
 
@@ -113,6 +114,9 @@ def _status() -> dict[str, Any]:
     try:
         status = ledger.operator_status(active_limit=25)
         status["configuration"] = _configuration_json(config)
+        metrics = RuntimeMetricsStore(ledger)
+        status["runtime_metrics"] = metrics.summary()
+        status["adaptive_sizing"] = metrics.recommendation().as_json()
         return status
     finally:
         ledger.close()

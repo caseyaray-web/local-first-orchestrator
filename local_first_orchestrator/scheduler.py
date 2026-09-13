@@ -15,6 +15,7 @@ from .paid_model import PaidInvocationError
 from .reconciliation import ReconciliationAction
 from .state_projection import StateProjectionWorker
 from .states import CanonicalState
+from .runtime_metrics import RuntimeMetricsStore
 
 
 SCHEDULER_STAGE_ORDER: tuple[str, ...] = (
@@ -998,6 +999,11 @@ class ProcessNextScheduler:
             self.ledger.complete_scheduler_claim(
                 claim_id, execution_owner, completion_result, now=now
             )
+            try:
+                RuntimeMetricsStore(self.ledger).materialize_completed(limit=100)
+            except Exception:
+                # Metrics are derived observability only; completion authority must never depend on them.
+                pass
             return ProcessNextResult("completed", "completion", ticket_id, claim_id)
 
         if (stage_allowed("native_dependency_graph") or stage_allowed("native_dependency_release")) and hasattr(self.board, "get_task") and hasattr(self.board, "link_dependency"):

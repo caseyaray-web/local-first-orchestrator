@@ -326,6 +326,23 @@ CREATE TABLE IF NOT EXISTS model_invocations (
 CREATE INDEX IF NOT EXISTS idx_model_invocations_incomplete ON model_invocations(status, ticket_id);
 CREATE INDEX IF NOT EXISTS idx_model_invocations_attempt_stage ON model_invocations(ticket_id, attempt_number, stage, started_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_model_invocations_one_started_review ON model_invocations(ticket_id, attempt_number, stage) WHERE stage='review' AND status='started';
+CREATE TABLE IF NOT EXISTS ticket_runtime_metrics (
+    ticket_id TEXT PRIMARY KEY REFERENCES tickets(id),
+    feature_id TEXT,
+    tranche_id TEXT,
+    attempts INTEGER NOT NULL CHECK(attempts >= 1),
+    accepted INTEGER NOT NULL CHECK(accepted IN (0,1)),
+    context_tokens INTEGER NOT NULL CHECK(context_tokens >= 0),
+    declared_files INTEGER NOT NULL CHECK(declared_files >= 0),
+    implementation_seconds REAL NOT NULL CHECK(implementation_seconds >= 0),
+    review_seconds REAL NOT NULL CHECK(review_seconds >= 0),
+    completed_at INTEGER NOT NULL,
+    recorded_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS ticket_runtime_metrics_immutable_update
+BEFORE UPDATE ON ticket_runtime_metrics BEGIN SELECT RAISE(ABORT, 'ticket runtime metrics are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS ticket_runtime_metrics_immutable_delete
+BEFORE DELETE ON ticket_runtime_metrics BEGIN SELECT RAISE(ABORT, 'ticket runtime metrics are append-only'); END;
 CREATE TABLE IF NOT EXISTS review_candidates (
     ticket_id TEXT NOT NULL REFERENCES tickets(id), attempt_number INTEGER NOT NULL,
     candidate_fingerprint TEXT NOT NULL, validation_evidence TEXT NOT NULL,
