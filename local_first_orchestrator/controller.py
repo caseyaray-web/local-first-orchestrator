@@ -148,7 +148,7 @@ class LocalFirstController:
                 snapshot.session_id, snapshot.branch_name, snapshot.started_at, snapshot.completed_at
             ))
             expected_gate = "Local First execution gate: authoritative dependencies/runtime authorization not satisfied"
-            runs_are_inert_safety_gates = all(
+            runs_are_inert_safety_gates = len(snapshot.runs) == 1 and all(
                 run.status == "blocked"
                 and run.outcome == "blocked"
                 and run.profile is None

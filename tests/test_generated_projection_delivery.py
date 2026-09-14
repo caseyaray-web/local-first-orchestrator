@@ -625,6 +625,31 @@ class GeneratedProjectionDeliveryTests(unittest.TestCase):
         )
         self.assertEqual(recovered["observed_status"], "blocked")
 
+    def test_controller_refuses_blocked_snapshot_without_the_exact_safety_gate_run(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        self.assertEqual(self.worker().deliver_one().external_task_id, "1")
+        self.ledger.pause("operator", reason="pre-native recovery")
+
+        class MissingGateBoard:
+            is_fake = False
+            def execution_snapshot(self, external_task_id: str) -> ExternalExecutionSnapshot:
+                return ExternalExecutionSnapshot(
+                    task=ExternalTicket(external_task_id, ticket_id, "legacy", "blocked", None),
+                    session_id=None, branch_name=None, started_at=None, completed_at=None, runs=(),
+                )
+
+        root = Path(self.temp.name)
+        controller = LocalFirstController(
+            self.ledger, MissingGateBoard(), RuntimeConfig(root, root / "worktrees", root / "artifacts", (root,))
+        )
+        with self.assertRaisesRegex(RuntimeError, "inert blocked"):
+            controller.recover_generated_projection(
+                ticket_id, event_id, operator_id="casey", reason="replace pre-native safety-gated projection"
+            )
+        self.assertEqual(self.ledger.connection.execute(
+            "SELECT COUNT(*) FROM generated_projection_recoveries WHERE ticket_id=?", (ticket_id,)
+        ).fetchone()[0], 0)
+
     def test_recovery_refuses_multiple_current_create_identities_without_mutation(self) -> None:
         ticket_id, event_id = self.activate_one()
         self.assertEqual(self.worker().deliver_one().external_task_id, "1")
