@@ -10,7 +10,7 @@ from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.controller import RuntimeConfig
 from local_first_orchestrator.admission import FeatureAdmissionSpec, FileDisposition
-from local_first_orchestrator.decomposition import Criterion, DecompositionPlan, FeatureContract, PlanValidator, Tranche, activate_validated_plan
+from local_first_orchestrator.decomposition import Criterion, DecompositionPlan, FeatureContract, PlanValidator, Tranche, create_and_activate_validated_plan
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.tranche_completion import completion_evidence
 from local_first_orchestrator.corrections import CorrectionService
@@ -67,7 +67,7 @@ class TrancheHandoffTests(unittest.TestCase):
         self.initial = DecompositionPlan(self.initial.plan_version, self.initial.feature_id, self.initial.feature_contract_hash, self.initial.repo_base_sha, self.initial.repo_snapshot_hash, self.initial.architecture_decisions, self.initial.criterion_coverage, self.initial.tranches, repository_identity=self.s1.repository_id, repo_snapshot_manifest_json=self.s1.manifest_json)
         pv = PlanValidator().validate(self.feature, self.initial); rv = RepositoryPlanValidator().validate(self.initial, self.s1)
         self.assertTrue(pv.passed, pv.reasons); self.assertTrue(rv.passed, rv.reasons)
-        activate_validated_plan(self.ledger, self.feature, self.initial, pv, rv)
+        create_and_activate_validated_plan(self.ledger, self.feature, self.initial, pv, rv)
         # Simulate the already-proven accepted first ticket and rolling head.
         (self.repo / "alpha.py").write_text("def alpha():\n    return 'accepted'\n")
         self.git("add", "alpha.py"); self.git("commit", "-qm", "accept A"); self.a1 = self.rev("HEAD")

@@ -10,7 +10,7 @@ from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.admission import FeatureAdmissionSpec, FileDisposition
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
-from local_first_orchestrator.decomposition import Criterion, DecompositionPlan, PlanValidator, Tranche, activate_validated_plan
+from local_first_orchestrator.decomposition import Criterion, DecompositionPlan, PlanValidator, Tranche, create_and_activate_validated_plan
 from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
 from local_first_orchestrator.ledger import Ledger, _hash_recheck_payload
 
@@ -113,7 +113,7 @@ class FeatureAdmissionTests(unittest.TestCase):
         validation = PlanValidator().validate(self.spec().contract, plan)
         self.assertTrue(validation.passed, validation.reasons)
         repository_validation = type("R", (), {"passed": True, "repository_identity": str(self.repo), "base_sha": result.repo_base_sha, "snapshot_hash": result.repo_snapshot_hash, "manifest_json": manifest})()
-        activate_validated_plan(self.ledger, self.spec().contract, plan, validation, repository_validation)
+        create_and_activate_validated_plan(self.ledger, self.spec().contract, plan, validation, repository_validation)
         self.assertEqual(self.ledger.connection.execute("select count(*) from feature_contracts where feature_id='C11'").fetchone()[0], 1)
         self.assertEqual(self.ledger.connection.execute("select count(*) from tranches where id='C11-T0'").fetchone()[0], 1)
         self.assertEqual(self.ledger.connection.execute("select count(*) from tickets where feature_id='C11'").fetchone()[0], 1)

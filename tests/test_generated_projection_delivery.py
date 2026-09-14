@@ -8,7 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from local_first_orchestrator.decomposition import PlanValidator, activate_validated_plan
+from local_first_orchestrator.decomposition import PlanValidator, create_and_activate_validated_plan
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
 from local_first_orchestrator.generated_activation import resolve_generated_activation_context
 from local_first_orchestrator.generated_projection import (
@@ -129,7 +129,7 @@ class GeneratedProjectionDeliveryTests(unittest.TestCase):
         single_active = type(active)(active.id, active.ordinal, active.objective, active.capabilities, active.criterion_ids, active.microtickets[:1])
         plan = plans.plan(tranches=(single_active, base.tranches[1]))
         validated = PlanValidator().validate(feature, plan)
-        activate_validated_plan(self.ledger, feature, plan, validated, Plans().repository_validation(plan))
+        create_and_activate_validated_plan(self.ledger, feature, plan, validated, Plans().repository_validation(plan))
         row = self.ledger.connection.execute("SELECT ticket_id, event_id FROM board_projection_outbox WHERE operation='create_microticket' ORDER BY ticket_id LIMIT 1").fetchone()
         return str(row["ticket_id"]), int(row["event_id"])
 

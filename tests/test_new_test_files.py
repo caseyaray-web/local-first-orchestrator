@@ -14,7 +14,7 @@ from local_first_orchestrator.decomposition import (
     FeatureContract,
     PlanValidator,
     Tranche,
-    activate_validated_plan,
+    create_and_activate_validated_plan,
 )
 from local_first_orchestrator.generated_projection import GeneratedProjectionDeliveryPolicy, GeneratedProjectionWorker
 from local_first_orchestrator.ledger import Ledger
@@ -137,7 +137,7 @@ class NewTestFilesContractTests(unittest.TestCase):
         plan, snap = self.plan(ticket)
         structural = PlanValidator(max_active_tickets=1).validate(self.feature(), plan)
         repository = RepositoryPlanValidator().validate(plan, snap)
-        activate_validated_plan(self.ledger, self.feature(), plan, structural, repository)
+        create_and_activate_validated_plan(self.ledger, self.feature(), plan, structural, repository)
         persisted = ticket_from_ledger(self.ledger.get_ticket(ticket.ticket_id))
         self.assertEqual(persisted.new_test_files, ("tests/test_new_behavior.py",))
         fake = FakeHermes()
@@ -167,7 +167,7 @@ class NewTestFilesContractTests(unittest.TestCase):
     def test_generated_e2e_creates_only_declared_test_and_reaches_done(self) -> None:
         ticket = self.ticket()
         plan, snap = self.plan(ticket)
-        activate_validated_plan(
+        create_and_activate_validated_plan(
             self.ledger, self.feature(), plan,
             PlanValidator(max_active_tickets=1).validate(self.feature(), plan),
             RepositoryPlanValidator().validate(plan, snap),

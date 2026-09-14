@@ -120,7 +120,7 @@ def generated_card_payload(feature: FeatureContract, tranche: Tranche, ticket: M
   "projection_key": projection_key,
  }
 
-def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:DecompositionPlan,validation:PlanValidationResult,repository_validation:object|None=None,*,request_key:str|None=None,expected_plan_id:str|None=None,require_paused:bool=False)->tuple[str,tuple[str,...]]:
+def _activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:DecompositionPlan,validation:PlanValidationResult,repository_validation:object|None=None,*,request_key:str|None=None,expected_plan_id:str|None=None,require_paused:bool=False)->tuple[str,tuple[str,...]]:
  if not validation.passed or repository_validation is None or not getattr(repository_validation,'passed',False): raise ValueError('rejected plan cannot activate')
  repository_identity=getattr(repository_validation,'repository_identity',None)
  repo_base_sha=getattr(repository_validation,'base_sha',None)
@@ -168,9 +168,11 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
   active_tranche=next(tr for tr in plan.tranches if tr.ordinal == 0)
   resolved_active=resolve(c,active_tranche)
   durable_active_id=str(resolved_active['id']) if resolved_active is not None else active_tranche.id
+  existing=c.execute('SELECT * FROM decomposition_plans WHERE fingerprint=?',(fp,)).fetchone()
+  if request_key is None and existing is not None and (existing['status'] != 'active' or (resolved_active is not None and resolved_active['status'] != 'active')):
+   raise ValueError('planning run request key required')
   if resolved_active is not None and resolved_active['status'] == 'planned':
    c.execute("UPDATE tranches SET status='active' WHERE id=?", (durable_active_id,))
-  existing=c.execute('SELECT * FROM decomposition_plans WHERE fingerprint=?',(fp,)).fetchone()
   if existing:
    if tuple(existing[x] for x in ('repository_identity','repo_base_sha','repo_snapshot_hash','repo_snapshot_manifest_json')) != (repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json): raise ValueError('repository provenance conflicts')
    active_tranche=next(tr for tr in plan.tranches if tr.ordinal == 0)
@@ -232,3 +234,10 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
    ledger._finalize_planning_run_activation(c, pending_runs[0]['request_key'], plan_id=activated_plan_id, ticket_ids=canonical_ids)
   if not canonical_ids: raise ValueError('active decomposition plan has no materialized tickets')
   return activated_plan_id,canonical_ids
+
+def create_and_activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:DecompositionPlan,validation:PlanValidationResult,repository_validation:object|None=None)->tuple[str,tuple[str,...]]:
+ return _activate_validated_plan(ledger,feature,plan,validation,repository_validation)
+
+def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:DecompositionPlan,validation:PlanValidationResult,repository_validation:object|None=None,*,request_key:str,expected_plan_id:str,require_paused:bool=False)->tuple[str,tuple[str,...]]:
+ if not request_key or not expected_plan_id: raise ValueError('planning run request key and plan identity required')
+ return _activate_validated_plan(ledger,feature,plan,validation,repository_validation,request_key=request_key,expected_plan_id=expected_plan_id,require_paused=require_paused)

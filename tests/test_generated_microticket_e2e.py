@@ -15,7 +15,7 @@ from local_first_orchestrator.decomposition import (
     FeatureContract,
     PlanValidator,
     Tranche,
-    activate_validated_plan,
+    create_and_activate_validated_plan,
 )
 from local_first_orchestrator.generated_activation import activate_generated_ticket
 from local_first_orchestrator.generated_projection import (
@@ -144,7 +144,7 @@ class GeneratedMicroticketEndToEndTests(unittest.TestCase):
         repository_validation = RepositoryPlanValidator().validate(plan, repository_snapshot)
         self.assertTrue(plan_validation.passed, plan_validation.reasons)
         self.assertTrue(repository_validation.passed, repository_validation.reasons)
-        _, materialized = activate_validated_plan(
+        _, materialized = create_and_activate_validated_plan(
             self.ledger, feature, plan, plan_validation, repository_validation
         )
         self.assertEqual(materialized, (ticket.ticket_id,))
@@ -237,7 +237,7 @@ class GeneratedMicroticketEndToEndTests(unittest.TestCase):
         repository_validation = RepositoryPlanValidator().validate(plan, repository_snapshot)
         self.assertTrue(plan_validation.passed, plan_validation.reasons)
         self.assertTrue(repository_validation.passed, repository_validation.reasons)
-        _, materialized = activate_validated_plan(
+        _, materialized = create_and_activate_validated_plan(
             self.ledger, feature, plan, plan_validation, repository_validation
         )
         self.assertEqual(materialized, (ticket.ticket_id,))
@@ -356,7 +356,7 @@ class GeneratedMicroticketEndToEndTests(unittest.TestCase):
         plan_validation = PlanValidator().validate(feature, plan)
         repository_validation = RepositoryPlanValidator().validate(plan, repository_snapshot)
         self.assertTrue(plan_validation.passed, plan_validation.reasons)
-        _, materialized = activate_validated_plan(self.ledger, feature, plan, plan_validation, repository_validation)
+        _, materialized = create_and_activate_validated_plan(self.ledger, feature, plan, plan_validation, repository_validation)
         self.assertEqual(materialized, (a_ticket.ticket_id, b_ticket.ticket_id))
         adapter = HermesBoardAdapter(executable=str(self.fake_hermes), board="board", allow_writes=True, timeout_seconds=2)
         worker = GeneratedProjectionWorker(self.ledger, adapter, GeneratedProjectionDeliveryPolicy(lease_seconds=15, retry_delay=5), worker_id="projection-worker", clock=lambda: 100)
