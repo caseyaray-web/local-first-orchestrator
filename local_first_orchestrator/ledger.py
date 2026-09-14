@@ -483,6 +483,7 @@ CREATE TABLE IF NOT EXISTS native_dependency_releases (
     graph_hash TEXT NOT NULL,
     child_external_id TEXT NOT NULL,
     parent_completion_hash TEXT NOT NULL,
+    routing_authority_json TEXT NOT NULL DEFAULT '{}',
     hermes_status TEXT NOT NULL,
     observed_at INTEGER NOT NULL
 );
@@ -1011,6 +1012,9 @@ class Ledger:
         comment_columns={row["name"] for row in self.connection.execute("PRAGMA table_info(evidence_comment_outbox)")}
         for name,definition in {"lease_expires_at":"INTEGER","next_attempt_at":"INTEGER","terminal_owner":"TEXT"}.items():
             if name not in comment_columns: self.connection.execute(f"ALTER TABLE evidence_comment_outbox ADD COLUMN {name} {definition}")
+        release_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(native_dependency_releases)")}
+        if "routing_authority_json" not in release_columns:
+            self.connection.execute("ALTER TABLE native_dependency_releases ADD COLUMN routing_authority_json TEXT NOT NULL DEFAULT '{}'")
         self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_model_calls_reservation ON model_calls(reservation_id)")
         self.connection.execute("CREATE TABLE IF NOT EXISTS review_retry_authorizations (authorization_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), attempt_number INTEGER NOT NULL, candidate_fingerprint TEXT NOT NULL, failed_invocation_id TEXT NOT NULL REFERENCES model_invocations(invocation_id), operator_id TEXT NOT NULL, authorized_at INTEGER NOT NULL, consumed_invocation_id TEXT REFERENCES model_invocations(invocation_id), consumed_at INTEGER, UNIQUE(ticket_id, attempt_number, failed_invocation_id))")
         candidate_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(review_candidates)")}
@@ -2524,19 +2528,23 @@ class Ledger:
                 raise RuntimeError("native_dependency_release_reconciliation_required: Hermes graph diverged")
             if str(result.get("hermes_status") or "") != "ready":
                 raise RuntimeError("native_dependency_release_reconciliation_required: Hermes did not expose child as ready")
+            expected_routing = identity.get("routing_authority", {})
+            if result.get("routing_authority") != expected_routing:
+                raise RuntimeError("native_dependency_release_reconciliation_required: routing authority evidence drift")
             existing = conn.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (claim["ticket_id"],)).fetchone()
             values = (
                 str(identity["graph_hash"]),
                 str(identity["child_external_id"]),
                 str(identity["parent_completion_hash"]),
+                json.dumps(expected_routing, sort_keys=True, separators=(",", ":")),
                 "ready",
             )
             if existing is not None:
-                if tuple(existing[key] for key in ("graph_hash", "child_external_id", "parent_completion_hash", "hermes_status")) != values:
+                if tuple(existing[key] for key in ("graph_hash", "child_external_id", "parent_completion_hash", "routing_authority_json", "hermes_status")) != values:
                     raise RuntimeError("native_dependency_release_reconciliation_required: release evidence conflicts")
             else:
                 conn.execute(
-                    "INSERT INTO native_dependency_releases(ticket_id,graph_hash,child_external_id,parent_completion_hash,hermes_status,observed_at) VALUES (?,?,?,?,?,?)",
+                    "INSERT INTO native_dependency_releases(ticket_id,graph_hash,child_external_id,parent_completion_hash,routing_authority_json,hermes_status,observed_at) VALUES (?,?,?,?,?,?,?)",
                     (claim["ticket_id"], *values, now),
                 )
             ticket = conn.execute("SELECT state FROM tickets WHERE id=?", (claim["ticket_id"],)).fetchone()

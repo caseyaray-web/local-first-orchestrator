@@ -804,8 +804,8 @@ def run_command(args: argparse.Namespace) -> int:
         elif args.command=="project-generated":
             if not args.allow_board_writes: raise PermissionError("project-generated requires --allow-board-writes")
             if not args.hermes_executable or not args.board: raise ValueError("project-generated requires --hermes-executable and --board")
-            board=HermesBoardAdapter(executable=args.hermes_executable,board=args.board,allow_writes=True)
-            result=GeneratedProjectionWorker(ledger,board,worker_id="local-first-cli").deliver_one()
+            controller, _ = _registered_controller(ledger, args, allow_board_writes=True)
+            result=GeneratedProjectionWorker(ledger,controller.board,worker_id="local-first-cli").deliver_one()
             print(json.dumps(result.__dict__,sort_keys=True))
         elif args.command in {"correction-plan", "create-correction-plan"}:
             service=_correction_service(ledger,args)

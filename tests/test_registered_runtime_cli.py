@@ -6,11 +6,13 @@ import io
 import json
 import subprocess
 import unittest
+from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.cli import _ad_hoc_controller, _registered_controller, main as cli_main, register_cli
 from local_first_orchestrator.ledger import Ledger
+from local_first_orchestrator.generated_projection import GeneratedProjectionDeliveryResult
 from local_first_orchestrator.operator_config import ModelRegistration, OperatorConfig, save_operator_config
 
 
@@ -198,5 +200,26 @@ class RegisteredRuntimeCliTests(unittest.TestCase):
         )
         row = self.ledger.connection.execute("SELECT * FROM paid_approvals WHERE idempotency_key='approval-paid-1'").fetchone()
         self.assertEqual((row["feature_id"], row["purpose"], row["calls"], row["actor_id"]), ("F-paid", "integration_checkpoint", 1, "operator"))
+
+    def test_project_generated_uses_registered_route_and_canonical_repository(self) -> None:
+        result = GeneratedProjectionDeliveryResult("no_work")
+        with mock.patch("local_first_orchestrator.cli.GeneratedProjectionWorker") as worker, mock.patch("local_first_orchestrator.cli.HermesBoardAdapter") as adapter:
+            worker.return_value.deliver_one.return_value = result
+            adapter.return_value.is_fake = False
+            cli_main([
+                "--database", str(self.database), "--operator-config-path", str(self.config_path),
+                "--hermes-executable", "/bin/true", "--board", "isolated", "project-generated", "--allow-board-writes",
+            ])
+        kwargs = adapter.call_args.kwargs
+        self.assertEqual(kwargs["implementation_profile"], "registered-profile")
+        self.assertEqual(kwargs["canonical_repository"], self.repo.resolve())
+        self.assertIs(worker.call_args.args[1], adapter.return_value)
+
+    def test_project_generated_rejects_unregistered_real_routing(self) -> None:
+        with self.assertRaisesRegex(ValueError, "operator dashboard is not registered"):
+            cli_main([
+                "--database", str(self.database), "--operator-config-path", str(self.root / "missing.json"),
+                "--hermes-executable", "/bin/true", "--board", "isolated", "project-generated", "--allow-board-writes",
+            ])
 
 if __name__ == "__main__": unittest.main()

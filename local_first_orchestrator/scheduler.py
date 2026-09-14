@@ -1129,12 +1129,15 @@ class ProcessNextScheduler:
                         routing = verifier(task, expected_workspace_path=prepared_workspace)
                         routing["canonical_repository"] = str(self.native_dependency_release_repository)
                     else:
-                        routing = {"profile": getattr(task, "assignee", None), "workspace_kind": getattr(task, "workspace_kind", None), "workspace_path": prepared.get("workspace_path")}
+                        routing = {}
                     actual_parents = sorted(set(getattr(task, "parents", ())))
                     if actual_parents != expected_parents:
                         raise RuntimeError("native_dependency_release_reconciliation_required: Hermes graph diverged")
                     if HANDOFF_MARKER in str(getattr(task, "body", "")) and str(getattr(task, "status", "")) == "blocked":
-                        self.board.set_state(child_external_id, CanonicalState.READY_LOCAL, idempotency_key=f"native-release:{identity['parent_completion_hash']}")
+                        if self.native_dependency_release_profile is not None:
+                            self.board.set_state(child_external_id, CanonicalState.READY_LOCAL, idempotency_key=f"native-release:{identity['parent_completion_hash']}", expected_routing=routing)
+                        else:
+                            self.board.set_state(child_external_id, CanonicalState.READY_LOCAL, idempotency_key=f"native-release:{identity['parent_completion_hash']}")
                         task = self.board.get_task(child_external_id)
                     hermes_status = str(getattr(task, "status", ""))
                     if hermes_status != "ready":

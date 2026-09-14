@@ -167,10 +167,16 @@ class HermesBoardAdapter:
                 return MarkerLookup.FOUND
         return MarkerLookup.NOT_FOUND
 
-    def set_state(self, ticket_id: str, state: CanonicalState, *, idempotency_key: str) -> None:
+    def set_state(self, ticket_id: str, state: CanonicalState, *, idempotency_key: str, expected_routing: dict[str, str] | None = None) -> None:
         if not self.allow_writes:
             raise PermissionError("real board writes require --allow-board-writes")
         task = self.get_task(ticket_id)
+        if expected_routing is not None:
+            self.verify_native_release_task(task, expected_workspace_path=expected_routing["workspace_path"])
+            if {"profile": task.assignee, "workspace_kind": task.workspace_kind, "workspace_path": task.workspace_path} != {
+                "profile": expected_routing.get("profile"), "workspace_kind": expected_routing.get("workspace_kind"), "workspace_path": expected_routing.get("workspace_path")
+            }:
+                raise RuntimeError("native release authority mismatch")
         current = task.status
         handoff = HANDOFF_MARKER in task.body
         if state == CanonicalState.DONE:
