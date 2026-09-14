@@ -210,6 +210,26 @@ class PlanningCoordinatorTests(unittest.TestCase):
         run = self.ledger.connection.execute("select status,plan_id,ticket_ids_json from planning_runs").fetchone()
         self.assertEqual((run["status"], run["plan_id"], json.loads(run["ticket_ids_json"])), ("activated", pending.plan_id, ["TK-1"]))
         self.assertEqual(planner.calls, 1)
+        original_projection = self.ledger.connection.execute(
+            "SELECT event_id FROM board_projection_outbox WHERE ticket_id='TK-1' AND operation='create_microticket' AND superseded_at IS NULL"
+        ).fetchone()
+        self.ledger.connection.execute(
+            "UPDATE board_projection_outbox SET acknowledged_at=10,external_task_id='legacy-card' WHERE ticket_id='TK-1' AND event_id=?",
+            (original_projection["event_id"],),
+        )
+        recovery = self.ledger.recover_generated_projection(
+            ticket_id="TK-1",
+            superseded_event_id=int(original_projection["event_id"]),
+            superseded_external_task_id="legacy-card",
+            observed_status="blocked",
+            observed_snapshot_hash="a" * 64,
+            operator_id="test",
+            reason="exercise active-plan replay after projection recovery",
+        )
+        self.ledger.connection.execute(
+            "UPDATE board_projection_outbox SET acknowledged_at=11,external_task_id='replacement-card' WHERE ticket_id='TK-1' AND event_id=?",
+            (recovery["replacement_event_id"],),
+        )
         self.ledger.connection.execute("update tranches set status='planned' where feature_id=? and ordinal=0", (self.feature.id,))
         self.ledger.pause("test", reason="repair legacy active-plan tranche")
         replay = coordinator.activate_persisted_plan(self.feature, request_key=str(pending.request_key), plan_id=str(pending.plan_id))

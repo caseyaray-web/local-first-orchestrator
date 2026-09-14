@@ -184,11 +184,14 @@ def _activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decompos
    else:
     for generated in active_tranche.microtickets:
      durable_active=active_tranche if durable_active_id == active_tranche.id else Tranche(durable_active_id, active_tranche.ordinal, active_tranche.objective, active_tranche.capabilities, active_tranche.criterion_ids, active_tranche.microtickets)
-     expected=generated_card_payload(feature, durable_active, generated, repository_identity=str(repository_identity), repo_base_sha=str(repo_base_sha), repo_snapshot_hash=str(repo_snapshot_hash))
      ticket_row=c.execute('SELECT id FROM tickets WHERE id=? AND feature_id=? AND tranche_id=? AND state=?',(generated.ticket_id,feature.id,durable_active_id,'draft')).fetchone()
-     event_row=c.execute("SELECT id FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='generated_microticket_created' ORDER BY id DESC LIMIT 1",(generated.ticket_id,)).fetchone()
-     projection=c.execute('SELECT operation,payload_json,idempotency_key FROM board_projection_outbox WHERE ticket_id=? AND event_id=?',(generated.ticket_id,event_row['id'] if event_row else -1)).fetchone()
-     if ticket_row is None or event_row is None or projection is None or (projection['operation'],projection['payload_json'],projection['idempotency_key']) != ('create_microticket',json.dumps(expected,sort_keys=True,separators=(',',':')),expected['projection_key']):
+     projections=c.execute("SELECT event_id,operation,payload_json,idempotency_key FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket' AND superseded_at IS NULL",(generated.ticket_id,)).fetchall()
+     if ticket_row is None or len(projections) != 1:
+      raise ValueError('create projection conflicts')
+     projection=projections[0]
+     identity=ledger.generated_projection_identity(generated.ticket_id,int(projection['event_id']))
+     expected=generated_card_payload(feature, durable_active, generated, repository_identity=str(repository_identity), repo_base_sha=str(repo_base_sha), repo_snapshot_hash=str(repo_snapshot_hash), projection_key=identity.get('projection_key'), projection_generation=str(identity.get('projection_generation','v1')))
+     if (projection['operation'],projection['payload_json'],projection['idempotency_key']) != ('create_microticket',json.dumps(expected,sort_keys=True,separators=(',',':')),expected['projection_key']):
       raise ValueError('create projection conflicts')
    if existing['status'] != 'validated_pending_activation':
     canonical_ids=tuple(str(r['id']) for r in c.execute('SELECT t.id FROM tickets AS t WHERE t.feature_id=? AND t.tranche_id=? ORDER BY t.id',(feature.id,durable_active_id)).fetchall())
