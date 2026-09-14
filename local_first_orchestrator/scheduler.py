@@ -709,6 +709,8 @@ class ProcessNextScheduler:
         hermes_execution_runner: Callable[[], dict[str, Any] | None] | None = None,
         generated_activation_runner: Callable[[], dict[str, Any] | None] | None = None,
         native_dependency_release_prepare_runner: Callable[[str, str], dict[str, Any]] | None = None,
+        native_dependency_release_profile: str | None = None,
+        native_dependency_release_repository: str | None = None,
         implementation_runner: Callable[[str], dict[str, Any]] | None = None,
         validation_runner: Callable[[str], dict[str, Any]] | None = None,
         review_runner: Callable[[str], dict[str, Any]] | None = None,
@@ -739,6 +741,8 @@ class ProcessNextScheduler:
         self.hermes_execution_runner = hermes_execution_runner
         self.generated_activation_runner = generated_activation_runner
         self.native_dependency_release_prepare_runner = native_dependency_release_prepare_runner
+        self.native_dependency_release_profile = native_dependency_release_profile
+        self.native_dependency_release_repository = native_dependency_release_repository
         self.implementation_runner = implementation_runner
         self.validation_runner = validation_runner
         self.review_runner = review_runner
@@ -1094,7 +1098,9 @@ class ProcessNextScheduler:
                 return ProcessNextResult("completed", "native_dependency_graph", ticket_id, claim_id)
 
             release_claim = self.ledger.claim_next_scheduler_native_dependency_release(
-                execution_owner, lease_seconds=self.lease_seconds, now=now
+                execution_owner, lease_seconds=self.lease_seconds, now=now,
+                implementation_profile=self.native_dependency_release_profile,
+                canonical_repository=self.native_dependency_release_repository,
             ) if stage_allowed("native_dependency_release") else None
             if release_claim is not None:
                 claim_id = str(release_claim["claim_id"])
@@ -1113,6 +1119,17 @@ class ProcessNextScheduler:
                     if self.native_dependency_release_prepare_runner is not None:
                         prepared = self.native_dependency_release_prepare_runner(ticket_id, child_external_id)
                     task = self.board.get_task(child_external_id)
+                    if self.native_dependency_release_profile is not None:
+                        prepared_workspace = str(prepared.get("workspace_path") or "")
+                        if not prepared_workspace:
+                            raise RuntimeError("native_dependency_release_reconciliation_required: prepared workspace is missing")
+                        verifier = getattr(self.board, "verify_native_release_task", None)
+                        if verifier is None:
+                            raise RuntimeError("native_dependency_release_reconciliation_required: board authority verifier is missing")
+                        routing = verifier(task, expected_workspace_path=prepared_workspace)
+                        routing["canonical_repository"] = str(self.native_dependency_release_repository)
+                    else:
+                        routing = {"profile": getattr(task, "assignee", None), "workspace_kind": getattr(task, "workspace_kind", None), "workspace_path": prepared.get("workspace_path")}
                     actual_parents = sorted(set(getattr(task, "parents", ())))
                     if actual_parents != expected_parents:
                         raise RuntimeError("native_dependency_release_reconciliation_required: Hermes graph diverged")
@@ -1128,9 +1145,12 @@ class ProcessNextScheduler:
                         "actual_parent_external_ids": actual_parents,
                         "hermes_status": hermes_status,
                         "prepared_execution": prepared,
+                        "routing_authority": routing,
                     }
                     current = self.ledger.apply_scheduler_native_dependency_release_effect(
-                        claim_id, execution_owner, release_result, now=now
+                        claim_id, execution_owner, release_result, now=now,
+                        implementation_profile=self.native_dependency_release_profile,
+                        canonical_repository=self.native_dependency_release_repository,
                     )
                     release_result = json.loads(str(current["result_json"]))
                 self.ledger.complete_scheduler_claim(

@@ -2375,7 +2375,7 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=str(claim["ticket_id"]), event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": "native_dependency_graph", "result": result})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
-    def _native_dependency_release_identity(self, conn: sqlite3.Connection, ticket_id: str) -> dict[str, Any]:
+    def _native_dependency_release_identity(self, conn: sqlite3.Connection, ticket_id: str, *, implementation_profile: str | None = None, canonical_repository: str | None = None) -> dict[str, Any]:
         graph = conn.execute("SELECT * FROM native_dependency_graphs WHERE ticket_id=?", (ticket_id,)).fetchone()
         if graph is None:
             raise RuntimeError("native_dependency_release_reconciliation_required: verified graph missing")
@@ -2430,9 +2430,14 @@ class Ledger:
             "parent_completions": completions,
         }
         completion_hash = hashlib.sha256(json.dumps(completions, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        return {**core, "parent_completion_hash": completion_hash}
+        identity = {**core, "parent_completion_hash": completion_hash}
+        if implementation_profile is not None or canonical_repository is not None:
+            if not implementation_profile or not canonical_repository:
+                raise RuntimeError("native_dependency_release_reconciliation_required: routing authority is incomplete")
+            identity["routing_authority"] = {"profile": implementation_profile, "canonical_repository": str(canonical_repository)}
+        return identity
 
-    def claim_next_scheduler_native_dependency_release(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+    def claim_next_scheduler_native_dependency_release(self, owner: str, *, lease_seconds: int, now: int | None = None, implementation_profile: str | None = None, canonical_repository: str | None = None) -> dict[str, Any] | None:
         if not owner or lease_seconds < 1:
             raise ValueError("native dependency release claim requires owner and positive lease")
         now = self._now() if now is None else now
@@ -2444,7 +2449,7 @@ class Ledger:
                 (now,),
             ).fetchone()
             if replay is not None:
-                identity = self._native_dependency_release_identity(conn, str(replay["ticket_id"]))
+                identity = self._native_dependency_release_identity(conn, str(replay["ticket_id"]), implementation_profile=implementation_profile, canonical_repository=canonical_repository)
                 if json.loads(str(replay["candidate_identity_json"] or "{}")) != identity:
                     raise RuntimeError("native_dependency_release_reconciliation_required: claim identity drift")
                 changed = conn.execute(
@@ -2482,7 +2487,7 @@ class Ledger:
             for candidate in candidates:
                 ticket_id = str(candidate["id"])
                 try:
-                    identity = self._native_dependency_release_identity(conn, ticket_id)
+                    identity = self._native_dependency_release_identity(conn, ticket_id, implementation_profile=implementation_profile, canonical_repository=canonical_repository)
                 except RuntimeError:
                     continue
                 encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
@@ -2495,7 +2500,7 @@ class Ledger:
                 return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
             return None
 
-    def apply_scheduler_native_dependency_release_effect(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
+    def apply_scheduler_native_dependency_release_effect(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None, implementation_profile: str | None = None, canonical_repository: str | None = None) -> dict[str, Any]:
         now = self._now() if now is None else now
         encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
         with self._transaction() as conn:
@@ -2510,7 +2515,7 @@ class Ledger:
                 if claim["result_json"] != encoded:
                     raise RuntimeError("native dependency release completed result conflicts")
                 return dict(claim)
-            identity = self._native_dependency_release_identity(conn, str(claim["ticket_id"]))
+            identity = self._native_dependency_release_identity(conn, str(claim["ticket_id"]), implementation_profile=implementation_profile, canonical_repository=canonical_repository)
             if json.loads(str(claim["candidate_identity_json"] or "{}")) != identity or result.get("candidate_identity") != identity:
                 raise RuntimeError("native_dependency_release_reconciliation_required: result identity drift")
             graph = conn.execute("SELECT * FROM native_dependency_graphs WHERE ticket_id=?", (claim["ticket_id"],)).fetchone()

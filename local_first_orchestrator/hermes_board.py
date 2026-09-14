@@ -21,6 +21,8 @@ class ExternalTicket:
     workspace_path: str | None
     parents: tuple[str, ...] = ()
     children: tuple[str, ...] = ()
+    assignee: str | None = None
+    workspace_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -50,12 +52,16 @@ class HermesBoardAdapter:
     """Hermes CLI adapter. Writes require explicit opt-in; reads are always safe."""
     is_fake = False
 
-    def __init__(self, *, board: str, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run, executable: str, allow_writes: bool = False, timeout_seconds: int = 15, output_limit: int = 200_000) -> None:
+    def __init__(self, *, board: str, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run, executable: str, allow_writes: bool = False, timeout_seconds: int = 15, output_limit: int = 200_000, implementation_profile: str | None = None, canonical_repository: Path | None = None) -> None:
         if timeout_seconds < 1 or output_limit < 1: raise ValueError("positive process limits required")
         if not board or not board.replace("-", "").replace("_", "").isalnum(): raise ValueError("explicit board slug required")
         path=Path(executable)
         if not path.is_absolute() or not path.is_file(): raise ValueError("Hermes executable must be an absolute existing path")
+        if implementation_profile is not None and (not implementation_profile.strip() or any(c.isspace() for c in implementation_profile)):
+            raise ValueError("implementation profile must be a non-empty token")
         self.runner, self.executable, self.board, self.allow_writes, self.timeout_seconds, self.output_limit = runner, str(path), board, allow_writes, timeout_seconds, output_limit
+        self.implementation_profile = implementation_profile
+        self.canonical_repository = None if canonical_repository is None else Path(canonical_repository).expanduser().resolve()
 
     def _run(self, *args: str) -> Any:
         try:
@@ -86,6 +92,8 @@ class HermesBoardAdapter:
             row.get("workspace_path"),
             tuple(sorted(set(parents))),
             tuple(sorted(set(children))),
+            None if row.get("assignee") is None else str(row["assignee"]),
+            None if row.get("workspace_kind") is None else str(row["workspace_kind"]),
         )
 
     def execution_snapshot(self, task_id: str) -> ExternalExecutionSnapshot:
@@ -108,6 +116,8 @@ class HermesBoardAdapter:
             row.get("workspace_path"),
             tuple(sorted(set(parents))),
             tuple(sorted(set(children))),
+            None if row.get("assignee") is None else str(row["assignee"]),
+            None if row.get("workspace_kind") is None else str(row["workspace_kind"]),
         )
         parsed: list[ExternalExecutionRun] = []
         for item in runs:
@@ -200,10 +210,34 @@ class HermesBoardAdapter:
     def create_microticket(self, title: str, body: str, *, idempotency_key: str) -> str:
         if not self.allow_writes:
             raise PermissionError("real board writes require --allow-board-writes")
-        payload = self._run("create", title, "--body", body, "--workspace", "worktree", "--idempotency-key", idempotency_key, "--initial-status", "blocked", "--json")
+        args = ["create", title, "--body", body]
+        if self.implementation_profile is not None:
+            if self.canonical_repository is None:
+                raise RuntimeError("native release authority missing canonical repository")
+            args += ["--assignee", self.implementation_profile, "--workspace", f"worktree:{self.canonical_repository}"]
+        else:
+            args += ["--workspace", "worktree"]
+        args += ["--idempotency-key", idempotency_key, "--initial-status", "blocked", "--json"]
+        payload = self._run(*args)
         if not isinstance(payload, dict) or not isinstance(payload.get("id"), str) or not payload["id"]:
             raise RuntimeError("Hermes create JSON missing task id")
         return payload["id"]
+
+    def verify_native_release_task(self, task: ExternalTicket, *, expected_workspace_path: str) -> dict[str, str]:
+        """Verify the externally resolved handoff against operator-owned authority."""
+        if self.implementation_profile is None or self.canonical_repository is None:
+            raise RuntimeError("native release authority is not configured")
+        expected = str(Path(expected_workspace_path).expanduser().resolve())
+        actual = None if task.workspace_path is None else str(Path(task.workspace_path).expanduser().resolve())
+        expected_root = (self.canonical_repository / ".worktrees").resolve()
+        try:
+            Path(expected).relative_to(expected_root)
+        except ValueError as exc:
+            raise RuntimeError("native release authority mismatch") from exc
+        if task.assignee != self.implementation_profile or task.workspace_kind != "worktree" or actual != expected:
+            raise RuntimeError("native release authority mismatch")
+        assert actual is not None
+        return {"profile": self.implementation_profile, "workspace_kind": "worktree", "workspace_path": actual}
 
     def link_dependency(self, parent_task_id: str, child_task_id: str) -> None:
         if not self.allow_writes:

@@ -178,12 +178,12 @@ def _registered_controller(ledger: Ledger, args: argparse.Namespace, *, allow_bo
         review_timeout_seconds=runtime.review_timeout_seconds,
     )
     model.review_provider, model.review_model = config.review.provider, config.review.model
-    return LocalFirstController(ledger,_board_for_cli(args,allow_board_writes),runtime,local_model=model), config
+    return LocalFirstController(ledger,_board_for_cli(args,allow_board_writes, implementation_profile=config.implementation.profile, canonical_repository=config.canonical_repository),runtime,local_model=model), config
 
 
-def _board_for_cli(args: argparse.Namespace, allow_board_writes: bool):
+def _board_for_cli(args: argparse.Namespace, allow_board_writes: bool, *, implementation_profile: str | None = None, canonical_repository: Path | None = None):
     if getattr(args, "hermes_executable", None) and getattr(args, "board", None):
-        return HermesBoardAdapter(executable=args.hermes_executable, board=args.board, allow_writes=allow_board_writes)
+        return HermesBoardAdapter(executable=args.hermes_executable, board=args.board, allow_writes=allow_board_writes, implementation_profile=implementation_profile, canonical_repository=canonical_repository)
     # Offline construction keeps read-only/reconciliation paths usable while any
     # external board write fails closed until --board/--hermes-executable exist.
     from .comment_delivery import MarkerLookup
@@ -345,6 +345,8 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         hermes_execution_runner=reconcile_hermes_owned_execution,
         generated_activation_runner=activate_generated_work,
         native_dependency_release_prepare_runner=lambda ticket_id, external_task_id: ctl.prepare_hermes_dispatch_worktree(ticket_id, external_task_id),
+        native_dependency_release_profile=registered.implementation.profile,
+        native_dependency_release_repository=str(registered.canonical_repository),
         implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(
             ticket_id, repository=registered.canonical_repository
         ),
