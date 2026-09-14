@@ -2236,6 +2236,17 @@ class Ledger:
             raise RuntimeError("native_dependency_graph_reconciliation_required: invalid dependency contract") from exc
         if ticket_id in dependencies or not all(isinstance(value, str) and value for value in dependencies):
             raise RuntimeError("native_dependency_graph_reconciliation_required: invalid dependency contract")
+        if not dependencies:
+            root_projections = conn.execute("""
+                SELECT b.event_id FROM board_projection_outbox b
+                JOIN events e ON e.id=b.event_id AND e.entity_type='ticket' AND e.entity_id=?
+                  AND e.event_type IN ('generated_microticket_created','generated_microticket_projection_recovered')
+                WHERE b.ticket_id=? AND b.operation='create_microticket'
+                  AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL
+                  AND b.superseded_at IS NULL
+            """, (ticket_id, ticket_id)).fetchall()
+            if len(root_projections) != 1:
+                raise RuntimeError("native_dependency_graph_reconciliation_required: generated root provenance missing")
         child_external_id = self._resolve_external_task_id_in_transaction(conn, ticket_id)
         parents: list[dict[str, str]] = []
         for dependency_id in dependencies:
@@ -2288,8 +2299,11 @@ class Ledger:
                 WHERE t.state IN ('draft','ready_local')
                   AND json_valid(t.dependencies_json)=1
                   AND json_type(t.dependencies_json)='array'
-                  AND (json_array_length(t.dependencies_json)>0 OR EXISTS (
-                      SELECT 1 FROM board_projection_outbox root_projection
+                  AND (json_array_length(t.dependencies_json)>0 OR 1=(
+                      SELECT COUNT(*) FROM board_projection_outbox root_projection
+                      JOIN events root_event ON root_event.id=root_projection.event_id
+                        AND root_event.entity_type='ticket' AND root_event.entity_id=t.id
+                        AND root_event.event_type IN ('generated_microticket_created','generated_microticket_projection_recovered')
                       WHERE root_projection.ticket_id=t.id
                         AND root_projection.operation='create_microticket'
                         AND root_projection.acknowledged_at IS NOT NULL
@@ -2366,12 +2380,25 @@ class Ledger:
         if graph is None:
             raise RuntimeError("native_dependency_release_reconciliation_required: verified graph missing")
         try:
+            current_graph = self._native_dependency_graph_identity(conn, ticket_id)
+        except (KeyError, ValueError, RuntimeError) as exc:
+            raise RuntimeError("native_dependency_release_reconciliation_required: graph provenance drift") from exc
+        try:
             dependencies = tuple(json.loads(str(graph["local_dependency_ids_json"])))
             parent_external_ids = tuple(json.loads(str(graph["parent_external_ids_json"])))
         except (TypeError, json.JSONDecodeError) as exc:
             raise RuntimeError("native_dependency_release_reconciliation_required: graph evidence malformed") from exc
         if len(dependencies) != len(parent_external_ids):
             raise RuntimeError("native_dependency_release_reconciliation_required: graph evidence malformed")
+        expected_dependencies = tuple(row["ticket_id"] for row in current_graph["parents"])
+        expected_parent_external_ids = tuple(row["external_task_id"] for row in current_graph["parents"])
+        if (
+            dependencies != expected_dependencies
+            or parent_external_ids != expected_parent_external_ids
+            or str(graph["child_external_id"]) != str(current_graph["child_external_id"])
+            or str(graph["graph_hash"]) != str(current_graph["graph_hash"])
+        ):
+            raise RuntimeError("native_dependency_release_reconciliation_required: graph contract drift")
         completions: list[dict[str, Any]] = []
         for dependency_id, parent_external_id in zip(dependencies, parent_external_ids):
             dependency = conn.execute("SELECT state FROM tickets WHERE id=?", (dependency_id,)).fetchone()
@@ -2434,6 +2461,21 @@ class Ledger:
                 JOIN native_dependency_graphs g ON g.ticket_id=t.id
                 WHERE t.state IN ('draft','ready_local')
                   AND NOT EXISTS (SELECT 1 FROM native_dependency_releases r WHERE r.ticket_id=t.id)
+                  AND json_valid(t.dependencies_json)=1 AND json_type(t.dependencies_json)='array'
+                  AND json_valid(g.local_dependency_ids_json)=1 AND json_type(g.local_dependency_ids_json)='array'
+                  AND json_array_length(t.dependencies_json)=json_array_length(g.local_dependency_ids_json)
+                  AND NOT EXISTS (SELECT 1 FROM json_each(t.dependencies_json) requested
+                                  WHERE requested.value NOT IN (SELECT value FROM json_each(g.local_dependency_ids_json)))
+                  AND (json_array_length(t.dependencies_json)>0 OR 1=(
+                      SELECT COUNT(*) FROM board_projection_outbox root_projection
+                      JOIN events root_event ON root_event.id=root_projection.event_id
+                        AND root_event.entity_type='ticket' AND root_event.entity_id=t.id
+                        AND root_event.event_type IN ('generated_microticket_created','generated_microticket_projection_recovered')
+                      WHERE root_projection.ticket_id=t.id
+                        AND root_projection.operation='create_microticket'
+                        AND root_projection.acknowledged_at IS NOT NULL
+                        AND root_projection.external_task_id IS NOT NULL
+                        AND root_projection.superseded_at IS NULL))
                   AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage='native_dependency_release')
                 ORDER BY t.created_at,t.id LIMIT 100
             """).fetchall()

@@ -205,6 +205,45 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         assert release is not None
         self.assertEqual(release["parent_completion_hash"], hashlib.sha256(b"[]").hexdigest())
 
+    def test_empty_root_graph_requires_generated_projection_provenance(self) -> None:
+        root = self.ticket("triage-root")
+        with self.ledger._transaction() as conn:
+            event_id = self.ledger._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=root,
+                event_type="triage_child_created",
+                actor_id="controller",
+                to_state="draft",
+                payload={"ticket_id": root},
+            )
+        self.ledger.enqueue_generated_create_projection(root, event_id, {"ticket_id": root}, "triage-create")
+        self.ledger.connection.execute(
+            "UPDATE board_projection_outbox SET acknowledged_at=100,external_task_id='external-triage-root' WHERE ticket_id=? AND event_id=? AND operation='create_microticket'",
+            (root, event_id),
+        )
+
+        self.assertNotEqual(preview_next(self.ledger, now=100).next_stage, "native_dependency_graph")
+        self.assertIsNone(self.ledger.claim_next_scheduler_native_dependency_graph("native", lease_seconds=30, now=100))
+
+    def test_release_rejects_forged_empty_graph_for_dependent_ticket(self) -> None:
+        parent = self.ticket("forged-parent", state=CanonicalState.ACCEPTED)
+        child = self.ticket("forged-child", dependencies=(parent,))
+        empty_hash = hashlib.sha256(
+            json.dumps(
+                {"ticket_id": child, "child_external_id": "external-forged-child", "parents": []},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        self.ledger.connection.execute(
+            "INSERT INTO native_dependency_graphs(ticket_id,child_external_id,local_dependency_ids_json,parent_external_ids_json,graph_hash,verified_at) VALUES (?,?,?,?,?,100)",
+            (child, "external-forged-child", "[]", "[]", empty_hash),
+        )
+
+        self.assertNotEqual(preview_next(self.ledger, now=100).next_stage, "native_dependency_release")
+        self.assertIsNone(self.ledger.claim_next_scheduler_native_dependency_release("native", lease_seconds=30, now=100))
+
     def test_native_dependency_graph_and_release_use_hermes_as_readiness_authority(self) -> None:
         board = NativeBoard()
         parent = self.ticket("parent", state=CanonicalState.ACCEPTED)

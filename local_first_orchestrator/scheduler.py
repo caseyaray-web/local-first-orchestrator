@@ -444,8 +444,11 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
         WHERE t.state IN ('draft','ready_local')
           AND json_valid(t.dependencies_json)=1
           AND json_type(t.dependencies_json)='array'
-          AND (json_array_length(t.dependencies_json)>0 OR EXISTS (
-              SELECT 1 FROM board_projection_outbox root_projection
+          AND (json_array_length(t.dependencies_json)>0 OR 1=(
+              SELECT COUNT(*) FROM board_projection_outbox root_projection
+              JOIN events root_event ON root_event.id=root_projection.event_id
+                AND root_event.entity_type='ticket' AND root_event.entity_id=t.id
+                AND root_event.event_type IN ('generated_microticket_created','generated_microticket_projection_recovered')
               WHERE root_projection.ticket_id=t.id
                 AND root_projection.operation='create_microticket'
                 AND root_projection.acknowledged_at IS NOT NULL
@@ -478,6 +481,21 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
         SELECT t.id FROM tickets t JOIN native_dependency_graphs g ON g.ticket_id=t.id
         WHERE t.state IN ('draft','ready_local')
           AND NOT EXISTS (SELECT 1 FROM native_dependency_releases r WHERE r.ticket_id=t.id)
+          AND json_valid(t.dependencies_json)=1 AND json_type(t.dependencies_json)='array'
+          AND json_valid(g.local_dependency_ids_json)=1 AND json_type(g.local_dependency_ids_json)='array'
+          AND json_array_length(t.dependencies_json)=json_array_length(g.local_dependency_ids_json)
+          AND NOT EXISTS (SELECT 1 FROM json_each(t.dependencies_json) requested
+                          WHERE requested.value NOT IN (SELECT value FROM json_each(g.local_dependency_ids_json)))
+          AND (json_array_length(t.dependencies_json)>0 OR 1=(
+              SELECT COUNT(*) FROM board_projection_outbox root_projection
+              JOIN events root_event ON root_event.id=root_projection.event_id
+                AND root_event.entity_type='ticket' AND root_event.entity_id=t.id
+                AND root_event.event_type IN ('generated_microticket_created','generated_microticket_projection_recovered')
+              WHERE root_projection.ticket_id=t.id
+                AND root_projection.operation='create_microticket'
+                AND root_projection.acknowledged_at IS NOT NULL
+                AND root_projection.external_task_id IS NOT NULL
+                AND root_projection.superseded_at IS NULL))
           AND NOT EXISTS (
               SELECT 1 FROM json_each(g.local_dependency_ids_json) requested
               LEFT JOIN tickets dependency ON dependency.id=requested.value
