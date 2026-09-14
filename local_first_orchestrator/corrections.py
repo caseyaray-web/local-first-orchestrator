@@ -293,17 +293,23 @@ class CorrectionService:
     def activate(self, correction_ticket_id: str) -> str:
         """Bind a delivered correction to its current authoritative lineage."""
         rows = self.ledger.connection.execute("""
-            SELECT e.id,b.acknowledged_at,b.external_task_id,b.terminal_error
+            SELECT e.id,e.event_type,b.acknowledged_at,b.external_task_id,b.terminal_error,r.recovery_id
             FROM supplemental_correction_tickets t
-            JOIN events e ON e.entity_type='ticket' AND e.entity_id=t.ticket_id AND e.event_type='generated_microticket_created'
-            LEFT JOIN board_projection_outbox b ON b.ticket_id=t.ticket_id AND b.event_id=e.id AND b.operation='create_microticket'
+            JOIN board_projection_outbox b ON b.ticket_id=t.ticket_id AND b.operation='create_microticket' AND b.superseded_at IS NULL
+            JOIN events e ON e.id=b.event_id AND e.entity_type='ticket' AND e.entity_id=t.ticket_id
+                AND e.event_type IN ('generated_microticket_created','generated_microticket_projection_recovered')
+            LEFT JOIN generated_projection_recoveries r ON r.ticket_id=t.ticket_id AND r.replacement_event_id=e.id
             WHERE t.ticket_id=?
         """, (correction_ticket_id,)).fetchall()
         if len(rows) != 1:
             raise ValueError("correction generated provenance is missing or ambiguous")
         row = rows[0]
+        if row["event_type"] == "generated_microticket_projection_recovered" and row["recovery_id"] is None:
+            raise ValueError("correction generated provenance is missing or ambiguous")
         if row["acknowledged_at"] is None or not isinstance(row["external_task_id"], str) or not row["external_task_id"] or row["terminal_error"] is not None:
             raise ValueError("correction board materialization is incomplete")
+        if self.ledger.resolve_external_task_id(correction_ticket_id) != str(row["external_task_id"]):
+            raise ValueError("correction generated provenance is missing or ambiguous")
         head = self.admission_base(correction_ticket_id)
         expected = (str(self.repository), head)
         with self.ledger._transaction() as conn:

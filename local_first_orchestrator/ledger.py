@@ -3264,7 +3264,7 @@ class Ledger:
                 "SELECT t.id,t.state FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id "
                 "WHERE t.state IN (?,?) AND (t.lease_expires_at IS NULL OR t.lease_expires_at<=?) "
                 "AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND (c.stage='implementation' OR c.stage LIKE 'implementation:%') AND c.status='claimed') "
-                "AND NOT EXISTS (SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=t.id AND b.operation='create_microticket') "
+                "AND NOT EXISTS (SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=t.id AND b.operation='create_microticket' AND b.superseded_at IS NULL) "
                 "ORDER BY t.created_at,t.id LIMIT 1",
                 (CanonicalState.READY_LOCAL.value, CanonicalState.REPAIRING.value, now),
             ).fetchone()
@@ -5149,8 +5149,8 @@ class Ledger:
             if ticket is None:
                 raise RuntimeError("next_tranche_activation_reconciliation_required: successor ticket missing")
             external_id = self._resolve_external_task_id_in_transaction(conn, ticket_id)
-            projection = conn.execute("SELECT acknowledged_at,external_task_id FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket' ORDER BY queued_at DESC LIMIT 1", (ticket_id,)).fetchone()
-            if projection is None or projection["acknowledged_at"] is None or str(projection["external_task_id"] or "") != external_id:
+            projections = conn.execute("SELECT acknowledged_at,external_task_id FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket' AND superseded_at IS NULL", (ticket_id,)).fetchall()
+            if len(projections) != 1 or projections[0]["acknowledged_at"] is None or str(projections[0]["external_task_id"] or "") != external_id:
                 raise RuntimeError("next_tranche_activation_reconciliation_required: successor card projection not acknowledged")
             external_task_ids.append(external_id)
             dependencies = sorted(set(json.loads(str(ticket["dependencies_json"]))))

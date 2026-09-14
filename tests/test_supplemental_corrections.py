@@ -334,6 +334,24 @@ class SupplementalCorrectionTests(unittest.TestCase):
         self.assertEqual((replay.status, replay.starting_sha), ("already_activated", head2))
         self.assertEqual(self.ledger.runtime_binding(ticket_id)["starting_sha"], head2)
 
+    def test_correction_activation_refuses_superseded_projection_until_replacement_is_delivered(self):
+        ticket_id = self.delivered_correction()
+        event_id = self.ledger.connection.execute(
+            "SELECT event_id FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket'",
+            (ticket_id,),
+        ).fetchone()[0]
+        self.ledger.pause("operator", reason="pre-native recovery")
+        self.ledger.recover_generated_projection(
+            ticket_id=ticket_id, superseded_event_id=event_id,
+            superseded_external_task_id="external-correction", observed_status="blocked",
+            observed_snapshot_hash="a" * 64, operator_id="casey", reason="replace stale correction projection",
+        )
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            activate_generated_ticket(ticket_id, self._runtime_config(), self.ledger)
+        self.assertEqual(self.ledger.connection.execute(
+            "SELECT COUNT(*) FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)
+        ).fetchone()[0], 0)
+
     def test_public_generated_activation_rejects_missing_predecessor_ancestry(self):
         ticket_id = self.delivered_correction()
         self.git("update-ref", "refs/local-first/tranches/T/integration-head", self.base)

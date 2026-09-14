@@ -291,7 +291,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
         "SELECT t.id FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id "
         "WHERE t.state IN (?,?) AND (t.lease_expires_at IS NULL OR t.lease_expires_at<=?) "
         "AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND (c.stage='implementation' OR c.stage LIKE 'implementation:%') AND c.status='claimed') "
-        "AND NOT EXISTS (SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=t.id AND b.operation='create_microticket') "
+        "AND NOT EXISTS (SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=t.id AND b.operation='create_microticket' AND b.superseded_at IS NULL) "
         "ORDER BY t.created_at,t.id LIMIT 1",
         ("ready_local", "repairing", now),
     ).fetchone()

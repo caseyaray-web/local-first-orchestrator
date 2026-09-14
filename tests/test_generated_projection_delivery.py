@@ -15,7 +15,7 @@ from local_first_orchestrator.generated_projection import (
     GeneratedProjectionDeliveryPolicy,
     GeneratedProjectionWorker,
 )
-from local_first_orchestrator.hermes_board import ExternalExecutionSnapshot, ExternalTicket, HermesBoardAdapter
+from local_first_orchestrator.hermes_board import ExternalExecutionRun, ExternalExecutionSnapshot, ExternalTicket, HermesBoardAdapter
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.states import CanonicalState
 from tests.test_decomposition import Plans
@@ -570,6 +570,60 @@ class GeneratedProjectionDeliveryTests(unittest.TestCase):
         self.assertEqual(self.ledger.connection.execute(
             "SELECT COUNT(*) FROM generated_projection_recoveries WHERE ticket_id=?", (ticket_id,)
         ).fetchone()[0], 0)
+
+    def test_controller_refuses_blocked_snapshot_with_any_execution_evidence(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        self.assertEqual(self.worker().deliver_one().external_task_id, "1")
+        self.ledger.pause("operator", reason="pre-native recovery")
+
+        class ExecutedBoard:
+            is_fake = False
+            def execution_snapshot(self, external_task_id: str) -> ExternalExecutionSnapshot:
+                return ExternalExecutionSnapshot(
+                    task=ExternalTicket(external_task_id, ticket_id, "legacy", "blocked", None),
+                    session_id="executed-session", branch_name="executed-branch",
+                    started_at=None, completed_at=20,
+                    runs=(ExternalExecutionRun(7, "completed", "completed", None, 20, "finished", None, None),),
+                )
+
+        root = Path(self.temp.name)
+        controller = LocalFirstController(
+            self.ledger, ExecutedBoard(), RuntimeConfig(root, root / "worktrees", root / "artifacts", (root,))
+        )
+        with self.assertRaisesRegex(RuntimeError, "inert blocked"):
+            controller.recover_generated_projection(
+                ticket_id, event_id, operator_id="casey", reason="replace bypassed projection"
+            )
+        self.assertEqual(self.ledger.connection.execute(
+            "SELECT COUNT(*) FROM generated_projection_recoveries WHERE ticket_id=?", (ticket_id,)
+        ).fetchone()[0], 0)
+
+    def test_controller_accepts_only_the_exact_inert_local_first_safety_gate_shape(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        self.assertEqual(self.worker().deliver_one().external_task_id, "1")
+        self.ledger.pause("operator", reason="pre-native recovery")
+
+        class SafetyGateBoard:
+            is_fake = False
+            def execution_snapshot(self, external_task_id: str) -> ExternalExecutionSnapshot:
+                return ExternalExecutionSnapshot(
+                    task=ExternalTicket(external_task_id, ticket_id, "legacy", "blocked", None),
+                    session_id=None, branch_name=None, started_at=None, completed_at=None,
+                    runs=(ExternalExecutionRun(
+                        7, "blocked", "blocked", 100, 100,
+                        "Local First execution gate: authoritative dependencies/runtime authorization not satisfied",
+                        None, None, None,
+                    ),),
+                )
+
+        root = Path(self.temp.name)
+        controller = LocalFirstController(
+            self.ledger, SafetyGateBoard(), RuntimeConfig(root, root / "worktrees", root / "artifacts", (root,))
+        )
+        recovered = controller.recover_generated_projection(
+            ticket_id, event_id, operator_id="casey", reason="replace pre-native safety-gated projection"
+        )
+        self.assertEqual(recovered["observed_status"], "blocked")
 
     def test_recovery_refuses_multiple_current_create_identities_without_mutation(self) -> None:
         ticket_id, event_id = self.activate_one()

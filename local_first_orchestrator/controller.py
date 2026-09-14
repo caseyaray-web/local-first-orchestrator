@@ -143,11 +143,23 @@ class LocalFirstController:
             raise RuntimeError("generated projection recovery snapshot identity conflicts")
         if snapshot.task.status not in {"done", "blocked"}:
             raise RuntimeError("generated projection recovery requires a done or inert blocked card")
-        if snapshot.task.status == "blocked" and any(
-            run.profile is not None or run.worker_pid is not None or run.started_at is not None
-            for run in snapshot.runs
-        ):
-            raise RuntimeError("generated projection recovery refuses a blocked card with worker execution")
+        if snapshot.task.status == "blocked":
+            task_is_inert = all(value is None for value in (
+                snapshot.session_id, snapshot.branch_name, snapshot.started_at, snapshot.completed_at
+            ))
+            expected_gate = "Local First execution gate: authoritative dependencies/runtime authorization not satisfied"
+            runs_are_inert_safety_gates = all(
+                run.status == "blocked"
+                and run.outcome == "blocked"
+                and run.profile is None
+                and run.worker_pid is None
+                and run.metadata is None
+                and (run.started_at, run.ended_at) in {(None, None), (run.started_at, run.started_at)}
+                and str(run.summary or "") == expected_gate
+                for run in snapshot.runs
+            )
+            if not task_is_inert or not runs_are_inert_safety_gates:
+                raise RuntimeError("generated projection recovery requires an inert blocked card without execution evidence")
         snapshot_hash = canonical_sha256(asdict(snapshot))
         return self.ledger.recover_generated_projection(
             ticket_id=ticket_id,
@@ -176,7 +188,7 @@ class LocalFirstController:
         if require_handoff and snapshot.task.status != "blocked":
             raise RuntimeError("Hermes execution handoff is not blocked for reconciliation")
         rows = self.ledger.connection.execute(
-            "SELECT DISTINCT t.* FROM tickets t LEFT JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL "
+            "SELECT DISTINCT t.* FROM tickets t LEFT JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL AND b.superseded_at IS NULL "
             "WHERE t.external_id=? OR b.external_task_id=? ORDER BY t.created_at,t.id LIMIT 2",
             (external_task_id, external_task_id),
         ).fetchall()

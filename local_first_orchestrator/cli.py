@@ -315,9 +315,10 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
             raise RuntimeError("next tranche activation produced no successor tickets")
         snapshot_values: set[tuple[str, str, str]] = set()
         for ticket_id in ticket_ids:
-            projection = ledger.connection.execute("SELECT payload_json FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket' ORDER BY queued_at DESC LIMIT 1", (ticket_id,)).fetchone()
-            if projection is None:
+            projections = ledger.connection.execute("SELECT payload_json FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket' AND superseded_at IS NULL", (ticket_id,)).fetchall()
+            if len(projections) != 1:
                 raise RuntimeError("next tranche activation missing generated card projection")
+            projection = projections[0]
             payload = json.loads(str(projection["payload_json"]))
             body = str(payload.get("body") or "")
             marker = "```local-first-contract\\n"
