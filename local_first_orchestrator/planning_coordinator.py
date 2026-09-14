@@ -355,15 +355,14 @@ class PlanningCoordinator:
         row = self.ledger.append_feature_snapshot_revalidation(feature_id=feature_id, feature_contract_hash=feature.contract_hash, repository_identity=snap.repository_id, repo_base_sha=snap.base_sha, source_snapshot_hash=authority["snapshot_hash"], target_snapshot_hash=snap.snapshot_hash, generation=generation, revalidation_hash=revalidation_hash)
         return {**row, "status": "revalidated"}
 
-    def activate_persisted_plan(self, feature: FeatureContract, *, request_key: str, plan_id: str) -> PlanningOutcome:
+    def activate_persisted_plan(self, feature: FeatureContract, *, request_key: str, plan_id: str, require_paused: bool = False) -> PlanningOutcome:
         row = self.ledger.connection.execute("SELECT * FROM decomposition_plans WHERE id=?", (plan_id,)).fetchone()
         if row is None: raise ValueError("persisted decomposition plan missing")
         proposal = self._load_plan(row)
         structural = self.plan_validator.validate(feature, proposal)
         snap = self._snapshot_for_feature(feature, proposal.repo_base_sha)
         repository_validation = self.repository_validator.validate(proposal, snap)
-        activated_id, ticket_ids = activate_validated_plan(self.ledger, feature, proposal, structural, repository_validation)
-        self.ledger.finalize_planning_run_activation(request_key, plan_id=activated_id, ticket_ids=ticket_ids)
+        activated_id, ticket_ids = activate_validated_plan(self.ledger, feature, proposal, structural, repository_validation, request_key=request_key, expected_plan_id=plan_id, require_paused=require_paused)
         return PlanningOutcome("activated", feature.id, request_key, snap.snapshot_hash, activated_id, ticket_ids)
 
     def plan(self, feature: FeatureContract, *, repository: Path | None = None, feature_terms: tuple[str, ...] = ()) -> PlanningOutcome:

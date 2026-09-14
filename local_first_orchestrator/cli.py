@@ -703,7 +703,6 @@ def run_command(args: argparse.Namespace) -> int:
             print(json.dumps(coordinator.generate_plan_only(feature,repository=registered.canonical_repository).__dict__,sort_keys=True,default=str))
         elif args.command=="activate-feature-plan":
             if args.ad_hoc_runtime: raise ValueError("activate-feature-plan requires registered operator runtime")
-            if not ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]: raise RuntimeError("activate-feature-plan requires paused controller")
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
             row=ledger.connection.execute("SELECT contract_json FROM feature_contracts WHERE feature_id=?", (args.feature_id,)).fetchone()
             if row is None: raise ValueError("authoritative feature contract is missing")
@@ -714,7 +713,7 @@ def run_command(args: argparse.Namespace) -> int:
             allowed_paths=tuple((item["path"], item["disposition"]) for item in stored["spec"]["files"])
             planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class=args.planner_cost_class,provider=route.provider,model=route.model,profile=route.profile,allowed_paths=allowed_paths,role="decomposition",routing_source="operator-config.decomposition",sizing_provider=RuntimeMetricsStore(ledger).recommendation)
             coordinator=PlanningCoordinator(ledger, ctl.config, planner)
-            print(json.dumps(coordinator.activate_persisted_plan(feature,request_key=args.request_key,plan_id=args.plan_id).__dict__,sort_keys=True,default=str))
+            print(json.dumps(coordinator.activate_persisted_plan(feature,request_key=args.request_key,plan_id=args.plan_id,require_paused=True).__dict__,sort_keys=True,default=str))
         elif args.command=="revalidate-feature-snapshot":
             if args.ad_hoc_runtime: raise ValueError("feature snapshot revalidation requires registered operator runtime")
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)

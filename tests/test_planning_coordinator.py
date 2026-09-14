@@ -210,6 +210,40 @@ class PlanningCoordinatorTests(unittest.TestCase):
         run = self.ledger.connection.execute("select status,plan_id,ticket_ids_json from planning_runs").fetchone()
         self.assertEqual((run["status"], run["plan_id"], json.loads(run["ticket_ids_json"])), ("activated", pending.plan_id, ["TK-1"]))
         self.assertEqual(planner.calls, 1)
+        self.ledger.connection.execute("update tranches set status='planned' where feature_id=? and ordinal=0", (self.feature.id,))
+        self.ledger.pause("test", reason="repair legacy active-plan tranche")
+        replay = coordinator.activate_persisted_plan(self.feature, request_key=str(pending.request_key), plan_id=str(pending.plan_id), require_paused=True)
+        self.assertEqual(replay.activated_ticket_ids, ("TK-1",))
+        self.assertEqual(self.ledger.connection.execute("select status from tranches where feature_id=? and ordinal=0", (self.feature.id,)).fetchone()[0], "active")
+
+    def test_wrong_activation_request_key_fails_before_any_mutation(self):
+        from local_first_orchestrator.repository_snapshot import snapshot
+        planner = FakeLocalPlanner(make_plan(self.feature, snapshot(self.repo, self.sha, self.feature)))
+        coordinator = PlanningCoordinator(self.ledger, self.config, planner)
+        pending = coordinator.generate_plan_only(self.feature)
+
+        with self.assertRaisesRegex(ValueError, "planning run is missing"):
+            coordinator.activate_persisted_plan(self.feature, request_key="unbound-request-key", plan_id=str(pending.plan_id))
+
+        self.assertEqual(self.ledger.connection.execute("select status from decomposition_plans").fetchone()[0], "validated_pending_activation")
+        self.assertEqual(self.ledger.connection.execute("select count(*) from tickets").fetchone()[0], 0)
+        self.assertEqual(self.ledger.connection.execute("select status from planning_runs where request_key=?", (pending.request_key,)).fetchone()[0], "validated_pending_activation")
+
+    def test_required_pause_is_checked_inside_activation_transaction(self):
+        from local_first_orchestrator.repository_snapshot import snapshot
+        planner = FakeLocalPlanner(make_plan(self.feature, snapshot(self.repo, self.sha, self.feature)))
+        coordinator = PlanningCoordinator(self.ledger, self.config, planner)
+        pending = coordinator.generate_plan_only(self.feature)
+
+        self.ledger.resume("test", reason="prove transactional pause gate")
+        with self.assertRaisesRegex(RuntimeError, "requires paused controller"):
+            coordinator.activate_persisted_plan(self.feature, request_key=str(pending.request_key), plan_id=str(pending.plan_id), require_paused=True)
+
+        self.assertEqual(self.ledger.connection.execute("select status from decomposition_plans").fetchone()[0], "validated_pending_activation")
+        self.assertEqual(self.ledger.connection.execute("select count(*) from tickets").fetchone()[0], 0)
+        self.ledger.pause("test", reason="authorize bounded activation")
+        result = coordinator.activate_persisted_plan(self.feature, request_key=str(pending.request_key), plan_id=str(pending.plan_id), require_paused=True)
+        self.assertEqual(result.status, "activated")
 
     def test_activation_failure_does_not_finalize_planning_run(self):
         from unittest.mock import patch

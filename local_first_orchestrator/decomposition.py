@@ -120,7 +120,7 @@ def generated_card_payload(feature: FeatureContract, tranche: Tranche, ticket: M
   "projection_key": projection_key,
  }
 
-def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:DecompositionPlan,validation:PlanValidationResult,repository_validation:object|None=None)->tuple[str,tuple[str,...]]:
+def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:DecompositionPlan,validation:PlanValidationResult,repository_validation:object|None=None,*,request_key:str|None=None,expected_plan_id:str|None=None,require_paused:bool=False)->tuple[str,tuple[str,...]]:
  if not validation.passed or repository_validation is None or not getattr(repository_validation,'passed',False): raise ValueError('rejected plan cannot activate')
  repository_identity=getattr(repository_validation,'repository_identity',None)
  repo_base_sha=getattr(repository_validation,'base_sha',None)
@@ -150,6 +150,16 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
   if slot['status'] not in {'planned','active'}: raise ValueError('incompatible admitted tranche lifecycle')
   return slot
  with ledger._transaction() as c:
+  if require_paused and not c.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
+   raise RuntimeError('plan activation requires paused controller')
+  if request_key is not None:
+   requested_run=c.execute('SELECT feature_id,plan_id,status FROM planning_runs WHERE request_key=?',(request_key,)).fetchone()
+   if requested_run is None: raise ValueError('planning run is missing')
+   bound_plan_id=expected_plan_id or pid
+   if (requested_run['feature_id'],requested_run['plan_id']) != (feature.id,bound_plan_id): raise ValueError('planning run plan identity conflicts')
+   if requested_run['status'] not in {'validated_pending_activation','activated'}: raise ValueError('planning run state conflicts')
+   persisted_plan=c.execute('SELECT id FROM decomposition_plans WHERE id=? AND feature_id=? AND fingerprint=?',(bound_plan_id,feature.id,fp)).fetchone()
+   if persisted_plan is None: raise ValueError('planning run plan identity conflicts')
   old=c.execute('SELECT * FROM feature_contracts WHERE feature_id=?',(feature.id,)).fetchone()
   if old and old['contract_hash']!=feature.contract_hash: raise ValueError('conflicting feature contract')
   if old is not None:
@@ -179,6 +189,7 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
    if existing['status'] != 'validated_pending_activation':
     canonical_ids=tuple(str(r['id']) for r in c.execute('SELECT t.id FROM tickets AS t WHERE t.feature_id=? AND t.tranche_id=? ORDER BY t.id',(feature.id,durable_active_id)).fetchall())
     if not canonical_ids: raise ValueError('active decomposition plan has no materialized tickets')
+    if request_key is not None: ledger._finalize_planning_run_activation(c,request_key,plan_id=str(existing['id']),ticket_ids=canonical_ids)
     return str(existing['id']),canonical_ids
   for tr in plan.tranches:
    if tr.ordinal == 0:
@@ -214,8 +225,8 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
   activated_plan_id=str(existing['id']) if existing else pid
   if existing and existing['status'] == 'validated_pending_activation':
    c.execute("UPDATE decomposition_plans SET status='active', activated_at=? WHERE id=?", (now, activated_plan_id))
-  pending_runs=c.execute("SELECT request_key FROM planning_runs WHERE feature_id=? AND plan_id=? AND status='validated_pending_activation' ORDER BY request_key", (feature.id, activated_plan_id)).fetchall()
-  if len(pending_runs)>1: raise ValueError('ambiguous planning run for activation')
+  pending_runs=c.execute("SELECT request_key FROM planning_runs WHERE feature_id=? AND plan_id=? AND status='validated_pending_activation' ORDER BY request_key", (feature.id, activated_plan_id)).fetchall() if request_key is None else ({'request_key':request_key},)
+  if request_key is None and len(pending_runs)>1: raise ValueError('ambiguous planning run for activation')
   canonical_ids=tuple(str(r['id']) for r in c.execute('SELECT t.id FROM tickets AS t WHERE t.feature_id=? AND t.tranche_id=? ORDER BY t.id',(feature.id,durable_active_id)).fetchall())
   if pending_runs:
    ledger._finalize_planning_run_activation(c, pending_runs[0]['request_key'], plan_id=activated_plan_id, ticket_ids=canonical_ids)
