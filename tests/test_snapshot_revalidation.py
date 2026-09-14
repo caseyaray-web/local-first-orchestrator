@@ -40,6 +40,7 @@ class SnapshotRevalidationTests(unittest.TestCase):
         self.db = self.root / "ledger.db"
         self.ledger = Ledger(self.db)
         self.ledger.migrate()
+        self.ledger.pause("test", reason="authorize persisted plan activation test")
         self.spec = FeatureAdmissionSpec("F", "Feature", "Objective", "T0", "Tranche", self.base, (Criterion("A", "A"),), (), (), (), (FileDisposition("app.py", "modify"),))
         self.feature = self.spec.contract
         self.s1 = snapshot(self.repo, self.base, self.feature, limit=1)

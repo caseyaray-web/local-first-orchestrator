@@ -160,6 +160,8 @@ def _activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decompos
    if requested_run['status'] not in {'validated_pending_activation','activated'}: raise ValueError('planning run state conflicts')
    persisted_plan=c.execute('SELECT id FROM decomposition_plans WHERE id=? AND feature_id=? AND fingerprint=?',(bound_plan_id,feature.id,fp)).fetchone()
    if persisted_plan is None: raise ValueError('planning run plan identity conflicts')
+  elif c.execute('SELECT 1 FROM decomposition_plans WHERE feature_id=? AND fingerprint!=? LIMIT 1',(feature.id,fp)).fetchone() is not None:
+   raise ValueError('existing feature plan requires planning run authority')
   old=c.execute('SELECT * FROM feature_contracts WHERE feature_id=?',(feature.id,)).fetchone()
   if old and old['contract_hash']!=feature.contract_hash: raise ValueError('conflicting feature contract')
   if old is not None:
@@ -238,6 +240,6 @@ def _activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decompos
 def create_and_activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:DecompositionPlan,validation:PlanValidationResult,repository_validation:object|None=None)->tuple[str,tuple[str,...]]:
  return _activate_validated_plan(ledger,feature,plan,validation,repository_validation)
 
-def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:DecompositionPlan,validation:PlanValidationResult,repository_validation:object|None=None,*,request_key:str,expected_plan_id:str,require_paused:bool=False)->tuple[str,tuple[str,...]]:
+def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:DecompositionPlan,validation:PlanValidationResult,repository_validation:object|None=None,*,request_key:str,expected_plan_id:str)->tuple[str,tuple[str,...]]:
  if not request_key or not expected_plan_id: raise ValueError('planning run request key and plan identity required')
- return _activate_validated_plan(ledger,feature,plan,validation,repository_validation,request_key=request_key,expected_plan_id=expected_plan_id,require_paused=require_paused)
+ return _activate_validated_plan(ledger,feature,plan,validation,repository_validation,request_key=request_key,expected_plan_id=expected_plan_id,require_paused=True)

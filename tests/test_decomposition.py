@@ -33,6 +33,20 @@ class Plans(unittest.TestCase):
  def test_activation_is_atomic_and_idempotent(self):
   d=TemporaryDirectory(); l=Ledger(Path(d.name)/'x.db');l.migrate(); f=self.feature();p=self.plan();v=PlanValidator().validate(f,p); ok=self.repository_validation(p); one=create_and_activate_validated_plan(l,f,p,v,ok);two=create_and_activate_validated_plan(l,f,p,v,ok);self.assertEqual(one,two);self.assertEqual(l.connection.execute('select count(*) n from tickets').fetchone()['n'],2);self.assertEqual(l.connection.execute('select count(*) n from tranches').fetchone()['n'],2);self.assertEqual(l.connection.execute("select count(*) from board_projection_outbox where operation='create_microticket'").fetchone()[0],2);l.close();d.cleanup()
 
+ def test_unbound_activation_refuses_different_plan_when_feature_plan_exists(self):
+  d=TemporaryDirectory(); l=Ledger(Path(d.name)/'x.db');l.migrate(); f=self.feature(); original=self.plan(); create_and_activate_validated_plan(l,f,original,PlanValidator().validate(f,original),self.repository_validation(original))
+  attack_ticket=ticket('attack',('A','B'))
+  attack_tranche=Tranche('now',0,'now',('c',),('A','B'),(attack_ticket,))
+  attack=self.plan(criterion_coverage={'A':('attack',),'B':('attack',)},tranches=(attack_tranche,original.tranches[1]))
+  self.assertTrue(PlanValidator().validate(f,attack).passed)
+  before=(l.connection.execute('SELECT COUNT(*) FROM decomposition_plans').fetchone()[0],l.connection.execute('SELECT COUNT(*) FROM tickets').fetchone()[0],l.connection.execute('SELECT COUNT(*) FROM board_projection_outbox').fetchone()[0])
+  with self.assertRaisesRegex(ValueError,'existing feature plan requires planning run authority'):
+   create_and_activate_validated_plan(l,f,attack,PlanValidator().validate(f,attack),self.repository_validation(attack))
+  after=(l.connection.execute('SELECT COUNT(*) FROM decomposition_plans').fetchone()[0],l.connection.execute('SELECT COUNT(*) FROM tickets').fetchone()[0],l.connection.execute('SELECT COUNT(*) FROM board_projection_outbox').fetchone()[0])
+  self.assertEqual(after,before)
+  self.assertIsNone(l.connection.execute("SELECT 1 FROM tickets WHERE id='attack'").fetchone())
+  l.close();d.cleanup()
+
  def test_activation_reuses_and_activates_admitted_initial_tranche(self):
   d=TemporaryDirectory(); l=Ledger(Path(d.name)/'x.db');l.migrate(); f=self.feature();p=self.plan();v=PlanValidator().validate(f,p); ok=self.repository_validation(p)
   now=l._now()

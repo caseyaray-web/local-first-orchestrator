@@ -72,7 +72,7 @@ class PlanningCoordinatorTests(unittest.TestCase):
         subprocess.run(("git", "add", "."), cwd=self.repo, check=True)
         subprocess.run(("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "base"), cwd=self.repo, check=True)
         self.sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=self.repo, text=True, capture_output=True, check=True).stdout.strip()
-        self.ledger = Ledger(root / "ledger.db"); self.ledger.migrate()
+        self.ledger = Ledger(root / "ledger.db"); self.ledger.migrate(); self.ledger.pause("test", reason="authorize persisted plan activation tests")
         self.config = RuntimeConfig(self.repo, root / "worktrees", root / "artifacts", (self.repo,))
         self.feature = make_feature(self.sha)
         admitted = FeatureAdmissionSpec(self.feature.id, self.feature.title, "T-1", "Implement the guard", self.feature.objective, self.sha, self.feature.acceptance_criteria, (), (), (), (FileDisposition("app.py", "modify"), FileDisposition("test_app.py", "modify")), None)
@@ -212,7 +212,7 @@ class PlanningCoordinatorTests(unittest.TestCase):
         self.assertEqual(planner.calls, 1)
         self.ledger.connection.execute("update tranches set status='planned' where feature_id=? and ordinal=0", (self.feature.id,))
         self.ledger.pause("test", reason="repair legacy active-plan tranche")
-        replay = coordinator.activate_persisted_plan(self.feature, request_key=str(pending.request_key), plan_id=str(pending.plan_id), require_paused=True)
+        replay = coordinator.activate_persisted_plan(self.feature, request_key=str(pending.request_key), plan_id=str(pending.plan_id))
         self.assertEqual(replay.activated_ticket_ids, ("TK-1",))
         self.assertEqual(self.ledger.connection.execute("select status from tranches where feature_id=? and ordinal=0", (self.feature.id,)).fetchone()[0], "active")
 
@@ -237,12 +237,12 @@ class PlanningCoordinatorTests(unittest.TestCase):
 
         self.ledger.resume("test", reason="prove transactional pause gate")
         with self.assertRaisesRegex(RuntimeError, "requires paused controller"):
-            coordinator.activate_persisted_plan(self.feature, request_key=str(pending.request_key), plan_id=str(pending.plan_id), require_paused=True)
+            coordinator.activate_persisted_plan(self.feature, request_key=str(pending.request_key), plan_id=str(pending.plan_id))
 
         self.assertEqual(self.ledger.connection.execute("select status from decomposition_plans").fetchone()[0], "validated_pending_activation")
         self.assertEqual(self.ledger.connection.execute("select count(*) from tickets").fetchone()[0], 0)
         self.ledger.pause("test", reason="authorize bounded activation")
-        result = coordinator.activate_persisted_plan(self.feature, request_key=str(pending.request_key), plan_id=str(pending.plan_id), require_paused=True)
+        result = coordinator.activate_persisted_plan(self.feature, request_key=str(pending.request_key), plan_id=str(pending.plan_id))
         self.assertEqual(result.status, "activated")
 
     def test_activation_failure_does_not_finalize_planning_run(self):

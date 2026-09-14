@@ -713,7 +713,7 @@ def run_command(args: argparse.Namespace) -> int:
             allowed_paths=tuple((item["path"], item["disposition"]) for item in stored["spec"]["files"])
             planner=LocalDecompositionPlanner(executable=args.planner_executable,cost_class=args.planner_cost_class,provider=route.provider,model=route.model,profile=route.profile,allowed_paths=allowed_paths,role="decomposition",routing_source="operator-config.decomposition",sizing_provider=RuntimeMetricsStore(ledger).recommendation)
             coordinator=PlanningCoordinator(ledger, ctl.config, planner)
-            print(json.dumps(coordinator.activate_persisted_plan(feature,request_key=args.request_key,plan_id=args.plan_id,require_paused=True).__dict__,sort_keys=True,default=str))
+            print(json.dumps(coordinator.activate_persisted_plan(feature,request_key=args.request_key,plan_id=args.plan_id).__dict__,sort_keys=True,default=str))
         elif args.command=="revalidate-feature-snapshot":
             if args.ad_hoc_runtime: raise ValueError("feature snapshot revalidation requires registered operator runtime")
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
