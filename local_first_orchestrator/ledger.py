@@ -1866,11 +1866,24 @@ class Ledger:
 
     def next_scheduler_reconciliation(self, *, now: int | None = None):
         now = self._now() if now is None else now
-        row = self.connection.execute(
-            "SELECT claim_id FROM scheduler_stage_claims WHERE status='claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
+        rows = self.connection.execute(
+            "SELECT claim_id,stage,candidate_identity_json FROM scheduler_stage_claims WHERE status='claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at<=? ORDER BY created_at,claim_id",
             (now,),
-        ).fetchone()
-        return None if row is None else self.scheduler_reconciliation(str(row["claim_id"]))
+        ).fetchall()
+        for row in rows:
+            if str(row["stage"]) == "tranche_checkpoint":
+                identity = json.loads(str(row["candidate_identity_json"] or "{}"))
+                try:
+                    current = self._tranche_checkpoint_identity(self.connection, str(identity.get("tranche_id") or ""))
+                except RuntimeError:
+                    pass
+                else:
+                    if self._tranche_checkpoint_h1_conflicts(self.connection, current):
+                        # The tranche-checkpoint claimer durably finalizes this
+                        # stale H1-generation claim instead of replaying it.
+                        continue
+            return self.scheduler_reconciliation(str(row["claim_id"]))
+        return None
 
     def _triage_claim_identity(self, row: sqlite3.Row | dict[str, Any], *, attempt_number: int, failure_evidence: str, triage_execution_policy_hash: str) -> dict[str, Any]:
         if not triage_execution_policy_hash:
@@ -5349,11 +5362,35 @@ class Ledger:
             if replay is not None:
                 identity = json.loads(str(replay["candidate_identity_json"] or "{}"))
                 current = self._tranche_checkpoint_identity(conn, str(identity.get("tranche_id") or ""))
-                if identity != current:
+                if self._tranche_checkpoint_h1_conflicts(conn, current):
+                    reason = "tranche checkpoint superseded by post-H1 completion authority"
+                    result = json.dumps({
+                        "status": "failed",
+                        "reason": reason,
+                        "claim_id": str(replay["claim_id"]),
+                        "tranche_id": str(current["tranche_id"]),
+                    }, sort_keys=True, separators=(",", ":"))
+                    conn.execute(
+                        "UPDATE scheduler_stage_claims SET status='failed',lease_owner=NULL,lease_expires_at=NULL,last_error=?,result_json=?,finalized_at=?,updated_at=? WHERE claim_id=? AND status='claimed'",
+                        (reason, result, now, now, replay["claim_id"]),
+                    )
+                    self._append_event(
+                        conn,
+                        entity_type="tranche",
+                        entity_id=str(current["tranche_id"]),
+                        event_type="scheduler_stage_reconciled",
+                        actor_id=owner,
+                        payload={"claim_id": str(replay["claim_id"]), "stage": "tranche_checkpoint", "outcome": "failed", "reason": reason},
+                    )
+                    replay = None
+                if replay is None:
+                    pass
+                elif identity != current:
                     raise RuntimeError("tranche_checkpoint_reconciliation_required: claim identity drift")
-                if conn.execute("UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?", (owner,now+lease_seconds,now,replay["claim_id"],now)).rowcount != 1:
+                elif conn.execute("UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?", (owner,now+lease_seconds,now,replay["claim_id"],now)).rowcount != 1:
                     return None
-                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
+                elif replay is not None:
+                    return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
             rows = conn.execute("SELECT id FROM tranches WHERE status='active' AND NOT EXISTS (SELECT 1 FROM tranche_checkpoint_evidence c WHERE c.tranche_id=tranches.id) ORDER BY feature_id,ordinal,id").fetchall()
             for row in rows:
                 try:
@@ -5395,7 +5432,7 @@ class Ledger:
         if existing is None:
             return False
         expected = (
-            identity["planning_base_sha"],
+            identity["tranche_base_sha"],
             identity["accepted_commit_shas"][-1],
             json.dumps(identity["ticket_ids"], separators=(",", ":")),
             json.dumps(identity["accepted_commit_shas"], separators=(",", ":")),

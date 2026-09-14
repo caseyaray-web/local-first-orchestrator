@@ -491,7 +491,16 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
         (now,),
     ).fetchone()
     if tranche_checkpoint_replay is not None:
-        return ProcessNextPreview(next_stage="tranche_checkpoint", ticket_id=str(tranche_checkpoint_replay["ticket_id"]), would_execute=True)
+        replay_ticket_id = str(tranche_checkpoint_replay["ticket_id"])
+        replay_tranche = ledger.connection.execute("SELECT tranche_id FROM tickets WHERE id=?", (replay_ticket_id,)).fetchone()
+        if replay_tranche is None:
+            return ProcessNextPreview(next_stage="tranche_checkpoint", ticket_id=replay_ticket_id, would_execute=True)
+        try:
+            replay_identity = ledger._tranche_checkpoint_identity(ledger.connection, str(replay_tranche["tranche_id"]))
+        except RuntimeError:
+            return ProcessNextPreview(next_stage="tranche_checkpoint", ticket_id=replay_ticket_id, would_execute=True)
+        if not ledger._tranche_checkpoint_h1_conflicts(ledger.connection, replay_identity):
+            return ProcessNextPreview(next_stage="tranche_checkpoint", ticket_id=replay_ticket_id, would_execute=True)
     tranche_checkpoint_rows = ledger.connection.execute("""
         SELECT t.id AS ticket_id FROM tranches tr
         JOIN tickets t ON t.tranche_id=tr.id

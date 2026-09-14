@@ -161,6 +161,81 @@ class SchedulerTrancheCheckpointTests(unittest.TestCase):
         self.assertEqual(completion["accepted_ticket_ids_json"], json.dumps([self.ticket], separators=(",", ":")))
         self.assertIsNone(self.ledger.tranche_checkpoint("T"))
 
+    def test_matching_h1_uses_tranche_base_even_when_active_plan_base_differs(self) -> None:
+        from local_first_orchestrator.tranche_completion import completion_evidence
+
+        self.ledger.record_tranche_completion(completion_evidence(self.ledger, self.repo, "T"))
+        self.ledger.connection.execute("UPDATE decomposition_plans SET repo_base_sha=? WHERE id='P'", (self.commit,))
+
+        preview = preview_next(self.ledger, now=100)
+
+        self.assertEqual((preview.next_stage, preview.ticket_id), ("tranche_checkpoint", self.ticket))
+        self.assertIsNotNone(self.ledger.claim_next_scheduler_tranche_checkpoint("checkpoint", lease_seconds=30, now=100))
+
+    def test_expired_claim_is_durably_failed_when_later_correction_conflicts_with_h1(self) -> None:
+        from local_first_orchestrator.tranche_completion import completion_evidence
+
+        self.ledger.record_tranche_completion(completion_evidence(self.ledger, self.repo, "T"))
+        claim = self.ledger.claim_next_scheduler_tranche_checkpoint("crashed", lease_seconds=1, now=100)
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        from local_first_orchestrator.corrections import AcceptedPredecessor, CorrectionService, CorrectionTicketSpec, SupplementalCorrectionPlan
+        from local_first_orchestrator.ticket import PatchBudget, VerificationProfile
+
+        correction_service = CorrectionService(self.ledger, self.repo)
+        correction_plan = correction_service.create_plan(SupplementalCorrectionPlan(
+            feature_id="F",
+            tranche_id="T",
+            source_kind="operator_review",
+            source_reference="post-H1-review",
+            finding_fingerprint="post-h1-correction",
+            finding_summary="accepted evidence requires a supplemental correction",
+            predecessors=(AcceptedPredecessor(self.ticket, self.commit),),
+            tickets=(CorrectionTicketSpec(
+                objective="Correct the accepted tranche evidence.",
+                criterion_ids=("AC",),
+                primary_symbol="app.py::VALUE",
+                allowed_existing_files=("app.py",),
+                new_test_files=(),
+                forbidden_changes=("none",),
+                patch_budget=PatchBudget(max_files=1, max_changed_lines=10),
+                verification=VerificationProfile((("python", "-c", "pass"),)),
+                risk="low",
+                review_required=True,
+                max_attempts=1,
+                dependencies=(),
+                relevant_symbols=("VALUE",),
+                acceptance_criteria=("correction is accepted",),
+                non_goals=("no unrelated changes",),
+                red_evidence="correction evidence fails before repair",
+            ),),
+            repository_identity=str(self.repo),
+            base_sha=self.base,
+            snapshot_hash="post-h1-snapshot",
+        ))
+        correction = correction_service.materialize(correction_plan.correction_plan_id).ticket_id
+        self.ledger.connection.execute("UPDATE tickets SET state=? WHERE id=?", (CanonicalState.DONE.value, correction))
+        self.git("commit", "--allow-empty", "-qm", "accepted correction")
+        correction_commit = self.rev("HEAD")
+        self.git("update-ref", "refs/local-first/tranches/T/integration-head", correction_commit)
+        self.ledger.record_accepted_evidence(correction, correction_commit, "diff", "validated")
+
+        preview = preview_next(self.ledger, now=102)
+        replay = self.ledger.claim_next_scheduler_tranche_checkpoint("restart", lease_seconds=30, now=102)
+
+        self.assertNotEqual(preview.next_stage, "tranche_checkpoint")
+        self.assertIsNone(replay)
+        stored = self.ledger.scheduler_claim(str(claim["claim_id"]))
+        self.assertEqual(stored["status"], "failed")
+        self.assertEqual(stored["last_error"], "tranche checkpoint superseded by post-H1 completion authority")
+        self.assertEqual(stored["finalized_at"], 102)
+        events = self.ledger.connection.execute(
+            "SELECT payload_json FROM events WHERE entity_type='tranche' AND entity_id='T' AND event_type='scheduler_stage_reconciled'"
+        ).fetchall()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(json.loads(events[0]["payload_json"])["claim_id"], claim["claim_id"])
+        self.assertIsNone(self.ledger.tranche_checkpoint("T"))
+
     def test_checkpoint_materializes_final_commit_when_attempt_worktree_is_gone(self) -> None:
         self.git("worktree", "remove", "--force", str(self.worktree))
         self.assertFalse(self.worktree.exists())
