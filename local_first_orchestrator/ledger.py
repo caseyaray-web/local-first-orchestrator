@@ -5360,6 +5360,8 @@ class Ledger:
                     identity = self._tranche_checkpoint_identity(conn, str(row["id"]))
                 except RuntimeError:
                     continue
+                if self._tranche_checkpoint_h1_conflicts(conn, identity):
+                    continue
                 claim_ticket_id = str(identity["ticket_ids"][-1])
                 if conn.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND stage='tranche_checkpoint'", (claim_ticket_id,)).fetchone():
                     continue
@@ -5383,6 +5385,24 @@ class Ledger:
         if not isinstance(commands, list) or any(not isinstance(c, list) or not c or not all(isinstance(x,str) and x for x in c) for c in commands):
             raise RuntimeError("tranche_checkpoint_reconciliation_required: integration commands malformed")
         return {"tranche_id":tranche_id,"feature_id":str(tranche["feature_id"]),"tranche_base_sha":str(tranche["base_sha"]),"repository_identity":str(plan["repository_identity"]),"planning_base_sha":str(plan["repo_base_sha"]),"planning_snapshot_hash":str(plan["repo_snapshot_hash"]),"planning_snapshot_manifest_json":str(plan["repo_snapshot_manifest_json"]),"integration_commands":commands,"ticket_ids":[str(r["id"]) for r in tickets],"accepted_commit_shas":[str(r["accepted_commit_sha"]) for r in tickets]}
+
+    def _tranche_checkpoint_h1_conflicts(self, conn: sqlite3.Connection, identity: dict[str, Any]) -> bool:
+        existing = conn.execute(
+            "SELECT root_planning_sha,final_integration_sha,accepted_ticket_ids_json,accepted_commit_shas_json "
+            "FROM tranche_completion_evidence WHERE tranche_id=?",
+            (identity["tranche_id"],),
+        ).fetchone()
+        if existing is None:
+            return False
+        expected = (
+            identity["planning_base_sha"],
+            identity["accepted_commit_shas"][-1],
+            json.dumps(identity["ticket_ids"], separators=(",", ":")),
+            json.dumps(identity["accepted_commit_shas"], separators=(",", ":")),
+        )
+        return tuple(existing[key] for key in (
+            "root_planning_sha", "final_integration_sha", "accepted_ticket_ids_json", "accepted_commit_shas_json"
+        )) != expected
 
     def apply_scheduler_tranche_checkpoint_effect(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
         now = self._now() if now is None else now

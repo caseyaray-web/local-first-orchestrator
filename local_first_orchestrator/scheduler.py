@@ -492,7 +492,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     ).fetchone()
     if tranche_checkpoint_replay is not None:
         return ProcessNextPreview(next_stage="tranche_checkpoint", ticket_id=str(tranche_checkpoint_replay["ticket_id"]), would_execute=True)
-    tranche_checkpoint = ledger.connection.execute("""
+    tranche_checkpoint_rows = ledger.connection.execute("""
         SELECT t.id AS ticket_id FROM tranches tr
         JOIN tickets t ON t.tranche_id=tr.id
         JOIN decomposition_plans p ON p.feature_id=tr.feature_id AND p.status='active'
@@ -503,10 +503,19 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
           AND NOT EXISTS (SELECT 1 FROM tranche_checkpoint_evidence c WHERE c.tranche_id=tr.id)
           AND NOT EXISTS (SELECT 1 FROM tickets x LEFT JOIN accepted_evidence ae ON ae.ticket_id=x.id WHERE x.tranche_id=tr.id AND (x.state!='done' OR ae.ticket_id IS NULL))
           AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.stage='tranche_checkpoint' AND json_extract(c.candidate_identity_json,'$.tranche_id')=tr.id)
-        ORDER BY tr.feature_id,tr.ordinal,tr.id,t.created_at DESC,t.id DESC LIMIT 1
-    """).fetchone()
-    if tranche_checkpoint is not None:
-        return ProcessNextPreview(next_stage="tranche_checkpoint", ticket_id=str(tranche_checkpoint["ticket_id"]), would_execute=True)
+        ORDER BY tr.feature_id,tr.ordinal,tr.id,t.created_at DESC,t.id DESC
+    """).fetchall()
+    for tranche_checkpoint in tranche_checkpoint_rows:
+        ticket_id = str(tranche_checkpoint["ticket_id"])
+        tranche_id_row = ledger.connection.execute("SELECT tranche_id FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+        if tranche_id_row is None:
+            continue
+        try:
+            identity = ledger._tranche_checkpoint_identity(ledger.connection, str(tranche_id_row["tranche_id"]))
+        except RuntimeError:
+            continue
+        if not ledger._tranche_checkpoint_h1_conflicts(ledger.connection, identity):
+            return ProcessNextPreview(next_stage="tranche_checkpoint", ticket_id=ticket_id, would_execute=True)
 
     paid_checkpoint_replay = ledger.connection.execute(
         "SELECT ticket_id FROM scheduler_stage_claims WHERE stage='paid_checkpoint' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",

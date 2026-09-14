@@ -128,6 +128,39 @@ class SchedulerTrancheCheckpointTests(unittest.TestCase):
         self.assertEqual(self.ledger.connection.execute("SELECT status FROM tranches WHERE id='T'").fetchone()[0], "active")
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM tickets WHERE tranche_id='T'").fetchone()[0], 1)
 
+    def test_existing_h1_with_later_accepted_correction_is_not_recheckpointed(self) -> None:
+        from local_first_orchestrator.tranche_completion import completion_evidence
+
+        self.ledger.record_tranche_completion(completion_evidence(self.ledger, self.repo, "T"))
+        correction = self.ledger.create_ticket(title="correction", state=CanonicalState.DONE, contract={
+            "objective": "correct tranche",
+            "criterion_ids": ["AC"],
+            "primary_symbol": "app.py::VALUE",
+            "allowed_files": ["app.py"],
+            "forbidden_changes": ["none"],
+            "patch_budget": {"max_files": 1, "max_changed_lines": 10},
+            "verification": {"commands": [["python", "-c", "pass"]]},
+            "risk": "low",
+            "review_required": True,
+            "max_attempts": 1,
+            "dependencies": [],
+        })
+        self.ledger.connection.execute("UPDATE tickets SET feature_id='F',tranche_id='T' WHERE id=?", (correction,))
+        self.git("commit", "--allow-empty", "-qm", "accepted correction")
+        correction_commit = self.rev("HEAD")
+        self.git("update-ref", "refs/local-first/tranches/T/integration-head", correction_commit)
+        self.ledger.record_accepted_evidence(correction, correction_commit, "diff", "validated")
+
+        preview = preview_next(self.ledger, now=100)
+
+        self.assertNotEqual(preview.next_stage, "tranche_checkpoint")
+        self.assertIsNone(self.ledger.claim_next_scheduler_tranche_checkpoint("checkpoint", lease_seconds=30, now=100))
+        completion = self.ledger.tranche_completion("T")
+        self.assertIsNotNone(completion)
+        assert completion is not None
+        self.assertEqual(completion["accepted_ticket_ids_json"], json.dumps([self.ticket], separators=(",", ":")))
+        self.assertIsNone(self.ledger.tranche_checkpoint("T"))
+
     def test_checkpoint_materializes_final_commit_when_attempt_worktree_is_gone(self) -> None:
         self.git("worktree", "remove", "--force", str(self.worktree))
         self.assertFalse(self.worktree.exists())
