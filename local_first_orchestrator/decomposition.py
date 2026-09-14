@@ -190,7 +190,7 @@ def _activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decompos
       raise ValueError('create projection conflicts')
      projection=projections[0]
      identity=ledger.generated_projection_identity(generated.ticket_id,int(projection['event_id']))
-     expected=generated_card_payload(feature, durable_active, generated, repository_identity=str(repository_identity), repo_base_sha=str(repo_base_sha), repo_snapshot_hash=str(repo_snapshot_hash), projection_key=identity.get('projection_key'), projection_generation=str(identity.get('projection_generation','v1')))
+     expected=generated_card_payload(feature, durable_active, generated, repository_identity=str(identity['repository_identity']), repo_base_sha=str(identity['repo_base_sha']), repo_snapshot_hash=str(identity['repo_snapshot_hash']), projection_key=identity.get('projection_key'), projection_generation=str(identity.get('projection_generation','v1')))
      if (projection['operation'],projection['payload_json'],projection['idempotency_key']) != ('create_microticket',json.dumps(expected,sort_keys=True,separators=(',',':')),expected['projection_key']):
       raise ValueError('create projection conflicts')
    if existing['status'] != 'validated_pending_activation':
