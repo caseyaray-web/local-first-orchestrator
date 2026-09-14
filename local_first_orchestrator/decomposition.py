@@ -158,6 +158,8 @@ def activate_validated_plan(ledger:Ledger,feature:FeatureContract,plan:Decomposi
   active_tranche=next(tr for tr in plan.tranches if tr.ordinal == 0)
   resolved_active=resolve(c,active_tranche)
   durable_active_id=str(resolved_active['id']) if resolved_active is not None else active_tranche.id
+  if resolved_active is not None and resolved_active['status'] == 'planned':
+   c.execute("UPDATE tranches SET status='active' WHERE id=?", (durable_active_id,))
   existing=c.execute('SELECT * FROM decomposition_plans WHERE fingerprint=?',(fp,)).fetchone()
   if existing:
    if tuple(existing[x] for x in ('repository_identity','repo_base_sha','repo_snapshot_hash','repo_snapshot_manifest_json')) != (repository_identity,repo_base_sha,repo_snapshot_hash,repo_snapshot_manifest_json): raise ValueError('repository provenance conflicts')

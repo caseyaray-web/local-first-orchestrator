@@ -33,6 +33,22 @@ class Plans(unittest.TestCase):
  def test_activation_is_atomic_and_idempotent(self):
   d=TemporaryDirectory(); l=Ledger(Path(d.name)/'x.db');l.migrate(); f=self.feature();p=self.plan();v=PlanValidator().validate(f,p); ok=self.repository_validation(p); one=activate_validated_plan(l,f,p,v,ok);two=activate_validated_plan(l,f,p,v,ok);self.assertEqual(one,two);self.assertEqual(l.connection.execute('select count(*) n from tickets').fetchone()['n'],2);self.assertEqual(l.connection.execute('select count(*) n from tranches').fetchone()['n'],2);self.assertEqual(l.connection.execute("select count(*) from board_projection_outbox where operation='create_microticket'").fetchone()[0],2);l.close();d.cleanup()
 
+ def test_activation_reuses_and_activates_admitted_initial_tranche(self):
+  d=TemporaryDirectory(); l=Ledger(Path(d.name)/'x.db');l.migrate(); f=self.feature();p=self.plan();v=PlanValidator().validate(f,p); ok=self.repository_validation(p)
+  now=l._now()
+  with l._transaction() as c:
+   c.execute('INSERT INTO features(id,title,objective,status,created_at,updated_at) VALUES (?,?,?,\'planned\',?,?)',(f.id,f.title,f.objective,now,now))
+   c.execute('INSERT INTO feature_contracts(feature_id,contract_hash,contract_json,created_at) VALUES (?,?,?,?)',(f.id,f.contract_hash,'{}',now))
+   c.execute('INSERT INTO tranches(id,feature_id,ordinal,status,base_sha,integration_commands_json) VALUES (?,?,0,\'planned\',?,\'[]\')',(p.tranches[0].id,f.id,p.repo_base_sha))
+   for criterion_id in p.tranches[0].criterion_ids:c.execute('INSERT INTO tranche_criteria(tranche_id,criterion_id) VALUES (?,?)',(p.tranches[0].id,criterion_id))
+  first=activate_validated_plan(l,f,p,v,ok)
+  self.assertEqual(l.connection.execute('SELECT status FROM tranches WHERE id=?',(p.tranches[0].id,)).fetchone()[0],'active')
+  l.connection.execute('UPDATE tranches SET status=\'planned\' WHERE id=?',(p.tranches[0].id,))
+  replay=activate_validated_plan(l,f,p,v,ok)
+  self.assertEqual(replay,first)
+  self.assertEqual(l.connection.execute('SELECT status FROM tranches WHERE id=?',(p.tranches[0].id,)).fetchone()[0],'active')
+  l.close();d.cleanup()
+
  def test_activation_rolls_back_ticket_and_projection_pair(self):
   d=TemporaryDirectory(); calls=[]
   def fail(point):
