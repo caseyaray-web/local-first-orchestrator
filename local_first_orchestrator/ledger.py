@@ -2234,7 +2234,7 @@ class Ledger:
             dependencies = tuple(sorted(set(json.loads(str(ticket["dependencies_json"])))))
         except (TypeError, json.JSONDecodeError) as exc:
             raise RuntimeError("native_dependency_graph_reconciliation_required: invalid dependency contract") from exc
-        if not dependencies or ticket_id in dependencies or not all(isinstance(value, str) and value for value in dependencies):
+        if ticket_id in dependencies or not all(isinstance(value, str) and value for value in dependencies):
             raise RuntimeError("native_dependency_graph_reconciliation_required: invalid dependency contract")
         child_external_id = self._resolve_external_task_id_in_transaction(conn, ticket_id)
         parents: list[dict[str, str]] = []
@@ -2285,10 +2285,16 @@ class Ledger:
             candidates = conn.execute("""
                 SELECT t.id FROM tickets t
                 JOIN runtime_bindings rb ON rb.ticket_id=t.id
-                WHERE t.state='draft'
+                WHERE t.state IN ('draft','ready_local')
                   AND json_valid(t.dependencies_json)=1
                   AND json_type(t.dependencies_json)='array'
-                  AND json_array_length(t.dependencies_json)>0
+                  AND (json_array_length(t.dependencies_json)>0 OR EXISTS (
+                      SELECT 1 FROM board_projection_outbox root_projection
+                      WHERE root_projection.ticket_id=t.id
+                        AND root_projection.operation='create_microticket'
+                        AND root_projection.acknowledged_at IS NOT NULL
+                        AND root_projection.external_task_id IS NOT NULL
+                        AND root_projection.superseded_at IS NULL))
                   AND NOT EXISTS (SELECT 1 FROM native_dependency_graphs g WHERE g.ticket_id=t.id)
                   AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage='native_dependency_graph')
                 ORDER BY t.created_at,t.id LIMIT 100
@@ -2364,7 +2370,7 @@ class Ledger:
             parent_external_ids = tuple(json.loads(str(graph["parent_external_ids_json"])))
         except (TypeError, json.JSONDecodeError) as exc:
             raise RuntimeError("native_dependency_release_reconciliation_required: graph evidence malformed") from exc
-        if not dependencies or len(dependencies) != len(parent_external_ids):
+        if len(dependencies) != len(parent_external_ids):
             raise RuntimeError("native_dependency_release_reconciliation_required: graph evidence malformed")
         completions: list[dict[str, Any]] = []
         for dependency_id, parent_external_id in zip(dependencies, parent_external_ids):
@@ -2426,7 +2432,7 @@ class Ledger:
             candidates = conn.execute("""
                 SELECT t.id FROM tickets t
                 JOIN native_dependency_graphs g ON g.ticket_id=t.id
-                WHERE t.state='draft'
+                WHERE t.state IN ('draft','ready_local')
                   AND NOT EXISTS (SELECT 1 FROM native_dependency_releases r WHERE r.ticket_id=t.id)
                   AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage='native_dependency_release')
                 ORDER BY t.created_at,t.id LIMIT 100

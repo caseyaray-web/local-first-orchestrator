@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import sqlite3
@@ -147,6 +148,62 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         self.assertEqual(self.ledger.get_ticket(blocked)["state"], "draft")
         event = self.ledger.events_for(ready)[-1]
         self.assertEqual(event["event_type"], "scheduler_stage_claimed")
+
+    def test_native_root_is_prepared_before_hermes_release(self) -> None:
+        board = NativeBoard()
+        root = self.ticket("root")
+        with self.ledger._transaction() as conn:
+            event_id = self.ledger._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=root,
+                event_type="generated_microticket_created",
+                actor_id="controller",
+                to_state="draft",
+                payload={"ticket_id": root},
+            )
+        self.ledger.enqueue_generated_create_projection(root, event_id, {"ticket_id": root}, "root-create")
+        self.ledger.connection.execute(
+            "UPDATE board_projection_outbox SET acknowledged_at=100,external_task_id='external-root' WHERE ticket_id=? AND event_id=? AND operation='create_microticket'",
+            (root, event_id),
+        )
+        board.add_task("external-root", status="blocked", body=HANDOFF_MARKER)
+        order: list[str] = []
+        original_set_state = board.set_state
+
+        def record_state(ticket_id, state, *, idempotency_key):
+            order.append("ready")
+            original_set_state(ticket_id, state, idempotency_key=idempotency_key)
+
+        board.set_state = record_state
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            board,
+            worker_id="native-root",
+            lease_seconds=30,
+            clock=lambda: 100,
+            native_dependency_release_prepare_runner=lambda ticket_id, external_id: order.append("prepared") or {"workspace": "isolated"},
+        )
+
+        preview = preview_next(self.ledger, now=100)
+        self.assertEqual((preview.next_stage, preview.ticket_id), ("native_dependency_graph", root))
+        graph_result = scheduler.process_next()
+        self.assertEqual((graph_result.stage, graph_result.ticket_id), ("native_dependency_graph", root))
+        self.assertEqual(board.get_task("external-root").status, "blocked")
+        graph = self.ledger.native_dependency_graph(root)
+        self.assertEqual(json.loads(graph["local_dependency_ids_json"]), [])
+        self.assertEqual(json.loads(graph["parent_external_ids_json"]), [])
+
+        release_preview = preview_next(self.ledger, now=100)
+        self.assertEqual((release_preview.next_stage, release_preview.ticket_id), ("native_dependency_release", root))
+        release_result = scheduler.process_next()
+        self.assertEqual((release_result.stage, release_result.ticket_id), ("native_dependency_release", root))
+        self.assertEqual(order, ["prepared", "ready"])
+        self.assertEqual(board.get_task("external-root").status, "ready")
+        self.assertEqual(self.ledger.get_ticket(root)["state"], "ready_local")
+        release = self.ledger.native_dependency_release(root)
+        assert release is not None
+        self.assertEqual(release["parent_completion_hash"], hashlib.sha256(b"[]").hexdigest())
 
     def test_native_dependency_graph_and_release_use_hermes_as_readiness_authority(self) -> None:
         board = NativeBoard()

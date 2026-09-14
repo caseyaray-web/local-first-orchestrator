@@ -441,10 +441,16 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
         return ProcessNextPreview(next_stage="native_dependency_graph", ticket_id=str(native_graph_replay["ticket_id"]), would_execute=True, would_write_board=True)
     native_graph = ledger.connection.execute("""
         SELECT t.id FROM tickets t JOIN runtime_bindings rb ON rb.ticket_id=t.id
-        WHERE t.state='draft'
+        WHERE t.state IN ('draft','ready_local')
           AND json_valid(t.dependencies_json)=1
           AND json_type(t.dependencies_json)='array'
-          AND json_array_length(t.dependencies_json)>0
+          AND (json_array_length(t.dependencies_json)>0 OR EXISTS (
+              SELECT 1 FROM board_projection_outbox root_projection
+              WHERE root_projection.ticket_id=t.id
+                AND root_projection.operation='create_microticket'
+                AND root_projection.acknowledged_at IS NOT NULL
+                AND root_projection.external_task_id IS NOT NULL
+                AND root_projection.superseded_at IS NULL))
           AND (t.external_id IS NOT NULL OR EXISTS (
               SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=t.id AND b.operation='create_microticket'
                 AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL AND b.superseded_at IS NULL))
@@ -470,7 +476,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
         return ProcessNextPreview(next_stage="native_dependency_release", ticket_id=str(native_release_replay["ticket_id"]), would_execute=True)
     native_release = ledger.connection.execute("""
         SELECT t.id FROM tickets t JOIN native_dependency_graphs g ON g.ticket_id=t.id
-        WHERE t.state='draft'
+        WHERE t.state IN ('draft','ready_local')
           AND NOT EXISTS (SELECT 1 FROM native_dependency_releases r WHERE r.ticket_id=t.id)
           AND NOT EXISTS (
               SELECT 1 FROM json_each(g.local_dependency_ids_json) requested
@@ -1051,7 +1057,7 @@ class ProcessNextScheduler:
                     actual_parents = sorted(set(getattr(task, "parents", ())))
                     if actual_parents != expected_parents:
                         raise RuntimeError("native_dependency_graph_reconciliation_required: Hermes graph did not converge")
-                    if HANDOFF_MARKER in str(getattr(task, "body", "")) and str(getattr(task, "status", "")) == "blocked":
+                    if expected_parents and HANDOFF_MARKER in str(getattr(task, "body", "")) and str(getattr(task, "status", "")) == "blocked":
                         self.board.set_state(child_external_id, CanonicalState.READY_LOCAL, idempotency_key=f"native-graph-release:{identity['graph_hash']}")
                         task = self.board.get_task(child_external_id)
                     graph_result = {
@@ -1092,6 +1098,9 @@ class ProcessNextScheduler:
                     actual_parents = sorted(set(getattr(task, "parents", ())))
                     if actual_parents != expected_parents:
                         raise RuntimeError("native_dependency_release_reconciliation_required: Hermes graph diverged")
+                    if HANDOFF_MARKER in str(getattr(task, "body", "")) and str(getattr(task, "status", "")) == "blocked":
+                        self.board.set_state(child_external_id, CanonicalState.READY_LOCAL, idempotency_key=f"native-release:{identity['parent_completion_hash']}")
+                        task = self.board.get_task(child_external_id)
                     hermes_status = str(getattr(task, "status", ""))
                     if hermes_status != "ready":
                         raise RuntimeError("native_dependency_release_reconciliation_required: Hermes did not expose child as ready")
