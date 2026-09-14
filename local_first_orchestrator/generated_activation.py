@@ -38,12 +38,15 @@ def resolve_generated_activation_context(ticket_id: str, runtime_config: Runtime
                m.feature_id successor_feature_id,m.repository_identity successor_repository_identity,
                m.repo_base_sha successor_repo_base_sha,m.repo_snapshot_hash successor_repo_snapshot_hash,
                m.ticket_ids_json successor_ticket_ids_json,
-               b.acknowledged_at,b.external_task_id,b.terminal_error,b.operation,e.entity_type,e.entity_id,e.event_type
+               b.acknowledged_at,b.external_task_id,b.terminal_error,b.operation,e.entity_type,e.entity_id,e.event_type,
+               r.recovery_id
         FROM tickets t JOIN tranches tr ON tr.id=t.tranche_id
         LEFT JOIN decomposition_plans p ON p.feature_id=t.feature_id AND p.status='active'
         LEFT JOIN next_tranche_materializations m ON m.successor_tranche_id=t.tranche_id
-        LEFT JOIN events e ON e.entity_id=t.id AND e.entity_type='ticket' AND e.event_type='generated_microticket_created'
-        LEFT JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.event_id=e.id AND b.operation='create_microticket'
+        JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket' AND b.superseded_at IS NULL
+        JOIN events e ON e.id=b.event_id AND e.entity_id=t.id AND e.entity_type='ticket'
+             AND e.event_type IN ('generated_microticket_created','generated_microticket_projection_recovered')
+        LEFT JOIN generated_projection_recoveries r ON r.ticket_id=t.id AND r.replacement_event_id=e.id
         WHERE t.id=?
     """, (ticket_id,)).fetchall()
     if not rows:
@@ -51,7 +54,10 @@ def resolve_generated_activation_context(ticket_id: str, runtime_config: Runtime
     if len(rows) != 1:
         raise GeneratedActivationError('ambiguous_generated_provenance')
     row = rows[0]
-    if (row['entity_type'],row['entity_id'],row['event_type']) != ('ticket',ticket_id,'generated_microticket_created') or row['feature_id'] != row['tranche_feature_id']:
+    valid_event = row['event_type'] == 'generated_microticket_created' or (
+        row['event_type'] == 'generated_microticket_projection_recovered' and row['recovery_id'] is not None
+    )
+    if (row['entity_type'],row['entity_id']) != ('ticket',ticket_id) or not valid_event or row['feature_id'] != row['tranche_feature_id']:
         raise GeneratedActivationError('invalid_generated_provenance')
     if row['tranche_status'] != 'active' or not row['plan_id']:
         raise GeneratedActivationError('inactive_or_wrong_tranche')

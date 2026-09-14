@@ -6,13 +6,16 @@ import stat
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from local_first_orchestrator.decomposition import PlanValidator, activate_validated_plan
+from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
+from local_first_orchestrator.generated_activation import resolve_generated_activation_context
 from local_first_orchestrator.generated_projection import (
     GeneratedProjectionDeliveryPolicy,
     GeneratedProjectionWorker,
 )
-from local_first_orchestrator.hermes_board import HermesBoardAdapter
+from local_first_orchestrator.hermes_board import ExternalExecutionSnapshot, ExternalTicket, HermesBoardAdapter
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.states import CanonicalState
 from tests.test_decomposition import Plans
@@ -387,6 +390,209 @@ class GeneratedProjectionDeliveryTests(unittest.TestCase):
             conn.execute("INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,operation,external_task_id,acknowledged_at) VALUES (?,?,?,?,?,?,?,?,?)", (ticket_id,event_id,"draft","{}",f"board-create:v1:{ticket_id}:conflict",1,"create_microticket","conflicting-task",1))
         with self.assertRaisesRegex(ValueError, "external_projection_identity_conflict"):
             self.ledger.resolve_external_task_id(ticket_id)
+
+    def test_paused_operator_recovery_supersedes_acknowledged_projection_without_changing_ticket_authority(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        self.assertEqual(self.worker().deliver_one().external_task_id, "1")
+        self.ledger.pause("operator", reason="pre-native recovery")
+
+        recovered = self.ledger.recover_generated_projection(
+            ticket_id=ticket_id,
+            superseded_event_id=event_id,
+            superseded_external_task_id="1",
+            observed_status="done",
+            observed_snapshot_hash="a" * 64,
+            operator_id="casey",
+            reason="Hermes completed before Local First reconciliation",
+        )
+
+        old = self.ledger.connection.execute(
+            "SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",
+            (ticket_id, event_id),
+        ).fetchone()
+        replacement = self.ledger.connection.execute(
+            "SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",
+            (ticket_id, recovered["replacement_event_id"]),
+        ).fetchone()
+        audit = self.ledger.connection.execute(
+            "SELECT * FROM generated_projection_recoveries WHERE recovery_id=?",
+            (recovered["recovery_id"],),
+        ).fetchone()
+        self.assertEqual(old["external_task_id"], "1")
+        self.assertIsNotNone(old["acknowledged_at"])
+        self.assertIsNotNone(old["superseded_at"])
+        self.assertEqual(old["superseded_by_event_id"], recovered["replacement_event_id"])
+        self.assertEqual(replacement["operation"], "create_microticket")
+        self.assertIsNone(replacement["external_task_id"])
+        self.assertIsNone(replacement["acknowledged_at"])
+        self.assertEqual(replacement["idempotency_key"], recovered["replacement_idempotency_key"])
+        self.assertTrue(replacement["idempotency_key"].startswith(f"board-create:v2:{ticket_id}:"))
+        self.assertEqual(audit["superseded_external_task_id"], "1")
+        self.assertEqual(audit["observed_status"], "done")
+        self.assertEqual(self.ledger.get_ticket(ticket_id)["state"], "draft")
+        self.assertEqual(self.ledger.attempt_count(ticket_id), 0)
+
+    def test_recovered_projection_delivers_as_the_only_current_external_identity(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        self.assertEqual(self.worker().deliver_one().external_task_id, "1")
+        self.ledger.pause("operator", reason="pre-native recovery")
+        recovered = self.ledger.recover_generated_projection(
+            ticket_id=ticket_id,
+            superseded_event_id=event_id,
+            superseded_external_task_id="1",
+            observed_status="done",
+            observed_snapshot_hash="b" * 64,
+            operator_id="casey",
+            reason="replace bypassed projection",
+        )
+
+        delivered = self.worker(now=200).deliver_one()
+
+        self.assertEqual(delivered.status, "delivered")
+        self.assertEqual(delivered.external_task_id, "2")
+        self.assertEqual(self.ledger.resolve_external_task_id(ticket_id), "2")
+        current = self.ledger.connection.execute(
+            "SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",
+            (ticket_id, recovered["replacement_event_id"]),
+        ).fetchone()
+        self.assertEqual(current["external_task_id"], "2")
+        self.assertIsNotNone(current["acknowledged_at"])
+        body = json.loads(self.state.read_text())["tasks"]["2"]["body"]
+        contract = json.loads(body.split("```local-first-contract\\n", 1)[1].split("\\n```", 1)[0])
+        self.assertEqual(contract["projection_generation"], "recovery-v2")
+        self.assertEqual(contract["projection_key"], recovered["replacement_idempotency_key"])
+        self.assertIn("local-first-awaiting-reconciliation", body)
+
+    def test_recovered_projection_is_the_only_generated_activation_identity(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        self.assertEqual(self.worker().deliver_one().external_task_id, "1")
+        self.ledger.pause("operator", reason="pre-native recovery")
+        self.ledger.recover_generated_projection(
+            ticket_id=ticket_id, superseded_event_id=event_id,
+            superseded_external_task_id="1", observed_status="done",
+            observed_snapshot_hash="e" * 64, operator_id="casey", reason="replace",
+        )
+        self.assertEqual(self.worker(now=200).deliver_one().external_task_id, "2")
+        self.assertEqual(
+            [(row["ticket_id"], row["external_task_id"]) for row in self.ledger.generated_activation_candidates()],
+            [(ticket_id, "2")],
+        )
+        root = Path(self.temp.name)
+        runtime = RuntimeConfig(root, root / "worktrees", root / "artifacts", (root,))
+        completed = type("Completed", (), {"stdout": "a\n"})()
+        with patch.object(RuntimeConfig, "canonical_repository", return_value=Path("fixture-repo")), \
+             patch("local_first_orchestrator.generated_activation.subprocess.run", return_value=completed):
+            context = resolve_generated_activation_context(ticket_id, runtime, self.ledger)
+        self.assertEqual(context.external_task_id, "2")
+
+    def test_recovery_replay_is_idempotent_and_conflicting_operator_evidence_fails_closed(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        self.assertEqual(self.worker().deliver_one().external_task_id, "1")
+        self.ledger.pause("operator", reason="pre-native recovery")
+        request = dict(
+            ticket_id=ticket_id,
+            superseded_event_id=event_id,
+            superseded_external_task_id="1",
+            observed_status="done",
+            observed_snapshot_hash="c" * 64,
+            operator_id="casey",
+            reason="replace bypassed projection",
+        )
+        first = self.ledger.recover_generated_projection(**request)
+        second = self.ledger.recover_generated_projection(**request)
+        self.assertEqual(second, first)
+        self.assertEqual(self.ledger.connection.execute(
+            "SELECT COUNT(*) FROM generated_projection_recoveries WHERE ticket_id=?", (ticket_id,)
+        ).fetchone()[0], 1)
+        with self.assertRaisesRegex(ValueError, "recovery replay conflicts"):
+            self.ledger.recover_generated_projection(**{**request, "reason": "different reason"})
+        self.assertEqual(self.ledger.connection.execute(
+            "SELECT COUNT(*) FROM generated_projection_recoveries WHERE ticket_id=?", (ticket_id,)
+        ).fetchone()[0], 1)
+
+    def test_controller_reads_exact_external_snapshot_before_recording_recovery(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        self.assertEqual(self.worker().deliver_one().external_task_id, "1")
+        self.ledger.pause("operator", reason="pre-native recovery")
+
+        class ReadOnlyExecutionBoard:
+            is_fake = False
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+            def execution_snapshot(self, external_task_id: str) -> ExternalExecutionSnapshot:
+                self.calls.append(external_task_id)
+                return ExternalExecutionSnapshot(
+                    task=ExternalTicket(external_task_id, ticket_id, "legacy", "done", None),
+                    session_id="legacy-session", branch_name="legacy-branch",
+                    started_at=10, completed_at=20, runs=(),
+                )
+
+        board = ReadOnlyExecutionBoard()
+        root = Path(self.temp.name)
+        controller = LocalFirstController(
+            self.ledger, board, RuntimeConfig(root, root / "worktrees", root / "artifacts", (root,))
+        )
+        recovered = controller.recover_generated_projection(
+            ticket_id, event_id, operator_id="casey", reason="replace bypassed projection"
+        )
+        replay = controller.recover_generated_projection(
+            ticket_id, event_id, operator_id="casey", reason="replace bypassed projection"
+        )
+        self.assertEqual(replay, recovered)
+        audit = self.ledger.connection.execute(
+            "SELECT * FROM generated_projection_recoveries WHERE recovery_id=?", (recovered["recovery_id"],)
+        ).fetchone()
+        self.assertEqual(board.calls, ["1", "1"])
+        self.assertEqual(audit["observed_status"], "done")
+        self.assertEqual(len(audit["observed_snapshot_hash"]), 64)
+
+    def test_recovery_refuses_existing_model_stage_authority_without_mutation(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        self.assertEqual(self.worker().deliver_one().external_task_id, "1")
+        self.ledger.pause("operator", reason="pre-native recovery")
+        self.ledger.connection.execute(
+            "INSERT INTO model_stage_artifacts(ticket_id,attempt_number,stage,purpose,adapter,request_hash,response_artifact,worktree_path,base_sha,diff_hash,completed_at,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ticket_id, 1, "implementation", "test", "test", "request", "artifact", "/tmp/worktree", "base", "diff", 1, "completed"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "existing lifecycle authority"):
+            self.ledger.recover_generated_projection(
+                ticket_id=ticket_id, superseded_event_id=event_id,
+                superseded_external_task_id="1", observed_status="done",
+                observed_snapshot_hash="d" * 64, operator_id="casey", reason="replace",
+            )
+
+        old = self.ledger.connection.execute(
+            "SELECT superseded_at FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",
+            (ticket_id, event_id),
+        ).fetchone()
+        self.assertIsNone(old["superseded_at"])
+        self.assertEqual(self.ledger.connection.execute(
+            "SELECT COUNT(*) FROM generated_projection_recoveries WHERE ticket_id=?", (ticket_id,)
+        ).fetchone()[0], 0)
+
+    def test_recovery_refuses_multiple_current_create_identities_without_mutation(self) -> None:
+        ticket_id, event_id = self.activate_one()
+        self.assertEqual(self.worker().deliver_one().external_task_id, "1")
+        self.ledger.pause("operator", reason="pre-native recovery")
+        with self.ledger._transaction() as conn:
+            conflicting_event = self.ledger._append_event(
+                conn, entity_type="ticket", entity_id=ticket_id,
+                event_type="generated_microticket_created", actor_id="test",
+            )
+            conn.execute(
+                "INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,operation,external_task_id,acknowledged_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (ticket_id, conflicting_event, "draft", "{}", "conflicting-current", 1, "create_microticket", "other", 1),
+            )
+        with self.assertRaisesRegex(ValueError, "current create identity"):
+            self.ledger.recover_generated_projection(
+                ticket_id=ticket_id, superseded_event_id=event_id,
+                superseded_external_task_id="1", observed_status="done",
+                observed_snapshot_hash="f" * 64, operator_id="casey", reason="replace",
+            )
+        self.assertEqual(self.ledger.connection.execute(
+            "SELECT COUNT(*) FROM generated_projection_recoveries WHERE ticket_id=?", (ticket_id,)
+        ).fetchone()[0], 0)
 
     def test_state_projection_uses_acknowledged_external_task_id_not_internal_ticket_id(self) -> None:
         ticket_id, _ = self.activate_one()

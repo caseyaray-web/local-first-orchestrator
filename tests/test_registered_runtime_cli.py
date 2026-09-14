@@ -88,6 +88,25 @@ class RegisteredRuntimeCliTests(unittest.TestCase):
                 "reconcile-hermes-execution", "--task-id", "H-1", "--run-id", "7",
             ])
 
+    def test_projection_recovery_cli_is_explicit_operator_only_and_read_only(self) -> None:
+        parser = argparse.ArgumentParser(); register_cli(parser)
+        args = parser.parse_args([
+            "--database", str(self.database),
+            "recover-generated-projection", "--task-id", "TK-1", "--event-id", "7",
+            "--operator-id", "casey", "--reason", "pre-native replacement",
+        ])
+        self.assertEqual(args.command, "recover-generated-projection")
+        self.assertEqual(args.task_id, "TK-1")
+        self.assertEqual(args.event_id, 7)
+        self.assertEqual(args.operator_id, "casey")
+        self.assertFalse(hasattr(args, "allow_board_writes"))
+        with self.assertRaisesRegex(ValueError, "requires --hermes-executable and --board"):
+            cli_main([
+                "--database", str(self.database),
+                "recover-generated-projection", "--task-id", "TK-1", "--event-id", "7",
+                "--operator-id", "casey", "--reason", "pre-native replacement",
+            ])
+
     def test_operator_lifecycle_cli_pause_resume_and_status_are_durable(self) -> None:
         paused = io.StringIO()
         with contextlib.redirect_stdout(paused):

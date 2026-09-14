@@ -532,6 +532,11 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     reopen_generated=commands.add_parser("reopen-terminal-generated-projection", help="ledger-only: reopen a terminal generated-card projection only when no external task was created and the current durable payload now verifies")
     reopen_generated.add_argument("--task-id", required=True)
     reopen_generated.add_argument("--event-id", required=True, type=int)
+    recover_generated=commands.add_parser("recover-generated-projection", help="paused operator-only: read-verify and supersede one pre-native generated Hermes card; performs no board writes")
+    recover_generated.add_argument("--task-id", required=True, help="Local First ticket id")
+    recover_generated.add_argument("--event-id", required=True, type=int, help="acknowledged generated create event id")
+    recover_generated.add_argument("--operator-id", required=True)
+    recover_generated.add_argument("--reason", required=True)
     hermes_execution=commands.add_parser("reconcile-hermes-execution", help="bind one completed dispatcher-owned Hermes run into a Local First attempt; never launches implementation")
     hermes_execution.add_argument("--task-id", required=True, help="Hermes task id / Local First external task id")
     hermes_execution.add_argument("--run-id", type=int, help="explicit Hermes run id; required when multiple unreconciled completed worker runs exist")
@@ -754,6 +759,11 @@ def run_command(args: argparse.Namespace) -> int:
             print(json.dumps(ledger.reconcile_state_projections(args.task_id), sort_keys=True))
         elif args.command=="reopen-terminal-generated-projection":
             print(json.dumps(ledger.reopen_terminal_generated_projection(args.task_id,args.event_id),sort_keys=True))
+        elif args.command=="recover-generated-projection":
+            if args.ad_hoc_runtime: raise ValueError("generated projection recovery requires registered operator runtime")
+            if not args.hermes_executable or not args.board: raise ValueError("generated projection recovery requires --hermes-executable and --board")
+            ctl, _ = _registered_controller(ledger,args,allow_board_writes=False)
+            print(json.dumps(ctl.recover_generated_projection(args.task_id,args.event_id,operator_id=args.operator_id,reason=args.reason),sort_keys=True))
         elif args.command=="reconcile-hermes-execution":
             if args.ad_hoc_runtime: raise ValueError("Hermes execution reconciliation requires registered operator runtime")
             if not args.hermes_executable or not args.board: raise ValueError("Hermes execution reconciliation requires --hermes-executable and --board")

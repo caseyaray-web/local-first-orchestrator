@@ -251,6 +251,26 @@ CREATE TABLE IF NOT EXISTS board_projection_outbox (
     supersession_reason TEXT,
     PRIMARY KEY(ticket_id, event_id)
 );
+CREATE TABLE IF NOT EXISTS generated_projection_recoveries (
+    recovery_id TEXT PRIMARY KEY,
+    ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    superseded_event_id INTEGER NOT NULL REFERENCES events(id),
+    superseded_external_task_id TEXT NOT NULL,
+    superseded_idempotency_key TEXT NOT NULL,
+    replacement_event_id INTEGER NOT NULL UNIQUE REFERENCES events(id),
+    replacement_idempotency_key TEXT NOT NULL UNIQUE,
+    operator_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    observed_status TEXT NOT NULL CHECK(observed_status IN ('done','blocked')),
+    observed_snapshot_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(ticket_id, superseded_event_id),
+    UNIQUE(ticket_id, replacement_event_id)
+);
+CREATE TRIGGER IF NOT EXISTS generated_projection_recoveries_immutable_update
+BEFORE UPDATE ON generated_projection_recoveries BEGIN SELECT RAISE(ABORT, 'generated projection recoveries are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS generated_projection_recoveries_immutable_delete
+BEFORE DELETE ON generated_projection_recoveries BEGIN SELECT RAISE(ABORT, 'generated projection recoveries are append-only'); END;
 CREATE TABLE IF NOT EXISTS acceptance_criteria (
     id TEXT NOT NULL, feature_id TEXT NOT NULL REFERENCES features(id),
     statement TEXT NOT NULL, verification TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
@@ -1081,7 +1101,7 @@ class Ledger:
         if ticket is None: raise KeyError(ticket_id)
         generated = conn.execute(
             "SELECT e.id FROM events e WHERE e.entity_type='ticket' AND e.entity_id=? "
-            "AND e.event_type='generated_microticket_created'", (ticket_id,)
+            "AND e.event_type IN ('generated_microticket_created','generated_microticket_projection_recovered')", (ticket_id,)
         ).fetchall()
         if not generated:
             # Pre-generated/imported tickets historically persist their board ID on
@@ -1091,8 +1111,9 @@ class Ledger:
         rows = conn.execute(
             "SELECT b.external_task_id FROM events e JOIN board_projection_outbox b "
             "ON b.ticket_id=e.entity_id AND b.event_id=e.id "
-            "WHERE e.entity_type='ticket' AND e.entity_id=? AND e.event_type='generated_microticket_created' "
-            "AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL",
+            "WHERE e.entity_type='ticket' AND e.entity_id=? "
+            "AND e.event_type IN ('generated_microticket_created','generated_microticket_projection_recovered') "
+            "AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL AND b.superseded_at IS NULL",
             (ticket_id,),
         ).fetchall()
         ids = {str(row["external_task_id"]) for row in rows if isinstance(row["external_task_id"], str) and row["external_task_id"]}
@@ -3278,7 +3299,7 @@ class Ledger:
         rows = self.connection.execute(
             "SELECT DISTINCT t.id AS ticket_id,t.state,b.external_task_id,t.created_at "
             "FROM tickets t JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket' "
-            "WHERE b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL "
+            "WHERE b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL AND b.superseded_at IS NULL "
             "AND t.state IN (?,?,?) "
             "ORDER BY t.created_at,t.id,b.external_task_id",
             (CanonicalState.READY_LOCAL.value, CanonicalState.IMPLEMENTING.value, CanonicalState.REPAIRING.value),
@@ -3289,7 +3310,7 @@ class Ledger:
         rows = self.connection.execute(
             "SELECT DISTINCT t.id AS ticket_id,b.external_task_id,t.created_at "
             "FROM tickets t JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket' "
-            "WHERE b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL "
+            "WHERE b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL AND b.superseded_at IS NULL "
             "AND t.state=? "
             "AND NOT EXISTS (SELECT 1 FROM runtime_bindings rb WHERE rb.ticket_id=t.id) "
             "ORDER BY t.created_at,t.id,b.external_task_id",
@@ -4402,8 +4423,16 @@ class Ledger:
             JOIN features f ON f.id=t.feature_id JOIN events e ON e.id=?
             WHERE t.id=?
         """, (event_id, ticket_id)).fetchone()
-        if row is None or (row["entity_type"], row["entity_id"], row["event_type"]) != ("ticket", ticket_id, "generated_microticket_created"):
+        if row is None or row["entity_type"] != "ticket" or row["entity_id"] != ticket_id or row["event_type"] not in {"generated_microticket_created", "generated_microticket_projection_recovered"}:
             raise KeyError("authoritative generated projection identity missing")
+        recovery = None
+        if row["event_type"] == "generated_microticket_projection_recovered":
+            recovery = self.connection.execute(
+                "SELECT replacement_idempotency_key FROM generated_projection_recoveries WHERE ticket_id=? AND replacement_event_id=?",
+                (ticket_id, event_id),
+            ).fetchone()
+            if recovery is None:
+                raise KeyError("authoritative generated projection recovery identity missing")
         if row["feature_id"] != row["tranche_feature_id"] or row["feature_id"] != row["resolved_feature_id"]:
             raise ValueError("authoritative generated projection identity conflicts")
         successor = self.connection.execute(
@@ -4439,8 +4468,12 @@ class Ledger:
             provenance = tuple(normal[0][x] for x in ("repository_identity", "repo_base_sha", "repo_snapshot_hash"))
         if not all(isinstance(value, str) and value for value in provenance):
             raise ValueError("authoritative generated projection provenance missing")
-        return {"ticket_id": str(row["ticket_id"]), "feature_id": str(row["feature_id"]), "tranche_id": str(row["tranche_id"]),
-                "repository_identity": str(provenance[0]), "repo_base_sha": str(provenance[1]), "repo_snapshot_hash": str(provenance[2])}
+        result = {"ticket_id": str(row["ticket_id"]), "feature_id": str(row["feature_id"]), "tranche_id": str(row["tranche_id"]),
+                  "repository_identity": str(provenance[0]), "repo_base_sha": str(provenance[1]), "repo_snapshot_hash": str(provenance[2])}
+        if recovery is not None:
+            result["projection_key"] = str(recovery["replacement_idempotency_key"])
+            result["projection_generation"] = "recovery-v2"
+        return result
 
     def reconcile_generated_projection(self, ticket_id: str, event_id: int) -> dict[str, Any]:
         """Refresh one never-attempted generated projection from persisted ledger truth.
@@ -4497,6 +4530,105 @@ class Ledger:
                 raise ValueError("generated projection reconciliation lost eligibility")
             return payload
 
+    def recover_generated_projection(self, *, ticket_id: str, superseded_event_id: int,
+                                     superseded_external_task_id: str, observed_status: str,
+                                     observed_snapshot_hash: str, operator_id: str, reason: str) -> dict[str, Any]:
+        """Supersede one bypassed generated-card identity without changing ticket authority."""
+        from .decomposition import generated_card_payload
+        from .ticket import MicroTicket, PatchBudget, VerificationProfile
+
+        if observed_status not in {"done", "blocked"}:
+            raise ValueError("recoverable Hermes status required")
+        if not operator_id.strip() or not reason.strip():
+            raise ValueError("operator identity and reason required")
+        if len(observed_snapshot_hash) != 64 or any(ch not in "0123456789abcdef" for ch in observed_snapshot_hash):
+            raise ValueError("canonical snapshot hash required")
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not bool(paused["paused"]):
+                raise RuntimeError("controller must be paused for projection recovery")
+            row = conn.execute("""
+                SELECT b.*,t.state AS ticket_state,t.feature_id,t.tranche_id,t.objective,
+                       t.criterion_ids_json,t.primary_symbol,t.allowed_files_json,t.create_files_json,
+                       t.new_test_files_json AS ticket_new_test_files_json,t.forbidden_changes_json,
+                       t.patch_budget_json,t.verification_json,t.risk,t.review_required,t.max_attempts,
+                       t.dependencies_json,e.entity_type,e.entity_id,e.event_type
+                FROM board_projection_outbox b JOIN tickets t ON t.id=b.ticket_id
+                JOIN events e ON e.id=b.event_id
+                WHERE b.ticket_id=? AND b.event_id=?
+            """, (ticket_id, superseded_event_id)).fetchone()
+            if row is None or (row["operation"], row["entity_type"], row["entity_id"], row["event_type"]) != ("create_microticket", "ticket", ticket_id, "generated_microticket_created"):
+                raise ValueError("generated projection recovery target is ineligible")
+            prior = conn.execute(
+                "SELECT * FROM generated_projection_recoveries WHERE ticket_id=? AND superseded_event_id=?",
+                (ticket_id, superseded_event_id),
+            ).fetchone()
+            if prior is not None:
+                requested = (superseded_external_task_id, operator_id, reason, observed_status, observed_snapshot_hash)
+                recorded = tuple(prior[name] for name in (
+                    "superseded_external_task_id", "operator_id", "reason", "observed_status", "observed_snapshot_hash"
+                ))
+                if requested != recorded:
+                    raise ValueError("generated projection recovery replay conflicts")
+                return dict(prior)
+            current_creates = conn.execute(
+                "SELECT event_id,external_task_id,acknowledged_at FROM board_projection_outbox "
+                "WHERE ticket_id=? AND operation='create_microticket' AND superseded_at IS NULL",
+                (ticket_id,),
+            ).fetchall()
+            if len(current_creates) != 1 or int(current_creates[0]["event_id"]) != superseded_event_id:
+                raise ValueError("generated projection recovery requires exactly one current create identity")
+            if row["ticket_state"] != "draft" or row["acknowledged_at"] is None or row["external_task_id"] != superseded_external_task_id or row["superseded_at"] is not None:
+                raise ValueError("generated projection recovery target is not current acknowledged draft")
+            if row["lease_owner"] is not None or row["lease_expires_at"] is not None:
+                raise ValueError("generated projection recovery target is leased")
+            authority_tables = (
+                "attempts", "model_stage_artifacts", "hermes_execution_reconciliations",
+                "model_invocations", "review_candidates", "accepted_candidates", "accepted_evidence",
+                "git_commit_intents", "git_commit_evidence",
+            )
+            if any(conn.execute(f"SELECT 1 FROM {table} WHERE ticket_id=? LIMIT 1", (ticket_id,)).fetchone() is not None for table in authority_tables):
+                raise ValueError("generated projection recovery refuses existing lifecycle authority")
+            if conn.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND status='claimed' LIMIT 1", (ticket_id,)).fetchone() is not None:
+                raise ValueError("generated projection recovery refuses active scheduler authority")
+            if conn.execute("SELECT 1 FROM board_projection_outbox WHERE ticket_id=? AND operation!='create_microticket' AND acknowledged_at IS NULL AND superseded_at IS NULL LIMIT 1", (ticket_id,)).fetchone() is not None:
+                raise ValueError("generated projection recovery refuses pending board effects")
+            if conn.execute("SELECT 1 FROM evidence_comment_outbox WHERE ticket_id=? AND status IN ('pending','retryable','delivering') LIMIT 1", (ticket_id,)).fetchone() is not None:
+                raise ValueError("generated projection recovery refuses pending board effects")
+            recovery_material = json.dumps({"ticket_id": ticket_id, "event_id": superseded_event_id,
+                "external_task_id": superseded_external_task_id, "snapshot_hash": observed_snapshot_hash,
+                "status": observed_status}, sort_keys=True, separators=(",", ":"))
+            recovery_id = hashlib.sha256(recovery_material.encode()).hexdigest()[:24]
+            replacement_key = f"board-create:v2:{ticket_id}:{recovery_id}"
+            existing = conn.execute("SELECT * FROM generated_projection_recoveries WHERE recovery_id=?", (recovery_id,)).fetchone()
+            if existing is not None:
+                return dict(existing)
+            identity = self.generated_projection_identity(ticket_id, superseded_event_id)
+            verification = json.loads(row["verification_json"])
+            ticket = MicroTicket(ticket_id, row["objective"], tuple(json.loads(row["criterion_ids_json"])), row["primary_symbol"], tuple(json.loads(row["allowed_files_json"])), tuple(json.loads(row["forbidden_changes_json"])), PatchBudget(**json.loads(row["patch_budget_json"])), VerificationProfile(tuple(tuple(command) for command in verification["commands"]), verification.get("working_directory", "."), int(verification.get("timeout_seconds", 60)), int(verification.get("output_limit", 20000))), row["risk"], bool(row["review_required"]), int(row["max_attempts"]), tuple(json.loads(row["dependencies_json"])), tuple(json.loads(row["ticket_new_test_files_json"] or "[]")), tuple(json.loads(row["create_files_json"] or "[]")))
+            feature = type("PersistedFeature", (), {"id": str(row["feature_id"])})()
+            tranche = type("PersistedTranche", (), {"id": str(row["tranche_id"])})()
+            payload = generated_card_payload(feature, tranche, ticket,
+                repository_identity=identity["repository_identity"], repo_base_sha=identity["repo_base_sha"],
+                repo_snapshot_hash=identity["repo_snapshot_hash"], projection_key=replacement_key,
+                projection_generation="recovery-v2")
+            replacement_event_id = self._append_event(conn, entity_type="ticket", entity_id=ticket_id,
+                event_type="generated_microticket_projection_recovered", actor_id=operator_id,
+                payload={"recovery_id": recovery_id, "superseded_event_id": superseded_event_id,
+                         "superseded_external_task_id": superseded_external_task_id,
+                         "observed_status": observed_status, "observed_snapshot_hash": observed_snapshot_hash,
+                         "reason": reason})
+            conn.execute("INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,operation) VALUES (?,?,?,?,?,?,'create_microticket')",
+                (ticket_id, replacement_event_id, "draft", json.dumps(payload, sort_keys=True, separators=(",", ":")), replacement_key, self._now()))
+            now = self._now()
+            changed = conn.execute("UPDATE board_projection_outbox SET superseded_at=?,superseded_by_event_id=?,supersession_reason=? WHERE ticket_id=? AND event_id=? AND superseded_at IS NULL",
+                (now, replacement_event_id, "operator_recovery_pre_native_projection", ticket_id, superseded_event_id)).rowcount
+            if changed != 1:
+                raise ValueError("generated projection recovery lost eligibility")
+            conn.execute("INSERT INTO generated_projection_recoveries(recovery_id,ticket_id,superseded_event_id,superseded_external_task_id,superseded_idempotency_key,replacement_event_id,replacement_idempotency_key,operator_id,reason,observed_status,observed_snapshot_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (recovery_id, ticket_id, superseded_event_id, superseded_external_task_id, row["idempotency_key"], replacement_event_id, replacement_key, operator_id, reason, observed_status, observed_snapshot_hash, now))
+            return dict(conn.execute("SELECT * FROM generated_projection_recoveries WHERE recovery_id=?", (recovery_id,)).fetchone())
+
     def _enqueue_generated_create_projection_in_transaction(self, conn: sqlite3.Connection, *, ticket_id: str, event_id: int, payload: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
         """Enqueue a generated-card intent using the caller's transaction."""
         ticket = conn.execute("SELECT id FROM tickets WHERE id=?", (ticket_id,)).fetchone()
@@ -4525,9 +4657,9 @@ class Ledger:
     def claim_next_generated_create_projection(self, owner: str, *, lease_seconds: int=60, now: int|None=None) -> dict[str, Any]|None:
         now=self._now() if now is None else now
         with self._transaction() as conn:
-            row=conn.execute("SELECT ticket_id,event_id FROM board_projection_outbox WHERE operation='create_microticket' AND terminal_error IS NULL AND acknowledged_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) AND (lease_expires_at IS NULL OR lease_expires_at<=?) ORDER BY queued_at LIMIT 1",(now,now)).fetchone()
+            row=conn.execute("SELECT ticket_id,event_id FROM board_projection_outbox WHERE operation='create_microticket' AND terminal_error IS NULL AND acknowledged_at IS NULL AND superseded_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) AND (lease_expires_at IS NULL OR lease_expires_at<=?) ORDER BY queued_at LIMIT 1",(now,now)).fetchone()
             if not row:return None
-            changed=conn.execute("UPDATE board_projection_outbox SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1 WHERE ticket_id=? AND event_id=? AND operation='create_microticket' AND terminal_error IS NULL AND acknowledged_at IS NULL AND (lease_expires_at IS NULL OR lease_expires_at<=?)",(owner,now+lease_seconds,row['ticket_id'],row['event_id'],now))
+            changed=conn.execute("UPDATE board_projection_outbox SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1 WHERE ticket_id=? AND event_id=? AND operation='create_microticket' AND terminal_error IS NULL AND acknowledged_at IS NULL AND superseded_at IS NULL AND (lease_expires_at IS NULL OR lease_expires_at<=?)",(owner,now+lease_seconds,row['ticket_id'],row['event_id'],now))
             if not changed.rowcount:return None
             return dict(conn.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",(row['ticket_id'],row['event_id'])).fetchone())
 

@@ -94,9 +94,9 @@ def generated_projection_key(ticket_id: str) -> str:
  return f"board-create:v1:{ticket_id}"
 
 
-def generated_card_payload(feature: FeatureContract, tranche: Tranche, ticket: MicroTicket, *, repository_identity: str, repo_base_sha: str, repo_snapshot_hash: str) -> dict[str, str]:
+def generated_card_payload(feature: FeatureContract, tranche: Tranche, ticket: MicroTicket, *, repository_identity: str, repo_base_sha: str, repo_snapshot_hash: str, projection_key: str | None = None, projection_generation: str = "v1") -> dict[str, str]:
  """Serialize the immutable generated-card contract and projection payload."""
- projection_key = generated_projection_key(ticket.ticket_id)
+ projection_key = projection_key or generated_projection_key(ticket.ticket_id)
  contract = {
   "kind": "microticket",
   "orchestrator_ticket_id": ticket.ticket_id,
@@ -108,6 +108,7 @@ def generated_card_payload(feature: FeatureContract, tranche: Tranche, ticket: M
   "repo_snapshot_hash": repo_snapshot_hash,
   **ticket.contract(),
  }
+ if projection_generation != "v1": contract["projection_generation"] = projection_generation
  encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"))
  body = attach_execution_handoff(f"{_LOCAL_FIRST_MARKER}\\n```{_LOCAL_FIRST_CONTRACT}\\n{encoded}\\n```")
  return {

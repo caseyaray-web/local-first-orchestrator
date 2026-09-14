@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -117,6 +117,47 @@ class LocalFirstController:
         return ticket_id
 
     def import_scheduled_cards(self) -> list[str]: return [self.import_card(c) for c in self.board.import_candidates()]
+
+    def recover_generated_projection(self, ticket_id: str, superseded_event_id: int, *, operator_id: str, reason: str) -> dict[str, Any]:
+        """Record a read-verified replacement intent for one pre-native Hermes card."""
+        if not hasattr(self.board, "execution_snapshot"):
+            raise RuntimeError("generated projection recovery requires execution snapshot support")
+        prior = self.ledger.connection.execute(
+            "SELECT * FROM generated_projection_recoveries WHERE ticket_id=? AND superseded_event_id=?",
+            (ticket_id, superseded_event_id),
+        ).fetchone()
+        rows = self.ledger.connection.execute(
+            "SELECT external_task_id,superseded_at FROM board_projection_outbox WHERE ticket_id=? AND event_id=? "
+            "AND operation='create_microticket' AND acknowledged_at IS NOT NULL",
+            (ticket_id, superseded_event_id),
+        ).fetchall()
+        if len(rows) != 1 or not isinstance(rows[0]["external_task_id"], str) or not rows[0]["external_task_id"]:
+            raise RuntimeError("generated projection recovery external identity missing or ambiguous")
+        if prior is None and rows[0]["superseded_at"] is not None:
+            raise RuntimeError("generated projection recovery target is already superseded")
+        external_task_id = str(rows[0]["external_task_id"])
+        if prior is None and self.ledger.resolve_external_task_id(ticket_id) != external_task_id:
+            raise RuntimeError("generated projection recovery external identity conflicts")
+        snapshot = self.board.execution_snapshot(external_task_id)
+        if snapshot.task.id != external_task_id:
+            raise RuntimeError("generated projection recovery snapshot identity conflicts")
+        if snapshot.task.status not in {"done", "blocked"}:
+            raise RuntimeError("generated projection recovery requires a done or inert blocked card")
+        if snapshot.task.status == "blocked" and any(
+            run.profile is not None or run.worker_pid is not None or run.started_at is not None
+            for run in snapshot.runs
+        ):
+            raise RuntimeError("generated projection recovery refuses a blocked card with worker execution")
+        snapshot_hash = canonical_sha256(asdict(snapshot))
+        return self.ledger.recover_generated_projection(
+            ticket_id=ticket_id,
+            superseded_event_id=superseded_event_id,
+            superseded_external_task_id=external_task_id,
+            observed_status=snapshot.task.status,
+            observed_snapshot_hash=snapshot_hash,
+            operator_id=operator_id,
+            reason=reason,
+        )
 
     def reconcile_hermes_execution(self, external_task_id: str, *, hermes_run_id: int | None = None, require_handoff: bool = False) -> dict[str, Any]:
         """Bind one completed dispatcher-owned Hermes run into Local First.

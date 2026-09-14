@@ -241,7 +241,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
 
     generated = ledger.connection.execute(
         "SELECT ticket_id FROM board_projection_outbox WHERE operation='create_microticket' AND terminal_error IS NULL "
-        "AND acknowledged_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) "
+        "AND acknowledged_at IS NULL AND superseded_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) "
         "AND (lease_expires_at IS NULL OR lease_expires_at<=?) ORDER BY queued_at LIMIT 1",
         (now, now),
     ).fetchone()
@@ -447,14 +447,14 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
           AND json_array_length(t.dependencies_json)>0
           AND (t.external_id IS NOT NULL OR EXISTS (
               SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=t.id AND b.operation='create_microticket'
-                AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL))
+                AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL AND b.superseded_at IS NULL))
           AND NOT EXISTS (
               SELECT 1 FROM json_each(t.dependencies_json) requested
               LEFT JOIN tickets dependency ON dependency.id=requested.value
               WHERE dependency.id IS NULL OR (
                   dependency.external_id IS NULL AND NOT EXISTS (
                       SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=dependency.id AND b.operation='create_microticket'
-                        AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL)))
+                        AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL AND b.superseded_at IS NULL)))
           AND NOT EXISTS (SELECT 1 FROM native_dependency_graphs g WHERE g.ticket_id=t.id)
           AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage='native_dependency_graph')
         ORDER BY t.created_at,t.id LIMIT 1
@@ -584,7 +584,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
               WHERE x.tranche_id=m.successor_tranche_id AND NOT EXISTS (
                   SELECT 1 FROM board_projection_outbox b
                   WHERE b.ticket_id=x.id AND b.operation='create_microticket'
-                    AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL))
+                    AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL AND b.superseded_at IS NULL))
           AND NOT EXISTS (
               SELECT 1 FROM tickets x
               WHERE x.tranche_id=m.successor_tranche_id AND json_array_length(x.dependencies_json)>0
@@ -604,7 +604,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
     generated_activation = ledger.connection.execute("""
         SELECT DISTINCT t.id FROM tickets t
         JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket'
-        WHERE b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL
+        WHERE b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL AND b.superseded_at IS NULL
           AND t.state='draft'
           AND NOT EXISTS (SELECT 1 FROM runtime_bindings rb WHERE rb.ticket_id=t.id)
         ORDER BY t.created_at,t.id LIMIT 1

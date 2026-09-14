@@ -118,7 +118,8 @@ def _canonical_payload(row: dict[str, Any], identity: dict[str, str]) -> dict[st
     )
     if any(not isinstance(raw.get(name), str) or not raw[name] for name in required):
         raise DeterministicProjectionError("generated projection payload is incomplete")
-    expected_key = triage_projection_key(identity["ticket_id"]) if identity.get("kind") == "triage_microticket" else generated_projection_key(identity["ticket_id"])
+    expected_key = (triage_projection_key(identity["ticket_id"]) if identity.get("kind") == "triage_microticket"
+                    else identity.get("projection_key", generated_projection_key(identity["ticket_id"])))
     if row["ticket_id"] != identity["ticket_id"] or raw["orchestrator_ticket_id"] != identity["ticket_id"]:
         raise DeterministicProjectionError("generated projection ticket identity mismatch")
     if identity.get("kind") == "triage_microticket":

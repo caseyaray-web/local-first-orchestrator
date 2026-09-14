@@ -411,6 +411,24 @@ hermes local-first-orchestrator --database <ledger> \
 
 It never retries an ambiguous external create.
 
+### `recover-generated-projection`
+
+While the controller is paused, read-verify and supersede one acknowledged pre-native generated card that reached Hermes `done` before reconciliation, or remains inertly `blocked` without worker execution. This records immutable recovery evidence and a fresh `board-create:v2` outbox intent; it does not write to Hermes, create an attempt, accept work, or change ticket state.
+
+```bash
+hermes local-first-orchestrator \
+  --database <ledger> \
+  --hermes-executable hermes \
+  --board <board> \
+  recover-generated-projection \
+  --task-id <local-first-ticket-id> \
+  --event-id <acknowledged-create-event-id> \
+  --operator-id <operator> \
+  --reason <reason>
+```
+
+Deliver the replacement separately with `project-generated --allow-board-writes`. Exact replay is idempotent; changed snapshot, status, external identity, operator, or reason fails closed. Existing attempts, model/review/acceptance/integration authority, active scheduler claims, pending board effects, leases, or multiple current create identities also fail closed.
+
 ### `reconcile-hermes-execution`
 
 Bind a completed dispatcher-owned Hermes worker run into a Local First attempt without launching implementation.
