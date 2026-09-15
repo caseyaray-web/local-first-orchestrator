@@ -50,14 +50,14 @@ def scheduler_stage_rank(stage: str) -> int:
     return SCHEDULER_STAGE_RANK[stage]
 
 
-def scheduler_observability(ledger: Ledger, *, now: int | None = None) -> dict[str, Any]:
+def scheduler_observability(ledger: Ledger, *, now: int | None = None, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None) -> dict[str, Any]:
     """Return one bounded, read-only scheduler lifecycle snapshot.
 
     This is a projection over existing durable authorities.  It never writes or
     persists a second metrics/recovery state machine.
     """
     now = ledger._now() if now is None else now
-    preview = preview_next(ledger, now=now)
+    preview = preview_next(ledger, now=now, signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint)
     claim = None
     if preview.claim_id is not None:
         claim = ledger.connection.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (preview.claim_id,)).fetchone()
@@ -678,7 +678,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
     return ProcessNextPreview()
 
 
-def preview_database(database: Path, *, now: int | None = None) -> ProcessNextPreview:
+def preview_database(database: Path, *, now: int | None = None, operator_config: Any | None = None) -> ProcessNextPreview:
     """Preview an existing migrated ledger through a strictly read-only handle."""
     try:
         path = Path(database).expanduser().resolve(strict=True)
@@ -690,7 +690,15 @@ def preview_database(database: Path, *, now: int | None = None) -> ProcessNextPr
         connection.row_factory = sqlite3.Row
         readonly_ledger = object.__new__(Ledger)
         readonly_ledger.connection = connection
-        return preview_next(readonly_ledger, now=now)
+        if operator_config is None:
+            signer_public_key = signer_fingerprint = None
+        else:
+            try:
+                signer_public_key = operator_config.signer_public_key_bytes
+                signer_fingerprint = operator_config.operator_signing_key_fingerprint
+            except (TypeError, ValueError):
+                signer_public_key = signer_fingerprint = None
+        return preview_next(readonly_ledger, now=now, signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint)
     except sqlite3.DatabaseError:
         return ProcessNextPreview(next_stage="no_work")
     finally:

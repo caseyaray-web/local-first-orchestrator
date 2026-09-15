@@ -2293,6 +2293,18 @@ class Ledger:
     def native_dependency_release_migration_required(self, *, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None) -> dict[str, Any] | None:
         """Find legacy releases that cannot authorize downstream execution."""
         rows = self.connection.execute("SELECT * FROM native_dependency_releases ORDER BY ticket_id").fetchall()
+        if (signer_public_key is None) != (signer_fingerprint is None):
+            signer_public_key = None
+            signer_fingerprint = None
+        if signer_public_key is not None:
+            try:
+                from .native_release_approval import fingerprint_public_key
+                if fingerprint_public_key(signer_public_key) != signer_fingerprint:
+                    signer_public_key = None
+                    signer_fingerprint = None
+            except (TypeError, ValueError):
+                signer_public_key = None
+                signer_fingerprint = None
         for row in rows:
             try:
                 authority = json.loads(str(row["routing_authority_json"] or "{}"))
@@ -2300,6 +2312,8 @@ class Ledger:
                 authority = None
             if not isinstance(authority, dict) or not authority.get("profile") or not authority.get("canonical_repository"):
                 ticket_id = str(row["ticket_id"])
+                if signer_public_key is None or not signer_fingerprint:
+                    return {"ticket_id": ticket_id, "reason": "legacy release requires externally registered signer authority"}
                 current = self.connection.execute("""
                     SELECT r.*, b.event_id AS current_projection_event_id, b.idempotency_key AS current_projection_key,
                            b.external_task_id AS current_external_task_id, e.event_type AS current_projection_event_type,
@@ -2373,18 +2387,43 @@ class Ledger:
             return False
         expected_event_key = "native-release-revalidated:" + str(row["revalidation_id"])
         expected_payload = {"event_key": expected_event_key, "revalidation_id": str(row["revalidation_id"]), "evidence_hash": str(row["evidence_hash"]), "evidence": document}
-        if row["approval_document_hash"] is not None:
-            expected_payload.update({"approval_document_hash": str(row["approval_document_hash"]), "signer_fingerprint": str(row["signer_fingerprint"])})
-            try:
-                from .native_release_approval import parse_approval_document, verify_detached_signature
-                raw = str(row["approval_document_json"]).encode("utf-8")
-                if signer_public_key is None or signer_fingerprint is None or hashlib.sha256(raw).hexdigest() != str(row["approval_document_hash"]):
-                    return False
-                parse_approval_document(raw)
-                verify_detached_signature(raw, base64.b64decode(str(row["detached_signature"]), validate=True), signer_public_key, signer_fingerprint)
-            except (ValueError, TypeError, binascii.Error):
+        expected_payload.update({"approval_document_hash": str(row["approval_document_hash"]), "signer_fingerprint": str(row["signer_fingerprint"])})
+        try:
+            from .native_release_approval import parse_approval_document, verify_detached_signature
+            if signer_public_key is None or not signer_fingerprint:
                 return False
-        return (
+            if not isinstance(row["approval_document_json"], str) or not row["approval_document_json"].strip():
+                return False
+            if not isinstance(row["approval_document_hash"], str) or not row["approval_document_hash"].strip():
+                return False
+            if not isinstance(row["detached_signature"], str) or not row["detached_signature"].strip():
+                return False
+            if not isinstance(row["signer_fingerprint"], str) or row["signer_fingerprint"] != signer_fingerprint:
+                return False
+            raw = row["approval_document_json"].encode("utf-8")
+            if hashlib.sha256(raw).hexdigest() != row["approval_document_hash"]:
+                return False
+            approval = parse_approval_document(raw)
+            signature = base64.b64decode(row["detached_signature"], validate=True)
+            if len(signature) != 64:
+                return False
+            verify_detached_signature(raw, signature, signer_public_key, signer_fingerprint)
+            if approval["operator_id"] != str(row["operator_id"]) or approval["reason"] != str(row["reason"]):
+                return False
+            approval_authority = approval["authority"]
+            if (approval_authority.get("ticket_id") != str(row["ticket_id"])
+                    or approval_authority.get("implementation_profile") != str(row["implementation_profile"])
+                    or approval_authority.get("repository_identity") != str(row["repository_identity"])
+                    or approval_authority.get("canonical_worktree_path") != str(row["canonical_worktree_path"])
+                    or approval_authority.get("branch") != str(row["branch"])
+                    or approval_authority.get("base_sha") != str(row["base_sha"])
+                    or approval_authority.get("snapshot_hash") != str(row["snapshot_hash"])
+                    or approval_authority.get("projection") != {"event_id": int(row["projection_event_id"]), "key": str(row["projection_key"]), "external_id": str(row["external_task_id"])}
+                    or approval_authority.get("release") != dict(release)):
+                return False
+        except (ValueError, TypeError, UnicodeError, binascii.Error):
+            return False
+        result = (
             isinstance(authority, dict) and authority == {}
             and str(row["release_graph_hash"]) == str(release["graph_hash"])
             and str(row["release_child_external_id"]) == str(release["child_external_id"])
@@ -2408,17 +2447,26 @@ class Ledger:
             and payload == expected_payload
             and str(row["evidence_hash"]) == canonical_sha256(document)
         )
+        return result
 
     def record_native_release_revalidation(self, *, ticket_id: str, projection_event_id: int,
                                            projection_key: str, external_task_id: str,
                                            implementation_profile: str, repository_identity: str,
                                            canonical_worktree_path: str, branch: str, base_sha: str,
                                            snapshot_hash: str, operator_id: str, reason: str,
-                                           approval_document_json: str | None = None, approval_document_hash: str | None = None,
-                                           detached_signature: bytes | None = None, signer_fingerprint: str | None = None,
-                                           signer_public_key: bytes | None = None) -> dict[str, Any]:
+                                           approval_document_json: str, approval_document_hash: str,
+                                           detached_signature: bytes, signer_fingerprint: str,
+                                           signer_public_key: bytes) -> dict[str, Any]:
         if not all(isinstance(value, str) and value.strip() for value in (ticket_id, projection_key, external_task_id, implementation_profile, repository_identity, canonical_worktree_path, branch, base_sha, snapshot_hash, operator_id, reason)):
             raise ValueError("native release revalidation requires non-empty identity and reason")
+        from .native_release_approval import parse_approval_document, verify_detached_signature
+        if not isinstance(approval_document_json, str) or not approval_document_json.strip() or not isinstance(approval_document_hash, str) or not approval_document_hash.strip() or not isinstance(detached_signature, bytes) or not isinstance(signer_fingerprint, str) or not signer_fingerprint.strip() or not isinstance(signer_public_key, bytes):
+            raise ValueError("native release revalidation requires complete external signer authority")
+        document_bytes = approval_document_json.encode("utf-8")
+        approval = parse_approval_document(document_bytes)
+        if hashlib.sha256(document_bytes).hexdigest() != approval_document_hash:
+            raise ValueError("native release approval document hash mismatch")
+        verify_detached_signature(document_bytes, detached_signature, signer_public_key, signer_fingerprint)
         with self._transaction() as conn:
             paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
             if paused is None or not bool(paused["paused"]):
@@ -2443,6 +2491,17 @@ class Ledger:
                 raise ValueError("native release revalidation runtime identity mismatch")
             if conn.execute("SELECT 1 FROM attempts WHERE ticket_id=? UNION SELECT 1 FROM model_invocations WHERE ticket_id=? UNION SELECT 1 FROM model_stage_artifacts WHERE ticket_id=? UNION SELECT 1 FROM review_candidates WHERE ticket_id=? UNION SELECT 1 FROM review_results WHERE ticket_id=? UNION SELECT 1 FROM review_findings WHERE ticket_id=? UNION SELECT 1 FROM accepted_candidates WHERE ticket_id=? UNION SELECT 1 FROM accepted_evidence WHERE ticket_id=? UNION SELECT 1 FROM git_commit_intents WHERE ticket_id=? UNION SELECT 1 FROM git_commit_evidence WHERE ticket_id=? UNION SELECT 1 FROM hermes_execution_reconciliations WHERE ticket_id=?", (ticket_id,)*11).fetchone() is not None:
                 raise ValueError("native release revalidation refuses lifecycle evidence")
+            if (approval["operator_id"] != operator_id or approval["reason"] != reason
+                    or approval["authority"].get("ticket_id") != ticket_id
+                    or approval["authority"].get("implementation_profile") != implementation_profile
+                    or approval["authority"].get("repository_identity") != repository_identity
+                    or approval["authority"].get("canonical_worktree_path") != canonical_worktree_path
+                    or approval["authority"].get("branch") != branch
+                    or approval["authority"].get("base_sha") != base_sha
+                    or approval["authority"].get("snapshot_hash") != snapshot_hash
+                    or approval["authority"].get("projection") != {"event_id": projection_event_id, "key": projection_key, "external_id": external_task_id}
+                    or approval["authority"].get("release") != dict(release)):
+                raise ValueError("native release approval document is stale or copied")
             if conn.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND status='claimed' UNION SELECT 1 FROM tickets WHERE id=? AND lease_owner IS NOT NULL", (ticket_id, ticket_id)).fetchone() is not None:
                 raise ValueError("native release revalidation refuses active lease or claim")
             values = (implementation_profile, repository_identity, canonical_worktree_path, branch, base_sha, snapshot_hash, operator_id, reason)
@@ -2476,8 +2535,7 @@ class Ledger:
             evidence = self._native_release_evidence_document(evidence_row)
             evidence_hash = canonical_sha256(evidence)
             event_payload = {"event_key": event_key, "revalidation_id": revalidation_id, "evidence_hash": evidence_hash, "evidence": evidence}
-            if approval_document_hash is not None:
-                event_payload.update({"approval_document_hash": approval_document_hash, "signer_fingerprint": signer_fingerprint})
+            event_payload.update({"approval_document_hash": approval_document_hash, "signer_fingerprint": signer_fingerprint})
             prior = conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=?", (revalidation_id,)).fetchone()
             if prior is not None:
                 expected = tuple(prior[key] for key in ("implementation_profile", "repository_identity", "canonical_worktree_path", "branch", "base_sha", "snapshot_hash", "operator_id", "reason"))

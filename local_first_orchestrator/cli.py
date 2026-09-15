@@ -609,7 +609,8 @@ def run_command(args: argparse.Namespace) -> int:
     """Run a parsed standalone or native Hermes CLI command."""
     if args.command=="process-next" and not args.execute:
         if args.ad_hoc_runtime: raise ValueError("process-next requires registered operator runtime")
-        print(json.dumps(asdict(preview_database(Path(args.database))),sort_keys=True))
+        registered = load_operator_config(Path(args.operator_config_path) if args.operator_config_path else None)
+        print(json.dumps(asdict(preview_database(Path(args.database), operator_config=registered)),sort_keys=True))
         return 0
     ledger=_ledger(args.database)
     try:

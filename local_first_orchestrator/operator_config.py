@@ -127,7 +127,7 @@ class OperatorConfig:
             raise ValueError("execution_runtime_not_configured")
         from .controller import RuntimeConfig
         assert self.worktree_root is not None and self.artifact_root is not None and self.implementation_timeout_seconds is not None and self.review_timeout_seconds is not None
-        config = RuntimeConfig(self.canonical_repository, self.worktree_root, self.artifact_root, self.repository_allowlist, implementation_timeout_seconds=self.implementation_timeout_seconds, review_timeout_seconds=self.review_timeout_seconds, operator_signer_fingerprint=self.operator_signing_key_fingerprint, operator_authority_hash=self.operator_authority_hash)
+        config = RuntimeConfig(self.canonical_repository, self.worktree_root, self.artifact_root, self.repository_allowlist, implementation_timeout_seconds=self.implementation_timeout_seconds, review_timeout_seconds=self.review_timeout_seconds, operator_signer_fingerprint=self.operator_signing_key_fingerprint, operator_authority_hash=self.operator_authority_hash, operator_signer_public_key=self.signer_public_key_bytes if self.operator_signing_public_key else None)
         config.validate_execution_roots()
         return config
 

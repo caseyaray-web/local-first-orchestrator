@@ -45,6 +45,7 @@ class RuntimeConfig:
     review_timeout_seconds: int = 300
     operator_signer_fingerprint: str | None = None
     operator_authority_hash: str | None = None
+    operator_signer_public_key: bytes | None = None
 
     def canonical_repository(self, candidate: Path) -> Path:
         path = Path(candidate).resolve(strict=True)
@@ -184,6 +185,12 @@ class LocalFirstController:
             raise RuntimeError("native release revalidation requires execution snapshot support")
         if not isinstance(operator_id, str) or not operator_id.strip() or not isinstance(reason, str) or not reason.strip() or not implementation_profile.strip():
             raise ValueError("operator identity, reason, and implementation profile required")
+        if not self.config.operator_signer_fingerprint or not self.config.operator_signer_public_key:
+            raise PermissionError("native release revalidation requires registered external signer authority")
+        registered_signer = self.config.operator_signer_public_key
+        fingerprint_public_key(registered_signer)
+        if not _prepare_only and (signer_public_key != registered_signer or signer_fingerprint != self.config.operator_signer_fingerprint):
+            raise PermissionError("native release revalidation signer authority is not the registered authority")
         projection = self.ledger.connection.execute("""
             SELECT event_id,idempotency_key,external_task_id FROM board_projection_outbox
             WHERE ticket_id=? AND operation='create_microticket' AND superseded_at IS NULL
@@ -235,7 +242,7 @@ class LocalFirstController:
         release = self.ledger.native_dependency_release(ticket_id)
         graph = self.ledger.native_dependency_graph(ticket_id)
         binding = self.ledger.runtime_binding(ticket_id)
-        if self.config.operator_signer_fingerprint and (binding.get("operator_signer_fingerprint") != self.config.operator_signer_fingerprint or binding.get("operator_authority_hash") != self.config.operator_authority_hash):
+        if binding.get("operator_signer_fingerprint") != self.config.operator_signer_fingerprint or binding.get("operator_authority_hash") != self.config.operator_authority_hash:
             raise PermissionError("registered runtime signer authority is not bound to this ticket")
         document = {
             "domain": APPROVAL_DOMAIN, "version": APPROVAL_VERSION,
@@ -255,23 +262,20 @@ class LocalFirstController:
         canonical = canonical_approval_bytes(document)
         if _prepare_only:
             return {"document": document, "canonical_document": canonical.decode("utf-8"), "approval_hash": hashlib.sha256(canonical).hexdigest()}
-        if approval_document is not None:
-            if signer_public_key is None or detached_signature is None or not signer_fingerprint:
-                raise PermissionError("native release revalidation requires detached operator signature")
-            supplied = canonical_approval_bytes(approval_document)
-            if supplied != canonical:
-                raise ValueError("approval document is stale or does not match current state")
-            verify_detached_signature(supplied, detached_signature, signer_public_key, signer_fingerprint)
-        elif self.config.operator_signer_fingerprint:
+        if approval_document is None or detached_signature is None or not signer_fingerprint:
             raise PermissionError("native release revalidation requires detached operator signature")
+        supplied = canonical_approval_bytes(approval_document)
+        if supplied != canonical:
+            raise ValueError("approval document is stale or does not match current state")
+        verify_detached_signature(supplied, detached_signature, registered_signer, signer_fingerprint)
         return self.ledger.record_native_release_revalidation(
             ticket_id=ticket_id, projection_event_id=int(projection["event_id"]),
             projection_key=str(projection["idempotency_key"]), external_task_id=external_task_id,
             implementation_profile=implementation_profile, repository_identity=str(repository),
             canonical_worktree_path=str(expected_path), branch=branch, base_sha=expected_base,
             snapshot_hash=canonical_sha256(asdict(snapshot)), operator_id=operator_id, reason=reason,
-            approval_document_json=canonical.decode("utf-8") if approval_document is not None else None,
-            approval_document_hash=hashlib.sha256(canonical).hexdigest() if approval_document is not None else None,
+            approval_document_json=canonical.decode("utf-8"),
+            approval_document_hash=hashlib.sha256(canonical).hexdigest(),
             detached_signature=detached_signature, signer_fingerprint=signer_fingerprint, signer_public_key=signer_public_key,
         )
 

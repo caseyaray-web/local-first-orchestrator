@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import subprocess
 import unittest
+import hashlib
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -10,6 +12,7 @@ from local_first_orchestrator.controller import LocalFirstController, RuntimeCon
 from local_first_orchestrator.hermes_board import ExternalExecutionRun, ExternalExecutionSnapshot, ExternalTicket
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.states import CanonicalState
+from local_first_orchestrator.native_release_approval import canonical_approval_bytes, fingerprint_public_key, parse_approval_document
 
 
 class ReadOnlyBoard:
@@ -39,9 +42,13 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         subprocess.run(("git", "worktree", "add", "-q", "-b", "local-first/TK-1/maintenance", str(self.worktree), self.base), cwd=self.repo, check=True)
         self.ledger = Ledger(self.root / "ledger.db")
         self.ledger.migrate()
+        self.signing_key = Ed25519PrivateKey.generate()
+        self.signer_public_key = self.signing_key.public_key().public_bytes_raw()
+        self.signer_fingerprint = fingerprint_public_key(self.signer_public_key)
         self.ticket = self.ledger.create_ticket(title="TK-1", state=CanonicalState.DRAFT, external_id="card-1")
         self.ledger.connection.execute("UPDATE tickets SET dependencies_json='[]' WHERE id=?", (self.ticket,))
-        self.ledger.bind_runtime(self.ticket, str(self.repo), self.base)
+        authority_hash = hashlib.sha256(self.signer_fingerprint.encode("ascii")).hexdigest()
+        self.ledger.bind_runtime(self.ticket, str(self.repo), self.base, operator_signer_fingerprint=self.signer_fingerprint, operator_authority_hash=authority_hash)
         with self.ledger._transaction() as conn:
             event = self.ledger._append_event(conn, entity_type="ticket", entity_id=self.ticket, event_type="generated_microticket_created", actor_id="test", to_state="draft", payload={"ticket_id": self.ticket})
             conn.execute("INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,acknowledged_at,external_task_id,operation) VALUES (?,?,?,?,?,1,1,'card-1','create_microticket')", (self.ticket, event, "draft", "{}", "legacy-key"))
@@ -54,26 +61,44 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
             runs=(), repository_identity=str(self.repo), base_sha=self.base,
         )
         self.board = ReadOnlyBoard(self.snapshot)
-        self.controller = LocalFirstController(self.ledger, self.board, RuntimeConfig(self.repo, self.root / "unused-worktrees", self.root / "artifacts", (self.repo,)))
+        self.controller = LocalFirstController(self.ledger, self.board, RuntimeConfig(self.repo, self.root / "unused-worktrees", self.root / "artifacts", (self.repo,), operator_signer_fingerprint=self.signer_fingerprint, operator_authority_hash=authority_hash, operator_signer_public_key=self.signer_public_key))
+
+    def signed_revalidate(self, *, reason: str = "verify legacy evidence") -> dict[str, object]:
+        if not hasattr(self, "approval_cache"):
+            self.approval_cache = {}
+        if reason in self.approval_cache:
+            document, signature = self.approval_cache[reason]
+            return self.controller.revalidate_native_release(self.ticket, operator_id="operator", reason=reason, implementation_profile="impl", approval_document=document, detached_signature=signature, signer_public_key=self.signer_public_key, signer_fingerprint=self.signer_fingerprint)
+        prepared = self.controller.prepare_native_release_revalidation(self.ticket, operator_id="operator", reason=reason, implementation_profile="impl")
+        document = parse_approval_document(prepared["canonical_document"])
+        canonical = canonical_approval_bytes(document)
+        signature = self.signing_key.sign(canonical)
+        self.approval_cache[reason] = (document, signature)
+        return self.controller.revalidate_native_release(self.ticket, operator_id="operator", reason=reason, implementation_profile="impl", approval_document=document, detached_signature=signature, signer_public_key=self.signer_public_key, signer_fingerprint=self.signer_fingerprint)
 
     def tearDown(self) -> None:
         self.ledger.close()
         self.temp.cleanup()
 
+    def test_direct_controller_omission_is_rejected_before_mutation(self) -> None:
+        with self.assertRaisesRegex((PermissionError, ValueError), "(signer|approval|authority)"):
+            self.controller.revalidate_native_release(self.ticket, operator_id="operator", reason="verify legacy evidence", implementation_profile="impl")
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM native_dependency_release_revalidations").fetchone()[0], 0)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM events WHERE event_type='native_dependency_release_revalidated'").fetchone()[0], 0)
+
     def test_success_appends_revalidation_and_controller_event_without_mutating_legacy_release(self) -> None:
-        result = self.controller.revalidate_native_release(self.ticket, operator_id="operator", reason="verify legacy evidence", implementation_profile="impl")
+        result = self.signed_revalidate()
         self.assertEqual(result["ticket_id"], self.ticket)
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM native_dependency_release_revalidations").fetchone()[0], 1)
         self.assertEqual(self.ledger.connection.execute("SELECT routing_authority_json FROM native_dependency_releases WHERE ticket_id=?", (self.ticket,)).fetchone()[0], "{}")
         self.assertEqual(self.ledger.connection.execute("SELECT event_type FROM events WHERE entity_type='controller' ORDER BY id DESC LIMIT 1").fetchone()[0], "native_dependency_release_revalidated")
 
     def test_replay_is_idempotent_only_for_exact_request(self) -> None:
-        request = dict(ticket_id=self.ticket, operator_id="operator", reason="verify legacy evidence", implementation_profile="impl")
-        first = self.controller.revalidate_native_release(**request)
-        second = self.controller.revalidate_native_release(**request)
+        first = self.signed_revalidate()
+        second = self.signed_revalidate()
         self.assertEqual(first, second)
         with self.assertRaisesRegex(ValueError, "revalidation replay conflicts"):
-            self.controller.revalidate_native_release(**{**request, "reason": "changed"})
+            self.signed_revalidate(reason="changed")
 
     def test_rejects_execution_evidence_and_allows_spawn_failed_without_worker(self) -> None:
         self.board.snapshot = ExternalExecutionSnapshot(
@@ -83,19 +108,19 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
             repository_identity=str(self.repo), base_sha=self.base,
         )
         with self.assertRaisesRegex(RuntimeError, "execution evidence"):
-            self.controller.revalidate_native_release(self.ticket, operator_id="operator", reason="verify", implementation_profile="impl")
+            self.signed_revalidate(reason="verify")
         self.board.snapshot = ExternalExecutionSnapshot(
             task=self.snapshot.task, session_id=None, branch_name=self.snapshot.branch_name,
             started_at=None, completed_at=None,
             runs=(ExternalExecutionRun(2, "spawn_failed", "spawn_failed", None, None, "could not spawn", None, None),),
             repository_identity=str(self.repo), base_sha=self.base,
         )
-        self.controller.revalidate_native_release(self.ticket, operator_id="operator", reason="verify", implementation_profile="impl")
+        self.signed_revalidate(reason="verify")
 
     def test_unpaused_and_worktree_drift_rollback_without_event(self) -> None:
         self.ledger.resume("operator", reason="test")
         with self.assertRaisesRegex(PermissionError, "paused"):
-            self.controller.revalidate_native_release(self.ticket, operator_id="operator", reason="verify", implementation_profile="impl")
+            self.signed_revalidate(reason="verify")
         self.ledger.pause("operator", reason="test")
         self.board.snapshot = ExternalExecutionSnapshot(
             task=ExternalTicket("card-1", "TK-1", "legacy", "scheduled", str(self.root / "wrong"), assignee="impl", workspace_kind="worktree"),
@@ -103,7 +128,7 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
             runs=(), repository_identity=str(self.repo), base_sha=self.base,
         )
         with self.assertRaisesRegex(RuntimeError, "worktree drift"):
-            self.controller.revalidate_native_release(self.ticket, operator_id="operator", reason="verify", implementation_profile="impl")
+            self.signed_revalidate(reason="verify")
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM native_dependency_release_revalidations").fetchone()[0], 0)
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM events WHERE event_type='native_dependency_release_revalidated'").fetchone()[0], 0)
 
@@ -111,15 +136,15 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         self.assertIsNotNone(self.ledger.native_dependency_release_migration_required())
         self.ledger.failure_injector = lambda point: (_ for _ in ()).throw(RuntimeError(point)) if point == "after_native_release_revalidation" else None
         with self.assertRaisesRegex(RuntimeError, "after_native_release_revalidation"):
-            self.controller.revalidate_native_release(self.ticket, operator_id="operator", reason="verify", implementation_profile="impl")
+            self.signed_revalidate(reason="verify")
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM native_dependency_release_revalidations").fetchone()[0], 0)
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM events WHERE event_type='native_dependency_release_revalidated'").fetchone()[0], 0)
         self.ledger.failure_injector = None
-        self.controller.revalidate_native_release(self.ticket, operator_id="operator", reason="verify", implementation_profile="impl")
-        self.assertIsNone(self.ledger.native_dependency_release_migration_required())
+        self.signed_revalidate(reason="verify")
+        self.assertIsNone(self.ledger.native_dependency_release_migration_required(signer_public_key=self.signer_public_key, signer_fingerprint=self.signer_fingerprint))
 
     def test_revalidation_table_is_immutable(self) -> None:
-        row = self.controller.revalidate_native_release(self.ticket, operator_id="operator", reason="verify", implementation_profile="impl")
+        row = self.signed_revalidate(reason="verify")
         with self.assertRaisesRegex(Exception, "append-only"):
             self.ledger.connection.execute("UPDATE native_dependency_release_revalidations SET reason='tampered' WHERE revalidation_id=?", (row["revalidation_id"],))
         with self.assertRaisesRegex(Exception, "append-only"):
