@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -52,11 +54,33 @@ class ExternalExecutionSnapshot:
     base_sha: str | None = None
 
 
+class _BoardRevalidationCapability:
+    """Adapter-owned proof that an IMMEDIATE transaction is still held."""
+
+    __slots__ = ("snapshot", "_adapter", "_connection", "_token", "_task_id", "_active")
+
+    def __init__(self, adapter: "HermesBoardAdapter", connection: sqlite3.Connection, task_id: str, snapshot: ExternalExecutionSnapshot, token: object) -> None:
+        self.snapshot, self._adapter, self._connection, self._token = snapshot, adapter, connection, token
+        self._task_id, self._active = task_id, True
+
+    def _verify_for_ledger(self, task_id: str, external_task_id: str) -> None:
+        if not self._active or self._token is not self._adapter._revalidation_token:
+            raise PermissionError("trusted board revalidation capability is inactive or unproven")
+        if task_id != self._task_id or external_task_id != self.snapshot.task.id:
+            raise PermissionError("trusted board revalidation capability identity mismatch")
+        current = self._adapter._snapshot_from_connection(self._connection, self._task_id)
+        if current != self.snapshot:
+            raise RuntimeError("native release revalidation board snapshot drift before ledger commit")
+
+    def close(self) -> None:
+        self._active = False
+
+
 class HermesBoardAdapter:
     """Hermes CLI adapter. Writes require explicit opt-in; reads are always safe."""
     is_fake = False
 
-    def __init__(self, *, board: str, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run, executable: str, allow_writes: bool = False, timeout_seconds: int = 15, output_limit: int = 200_000, implementation_profile: str | None = None, canonical_repository: Path | None = None) -> None:
+    def __init__(self, *, board: str, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run, executable: str, allow_writes: bool = False, timeout_seconds: int = 15, output_limit: int = 200_000, implementation_profile: str | None = None, canonical_repository: Path | None = None, board_db_path: Path | None = None) -> None:
         if timeout_seconds < 1 or output_limit < 1: raise ValueError("positive process limits required")
         if not board or not board.replace("-", "").replace("_", "").isalnum(): raise ValueError("explicit board slug required")
         path=Path(executable)
@@ -66,6 +90,77 @@ class HermesBoardAdapter:
         self.runner, self.executable, self.board, self.allow_writes, self.timeout_seconds, self.output_limit = runner, str(path), board, allow_writes, timeout_seconds, output_limit
         self.implementation_profile = implementation_profile
         self.canonical_repository = None if canonical_repository is None else Path(canonical_repository).expanduser().resolve()
+        self.board_db_path = None if board_db_path is None else Path(board_db_path).expanduser().resolve()
+        self._revalidation_token: object | None = None
+
+    def _resolved_board_db_path(self) -> Path:
+        if self.board_db_path is not None:
+            path = self.board_db_path
+        else:
+            try:
+                from hermes_cli import kanban_db
+                path = Path(kanban_db.kanban_db_path(self.board))
+            except Exception as exc:
+                raise RuntimeError("trusted board revalidation cannot resolve Hermes Kanban DB") from exc
+        try:
+            path = path.expanduser().resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError("trusted board revalidation requires an existing local SQLite board DB") from exc
+        if not path.is_file():
+            raise RuntimeError("trusted board revalidation requires an existing local SQLite board DB")
+        return path
+
+    @staticmethod
+    def _snapshot_from_connection(connection: sqlite3.Connection, task_id: str) -> ExternalExecutionSnapshot:
+        try:
+            from hermes_cli import kanban_db
+            task = kanban_db.get_task(connection, task_id)
+            if task is None:
+                raise KeyError(task_id)
+            raw_task = connection.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            parents = tuple(sorted(str(row["parent_id"]) for row in connection.execute("SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id", (task_id,))))
+            children = tuple(sorted(str(row["child_id"]) for row in connection.execute("SELECT child_id FROM task_links WHERE parent_id=? ORDER BY child_id", (task_id,))))
+            runs = kanban_db.list_runs(connection, task_id)
+        except (sqlite3.DatabaseError, KeyError, AttributeError, TypeError) as exc:
+            raise RuntimeError("Hermes Kanban execution snapshot read failed") from exc
+        keys = set(raw_task.keys()) if raw_task is not None else set()
+        optional = lambda name, fallback=None: raw_task[name] if raw_task is not None and name in keys else fallback
+        external_runs = tuple(ExternalExecutionRun(int(run.id), str(run.status or ""), None if run.outcome is None else str(run.outcome), int(run.started_at) if run.started_at is not None else None, None if run.ended_at is None else int(run.ended_at), None if run.summary is None else str(run.summary), None if run.profile is None else str(run.profile), None if run.worker_pid is None else int(run.worker_pid), run.metadata) for run in runs)
+        return ExternalExecutionSnapshot(
+            task=ExternalTicket(str(task.id), str(task.title or ""), str(task.body or ""), str(task.status or ""), task.workspace_path, parents=parents, children=children, assignee=task.assignee, workspace_kind=task.workspace_kind, repository_identity=optional("repository_identity"), base_sha=optional("base_sha")),
+            session_id=optional("session_id", task.session_id), branch_name=task.branch_name, started_at=task.started_at, completed_at=task.completed_at,
+            runs=external_runs, repository_identity=optional("repository_identity"), base_sha=optional("base_sha"),
+        )
+
+    @contextmanager
+    def revalidation(self, task_id: str):
+        """Hold the exact Hermes board write lock across the caller's ledger commit."""
+        path = self._resolved_board_db_path()
+        try:
+            from hermes_cli.sqlite_util import open_db
+            connection = open_db(path, db_label=f"kanban:{self.board}", busy_timeout_ms=int(self.timeout_seconds * 1000), wal=False, check_same_thread=False)
+        except Exception as exc:
+            raise RuntimeError("trusted board revalidation cannot open the configured local SQLite board") from exc
+        token = object()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            snapshot = self._snapshot_from_connection(connection, task_id)
+            self._revalidation_token = token
+            capability = _BoardRevalidationCapability(self, connection, task_id, snapshot, token)
+            try:
+                yield capability
+            finally:
+                capability.close()
+                self._revalidation_token = None
+            connection.execute("COMMIT")
+        except Exception:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+        finally:
+            connection.close()
 
     def _run(self, *args: str) -> Any:
         try:

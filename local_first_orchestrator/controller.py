@@ -224,7 +224,29 @@ class LocalFirstController:
                                   implementation_profile: str, approval_document: dict[str, Any] | None = None,
                                   detached_signature: bytes | None = None, signer_public_key: bytes | None = None,
                                   signer_fingerprint: str | None = None, _prepare_only: bool = False) -> dict[str, Any]:
-        """Append-only operator proof for one legacy native release."""
+        """Authorize only inside the trusted Hermes board transaction boundary."""
+        projection = self.ledger.connection.execute(
+            "SELECT external_task_id FROM board_projection_outbox WHERE ticket_id=? AND operation='create_microticket' AND superseded_at IS NULL AND acknowledged_at IS NOT NULL AND external_task_id IS NOT NULL",
+            (ticket_id,),
+        ).fetchall()
+        if len(projection) != 1:
+            raise ValueError("native release revalidation requires exactly one current projection")
+        external_task_id = str(projection[0]["external_task_id"])
+        if not hasattr(self.board, "revalidation"):
+            raise RuntimeError("native release revalidation requires a trusted local SQLite board adapter")
+        with self.board.revalidation(external_task_id) as board_capability:
+            return self._revalidate_native_release_locked(ticket_id, operator_id=operator_id, reason=reason,
+                implementation_profile=implementation_profile, approval_document=approval_document,
+                detached_signature=detached_signature, signer_public_key=signer_public_key,
+                signer_fingerprint=signer_fingerprint, _prepare_only=_prepare_only,
+                _trusted_board_capability=board_capability)
+
+    def _revalidate_native_release_locked(self, ticket_id: str, *, operator_id: str | None, reason: str | None,
+                                  implementation_profile: str, approval_document: dict[str, Any] | None,
+                                  detached_signature: bytes | None, signer_public_key: bytes | None,
+                                  signer_fingerprint: str | None, _prepare_only: bool,
+                                  _trusted_board_capability: Any) -> dict[str, Any]:
+        """Implementation called only while HermesBoardAdapter holds BEGIN IMMEDIATE."""
         if not hasattr(self.board, "execution_snapshot"):
             raise RuntimeError("native release revalidation requires execution snapshot support")
         if not isinstance(operator_id, str) or not operator_id.strip() or not isinstance(reason, str) or not reason.strip() or not implementation_profile.strip():
@@ -244,7 +266,7 @@ class LocalFirstController:
             raise ValueError("native release revalidation requires exactly one current projection")
         projection = projection[0]
         external_task_id = str(projection["external_task_id"])
-        snapshot = self.board.execution_snapshot(external_task_id)
+        snapshot = _trusted_board_capability.snapshot
         repository = self.config.repository.resolve(strict=True)
         expected_base = str(self.ledger.runtime_binding(ticket_id)["starting_sha"])
         expected_path = Path(str(snapshot.task.workspace_path)).expanduser().resolve() if snapshot.task.workspace_path else None
@@ -278,10 +300,6 @@ class LocalFirstController:
         if supplied != canonical:
             raise ValueError("approval document is stale or does not match current state")
         verify_detached_signature(supplied, detached_signature, registered_signer, signer_fingerprint)
-        def freshness_guard() -> None:
-            current = self.board.execution_snapshot(external_task_id)
-            self._validate_native_release_snapshot(current, external_task_id=external_task_id, implementation_profile=implementation_profile, repository=repository, expected_base=expected_base, expected_path=expected_path, expected_branch=branch, expected_snapshot_hash=str(document["authority"]["snapshot_hash"]))
-
         result = self.ledger.record_native_release_revalidation(
             ticket_id=ticket_id, projection_event_id=int(projection["event_id"]),
             projection_key=str(projection["idempotency_key"]), external_task_id=external_task_id,
@@ -291,10 +309,8 @@ class LocalFirstController:
             approval_document_json=canonical.decode("utf-8"),
             approval_document_hash=hashlib.sha256(canonical).hexdigest(),
             detached_signature=detached_signature, signer_fingerprint=signer_fingerprint, signer_public_key=signer_public_key,
-            freshness_guard=freshness_guard,
+            _trusted_board_capability=_trusted_board_capability,
         )
-        final = self.board.execution_snapshot(external_task_id)
-        self._validate_native_release_snapshot(final, external_task_id=external_task_id, implementation_profile=implementation_profile, repository=repository, expected_base=expected_base, expected_path=expected_path, expected_branch=branch, expected_snapshot_hash=str(document["authority"]["snapshot_hash"]))
         return result
 
     def prepare_native_release_revalidation(self, ticket_id: str, *, operator_id: str, reason: str, implementation_profile: str) -> dict[str, Any]:

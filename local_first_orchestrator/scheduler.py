@@ -51,14 +51,14 @@ def scheduler_stage_rank(stage: str) -> int:
     return SCHEDULER_STAGE_RANK[stage]
 
 
-def scheduler_observability(ledger: Ledger, *, now: int | None = None, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None) -> dict[str, Any]:
+def scheduler_observability(ledger: Ledger, *, now: int | None = None, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None, board: Any | None = None) -> dict[str, Any]:
     """Return one bounded, read-only scheduler lifecycle snapshot.
 
     This is a projection over existing durable authorities.  It never writes or
     persists a second metrics/recovery state machine.
     """
     now = ledger._now() if now is None else now
-    preview = preview_next(ledger, now=now, signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint)
+    preview = preview_next(ledger, now=now, signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint, board=board)
     claim = None
     if preview.claim_id is not None:
         claim = ledger.connection.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (preview.claim_id,)).fetchone()
@@ -221,7 +221,7 @@ class ProcessNextPreview:
     reconciliation_action: str | None = None
 
 
-def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None) -> ProcessNextPreview:
+def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None, board: Any | None = None) -> ProcessNextPreview:
     """Read the next eligible control stage without claiming or mutating it."""
     now = Ledger._now() if now is None else now
     paused = ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
@@ -242,6 +242,17 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
     migration = ledger.native_dependency_release_migration_required(signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint) if hasattr(ledger, "native_dependency_release_migration_required") else None
     if migration is not None:
         return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(migration["ticket_id"]), reconciliation_action=ReconciliationAction.STOP.value)
+    legacy = ledger.connection.execute("SELECT ticket_id,external_task_id,snapshot_hash FROM native_dependency_release_revalidations r JOIN native_dependency_releases l USING(ticket_id) WHERE json_extract(l.routing_authority_json,'$.profile') IS NULL").fetchall()
+    if legacy:
+        if board is None or not hasattr(board, "revalidation"):
+            return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(legacy[0]["ticket_id"]), reconciliation_action=ReconciliationAction.STOP.value)
+        try:
+            for row in legacy:
+                with board.revalidation(str(row["external_task_id"])) as proof:
+                    if canonical_sha256(asdict(proof.snapshot)) != str(row["snapshot_hash"]):
+                        raise RuntimeError("board snapshot drift")
+        except Exception:
+            return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(legacy[0]["ticket_id"]), reconciliation_action=ReconciliationAction.STOP.value)
 
     generated = ledger.connection.execute(
         "SELECT ticket_id FROM board_projection_outbox WHERE operation='create_microticket' AND terminal_error IS NULL "
@@ -679,7 +690,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
     return ProcessNextPreview()
 
 
-def preview_database(database: Path, *, now: int | None = None, operator_config: Any | None = None) -> ProcessNextPreview:
+def preview_database(database: Path, *, now: int | None = None, operator_config: Any | None = None, board: Any | None = None) -> ProcessNextPreview:
     """Preview an existing migrated ledger through a strictly read-only handle."""
     try:
         path = Path(database).expanduser().resolve(strict=True)
@@ -699,7 +710,7 @@ def preview_database(database: Path, *, now: int | None = None, operator_config:
                 signer_fingerprint = operator_config.operator_signing_key_fingerprint
             except (TypeError, ValueError):
                 signer_public_key = signer_fingerprint = None
-        return preview_next(readonly_ledger, now=now, signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint)
+        return preview_next(readonly_ledger, now=now, signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint, board=board)
     except sqlite3.DatabaseError:
         return ProcessNextPreview(next_stage="no_work")
     finally:
@@ -821,7 +832,10 @@ class ProcessNextScheduler:
                 if run.status not in {"blocked", "spawn_failed"}:
                     raise RuntimeError("native_dependency_release_reconciliation_required: current external run is ambiguous")
 
-        migration = self.ledger.native_dependency_release_migration_required(signer_public_key=self.native_dependency_release_signer_public_key, signer_fingerprint=self.native_dependency_release_signer_fingerprint, freshness_guard=verify_current_native_release)
+        trusted_preview = preview_next(self.ledger, now=now, signer_public_key=self.native_dependency_release_signer_public_key, signer_fingerprint=self.native_dependency_release_signer_fingerprint, board=self.board)
+        if trusted_preview.next_stage == "reconciliation_required":
+            raise RuntimeError("native_dependency_release_reconciliation_required: trusted current board proof unavailable")
+        migration = self.ledger.native_dependency_release_migration_required(signer_public_key=self.native_dependency_release_signer_public_key, signer_fingerprint=self.native_dependency_release_signer_fingerprint)
         if migration is not None:
             raise RuntimeError(
                 "native_dependency_release_reconciliation_required: legacy release routing authority requires paused operator revalidation"

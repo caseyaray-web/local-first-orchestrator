@@ -610,7 +610,8 @@ def run_command(args: argparse.Namespace) -> int:
     if args.command=="process-next" and not args.execute:
         if args.ad_hoc_runtime: raise ValueError("process-next requires registered operator runtime")
         registered = load_operator_config(Path(args.operator_config_path) if args.operator_config_path else None)
-        print(json.dumps(asdict(preview_database(Path(args.database), operator_config=registered)),sort_keys=True))
+        board = _board_for_cli(args, False, implementation_profile=registered.implementation.profile, canonical_repository=registered.canonical_repository)
+        print(json.dumps(asdict(preview_database(Path(args.database), operator_config=registered, board=board)),sort_keys=True))
         return 0
     ledger=_ledger(args.database)
     try:
