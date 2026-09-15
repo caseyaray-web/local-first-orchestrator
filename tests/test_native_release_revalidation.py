@@ -6,20 +6,19 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from hermes_cli import kanban_db
-from hermes_cli.kanban_db_connect import connect_closing
+from hermes_cli.sqlite_util import open_db
 
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
 from local_first_orchestrator.hermes_board import HermesBoardAdapter, ExternalExecutionSnapshot
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.states import CanonicalState
-from local_first_orchestrator.test_kanban_db import init_test_kanban_db
 from local_first_orchestrator.native_release_approval import (
     canonical_approval_bytes,
     fingerprint_public_key,
@@ -55,9 +54,53 @@ class _TestHermesBoardAdapter(HermesBoardAdapter):
 
 
 class NativeReleaseRevalidationTests(unittest.TestCase):
+    _PARENT_IDENTITY_KEYS = (
+        "HERMES_DELEGATED_CHILD_CONTEXT",
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_CLAIM_LOCK",
+        "HERMES_KANBAN_GOAL_MODE",
+        "HERMES_KANBAN_GOAL_MAX_TURNS",
+    )
+
     def setUp(self) -> None:
         self.temp = TemporaryDirectory()
         self.root = Path(self.temp.name)
+        self.board_name = "native-release-test"
+        self.board_db = self.root / "kanban-test.db"
+        self._parent_identity = {key: os.environ.get(key) for key in self._PARENT_IDENTITY_KEYS}
+        self.assertEqual(self.board_db.parent, self.root)
+        self.assertEqual(self.board_db.name, "kanban-test.db")
+        self.assertFalse(self.board_db.exists())
+        self.assertFalse(self.board_db.is_symlink())
+        initializer = (
+            "from pathlib import Path; "
+            "import os, sys; "
+            "assert not os.getenv('HERMES_DELEGATED_CHILD_CONTEXT'); "
+            "assert not any(key.startswith('HERMES_KANBAN_') for key in os.environ); "
+            "path = Path(sys.argv[1]); "
+            "assert path.name == 'kanban-test.db'; "
+            "assert path.parent == Path.cwd(); "
+            "assert not path.exists() and not path.is_symlink(); "
+            "from hermes_cli.kanban_db_connect import init_db; "
+            "init_db(path, board='native-release-test')"
+        )
+        result = subprocess.run(
+            (sys.executable, "-c", initializer, str(self.board_db)),
+            cwd=self.root,
+            env={"PATH": os.environ.get("PATH", ""), "PYTHONUTF8": "1"},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            self.fail(f"Hermes test DB initialization failed: {detail}")
+        self.assertEqual(self.board_db.parent, self.root)
+        self.assertEqual(self.board_db.name, "kanban-test.db")
+        self.assertTrue(self.board_db.is_file())
+        self.assertFalse(self.board_db.is_symlink())
+        self._assert_parent_identity_unchanged()
         self.repo = self.root / "repo"
         self.repo.mkdir()
         subprocess.run(("git", "init", "-q"), cwd=self.repo, check=True)
@@ -68,25 +111,6 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         self.worktree = self.repo / ".worktrees" / "TK-1"
         subprocess.run(("git", "worktree", "add", "-q", "-b", "local-first/TK-1/maintenance", str(self.worktree), self.base), cwd=self.repo, check=True)
 
-        self.board_name = "native-release-test"
-        self.board_db = self.root / "native-release-test.db"
-        init_test_kanban_db(self.board_db, temp_root=self.root, board=self.board_name)
-        # The board fixture is created by the fenced helper while the delegated
-        # marker is present.  The remainder of this legacy test exercises real
-        # Kanban writes, so run those writes in the ordinary test process and
-        # restore the reviewer's environment in tearDown.  No Hermes predicate
-        # or production module is patched.
-        self._saved_kanban_env = {
-            key: os.environ.pop(key, None)
-            for key in (
-                "HERMES_DELEGATED_CHILD_CONTEXT",
-                "HERMES_KANBAN_TASK",
-                "HERMES_KANBAN_RUN_ID",
-                "HERMES_KANBAN_CLAIM_LOCK",
-                "HERMES_KANBAN_GOAL_MODE",
-                "HERMES_KANBAN_GOAL_MAX_TURNS",
-            )
-        }
         self.signing_key = Ed25519PrivateKey.generate()
         self.signer_public_key = self.signing_key.public_key().public_bytes_raw()
         self.signer_fingerprint = fingerprint_public_key(self.signer_public_key)
@@ -98,18 +122,21 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         )
         self.adapter.repository_identity = str(self.repo)
         self.adapter.base_sha = self.base
-        with connect_closing(self.board_db) as connection:
-            self.external_id = kanban_db.create_task(
-                connection,
-                title="TK-1",
-                body="legacy native release",
-                assignee="impl",
-                created_by="test",
-                workspace_kind="worktree",
-                workspace_path=str(self.worktree),
-                branch_name="local-first/TK-1/maintenance",
-                initial_status="blocked",
+        with self._open_board() as connection:
+            self.external_id = "TK-1"
+            connection.execute(
+                "INSERT INTO tasks (id, title, body, assignee, status, priority, created_by, created_at, workspace_kind, workspace_path, branch_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (self.external_id, "TK-1", "legacy native release", "impl", "blocked", 0, "test", int(time.time()), "worktree", str(self.worktree), "local-first/TK-1/maintenance"),
             )
+            connection.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                (self.external_id, "created", '{"assignee":"impl","status":"blocked"}', int(time.time())),
+            )
+            connection.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                (self.external_id, "blocked", '{"reason":"initial_status","status":"blocked","actor":"test"}', int(time.time())),
+            )
+            connection.commit()
 
         self.ledger = Ledger(self.root / "ledger.db")
         self.ledger.migrate()
@@ -126,7 +153,14 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         self.controller = LocalFirstController(self.ledger, self.adapter, RuntimeConfig(self.repo, self.root / "unused-worktrees", self.root / "artifacts", (self.repo,), operator_signer_fingerprint=self.signer_fingerprint, operator_authority_hash=authority_hash, operator_signer_public_key=self.signer_public_key))
         self.approval_cache: dict[str, tuple[dict, bytes]] = {}
 
+    def _open_board(self) -> sqlite3.Connection:
+        return open_db(self.board_db, db_label=f"kanban:{self.board_name}", busy_timeout_ms=5000, wal=False, check_same_thread=False)
+
+    def _assert_parent_identity_unchanged(self) -> None:
+        self.assertEqual(self._parent_identity, {key: os.environ.get(key) for key in self._PARENT_IDENTITY_KEYS})
+
     def signed_revalidate(self, *, reason: str = "verify legacy evidence") -> dict[str, object]:
+        self._assert_parent_identity_unchanged()
         if reason in self.approval_cache:
             document, signature = self.approval_cache[reason]
         else:
@@ -137,18 +171,22 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         return self.controller.revalidate_native_release(self.ticket, operator_id="operator", reason=reason, implementation_profile="impl", approval_document=document, detached_signature=signature, signer_public_key=self.signer_public_key, signer_fingerprint=self.signer_fingerprint)
 
     def seed_run(self, *, status: str, outcome: str, summary: str, started_at: int | None, ended_at: int | None, profile: str | None = None, worker_pid: int | None = None) -> None:
-        with connect_closing(self.board_db) as connection:
+        self._assert_parent_identity_unchanged()
+        with self._open_board() as connection:
             connection.execute("INSERT INTO task_runs(task_id,profile,step_key,status,claim_lock,claim_expires,worker_pid,max_runtime_seconds,last_heartbeat_at,started_at,ended_at,outcome,summary,metadata,error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (self.external_id, profile, None, status, None, None, worker_pid, None, None, started_at or 1, ended_at, outcome, summary, None, None))
             connection.commit()
 
+    def test_test_database_is_owned_by_fixture_root_and_fixed_filename(self) -> None:
+        self._assert_parent_identity_unchanged()
+        self.assertEqual(self.board_db.parent, self.root)
+        self.assertEqual(self.board_db.name, "kanban-test.db")
+        self.assertTrue(self.board_db.is_file())
+        self.assertFalse(self.board_db.is_symlink())
+
     def tearDown(self) -> None:
+        self._assert_parent_identity_unchanged()
         self.ledger.close()
         self.temp.cleanup()
-        for key, value in self._saved_kanban_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
     def test_direct_ledger_fake_verify_method_cannot_authorize_stale_board(self) -> None:
         prepared = self.controller.prepare_native_release_revalidation(self.ticket, operator_id="operator", reason="verify", implementation_profile="impl")
@@ -211,7 +249,7 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         started = threading.Event()
         finished = threading.Event()
         def compete() -> None:
-            with connect_closing(self.board_db) as connection:
+            with self._open_board() as connection:
                 started.set()
                 connection.execute("UPDATE tasks SET status='running' WHERE id=?", (self.external_id,))
                 connection.commit()
@@ -236,7 +274,7 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         self.seed_run(status="done", outcome="completed", summary="done", started_at=1, ended_at=2)
         with self.assertRaisesRegex(RuntimeError, "execution evidence"):
             self.signed_revalidate(reason="verify")
-        with connect_closing(self.board_db) as connection:
+        with self._open_board() as connection:
             connection.execute("DELETE FROM task_runs WHERE task_id=?", (self.external_id,))
             connection.commit()
         self.seed_run(status="spawn_failed", outcome="spawn_failed", summary="could not spawn", started_at=None, ended_at=None)
@@ -247,7 +285,7 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "paused"):
             self.signed_revalidate(reason="verify")
         self.ledger.pause("operator", reason="test")
-        with connect_closing(self.board_db) as connection:
+        with self._open_board() as connection:
             connection.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(self.root / "wrong"), self.external_id))
             connection.commit()
         with self.assertRaisesRegex(RuntimeError, "worktree drift"):
