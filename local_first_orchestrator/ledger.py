@@ -328,7 +328,7 @@ CREATE TABLE IF NOT EXISTS runtime_signer_enrollment_intents (
     selected_bindings_json TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending_config','config_written','finalized','invalidated')),
  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, config_identity_json TEXT,
  document_json TEXT, document_hash TEXT, detached_signature TEXT, ledger_identity TEXT,
- old_config_identity_json TEXT, nonce TEXT
+ old_config_identity_json TEXT, nonce TEXT, new_config_bytes TEXT
  );
 CREATE TABLE IF NOT EXISTS runtime_signer_enrollments (
     enrollment_key TEXT NOT NULL REFERENCES runtime_signer_enrollment_intents(enrollment_key),
@@ -905,6 +905,9 @@ class Ledger:
         binding_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(runtime_bindings)")}
         if "canonical_sha" not in binding_columns:
             self.connection.execute("ALTER TABLE runtime_bindings ADD COLUMN canonical_sha TEXT")
+        enrollment_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(runtime_signer_enrollment_intents)")}
+        if "new_config_bytes" not in enrollment_columns:
+            self.connection.execute("ALTER TABLE runtime_signer_enrollment_intents ADD COLUMN new_config_bytes TEXT")
         runtime_stage_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(runtime_stages)")}
         for column, definition in (("attempt_number", "INTEGER"), ("artifact_path", "TEXT"), ("artifact_sha256", "TEXT"), ("base_sha", "TEXT")):
             if column not in runtime_stage_columns:
@@ -1106,6 +1109,13 @@ class Ledger:
         for name, definition in {"document_json": "TEXT", "document_hash": "TEXT", "detached_signature": "TEXT", "config_identity_json": "TEXT"}.items():
             if name not in evidence_columns:
                 self.connection.execute(f"ALTER TABLE runtime_signer_enrollments ADD COLUMN {name} {definition}")
+        trigger = self.connection.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='runtime_signer_enrollment_intents_immutable_identity'").fetchone()
+        if trigger is not None and "NEW.status IN ('config_written','finalized')" not in str(trigger["sql"]):
+            self.connection.executescript("""
+            DROP TRIGGER runtime_signer_enrollment_intents_immutable_identity;
+            DROP TRIGGER runtime_signer_enrollment_intents_status_transition;
+            DROP TRIGGER runtime_signer_enrollment_intents_no_delete;
+            """)
         self.connection.executescript("""
         CREATE TRIGGER IF NOT EXISTS runtime_signer_enrollment_intents_immutable_identity
         BEFORE UPDATE ON runtime_signer_enrollment_intents
@@ -1113,11 +1123,12 @@ class Ledger:
          OR OLD.reason IS NOT NEW.reason OR OLD.ticket_ids_json IS NOT NEW.ticket_ids_json
          OR OLD.public_key_fingerprint IS NOT NEW.public_key_fingerprint OR OLD.authority_hash IS NOT NEW.authority_hash
          OR OLD.old_config_hash IS NOT NEW.old_config_hash OR OLD.new_config_hash IS NOT NEW.new_config_hash
+         OR OLD.new_config_bytes IS NOT NEW.new_config_bytes
          OR OLD.selected_bindings_json IS NOT NEW.selected_bindings_json OR OLD.created_at IS NOT NEW.created_at
          OR OLD.document_json IS NOT NEW.document_json OR OLD.document_hash IS NOT NEW.document_hash
          OR OLD.detached_signature IS NOT NEW.detached_signature OR OLD.ledger_identity IS NOT NEW.ledger_identity
          OR OLD.old_config_identity_json IS NOT NEW.old_config_identity_json OR OLD.nonce IS NOT NEW.nonce
-         OR (OLD.config_identity_json IS NOT NEW.config_identity_json AND NOT (OLD.config_identity_json IS NULL AND NEW.config_identity_json IS NOT NULL AND NEW.status='finalized'))
+         OR (OLD.config_identity_json IS NOT NEW.config_identity_json AND NOT (OLD.config_identity_json IS NULL AND NEW.config_identity_json IS NOT NULL AND NEW.status IN ('config_written','finalized')))
         BEGIN SELECT RAISE(ABORT, 'runtime signer enrollment intent identity is immutable'); END;
         CREATE TRIGGER IF NOT EXISTS runtime_signer_enrollment_intents_status_transition
         BEFORE UPDATE OF status ON runtime_signer_enrollment_intents

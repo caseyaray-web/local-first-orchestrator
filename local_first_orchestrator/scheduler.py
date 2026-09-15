@@ -224,6 +224,11 @@ class ProcessNextPreview:
 def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None, signer_config_path: Path | None = None, board: Any | None = None) -> ProcessNextPreview:
     """Read the next eligible control stage without claiming or mutating it."""
     now = Ledger._now() if now is None else now
+    enrollment = ledger.connection.execute(
+        "SELECT enrollment_key FROM runtime_signer_enrollment_intents WHERE status IN ('pending_config','config_written') ORDER BY created_at,enrollment_key LIMIT 1"
+    ).fetchone()
+    if enrollment is not None:
+        return ProcessNextPreview(next_stage="reconciliation_required", reconciliation_action=ReconciliationAction.STOP.value)
     paused = ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
     if paused is None or paused["paused"]:
         return ProcessNextPreview(next_stage="paused")

@@ -25,6 +25,7 @@ ENROLLMENT_DOMAIN = "local-first-operator-signer-enrollment"
 ENROLLMENT_VERSION = 1
 _REQUIRED_DOCUMENT_FIELDS = {
     "domain", "version", "operation", "ledger_identity", "old_config_identity", "old_config_hash",
+    "new_config_hash", "new_config_bytes",
     "new_public_key", "new_fingerprint", "ticket_ids", "binding_projection_release_identities",
     "operator_id", "reason", "nonce",
 }
@@ -89,7 +90,7 @@ def _canonical_document(document: dict[str, Any]) -> bytes:
         raise ValueError("signer enrollment document has unexpected or missing fields")
     if document["domain"] != ENROLLMENT_DOMAIN or document["version"] != ENROLLMENT_VERSION or document["operation"] != "enroll-operator-signer":
         raise ValueError("signer enrollment document domain or version mismatch")
-    for field in ("ledger_identity", "old_config_hash", "new_fingerprint", "operator_id", "reason", "nonce", "new_public_key"):
+    for field in ("ledger_identity", "old_config_hash", "new_config_hash", "new_config_bytes", "new_fingerprint", "operator_id", "reason", "nonce", "new_public_key"):
         if type(document[field]) is not str or not document[field].strip():
             raise ValueError(f"signer enrollment document {field} is required")
     if type(document["old_config_identity"]) is not dict or type(document["ticket_ids"]) is not list or not document["ticket_ids"]:
@@ -98,6 +99,13 @@ def _canonical_document(document: dict[str, Any]) -> bytes:
         raise ValueError("signer enrollment ticket IDs must be non-empty strings")
     if type(document["binding_projection_release_identities"]) is not dict:
         raise ValueError("signer enrollment binding identities are required")
+    try:
+        new_raw = base64.b64decode(document["new_config_bytes"], validate=True)
+    except Exception as exc:
+        raise ValueError("signed new operator config bytes must be base64") from exc
+    if hashlib.sha256(new_raw).hexdigest() != document["new_config_hash"]:
+        raise ValueError("signed new operator config hash does not match bytes")
+    _parse_config(new_raw)
     return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
 
 
@@ -155,7 +163,8 @@ def prepare_operator_signer_enrollment(ledger: Any, *, config_path: Path, operat
     raw, obj, identity = _raw_config(Path(config_path).expanduser())
     config = load_operator_config(Path(config_path).expanduser())
     selected = _eligible(ledger, tuple(ticket_ids), config.canonical_repository)
-    document = {"domain": ENROLLMENT_DOMAIN, "version": ENROLLMENT_VERSION, "operation": "enroll-operator-signer", "ledger_identity": str(Path(ledger.database).resolve()), "old_config_identity": identity, "old_config_hash": hashlib.sha256(raw).hexdigest(), "new_public_key": public_key_b64, "new_fingerprint": fingerprint, "ticket_ids": list(ticket_ids), "binding_projection_release_identities": selected, "operator_id": operator_id, "reason": reason, "nonce": nonce}
+    new_raw = _with_signer_bytes(raw, public_key_b64, fingerprint)
+    document = {"domain": ENROLLMENT_DOMAIN, "version": ENROLLMENT_VERSION, "operation": "enroll-operator-signer", "ledger_identity": str(Path(ledger.database).resolve()), "old_config_identity": identity, "old_config_hash": hashlib.sha256(raw).hexdigest(), "new_config_hash": hashlib.sha256(new_raw).hexdigest(), "new_config_bytes": base64.b64encode(new_raw).decode(), "new_public_key": public_key_b64, "new_fingerprint": fingerprint, "ticket_ids": list(ticket_ids), "binding_projection_release_identities": selected, "operator_id": operator_id, "reason": reason, "nonce": nonce}
     data = _canonical_document(document)
     return {"document": document, "document_bytes": data, "document_hash": hashlib.sha256(data).hexdigest()}
 
@@ -176,34 +185,52 @@ def enroll_operator_signer(ledger: Any, *, config_path: Path, document: dict[str
     if reason is not None and reason != document_obj["reason"]: raise ValueError("reason conflicts with signed document")
     config_path = Path(config_path).expanduser()
     key = canonical_sha256({"document_hash": hashlib.sha256(data).hexdigest(), "signature": base64.b64encode(detached_signature if isinstance(detached_signature, bytes) else base64.b64decode(detached_signature)).decode(), "ticket_ids": list(selected)})
+    expected_new_raw = base64.b64decode(document_obj["new_config_bytes"], validate=True)
+    expected_new_hash = hashlib.sha256(expected_new_raw).hexdigest()
+    if expected_new_hash != document_obj["new_config_hash"]:
+        raise RuntimeError("signed new operator config hash proof failed")
     config_lock = _locked_config(config_path, write=True)
     with config_lock as (fd, identity):
         raw = _read_verified_fd(fd, identity); obj = _parse_config(raw)
         existing = ledger.connection.execute("SELECT * FROM runtime_signer_enrollment_intents WHERE enrollment_key=?", (key,)).fetchone()
+        resume_write = False
         if existing is not None and existing["status"] == "finalized":
-            if hashlib.sha256(raw).hexdigest() != existing["new_config_hash"] or obj.get("operator_signing_key_fingerprint") != fingerprint:
+            if hashlib.sha256(raw).hexdigest() != expected_new_hash or raw != expected_new_raw or obj.get("operator_signing_key_fingerprint") != fingerprint:
                 raise RuntimeError("finalized signer enrollment replay config mismatch")
             if existing["config_identity_json"] and json.loads(str(existing["config_identity_json"])) != identity:
                 raise RuntimeError("finalized signer enrollment replay identity mismatch")
             event = ledger.connection.execute("SELECT id FROM events WHERE event_type='runtime_signer_enrollment_completed' AND json_extract(payload_json,'$.enrollment_key')=? ORDER BY id DESC LIMIT 1", (key,)).fetchone()
             return {"status":"finalized","enrollment_key":key,"ticket_ids":list(selected),"public_key_fingerprint":fingerprint,"operator_authority_hash":hashlib.sha256(fingerprint.encode()).hexdigest(),"event_id":int(event["id"]) if event else None}
-        if hashlib.sha256(raw).hexdigest() != document_obj["old_config_hash"] or identity != document_obj["old_config_identity"]: raise RuntimeError("external operator config differs from signed enrollment document")
-        config = _parse_operator_config_bytes(raw, config_path)
+        if existing is not None and existing["status"] == "config_written":
+            if raw != expected_new_raw or hashlib.sha256(raw).hexdigest() != expected_new_hash or obj.get("operator_signing_key_fingerprint") != fingerprint:
+                raise RuntimeError("config_written signer enrollment replay config mismatch")
+            stored_identity = json.loads(str(existing["config_identity_json"] or "null"))
+            if stored_identity != identity:
+                raise RuntimeError("config_written signer enrollment replay identity mismatch")
+            resume_write = True
+        elif existing is not None and existing["status"] == "pending_config" and raw == expected_new_raw and obj.get("operator_signing_key_fingerprint") == fingerprint:
+            # The atomic write completed but the checkpoint did not.  This is
+            # the only legal pending replay besides the exact old file.
+            resume_write = True
+        elif hashlib.sha256(raw).hexdigest() != document_obj["old_config_hash"] or identity != document_obj["old_config_identity"]:
+            raise RuntimeError("external operator config differs from signed enrollment document")
+        config = _parse_operator_config_bytes(expected_new_raw if resume_write else raw, config_path)
         if str(Path(ledger.database).resolve()) != document_obj["ledger_identity"]: raise ValueError("ledger identity conflicts with signed enrollment document")
         selected_bindings = _eligible(ledger, selected, config.canonical_repository)
         if selected_bindings != document_obj["binding_projection_release_identities"]: raise RuntimeError("ticket, projection, or release evidence drifted")
         old_hash = document_obj["old_config_hash"]
-        new_raw = _with_signer_bytes(raw, public_key_b64, fingerprint)
-        new_hash = hashlib.sha256(new_raw).hexdigest()
+        new_raw = expected_new_raw
+        new_hash = expected_new_hash
         existing = ledger.connection.execute("SELECT * FROM runtime_signer_enrollment_intents WHERE enrollment_key=?", (key,)).fetchone()
         now = ledger._now()
         with ledger._transaction() as conn:
             if existing is None:
-                conn.execute("INSERT INTO runtime_signer_enrollment_intents (enrollment_key,operator_id,reason,ticket_ids_json,public_key_fingerprint,authority_hash,old_config_hash,new_config_hash,selected_bindings_json,status,created_at,updated_at,document_json,document_hash,detached_signature,ledger_identity,old_config_identity_json,nonce) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (key,document_obj["operator_id"],document_obj["reason"],json.dumps(selected,separators=(",",":")),fingerprint,hashlib.sha256(fingerprint.encode()).hexdigest(),old_hash,new_hash,json.dumps(selected_bindings,sort_keys=True,separators=(",",":")),"pending_config",now,now,data.decode(),hashlib.sha256(data).hexdigest(),base64.b64encode(detached_signature if isinstance(detached_signature,bytes) else base64.b64decode(detached_signature)).decode(),document_obj["ledger_identity"],json.dumps(identity,sort_keys=True,separators=(",",":")),document_obj["nonce"]))
+                conn.execute("INSERT INTO runtime_signer_enrollment_intents (enrollment_key,operator_id,reason,ticket_ids_json,public_key_fingerprint,authority_hash,old_config_hash,new_config_hash,selected_bindings_json,status,created_at,updated_at,document_json,document_hash,detached_signature,ledger_identity,old_config_identity_json,nonce,new_config_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (key,document_obj["operator_id"],document_obj["reason"],json.dumps(selected,separators=(",",":")),fingerprint,hashlib.sha256(fingerprint.encode()).hexdigest(),old_hash,new_hash,json.dumps(selected_bindings,sort_keys=True,separators=(",",":")),"pending_config",now,now,data.decode(),hashlib.sha256(data).hexdigest(),base64.b64encode(detached_signature if isinstance(detached_signature,bytes) else base64.b64decode(detached_signature)).decode(),document_obj["ledger_identity"],json.dumps(identity,sort_keys=True,separators=(",",":")),document_obj["nonce"],base64.b64encode(new_raw).decode()))
             else:
-                if existing["document_hash"] != hashlib.sha256(data).hexdigest() or existing["new_config_hash"] != new_hash: raise ValueError("conflicting signer enrollment replay")
-        if failure_injector: failure_injector("before_config_write")
-        _atomic_config_replace(config_path, new_raw, identity)
+                if existing["document_hash"] != hashlib.sha256(data).hexdigest() or existing["new_config_hash"] != new_hash or existing["new_config_bytes"] not in (None, base64.b64encode(new_raw).decode()): raise ValueError("conflicting signer enrollment replay")
+        if not resume_write:
+            if failure_injector: failure_injector("before_config_write")
+            _atomic_config_replace(config_path, new_raw, identity)
         # Atomic replace intentionally changes inode identity. Reopen the new
         # file through the already-held writer lock; never reacquire its flock.
         _, written_identity = config_lock.reopen()
@@ -214,10 +241,17 @@ def enroll_operator_signer(ledger: Any, *, config_path: Path, document: dict[str
         fresh_obj = _parse_config(written_raw)
         if fresh_obj.get("operator_signing_key_fingerprint") != fingerprint:
             raise RuntimeError("external operator config reread proof failed")
+        # Commit the external-effect checkpoint separately from all binding and
+        # finalization writes.  A crash after this commit resumes idempotently.
+        if existing is None or existing["status"] == "pending_config":
+            with ledger._transaction() as conn:
+                intent = conn.execute("SELECT status FROM runtime_signer_enrollment_intents WHERE enrollment_key=?", (key,)).fetchone()
+                if intent is None or intent["status"] != "pending_config": raise RuntimeError("invalid signer enrollment state")
+                conn.execute("UPDATE runtime_signer_enrollment_intents SET status='config_written',config_identity_json=?,updated_at=? WHERE enrollment_key=? AND status='pending_config'", (json.dumps(written_identity,sort_keys=True,separators=(",",":")), ledger._now(), key))
+        if failure_injector: failure_injector("after_config_written")
         with ledger._transaction() as conn:
             intent = conn.execute("SELECT * FROM runtime_signer_enrollment_intents WHERE enrollment_key=?", (key,)).fetchone()
-            if intent is None or intent["status"] not in {"pending_config", "config_written"}: raise RuntimeError("signer enrollment intent is not recoverable")
-            if conn.execute("UPDATE runtime_signer_enrollment_intents SET status='config_written',updated_at=? WHERE enrollment_key=? AND status='pending_config'", (ledger._now(),key)).rowcount not in (0,1): raise RuntimeError("invalid signer enrollment state")
+            if intent is None or intent["status"] not in {"pending_config","config_written"}: raise RuntimeError("signer enrollment intent is not recoverable")
             for ticket_id in selected:
                 binding = conn.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone(); old = selected_bindings[ticket_id]["binding"]
                 actual = {k: binding[k] for k in old}
