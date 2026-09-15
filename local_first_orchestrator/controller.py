@@ -176,6 +176,50 @@ class LocalFirstController:
             reason=reason,
         )
 
+    def _validate_native_release_snapshot(self, snapshot: Any, *, external_task_id: str, implementation_profile: str,
+                                          repository: Path, expected_base: str, expected_path: Path | None,
+                                          expected_branch: str | None = None, expected_snapshot_hash: str | None = None) -> tuple[str, str]:
+        if snapshot.task.id != external_task_id:
+            raise RuntimeError("native release revalidation external identity drift")
+        if expected_snapshot_hash is not None and canonical_sha256(asdict(snapshot)) != expected_snapshot_hash:
+            raise RuntimeError("native release revalidation snapshot drift")
+        if snapshot.task.assignee != implementation_profile or snapshot.task.workspace_kind != "worktree":
+            raise RuntimeError("native release revalidation routing drift")
+        if expected_path is None or not expected_path.is_dir():
+            raise RuntimeError("native release revalidation worktree drift")
+        try:
+            expected_path.relative_to((repository / ".worktrees").resolve())
+        except ValueError as exc:
+            raise RuntimeError("native release revalidation worktree drift") from exc
+        try:
+            top = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            branch = subprocess.run(("git", "branch", "--show-current"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError("native release revalidation worktree verification failed") from exc
+        snapshot_base = snapshot.base_sha or snapshot.task.base_sha
+        snapshot_repository = snapshot.repository_identity or snapshot.task.repository_identity
+        if top != str(expected_path) or head != expected_base or branch != (snapshot.branch_name or "") or snapshot_base != expected_base or snapshot_repository != str(repository):
+            raise RuntimeError("native release revalidation branch/base/repository drift")
+        if expected_branch is not None and branch != expected_branch:
+            raise RuntimeError("native release revalidation branch/base/repository drift")
+        forbidden = {"running", "completed", "success", "successful"}
+        if snapshot.task.status not in {"scheduled", "blocked"}:
+            raise RuntimeError("native release revalidation card is dispatchable or final")
+        if any(value is not None for value in (snapshot.session_id, snapshot.started_at, snapshot.completed_at)):
+            raise RuntimeError("native release revalidation execution evidence exists")
+        gate = "Local First execution gate: authoritative dependencies/runtime authorization not satisfied"
+        for run in snapshot.runs:
+            if run.status in forbidden or (run.outcome or "").lower() in forbidden or run.worker_pid is not None or run.profile is not None or run.metadata is not None:
+                raise RuntimeError("native release revalidation execution evidence exists")
+            if run.status == "blocked" and not (run.outcome == "blocked" and str(run.summary or "") == gate and (run.started_at, run.ended_at) in {(None, None), (run.started_at, run.started_at)}):
+                raise RuntimeError("native release revalidation blocked run is not inert")
+            if run.status == "spawn_failed" and run.outcome not in {None, "spawn_failed"}:
+                raise RuntimeError("native release revalidation spawn evidence is ambiguous")
+            if run.status not in {"blocked", "spawn_failed"}:
+                raise RuntimeError("native release revalidation run evidence is ambiguous")
+        return branch, canonical_sha256(asdict(snapshot))
+
     def revalidate_native_release(self, ticket_id: str, *, operator_id: str | None = None, reason: str | None = None,
                                   implementation_profile: str, approval_document: dict[str, Any] | None = None,
                                   detached_signature: bytes | None = None, signer_public_key: bytes | None = None,
@@ -201,44 +245,10 @@ class LocalFirstController:
         projection = projection[0]
         external_task_id = str(projection["external_task_id"])
         snapshot = self.board.execution_snapshot(external_task_id)
-        if snapshot.task.id != external_task_id:
-            raise RuntimeError("native release revalidation external identity drift")
         repository = self.config.repository.resolve(strict=True)
         expected_base = str(self.ledger.runtime_binding(ticket_id)["starting_sha"])
         expected_path = Path(str(snapshot.task.workspace_path)).expanduser().resolve() if snapshot.task.workspace_path else None
-        if snapshot.task.assignee != implementation_profile or snapshot.task.workspace_kind != "worktree":
-            raise RuntimeError("native release revalidation routing drift")
-        if expected_path is None or not expected_path.is_dir():
-            raise RuntimeError("native release revalidation worktree drift")
-        try:
-            expected_path.relative_to((repository / ".worktrees").resolve())
-        except ValueError as exc:
-            raise RuntimeError("native release revalidation worktree drift") from exc
-        try:
-            top = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
-            head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
-            branch = subprocess.run(("git", "branch", "--show-current"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError("native release revalidation worktree verification failed") from exc
-        snapshot_base = snapshot.base_sha or snapshot.task.base_sha
-        snapshot_repository = snapshot.repository_identity or snapshot.task.repository_identity
-        if top != str(expected_path) or head != expected_base or branch != (snapshot.branch_name or "") or snapshot_base != expected_base or snapshot_repository != str(repository):
-            raise RuntimeError("native release revalidation branch/base/repository drift")
-        forbidden = {"running", "completed", "success", "successful"}
-        if snapshot.task.status not in {"scheduled", "blocked"}:
-            raise RuntimeError("native release revalidation card is dispatchable or final")
-        if any(value is not None for value in (snapshot.session_id, snapshot.started_at, snapshot.completed_at)):
-            raise RuntimeError("native release revalidation execution evidence exists")
-        gate = "Local First execution gate: authoritative dependencies/runtime authorization not satisfied"
-        for run in snapshot.runs:
-            if run.status in forbidden or (run.outcome or "").lower() in forbidden or run.worker_pid is not None or run.profile is not None or run.metadata is not None:
-                raise RuntimeError("native release revalidation execution evidence exists")
-            if run.status == "blocked" and not (run.outcome == "blocked" and str(run.summary or "") == gate and (run.started_at, run.ended_at) in {(None, None), (run.started_at, run.started_at)}):
-                raise RuntimeError("native release revalidation blocked run is not inert")
-            if run.status == "spawn_failed" and run.outcome not in {None, "spawn_failed"}:
-                raise RuntimeError("native release revalidation spawn evidence is ambiguous")
-            if run.status not in {"blocked", "spawn_failed"}:
-                raise RuntimeError("native release revalidation run evidence is ambiguous")
+        branch, initial_snapshot_hash = self._validate_native_release_snapshot(snapshot, external_task_id=external_task_id, implementation_profile=implementation_profile, repository=repository, expected_base=expected_base, expected_path=expected_path)
         release = self.ledger.native_dependency_release(ticket_id)
         graph = self.ledger.native_dependency_graph(ticket_id)
         binding = self.ledger.runtime_binding(ticket_id)
@@ -251,7 +261,7 @@ class LocalFirstController:
             "authority": {"ledger_identity": str(self.ledger.database.resolve()), "ticket_id": ticket_id,
                 "release": release, "graph": graph, "projection": {"event_id": int(projection["event_id"]), "key": str(projection["idempotency_key"]), "external_id": external_task_id},
                 "implementation_profile": implementation_profile, "repository_identity": str(repository), "canonical_worktree_path": str(expected_path),
-                "branch": branch, "base_sha": expected_base, "snapshot_hash": canonical_sha256(asdict(snapshot)),
+                "branch": branch, "base_sha": expected_base, "snapshot_hash": initial_snapshot_hash,
                 "runtime_authority_hash": binding.get("operator_authority_hash")},
         }
         if approval_document is not None:
@@ -268,16 +278,24 @@ class LocalFirstController:
         if supplied != canonical:
             raise ValueError("approval document is stale or does not match current state")
         verify_detached_signature(supplied, detached_signature, registered_signer, signer_fingerprint)
-        return self.ledger.record_native_release_revalidation(
+        def freshness_guard() -> None:
+            current = self.board.execution_snapshot(external_task_id)
+            self._validate_native_release_snapshot(current, external_task_id=external_task_id, implementation_profile=implementation_profile, repository=repository, expected_base=expected_base, expected_path=expected_path, expected_branch=branch, expected_snapshot_hash=str(document["authority"]["snapshot_hash"]))
+
+        result = self.ledger.record_native_release_revalidation(
             ticket_id=ticket_id, projection_event_id=int(projection["event_id"]),
             projection_key=str(projection["idempotency_key"]), external_task_id=external_task_id,
             implementation_profile=implementation_profile, repository_identity=str(repository),
             canonical_worktree_path=str(expected_path), branch=branch, base_sha=expected_base,
-            snapshot_hash=canonical_sha256(asdict(snapshot)), operator_id=operator_id, reason=reason,
+            snapshot_hash=initial_snapshot_hash, operator_id=operator_id, reason=reason,
             approval_document_json=canonical.decode("utf-8"),
             approval_document_hash=hashlib.sha256(canonical).hexdigest(),
             detached_signature=detached_signature, signer_fingerprint=signer_fingerprint, signer_public_key=signer_public_key,
+            freshness_guard=freshness_guard,
         )
+        final = self.board.execution_snapshot(external_task_id)
+        self._validate_native_release_snapshot(final, external_task_id=external_task_id, implementation_profile=implementation_profile, repository=repository, expected_base=expected_base, expected_path=expected_path, expected_branch=branch, expected_snapshot_hash=str(document["authority"]["snapshot_hash"]))
+        return result
 
     def prepare_native_release_revalidation(self, ticket_id: str, *, operator_id: str, reason: str, implementation_profile: str) -> dict[str, Any]:
         """Read-only first step; never writes ledger, board, repository, or invokes a model."""

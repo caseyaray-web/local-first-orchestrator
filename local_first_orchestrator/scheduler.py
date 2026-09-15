@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -16,6 +16,7 @@ from .reconciliation import ReconciliationAction
 from .state_projection import StateProjectionWorker
 from .states import CanonicalState
 from .runtime_metrics import RuntimeMetricsStore
+from .evidence_hash import canonical_sha256
 
 
 SCHEDULER_STAGE_ORDER: tuple[str, ...] = (
@@ -795,7 +796,32 @@ class ProcessNextScheduler:
             self.ledger.release_scheduler_tick(self.worker_id, lease_token)
 
     def _process_claimed_tick(self, now: int, execution_owner: str) -> ProcessNextResult:
-        migration = self.ledger.native_dependency_release_migration_required(signer_public_key=self.native_dependency_release_signer_public_key, signer_fingerprint=self.native_dependency_release_signer_fingerprint)
+        def verify_current_native_release(ticket_id: str) -> None:
+            row = self.ledger.connection.execute("SELECT * FROM native_dependency_release_revalidations WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if row is None:
+                raise RuntimeError("native_dependency_release_reconciliation_required: revalidation evidence missing")
+            snapshot = self.board.execution_snapshot(str(row["external_task_id"]))
+            if snapshot.task.id != str(row["external_task_id"]) or canonical_sha256(asdict(snapshot)) != str(row["snapshot_hash"]):
+                raise RuntimeError("native_dependency_release_reconciliation_required: current external snapshot drift")
+            if snapshot.task.status not in {"scheduled", "blocked"} or any(value is not None for value in (snapshot.session_id, snapshot.started_at, snapshot.completed_at)):
+                raise RuntimeError("native_dependency_release_reconciliation_required: current external task is unsafe")
+            if snapshot.task.assignee != str(row["implementation_profile"]) or snapshot.task.workspace_kind != "worktree" or str(Path(str(snapshot.task.workspace_path)).expanduser().resolve()) != str(row["canonical_worktree_path"]):
+                raise RuntimeError("native_dependency_release_reconciliation_required: current external routing drift")
+            if (snapshot.branch_name or "") != str(row["branch"]) or (snapshot.base_sha or snapshot.task.base_sha) != str(row["base_sha"]) or (snapshot.repository_identity or snapshot.task.repository_identity) != str(row["repository_identity"]):
+                raise RuntimeError("native_dependency_release_reconciliation_required: current external authority drift")
+            forbidden = {"running", "completed", "success", "successful"}
+            gate = "Local First execution gate: authoritative dependencies/runtime authorization not satisfied"
+            for run in snapshot.runs:
+                if run.status in forbidden or (run.outcome or "").lower() in forbidden or run.worker_pid is not None or run.profile is not None or run.metadata is not None:
+                    raise RuntimeError("native_dependency_release_reconciliation_required: current external execution evidence exists")
+                if run.status == "blocked" and not (run.outcome == "blocked" and str(run.summary or "") == gate and (run.started_at, run.ended_at) in {(None, None), (run.started_at, run.started_at)}):
+                    raise RuntimeError("native_dependency_release_reconciliation_required: current external run is unsafe")
+                if run.status == "spawn_failed" and run.outcome not in {None, "spawn_failed"}:
+                    raise RuntimeError("native_dependency_release_reconciliation_required: current external run is unsafe")
+                if run.status not in {"blocked", "spawn_failed"}:
+                    raise RuntimeError("native_dependency_release_reconciliation_required: current external run is ambiguous")
+
+        migration = self.ledger.native_dependency_release_migration_required(signer_public_key=self.native_dependency_release_signer_public_key, signer_fingerprint=self.native_dependency_release_signer_fingerprint, freshness_guard=verify_current_native_release)
         if migration is not None:
             raise RuntimeError(
                 "native_dependency_release_reconciliation_required: legacy release routing authority requires paused operator revalidation"

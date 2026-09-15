@@ -12,7 +12,7 @@ import uuid
 from threading import RLock
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .adapters import BoardAdapter
 from .readiness import ReadinessError, validate_ticket
@@ -2290,7 +2290,7 @@ class Ledger:
         row = self.connection.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (ticket_id,)).fetchone()
         return dict(row) if row else None
 
-    def native_dependency_release_migration_required(self, *, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None) -> dict[str, Any] | None:
+    def native_dependency_release_migration_required(self, *, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None, freshness_guard: Callable[[str], None] | None = None) -> dict[str, Any] | None:
         """Find legacy releases that cannot authorize downstream execution."""
         rows = self.connection.execute("SELECT * FROM native_dependency_releases ORDER BY ticket_id").fetchall()
         if (signer_public_key is None) != (signer_fingerprint is None):
@@ -2346,6 +2346,9 @@ class Ledger:
                     valid = []
                 if len(current) != 1 or len(valid) != 1:
                     return {"ticket_id": ticket_id, "reason": "legacy release routing authority requires paused operator revalidation"}
+                if freshness_guard is None:
+                    return {"ticket_id": ticket_id, "reason": "legacy release requires an immediate external safety verification"}
+                freshness_guard(ticket_id)
         return None
 
     @staticmethod
@@ -2456,9 +2459,12 @@ class Ledger:
                                            snapshot_hash: str, operator_id: str, reason: str,
                                            approval_document_json: str, approval_document_hash: str,
                                            detached_signature: bytes, signer_fingerprint: str,
-                                           signer_public_key: bytes) -> dict[str, Any]:
+                                           signer_public_key: bytes,
+                                           freshness_guard: Callable[[], None]) -> dict[str, Any]:
         if not all(isinstance(value, str) and value.strip() for value in (ticket_id, projection_key, external_task_id, implementation_profile, repository_identity, canonical_worktree_path, branch, base_sha, snapshot_hash, operator_id, reason)):
             raise ValueError("native release revalidation requires non-empty identity and reason")
+        if not callable(freshness_guard):
+            raise PermissionError("native release revalidation requires a freshness guard")
         from .native_release_approval import parse_approval_document, verify_detached_signature
         if not isinstance(approval_document_json, str) or not approval_document_json.strip() or not isinstance(approval_document_hash, str) or not approval_document_hash.strip() or not isinstance(detached_signature, bytes) or not isinstance(signer_fingerprint, str) or not signer_fingerprint.strip() or not isinstance(signer_public_key, bytes):
             raise ValueError("native release revalidation requires complete external signer authority")
@@ -2504,6 +2510,7 @@ class Ledger:
                 raise ValueError("native release approval document is stale or copied")
             if conn.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND status='claimed' UNION SELECT 1 FROM tickets WHERE id=? AND lease_owner IS NOT NULL", (ticket_id, ticket_id)).fetchone() is not None:
                 raise ValueError("native release revalidation refuses active lease or claim")
+            freshness_guard()
             values = (implementation_profile, repository_identity, canonical_worktree_path, branch, base_sha, snapshot_hash, operator_id, reason)
             existing_ticket = conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE ticket_id=?", (ticket_id,)).fetchone()
             if existing_ticket is not None:
@@ -2550,6 +2557,7 @@ class Ledger:
             conn.execute("""INSERT INTO native_dependency_release_revalidations
                 (revalidation_id,ticket_id,release_graph_hash,release_child_external_id,release_parent_completion_hash,release_routing_authority_json,release_hermes_status,release_observed_at,projection_event_id,projection_key,external_task_id,implementation_profile,repository_identity,canonical_worktree_path,branch,base_sha,snapshot_hash,operator_id,reason,created_at,revalidation_event_id,event_key,evidence_hash,approval_document_json,approval_document_hash,detached_signature,signer_fingerprint)
                 VALUES (?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?)""", (revalidation_id,ticket_id,release["graph_hash"],release["child_external_id"],release["parent_completion_hash"],release["routing_authority_json"],release["hermes_status"],release["observed_at"],projection_event_id,projection_key,external_task_id,*values,self._now(),event_id,event_key,evidence_hash,approval_document_json,approval_document_hash,base64.b64encode(detached_signature).decode("ascii") if detached_signature else None,signer_fingerprint))
+            freshness_guard()
             self._inject_failure("after_native_release_revalidation")
             return dict(conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=?", (revalidation_id,)).fetchone())
 

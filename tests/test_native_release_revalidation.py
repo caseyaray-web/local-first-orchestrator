@@ -27,6 +27,25 @@ class ReadOnlyBoard:
         return self.snapshot
 
 
+class RaceBoard(ReadOnlyBoard):
+    def __init__(self, snapshot: ExternalExecutionSnapshot, *, mutate_on: int | None = None, failure_on: int | None = None):
+        super().__init__(snapshot)
+        self.mutate_on = mutate_on
+        self.failure_on = failure_on
+
+    def execution_snapshot(self, task_id: str) -> ExternalExecutionSnapshot:
+        self.calls += 1
+        if self.failure_on == self.calls:
+            raise RuntimeError("fixture snapshot read failure")
+        if self.mutate_on == self.calls:
+            self.snapshot = ExternalExecutionSnapshot(
+                task=self.snapshot.task.__class__(self.snapshot.task.id, self.snapshot.task.title, self.snapshot.task.body, "running", self.snapshot.task.workspace_path, assignee=self.snapshot.task.assignee, workspace_kind=self.snapshot.task.workspace_kind),
+                session_id="race-session", branch_name=self.snapshot.branch_name, started_at=2, completed_at=None,
+                runs=self.snapshot.runs, repository_identity=self.snapshot.repository_identity, base_sha=self.snapshot.base_sha,
+            )
+        return self.snapshot
+
+
 class NativeReleaseRevalidationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = TemporaryDirectory()
@@ -93,6 +112,30 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         self.assertEqual(self.ledger.connection.execute("SELECT routing_authority_json FROM native_dependency_releases WHERE ticket_id=?", (self.ticket,)).fetchone()[0], "{}")
         self.assertEqual(self.ledger.connection.execute("SELECT event_type FROM events WHERE entity_type='controller' ORDER BY id DESC LIMIT 1").fetchone()[0], "native_dependency_release_revalidated")
 
+    def test_race_after_initial_record_read_stops_before_any_mutation(self) -> None:
+        self.board = RaceBoard(self.snapshot, mutate_on=3)
+        self.controller.board = self.board
+        with self.assertRaisesRegex(RuntimeError, "snapshot|execution evidence|drift"):
+            self.signed_revalidate()
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM native_dependency_release_revalidations").fetchone()[0], 0)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM events WHERE event_type='native_dependency_release_revalidated'").fetchone()[0], 0)
+
+    def test_snapshot_read_error_before_insert_rolls_back(self) -> None:
+        self.board = RaceBoard(self.snapshot, failure_on=3)
+        self.controller.board = self.board
+        with self.assertRaisesRegex(RuntimeError, "snapshot read failure"):
+            self.signed_revalidate()
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM native_dependency_release_revalidations").fetchone()[0], 0)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM events WHERE event_type='native_dependency_release_revalidated'").fetchone()[0], 0)
+
+    def test_post_commit_snapshot_drift_is_reported_fail_closed(self) -> None:
+        self.board = RaceBoard(self.snapshot, mutate_on=5)
+        self.controller.board = self.board
+        with self.assertRaisesRegex(RuntimeError, "post-commit|current snapshot|drift"):
+            self.signed_revalidate()
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM native_dependency_release_revalidations").fetchone()[0], 1)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM events WHERE event_type='native_dependency_release_revalidated'").fetchone()[0], 1)
+
     def test_replay_is_idempotent_only_for_exact_request(self) -> None:
         first = self.signed_revalidate()
         second = self.signed_revalidate()
@@ -141,7 +184,7 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM events WHERE event_type='native_dependency_release_revalidated'").fetchone()[0], 0)
         self.ledger.failure_injector = None
         self.signed_revalidate(reason="verify")
-        self.assertIsNone(self.ledger.native_dependency_release_migration_required(signer_public_key=self.signer_public_key, signer_fingerprint=self.signer_fingerprint))
+        self.assertIsNone(self.ledger.native_dependency_release_migration_required(signer_public_key=self.signer_public_key, signer_fingerprint=self.signer_fingerprint, freshness_guard=lambda ticket_id: None))
 
     def test_revalidation_table_is_immutable(self) -> None:
         row = self.signed_revalidate(reason="verify")
