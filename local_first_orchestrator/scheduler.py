@@ -219,6 +219,7 @@ class ProcessNextPreview:
     would_write_board: bool = False
     claim_id: str | None = None
     reconciliation_action: str | None = None
+    blocker_reason: str | None = None
 
 
 def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None, signer_config_path: Path | None = None, board: Any | None = None) -> ProcessNextPreview:
@@ -246,7 +247,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
         )
     migration = ledger.native_dependency_release_migration_required(signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint, config_path=signer_config_path) if hasattr(ledger, "native_dependency_release_migration_required") else None
     if migration is not None:
-        return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(migration["ticket_id"]), reconciliation_action=ReconciliationAction.STOP.value)
+        return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(migration["ticket_id"]), reconciliation_action=ReconciliationAction.STOP.value, blocker_reason=str(migration["reason"]))
     legacy = ledger.connection.execute("SELECT ticket_id,external_task_id,snapshot_hash FROM native_dependency_release_revalidations r JOIN native_dependency_releases l USING(ticket_id) WHERE json_extract(l.routing_authority_json,'$.profile') IS NULL").fetchall()
     if legacy:
         if board is None or not hasattr(board, "revalidation"):
@@ -841,11 +842,17 @@ class ProcessNextScheduler:
 
         trusted_preview = preview_next(self.ledger, now=now, signer_public_key=self.native_dependency_release_signer_public_key, signer_fingerprint=self.native_dependency_release_signer_fingerprint, signer_config_path=self.native_dependency_release_signer_config_path, board=self.board)
         if trusted_preview.next_stage == "reconciliation_required":
-            raise RuntimeError("native_dependency_release_reconciliation_required: trusted current board proof unavailable")
+            reason = trusted_preview.blocker_reason or "trusted current board proof unavailable"
+            if reason.startswith("signer enrollment reconciliation required:"):
+                raise RuntimeError(reason)
+            raise RuntimeError("native_dependency_release_reconciliation_required: " + reason)
         migration = self.ledger.native_dependency_release_migration_required(signer_public_key=self.native_dependency_release_signer_public_key, signer_fingerprint=self.native_dependency_release_signer_fingerprint, config_path=self.native_dependency_release_signer_config_path)
         if migration is not None:
+            reason = str(migration["reason"])
+            if reason.startswith("signer enrollment reconciliation required:"):
+                raise RuntimeError(reason)
             raise RuntimeError(
-                "native_dependency_release_reconciliation_required: legacy release routing authority requires paused operator revalidation"
+                "native_dependency_release_reconciliation_required: " + reason
             )
         reconciliation = self.ledger.next_scheduler_reconciliation(now=now)
         if reconciliation is not None and reconciliation.action == ReconciliationAction.STOP:

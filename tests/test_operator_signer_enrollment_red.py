@@ -17,7 +17,7 @@ from local_first_orchestrator.signer_enrollment import (
     ENROLLMENT_DOMAIN, ENROLLMENT_VERSION, parse_enrollment_document,
     _canonical_document, _verify, prepare_operator_signer_enrollment,
 )
-from local_first_orchestrator.scheduler import preview_next
+from local_first_orchestrator.scheduler import ProcessNextScheduler, preview_next
 from local_first_orchestrator.states import CanonicalState
 
 
@@ -148,6 +148,39 @@ class OperatorSignerEnrollmentRedTests(unittest.TestCase):
             enroll_operator_signer(ledger, config_path=config_path, document=prepared["document"], detached_signature=signature, public_key_b64=public_b64, fingerprint=fingerprint, failure_injector=crash)
         self.assertEqual(ledger.connection.execute("SELECT status FROM runtime_signer_enrollment_intents").fetchone()[0], "config_written")
         self.assertEqual(enroll_operator_signer(ledger, config_path=config_path, document=prepared["document"], detached_signature=signature, public_key_b64=public_b64, fingerprint=fingerprint)["status"], "finalized")
+        ledger.close(); tmp.cleanup()
+
+    def test_detector_rejects_forged_finalized_enrollment_for_same_signer_altered_bytes(self) -> None:
+        tmp, root, ledger, config_path, prepared, signature, public_b64, fingerprint, ticket = self._enrollment_fixture()
+        enroll_operator_signer(ledger, config_path=config_path, document=prepared["document"], detached_signature=signature, public_key_b64=public_b64, fingerprint=fingerprint)
+        altered = config_path.read_bytes() + b" "
+        config_path.write_bytes(altered)
+        altered_hash = hashlib.sha256(altered).hexdigest()
+        enrollment_key = ledger.connection.execute("SELECT enrollment_key FROM runtime_signer_enrollment_intents").fetchone()[0]
+        from local_first_orchestrator.operator_config import _config_identity
+        altered_identity = _config_identity(config_path)
+        ledger.connection.executescript("""
+            DROP TRIGGER events_immutable_update;
+            DROP TRIGGER runtime_signer_enrollment_intents_immutable_identity;
+            DROP TRIGGER runtime_signer_enrollments_immutable_update;
+        """)
+        ledger.connection.execute("UPDATE runtime_signer_enrollment_intents SET new_config_hash=?,config_identity_json=? WHERE enrollment_key=?", (altered_hash, json.dumps(altered_identity, sort_keys=True, separators=(",", ":")), enrollment_key))
+        ledger.connection.execute("UPDATE runtime_signer_enrollments SET config_identity_json=? WHERE enrollment_key=?", (json.dumps(altered_identity, sort_keys=True, separators=(",", ":")), enrollment_key))
+        event = ledger.connection.execute("SELECT id,payload_json FROM events WHERE event_type='runtime_signer_enrollment_completed'").fetchone()
+        payload = json.loads(event["payload_json"]); payload["new_config_hash"] = altered_hash
+        ledger.connection.execute("UPDATE events SET payload_json=? WHERE id=?", (json.dumps(payload, sort_keys=True, separators=(",", ":")), event["id"]))
+        blocker = ledger.native_dependency_release_migration_required(signer_public_key=base64.b64decode(public_b64), signer_fingerprint=fingerprint, config_path=config_path)
+        self.assertIsNotNone(blocker)
+        self.assertIn("signer enrollment reconciliation required", blocker["reason"])
+        self.assertIn("signed new config", blocker["reason"])
+        ledger.connection.execute("UPDATE controller_state SET paused=0 WHERE id=1")
+        preview = preview_next(ledger, signer_public_key=base64.b64decode(public_b64), signer_fingerprint=fingerprint, signer_config_path=config_path)
+        self.assertEqual(preview.next_stage, "reconciliation_required")
+        self.assertTrue((preview.blocker_reason or "").startswith("signer enrollment reconciliation required:"))
+        class NoSideEffectsBoard:
+            timeout_seconds = 1
+        with self.assertRaisesRegex(RuntimeError, "signer enrollment reconciliation required"):
+            ProcessNextScheduler(ledger, NoSideEffectsBoard(), worker_id="fixture", lease_seconds=30, clock=lambda: 100, native_dependency_release_signer_public_key=base64.b64decode(public_b64), native_dependency_release_signer_fingerprint=fingerprint, native_dependency_release_signer_config_path=config_path).process_next()
         ledger.close(); tmp.cleanup()
 
 

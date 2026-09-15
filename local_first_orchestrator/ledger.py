@@ -2397,16 +2397,16 @@ class Ledger:
                 signer_fingerprint = None
         fresh_config_hash = None
         fresh_config_identity = None
+        fresh_config_raw = None
         if config_path is not None and signer_fingerprint is not None:
             try:
-                from .operator_config import _raw_config, _config_identity
-                fresh_raw, fresh_obj, _ = _raw_config(Path(config_path))
-                fresh_config_hash = hashlib.sha256(fresh_raw).hexdigest()
-                fresh_config_identity = _config_identity(Path(config_path))
+                from .operator_config import _raw_config
+                fresh_config_raw, fresh_obj, fresh_config_identity = _raw_config(Path(config_path))
+                fresh_config_hash = hashlib.sha256(fresh_config_raw).hexdigest()
                 if fresh_obj.get("operator_signing_key_fingerprint") != signer_fingerprint:
-                    return {"ticket_id": str(rows[0]["ticket_id"]) if rows else "", "reason": "fresh external signer config differs"}
+                    return {"ticket_id": str(rows[0]["ticket_id"]) if rows else "", "reason": "signer enrollment reconciliation required: fresh external signer config differs"}
             except (OSError, ValueError):
-                return {"ticket_id": str(rows[0]["ticket_id"]) if rows else "", "reason": "fresh external signer config is unavailable"}
+                return {"ticket_id": str(rows[0]["ticket_id"]) if rows else "", "reason": "signer enrollment reconciliation required: fresh external signer config is unavailable"}
         for row in rows:
             try:
                 authority = json.loads(str(row["routing_authority_json"] or "{}"))
@@ -2422,6 +2422,8 @@ class Ledger:
                 try:
                     enrollments = self.connection.execute("""
                         SELECT e.*, i.status, i.ticket_ids_json, i.selected_bindings_json, i.old_config_hash, i.new_config_hash,
+                               i.new_config_bytes AS intent_new_config_bytes, i.config_identity_json AS intent_config_identity_json,
+                               i.old_config_identity_json AS intent_old_config_identity_json,
                                i.document_json AS intent_document_json, i.document_hash AS intent_document_hash,
                                i.detached_signature AS intent_detached_signature,
                                i.public_key_fingerprint AS intent_fingerprint, i.authority_hash AS intent_authority_hash
@@ -2439,14 +2441,33 @@ class Ledger:
                             return {"ticket_id": ticket_id, "reason": "legacy release signer enrollment evidence is missing, pending, or duplicated"}
                         raise _LegacyRevalidationCompatibility
                     enrollment = enrollments[0]
+                    from .signer_enrollment import parse_enrollment_document
+                    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+                    signed_document_raw = str(enrollment["document_json"]).encode("utf-8")
+                    signed_document, canonical_document = parse_enrollment_document(signed_document_raw)
+                    signed_new_raw = base64.b64decode(str(signed_document["new_config_bytes"]), validate=True)
+                    signed_new_hash = hashlib.sha256(signed_new_raw).hexdigest()
+                    signed_new_b64 = base64.b64encode(signed_new_raw).decode("ascii")
+                    signed_signature = base64.b64decode(str(enrollment["detached_signature"]), validate=True)
+                    Ed25519PublicKey.from_public_bytes(signer_public_key).verify(signed_signature, canonical_document)
+                    if (canonical_document != signed_document_raw
+                            or hashlib.sha256(canonical_document).hexdigest() != str(enrollment["document_hash"])
+                            or signed_new_hash != str(signed_document["new_config_hash"])
+                            or str(enrollment["new_config_hash"]) != signed_new_hash
+                            or str(enrollment["intent_new_config_bytes"] or "") != signed_new_b64
+                            or json.loads(str(enrollment["intent_old_config_identity_json"] or "null")) != signed_document["old_config_identity"]
+                            or (fresh_config_raw is not None and (signed_new_hash != fresh_config_hash or signed_new_raw != fresh_config_raw))):
+                        return {"ticket_id": ticket_id, "reason": "signer enrollment reconciliation required: signed new config bytes/hash differ from persisted or live config"}
+                    if signed_document.get("new_fingerprint") != signer_fingerprint:
+                        return {"ticket_id": ticket_id, "reason": "signer enrollment reconciliation required: signed signer identity differs"}
                     selected_ids = tuple(json.loads(str(enrollment["ticket_ids_json"])))
                     if not selected_ids or len(set(selected_ids)) != len(selected_ids):
                         return {"ticket_id": ticket_id, "reason": "legacy signer enrollment ticket set is invalid"}
                     all_evidence = self.connection.execute("SELECT * FROM runtime_signer_enrollments WHERE enrollment_key=? ORDER BY ticket_id", (enrollment["enrollment_key"],)).fetchall()
                     if enrollment["status"] != "finalized" or (fresh_config_hash is not None and enrollment["new_config_hash"] != fresh_config_hash) or tuple(str(x) for x in selected_ids) != tuple(str(x["ticket_id"]) for x in all_evidence) or len(all_evidence) != len(selected_ids):
-                        return {"ticket_id": ticket_id, "reason": "legacy signer enrollment is not finalized for the exact ticket set"}
-                    if any(x["document_hash"] != enrollment["document_hash"] or x["detached_signature"] != enrollment["detached_signature"] for x in all_evidence):
-                        return {"ticket_id": ticket_id, "reason": "legacy signer enrollment evidence document drift"}
+                        return {"ticket_id": ticket_id, "reason": "signer enrollment reconciliation required: finalized enrollment state or config hash is not authoritative"}
+                    if any(x["document_hash"] != enrollment["document_hash"] or x["detached_signature"] != enrollment["detached_signature"] or x["document_json"] != enrollment["document_json"] or str(x["config_identity_json"] or "") != str(enrollment["config_identity_json"] or "") for x in all_evidence):
+                        return {"ticket_id": ticket_id, "reason": "signer enrollment reconciliation required: per-ticket enrollment evidence document or config identity drift"}
                     from .signer_enrollment import parse_enrollment_document
                     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
                     document = parse_enrollment_document(str(enrollment["document_json"]))[0]
@@ -2467,8 +2488,21 @@ class Ledger:
                         payload = json.loads(str(event["payload_json"]))
                         if payload.get("enrollment_key") == enrollment["enrollment_key"] and payload.get("document_hash") == enrollment["document_hash"] and tuple(payload.get("ticket_ids", ())) == selected_ids:
                             matching.append(payload)
-                    if len(matching) != 1 or document.get("ticket_ids") != list(selected_ids) or document.get("old_config_hash") != enrollment["old_config_hash"]:
-                        return {"ticket_id": ticket_id, "reason": "legacy signer enrollment event or document is missing or forged"}
+                    expected_event_config_identity = json.loads(str(enrollment["config_identity_json"] or "null"))
+                    expected_event = {
+                        "enrollment_key": str(enrollment["enrollment_key"]),
+                        "document_hash": str(enrollment["document_hash"]),
+                        "old_config_hash": str(enrollment["old_config_hash"]),
+                        "new_config_hash": signed_new_hash,
+                        "new_config_bytes": signed_new_b64,
+                        "config_identity": expected_event_config_identity,
+                        "ticket_ids": list(selected_ids),
+                        "public_key_fingerprint": str(enrollment["public_key_fingerprint"]),
+                        "operator_id": str(enrollment["operator_id"]),
+                        "reason": str(enrollment["reason"]),
+                    }
+                    if len(matching) != 1 or matching[0] != expected_event or document.get("ticket_ids") != list(selected_ids) or document.get("old_config_hash") != enrollment["old_config_hash"]:
+                        return {"ticket_id": ticket_id, "reason": "signer enrollment reconciliation required: enrollment event is missing, forged, or outside signed config authority"}
                     binding = self.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
                     evidence = self.connection.execute("SELECT * FROM runtime_signer_enrollments WHERE enrollment_key=? AND ticket_id=?", (enrollment["enrollment_key"], ticket_id)).fetchone()
                     new_binding = json.loads(str(evidence["new_binding_identity_json"]))
@@ -2481,9 +2515,24 @@ class Ledger:
                         return {"ticket_id": ticket_id, "reason": "enrollment evidence binding differs from signed authority"}
                     if expected_selected != {"binding": {k: binding[k] for k in ("ticket_id", "repository_path", "starting_sha", "canonical_sha", "ownership_verified")}, "projection": {k: expected_selected.get("projection", {}).get(k) for k in ("event_id", "idempotency_key", "external_task_id")}, "release": expected_selected.get("release")}:
                         return {"ticket_id": ticket_id, "reason": "signed binding projection release evidence mismatch"}
+                    current_release = self.connection.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (ticket_id,)).fetchone()
+                    current_projection = self.connection.execute("""
+                        SELECT b.event_id,b.idempotency_key,b.external_task_id,e.entity_type,e.entity_id,e.event_type
+                        FROM board_projection_outbox b JOIN events e ON e.id=b.event_id
+                        WHERE b.ticket_id=? AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL
+                          AND b.superseded_at IS NULL AND b.external_task_id IS NOT NULL
+                    """, (ticket_id,)).fetchall()
+                    current_release_identity = None if current_release is None else {k: current_release[k] for k in ("ticket_id", "graph_hash", "child_external_id", "parent_completion_hash", "routing_authority_json", "hermes_status")}
+                    current_projection_identity = None if len(current_projection) != 1 else {
+                        "event_id": int(current_projection[0]["event_id"]), "idempotency_key": str(current_projection[0]["idempotency_key"]), "external_task_id": str(current_projection[0]["external_task_id"])
+                    }
+                    if expected_selected.get("release") != current_release_identity or expected_selected.get("projection") != current_projection_identity or (current_projection and (str(current_projection[0]["entity_type"]) != "ticket" or str(current_projection[0]["entity_id"]) != ticket_id or str(current_projection[0]["event_type"]) not in {"generated_microticket_created", "generated_microticket_projection_recovered"})):
+                        return {"ticket_id": ticket_id, "reason": "signer enrollment reconciliation required: signed ticket, projection, or release identity drift"}
                     if fresh_config_identity is not None:
-                        if json.loads(str(enrollment["config_identity_json"] or "null")) != fresh_config_identity or json.loads(str(evidence["config_identity_json"] or "null")) != fresh_config_identity:
-                            return {"ticket_id": ticket_id, "reason": "fresh external signer config identity differs from finalized evidence"}
+                        if (json.loads(str(enrollment["intent_config_identity_json"] or "null")) != fresh_config_identity
+                                or json.loads(str(enrollment["config_identity_json"] or "null")) != fresh_config_identity
+                                or json.loads(str(evidence["config_identity_json"] or "null")) != fresh_config_identity):
+                            return {"ticket_id": ticket_id, "reason": "signer enrollment reconciliation required: post-write config identity differs from finalized evidence"}
                 except _LegacyRevalidationCompatibility:
                     pass
                 except (ValueError, TypeError, KeyError, json.JSONDecodeError, binascii.Error, InvalidSignature):
