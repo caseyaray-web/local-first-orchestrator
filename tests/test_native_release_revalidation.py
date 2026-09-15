@@ -124,6 +124,28 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
             self.ledger.connection.execute("UPDATE native_dependency_release_revalidations SET reason='tampered' WHERE revalidation_id=?", (row["revalidation_id"],))
         with self.assertRaisesRegex(Exception, "append-only"):
             self.ledger.connection.execute("DELETE FROM native_dependency_release_revalidations WHERE revalidation_id=?", (row["revalidation_id"],))
+        with self.assertRaisesRegex(Exception, "immutable"):
+            self.ledger.connection.execute("UPDATE events SET payload_json='{}' WHERE id=?", (row["revalidation_event_id"],))
+
+    def test_direct_sql_valid_length_forgery_without_event_stays_reconciliation_required(self) -> None:
+        self.ledger.connection.execute("""INSERT INTO native_dependency_release_revalidations
+            (revalidation_id,ticket_id,release_graph_hash,release_child_external_id,release_parent_completion_hash,release_routing_authority_json,release_hermes_status,release_observed_at,projection_event_id,projection_key,external_task_id,implementation_profile,repository_identity,canonical_worktree_path,branch,base_sha,snapshot_hash,operator_id,reason,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", ("forged", self.ticket, "graph-hash", "card-1", "parents", "{}", "ready", 1, 999999, "legacy-key", "card-1", "impl", str(self.repo), str(self.root / "outside"), "forged", "a" * 40, "b" * 64, "operator", "forged", 1))
+        result = self.ledger.native_dependency_release_migration_required()
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["ticket_id"], self.ticket)
+
+    def test_fake_event_does_not_authorize_forged_revalidation(self) -> None:
+        with self.ledger._transaction() as conn:
+            event_id = self.ledger._append_event(conn, entity_type="controller", entity_id="controller", event_type="native_dependency_release_revalidated", actor_id="forger", payload={"ticket_id": self.ticket, "revalidation_id": "forged"})
+            self.ledger.connection.execute("""INSERT INTO native_dependency_release_revalidations
+                (revalidation_id,ticket_id,release_graph_hash,release_child_external_id,release_parent_completion_hash,release_routing_authority_json,release_hermes_status,release_observed_at,projection_event_id,projection_key,external_task_id,implementation_profile,repository_identity,canonical_worktree_path,branch,base_sha,snapshot_hash,operator_id,reason,created_at,revalidation_event_id,event_key,evidence_hash)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", ("forged", self.ticket, "graph-hash", "card-1", "parents", "{}", "ready", 1, 999999, "legacy-key", "card-1", "impl", str(self.repo), str(self.root / "outside"), "forged", "a" * 40, "b" * 64, "operator", "forged", 1, event_id, "native-release-revalidated:forged", "c" * 64))
+        result = self.ledger.native_dependency_release_migration_required()
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["ticket_id"], self.ticket)
 
 
 if __name__ == "__main__":
