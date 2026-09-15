@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 import subprocess
 import sys
@@ -12,12 +13,13 @@ from tempfile import TemporaryDirectory
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from hermes_cli import kanban_db
-from hermes_cli.kanban_db_connect import connect_closing, init_db
+from hermes_cli.kanban_db_connect import connect_closing
 
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
 from local_first_orchestrator.hermes_board import HermesBoardAdapter, ExternalExecutionSnapshot
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.states import CanonicalState
+from local_first_orchestrator.test_kanban_db import init_test_kanban_db
 from local_first_orchestrator.native_release_approval import (
     canonical_approval_bytes,
     fingerprint_public_key,
@@ -67,8 +69,24 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         subprocess.run(("git", "worktree", "add", "-q", "-b", "local-first/TK-1/maintenance", str(self.worktree), self.base), cwd=self.repo, check=True)
 
         self.board_name = "native-release-test"
-        self.board_db = self.root / "kanban.db"
-        init_db(self.board_db, board=self.board_name)
+        self.board_db = self.root / "native-release-test.db"
+        init_test_kanban_db(self.board_db, temp_root=self.root, board=self.board_name)
+        # The board fixture is created by the fenced helper while the delegated
+        # marker is present.  The remainder of this legacy test exercises real
+        # Kanban writes, so run those writes in the ordinary test process and
+        # restore the reviewer's environment in tearDown.  No Hermes predicate
+        # or production module is patched.
+        self._saved_kanban_env = {
+            key: os.environ.pop(key, None)
+            for key in (
+                "HERMES_DELEGATED_CHILD_CONTEXT",
+                "HERMES_KANBAN_TASK",
+                "HERMES_KANBAN_RUN_ID",
+                "HERMES_KANBAN_CLAIM_LOCK",
+                "HERMES_KANBAN_GOAL_MODE",
+                "HERMES_KANBAN_GOAL_MAX_TURNS",
+            )
+        }
         self.signing_key = Ed25519PrivateKey.generate()
         self.signer_public_key = self.signing_key.public_key().public_bytes_raw()
         self.signer_fingerprint = fingerprint_public_key(self.signer_public_key)
@@ -126,6 +144,11 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.ledger.close()
         self.temp.cleanup()
+        for key, value in self._saved_kanban_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     def test_direct_ledger_fake_verify_method_cannot_authorize_stale_board(self) -> None:
         prepared = self.controller.prepare_native_release_revalidation(self.ticket, operator_id="operator", reason="verify", implementation_profile="impl")
