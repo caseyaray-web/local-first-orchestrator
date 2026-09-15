@@ -25,14 +25,21 @@ class PinnedNativeWorkspace:
     repository_identity: NativePathIdentity
     git_identity: NativePathIdentity
     worktree_parent_identity: NativePathIdentity
+    admin_parent: Path
+    admin_parent_fd: int
+    admin_parent_identity: NativePathIdentity
     target: Path
     target_fd: int | None = None
     target_identity: NativePathIdentity | None = None
+    target_git_metadata_fd: int | None = None
+    target_git_metadata_identity: NativePathIdentity | None = None
+    target_git_metadata_id: str | None = None
 
     @classmethod
     def open(cls, repository: Path, target: Path) -> "PinnedNativeWorkspace":
         repository = Path(repository)
         worktree_parent = repository / ".worktrees"
+        admin_parent = repository / ".git" / "worktrees"
         _check_existing_components(repository)
         repository_fd = os.open(repository, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
@@ -40,42 +47,64 @@ class PinnedNativeWorkspace:
             git_path = repository / ".git"
             _check_existing_components(git_path)
             git_fd = os.open(git_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            parent_fd: int | None = None
+            admin_fd: int | None = None
             try:
                 _require_fd_path(git_path, git_fd, ".git")
                 try:
-                    os.mkdir(f"/proc/self/fd/{repository_fd}/.worktrees")
+                    os.mkdir(".worktrees", dir_fd=repository_fd)
                 except FileExistsError:
                     pass
                 _check_existing_components(worktree_parent)
-                parent_fd = os.open(worktree_parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                parent_fd = os.open(".worktrees", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=repository_fd)
+                try:
+                    os.mkdir("worktrees", dir_fd=git_fd)
+                except FileExistsError:
+                    pass
+                _check_existing_components(admin_parent)
+                admin_fd = os.open("worktrees", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=git_fd)
             except BaseException:
+                if parent_fd is not None:
+                    os.close(parent_fd)
+                if admin_fd is not None:
+                    os.close(admin_fd)
                 os.close(git_fd)
                 raise
         except BaseException:
             os.close(repository_fd)
             raise
         try:
+            if parent_fd is None or admin_fd is None:
+                raise RuntimeError("native workspace STOP: workspace pin incomplete")
             _require_fd_path(worktree_parent, parent_fd, ".worktrees")
+            _require_fd_path(admin_parent, admin_fd, ".git/worktrees")
             instance = cls(repository, worktree_parent, repository_fd, git_fd, parent_fd,
-                           _fd_identity(repository_fd), _fd_identity(git_fd), _fd_identity(parent_fd), target)
+                           _fd_identity(repository_fd), _fd_identity(git_fd), _fd_identity(parent_fd),
+                           admin_parent, admin_fd, _fd_identity(admin_fd), target)
             instance.revalidate()
             if target.exists():
                 instance.pin_existing_target(already_created=True)
             return instance
         except BaseException:
-            os.close(parent_fd)
+            if parent_fd is not None:
+                os.close(parent_fd)
+            if admin_fd is not None:
+                os.close(admin_fd)
             os.close(git_fd)
             os.close(repository_fd)
             raise
 
     def close(self) -> None:
-        for fd in (self.target_fd, self.worktree_parent_fd, self.git_fd, self.repository_fd):
+        for fd in (self.target_git_metadata_fd, self.target_fd, self.worktree_parent_fd, self.admin_parent_fd, self.git_fd, self.repository_fd):
             if fd is not None:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
         self.target_fd = None
+        self.target_git_metadata_fd = None
+        self.target_git_metadata_identity = None
+        self.target_git_metadata_id = None
 
     def __enter__(self) -> "PinnedNativeWorkspace":
         return self
@@ -87,6 +116,11 @@ class PinnedNativeWorkspace:
         _require_fd_path(self.repository, self.repository_fd, "repository", self.repository_identity)
         _require_fd_path(self.repository / ".git", self.git_fd, ".git", self.git_identity)
         _require_fd_path(self.worktree_parent, self.worktree_parent_fd, ".worktrees", self.worktree_parent_identity)
+        _require_fd_path(self.admin_parent, self.admin_parent_fd, ".git/worktrees", self.admin_parent_identity)
+        if self.target_git_metadata_fd is not None:
+            if self.target_git_metadata_id is None or self.target_git_metadata_identity is None:
+                raise RuntimeError("native workspace STOP: target Git metadata pin is incomplete")
+            _require_fd_path(self._metadata_path(self.target_git_metadata_id), self.target_git_metadata_fd, "target Git metadata", self.target_git_metadata_identity)
         if target_must_exist is False:
             try:
                 os.lstat(self.target)
@@ -116,6 +150,16 @@ class PinnedNativeWorkspace:
             self.target_identity = None
             raise
 
+    def require_expected_metadata_absent(self, metadata_id: str) -> None:
+        """Reject stale metadata before Git can select a suffixed administrative ID."""
+        self.revalidate(target_must_exist=False)
+        self._validate_metadata_id(metadata_id)
+        try:
+            os.lstat(metadata_id, dir_fd=self.admin_parent_fd)
+        except FileNotFoundError:
+            return
+        raise RuntimeError("native workspace STOP: expected Git worktree metadata already exists")
+
     def git(self, *args: str, check: bool = True, target: bool = False, git_fd_override: int | None = None, creates_target: bool = False, cwd_fd_override: int | None = None) -> subprocess.CompletedProcess[str]:
         self.revalidate(target_must_exist=True if target else (False if self.target_fd is None and not creates_target else None))
         git_fd = self.git_fd if git_fd_override is None else git_fd_override
@@ -129,25 +173,95 @@ class PinnedNativeWorkspace:
                                     text=True, capture_output=True, timeout=30, check=check)
         except subprocess.CalledProcessError as exc:
             raise RuntimeError(exc.stderr.strip() or exc.stdout.strip() or "Git command failed") from exc
+        if creates_target:
+            self._pin_expected_metadata(self.target.name)
         self.revalidate(target_must_exist=True if target else (False if self.target_fd is None and not creates_target else None))
         return result
 
     def target_git_fd(self) -> int:
         if self.target_fd is None:
             raise RuntimeError("native workspace STOP: target is not pinned")
-        raw = Path(f"/proc/self/fd/{self.target_fd}/.git").read_text(encoding="utf-8").strip()
+        self.revalidate(target_must_exist=True)
+        try:
+            metadata_file_fd = os.open(".git", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.target_fd)
+        except OSError as exc:
+            raise RuntimeError("native workspace STOP: target Git metadata is invalid") from exc
+        try:
+            info = os.fstat(metadata_file_fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise RuntimeError("native workspace STOP: target Git metadata is invalid")
+            content = bytearray()
+            while chunk := os.read(metadata_file_fd, 4096):
+                content.extend(chunk)
+            raw = bytes(content).decode("utf-8").strip()
+        finally:
+            os.close(metadata_file_fd)
         if not raw.startswith("gitdir: "):
             raise RuntimeError("native workspace STOP: target Git metadata is invalid")
-        gitdir = Path(raw[8:]).resolve(strict=True)
-        expected_parent = (self.repository / ".git" / "worktrees").resolve(strict=True)
+        raw_gitdir = raw[8:]
+        gitdir = Path(raw_gitdir) if os.path.isabs(raw_gitdir) else self.target / raw_gitdir
+        gitdir = Path(os.path.normpath(os.fspath(gitdir)))
+        if gitdir.parent != self.admin_parent:
+            raise RuntimeError("native workspace STOP: target Git metadata escapes pinned repository")
+        metadata_id = gitdir.name
+        self._validate_metadata_id(metadata_id)
+        if metadata_id != self.target.name:
+            raise RuntimeError("native workspace STOP: Git worktree administrative ID is ambiguous")
+        if self.target_git_metadata_fd is not None:
+            self.revalidate(target_must_exist=True)
+            return self.target_git_metadata_fd
+        self.revalidate(target_must_exist=True)
         try:
-            gitdir.relative_to(expected_parent)
-        except ValueError as exc:
-            raise RuntimeError("native workspace STOP: target Git metadata escapes pinned repository") from exc
-        _check_existing_components(gitdir)
-        fd = os.open(gitdir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        _require_fd_path(gitdir, fd, "target Git metadata")
-        return fd
+            fd = os.open(metadata_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.admin_parent_fd)
+        except OSError as exc:
+            raise RuntimeError("native workspace STOP: target Git metadata is unavailable") from exc
+        try:
+            identity = _fd_identity(fd)
+            _require_fd_path(gitdir, fd, "target Git metadata", identity)
+            self.target_git_metadata_fd = fd
+            self.target_git_metadata_identity = identity
+            self.target_git_metadata_id = metadata_id
+            self.revalidate(target_must_exist=True)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _pin_expected_metadata(self, metadata_id: str) -> None:
+        self._validate_metadata_id(metadata_id)
+        self.revalidate()
+        try:
+            fd = os.open(metadata_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.admin_parent_fd)
+        except OSError as exc:
+            raise RuntimeError("native workspace STOP: expected Git worktree metadata is unavailable") from exc
+        try:
+            identity = _fd_identity(fd)
+            _require_fd_path(self._metadata_path(metadata_id), fd, "target Git metadata", identity)
+            self.target_git_metadata_fd = fd
+            self.target_git_metadata_identity = identity
+            self.target_git_metadata_id = metadata_id
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def close_target_git_metadata(self) -> None:
+        if self.target_git_metadata_fd is not None:
+            try:
+                os.close(self.target_git_metadata_fd)
+            except OSError:
+                pass
+        self.target_git_metadata_fd = None
+        self.target_git_metadata_identity = None
+        self.target_git_metadata_id = None
+
+    def _metadata_path(self, metadata_id: str) -> Path:
+        self._validate_metadata_id(metadata_id)
+        return self.admin_parent / metadata_id
+
+    @staticmethod
+    def _validate_metadata_id(metadata_id: str) -> None:
+        if not isinstance(metadata_id, str) or not metadata_id or metadata_id in {".", ".."} or "/" in metadata_id or "\\" in metadata_id or "\x00" in metadata_id or any(not (char.isascii() and (char.isalnum() or char in "._-")) for char in metadata_id):
+            raise RuntimeError("native workspace STOP: unsafe Git worktree administrative ID")
 
 
 def _fd_identity(fd: int) -> NativePathIdentity:

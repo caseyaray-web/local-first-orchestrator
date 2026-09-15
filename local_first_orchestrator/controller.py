@@ -591,13 +591,15 @@ class LocalFirstController:
                     actual_branch = pin.git("branch", "--show-current", target=True, git_fd_override=target_git_fd).stdout.strip()
                     status = pin.git("status", "--porcelain=v1", target=True, git_fd_override=target_git_fd).stdout.strip()
                 finally:
-                    os.close(target_git_fd)
+                    pin.close_target_git_metadata()
                 if target_root != target or target_common != repo_common or head != base_sha or actual_branch != branch or status:
                     raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: existing worktree drift")
                 validate_native_workspace_path(target, repository=repository, external_task_id=external_task_id)
+                pin.revalidate(target_must_exist=True)
                 return {"workspace_path": str(target), "branch_name": branch, "base_sha": base_sha}
 
             pin.revalidate(target_must_exist=False)
+            pin.require_expected_metadata_absent(external_task_id)
             branch_check = pin.git("rev-parse", "--verify", f"refs/heads/{branch}", check=False)
             if branch_check.returncode == 0 and branch_check.stdout.strip() != base_sha:
                 raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: existing branch drift")
@@ -616,10 +618,11 @@ class LocalFirstController:
                 head = pin.git("rev-parse", "HEAD", target=True, git_fd_override=target_git_fd).stdout.strip()
                 actual_branch = pin.git("branch", "--show-current", target=True, git_fd_override=target_git_fd).stdout.strip()
             finally:
-                os.close(target_git_fd)
+                pin.close_target_git_metadata()
             if target_root != target or target_common != repo_common or head != base_sha or actual_branch != branch:
                 raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: created worktree drift")
             validate_native_workspace_path(target, repository=repository, external_task_id=external_task_id)
+            pin.revalidate(target_must_exist=True)
             return {"workspace_path": str(target), "branch_name": branch, "base_sha": base_sha}
 
     def dry_run(self, task_id: str) -> dict[str, object]:
