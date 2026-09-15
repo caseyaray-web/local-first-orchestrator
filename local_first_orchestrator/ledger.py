@@ -307,6 +307,35 @@ CREATE TABLE IF NOT EXISTS runtime_bindings (
     starting_sha TEXT NOT NULL, ownership_verified INTEGER NOT NULL, created_at INTEGER NOT NULL,
     operator_signer_fingerprint TEXT, operator_authority_hash TEXT
 );
+CREATE TRIGGER IF NOT EXISTS runtime_bindings_signer_pair_required
+BEFORE UPDATE ON runtime_bindings
+WHEN (NEW.operator_signer_fingerprint IS NULL) != (NEW.operator_authority_hash IS NULL)
+BEGIN SELECT RAISE(ABORT, 'runtime binding signer fields must be paired'); END;
+CREATE TRIGGER IF NOT EXISTS runtime_bindings_signer_immutable
+BEFORE UPDATE ON runtime_bindings
+WHEN (OLD.operator_signer_fingerprint IS NOT NULL OR OLD.operator_authority_hash IS NOT NULL)
+ AND (OLD.operator_signer_fingerprint IS NOT NEW.operator_signer_fingerprint
+      OR OLD.operator_authority_hash IS NOT NEW.operator_authority_hash)
+BEGIN SELECT RAISE(ABORT, 'runtime binding signer authority is immutable'); END;
+CREATE TABLE IF NOT EXISTS runtime_signer_enrollment_intents (
+    enrollment_key TEXT PRIMARY KEY, operator_id TEXT NOT NULL, reason TEXT NOT NULL,
+    ticket_ids_json TEXT NOT NULL, public_key_fingerprint TEXT NOT NULL,
+    authority_hash TEXT NOT NULL, old_config_hash TEXT NOT NULL, new_config_hash TEXT NOT NULL,
+    selected_bindings_json TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending_config','config_written','finalized')),
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_signer_enrollments (
+    enrollment_key TEXT NOT NULL REFERENCES runtime_signer_enrollment_intents(enrollment_key),
+    ticket_id TEXT NOT NULL REFERENCES tickets(id), operator_id TEXT NOT NULL, reason TEXT NOT NULL,
+    old_binding_identity_json TEXT NOT NULL, new_binding_identity_json TEXT NOT NULL,
+    public_key_fingerprint TEXT NOT NULL, authority_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL, evidence_hash TEXT NOT NULL,
+    PRIMARY KEY(enrollment_key, ticket_id)
+);
+CREATE TRIGGER IF NOT EXISTS runtime_signer_enrollments_immutable_update
+BEFORE UPDATE ON runtime_signer_enrollments BEGIN SELECT RAISE(ABORT, 'runtime signer enrollments are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS runtime_signer_enrollments_immutable_delete
+BEFORE DELETE ON runtime_signer_enrollments BEGIN SELECT RAISE(ABORT, 'runtime signer enrollments are append-only'); END;
 CREATE TABLE IF NOT EXISTS runtime_stages (
     ticket_id TEXT NOT NULL REFERENCES tickets(id), stage TEXT NOT NULL, detail TEXT NOT NULL,
     attempt_number INTEGER, artifact_path TEXT, artifact_sha256 TEXT, base_sha TEXT,
@@ -2293,6 +2322,15 @@ class Ledger:
     def native_dependency_release_migration_required(self, *, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None) -> dict[str, Any] | None:
         """Find legacy releases that cannot authorize downstream execution."""
         rows = self.connection.execute("SELECT * FROM native_dependency_releases ORDER BY ticket_id").fetchall()
+        missing_signer = self.connection.execute("""
+            SELECT r.ticket_id FROM native_dependency_releases r
+            JOIN runtime_bindings b ON b.ticket_id=r.ticket_id
+            WHERE (b.operator_signer_fingerprint IS NULL OR b.operator_authority_hash IS NULL)
+              AND json_valid(r.routing_authority_json)=1 AND json(r.routing_authority_json)='{}'
+            ORDER BY r.ticket_id LIMIT 1
+        """).fetchone()
+        if missing_signer is not None:
+            return {"ticket_id": str(missing_signer["ticket_id"]), "reason": "legacy release requires completed signer enrollment"}
         if (signer_public_key is None) != (signer_fingerprint is None):
             signer_public_key = None
             signer_fingerprint = None

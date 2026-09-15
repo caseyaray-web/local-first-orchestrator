@@ -204,3 +204,9 @@ def save_operator_config(config: OperatorConfig, path: Path | None = None) -> Pa
     temporary.write_text(json.dumps(checked.as_json(), sort_keys=True, indent=2) + "\n", encoding="utf-8")
     temporary.replace(config_path)
     return config_path
+
+
+def enroll_operator_signer(*args, **kwargs):
+    """Supported paused legacy signer enrollment entry point."""
+    from .signer_enrollment import enroll_operator_signer as _enroll
+    return _enroll(*args, **kwargs)

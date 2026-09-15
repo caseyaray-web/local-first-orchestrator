@@ -19,6 +19,7 @@ from .hermes_board import HermesBoardAdapter
 from .ledger import Ledger
 from .local_qwen import LOCAL_QWEN_MODEL, LOCAL_QWEN_PROVIDER, LocalQwenAdapter
 from .operator_config import ModelRegistration, OperatorConfig, default_execution_roots, load_operator_config, save_operator_config
+from .signer_enrollment import enroll_operator_signer
 from .runtime_metrics import RuntimeMetricsStore
 from .native_release_approval import parse_approval_document
 from .paid_model import HermesPaidModelAdapter
@@ -553,6 +554,12 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     native_revalidate.add_argument("--reason", required=True)
     native_revalidate.add_argument("--approval-file")
     native_revalidate.add_argument("--signature-file")
+    enroll_signer=commands.add_parser("enroll-operator-signer", help="paused operator-only: enroll one public Ed25519 signer for selected legacy native releases")
+    enroll_signer.add_argument("--operator-id", required=True)
+    enroll_signer.add_argument("--reason", required=True)
+    enroll_signer.add_argument("--public-key", required=True, help="base64 raw Ed25519 public key; private keys are never read")
+    enroll_signer.add_argument("--fingerprint", required=True, help="lowercase SHA-256 public-key fingerprint")
+    enroll_signer.add_argument("--ticket-id", action="append", dest="ticket_ids", required=True, help="explicit legacy ticket ID; repeatable")
     prepare_native=commands.add_parser("prepare-native-release-revalidation", help="read-only: emit canonical approval document; never signs or mutates")
     prepare_native.add_argument("--task-id", required=True)
     prepare_native.add_argument("--operator-id", required=True)
@@ -823,6 +830,16 @@ def run_command(args: argparse.Namespace) -> int:
             if document["operator_id"] != args.operator_id or document["reason"] != args.reason:
                 raise ValueError("CLI operator identity/reason must match signed approval document")
             result = ctl.revalidate_native_release(args.task_id, operator_id=args.operator_id, reason=args.reason, implementation_profile=registered.implementation.profile, approval_document=document, detached_signature=Path(args.signature_file).read_bytes(), signer_public_key=registered.signer_public_key_bytes, signer_fingerprint=registered.operator_signing_key_fingerprint)
+            print(json.dumps(result, sort_keys=True))
+        elif args.command=="enroll-operator-signer":
+            if args.ad_hoc_runtime: raise ValueError("signer enrollment requires registered operator configuration")
+            if args.worktree_root or args.artifact_root or args.implementation_timeout_seconds is not None or args.review_timeout_seconds is not None or args.allow_repository or args.repository != "." or args.hermes_executable or args.board:
+                raise ValueError("signer enrollment forbids runtime, repository, board, and model overrides")
+            config_path = Path(args.operator_config_path) if args.operator_config_path else None
+            if config_path is None:
+                from .operator_config import default_config_path
+                config_path = default_config_path()
+            result = enroll_operator_signer(ledger, config_path=config_path, operator_id=args.operator_id, reason=args.reason, ticket_ids=tuple(args.ticket_ids), public_key_b64=args.public_key, fingerprint=args.fingerprint)
             print(json.dumps(result, sort_keys=True))
         elif args.command=="prepare-native-release-revalidation":
             if args.ad_hoc_runtime: raise ValueError("native release preparation requires registered operator runtime")
