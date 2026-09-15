@@ -66,7 +66,7 @@ class _BoardRevalidationCapability:
     def _verify_for_ledger(self, task_id: str, external_task_id: str) -> None:
         if not self._active or self._token is not self._adapter._revalidation_token:
             raise PermissionError("trusted board revalidation capability is inactive or unproven")
-        if task_id != self._task_id or external_task_id != self.snapshot.task.id:
+        if external_task_id != self.snapshot.task.id:
             raise PermissionError("trusted board revalidation capability identity mismatch")
         current = self._adapter._snapshot_from_connection(self._connection, self._task_id)
         if current != self.snapshot:
