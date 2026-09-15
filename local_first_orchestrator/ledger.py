@@ -2437,9 +2437,20 @@ class Ledger:
                     if intent["updated_at"] < events[0]["created_at"] or any(row["created_at"] != intent["created_at"] for row in evidence):
                         raise ValueError("enrollment finalized timestamps drifted")
                     event_payload = json.loads(str(events[0]["payload_json"]))
-                    expected_event = {"enrollment_key": str(intent["enrollment_key"]), "document_hash": str(intent["document_hash"]), "old_config_hash": document["old_config_hash"], "new_config_hash": document["new_config_hash"], "new_config_bytes": document["new_config_bytes"], "document_json": document_raw.decode("utf-8"), "detached_signature": str(intent["detached_signature"]), "config_identity": json.loads(str(intent["config_identity_json"])), "ticket_ids": list(selected), "public_key_fingerprint": signer_fingerprint, "operator_id": document["operator_id"], "reason": document["reason"]}
-                    if event_payload != expected_event or str(events[0]["actor_id"]) != document["operator_id"]:
-                        raise ValueError("enrollment completion event is outside signed authority")
+                    from .signer_enrollment import validate_completion_event_payload
+                    validate_completion_event_payload(
+                        event_payload,
+                        enrollment_key=str(intent["enrollment_key"]),
+                        document=document_raw,
+                        detached_signature=str(intent["detached_signature"]),
+                        config_identity=json.loads(str(intent["config_identity_json"])),
+                        ticket_ids=list(selected),
+                        public_key_fingerprint=signer_fingerprint,
+                        operator_id=document["operator_id"],
+                        reason=document["reason"],
+                    )
+                    if str(events[0]["actor_id"]) != document["operator_id"]:
+                        raise ValueError("enrollment completion event actor drift")
                     for evidence_row in evidence:
                         if any(evidence_row[field] != intent[field] for field in ("document_json", "document_hash", "detached_signature")):
                             raise ValueError("per-ticket signed document drift")
@@ -2588,26 +2599,31 @@ class Ledger:
                         return {"ticket_id": ticket_id, "reason": "legacy signer enrollment fingerprint drift"}
                     signature = base64.b64decode(str(enrollment["detached_signature"]), validate=True)
                     Ed25519PublicKey.from_public_bytes(signer_public_key).verify(signature, document_bytes)
-                    event_rows = self.connection.execute("SELECT payload_json FROM events WHERE entity_type='controller' AND entity_id='controller' AND event_type='runtime_signer_enrollment_completed'").fetchall()
+                    from .signer_enrollment import validate_completion_event_payload
+                    event_rows = self.connection.execute("SELECT actor_id,payload_json FROM events WHERE entity_type='controller' AND entity_id='controller' AND event_type='runtime_signer_enrollment_completed'").fetchall()
                     matching = []
+                    expected_event_config_identity = json.loads(str(enrollment["config_identity_json"] or "null"))
                     for event in event_rows:
                         payload = json.loads(str(event["payload_json"]))
-                        if payload.get("enrollment_key") == enrollment["enrollment_key"] and payload.get("document_hash") == enrollment["document_hash"] and tuple(payload.get("ticket_ids", ())) == selected_ids:
-                            matching.append(payload)
-                    expected_event_config_identity = json.loads(str(enrollment["config_identity_json"] or "null"))
-                    expected_event = {
-                        "enrollment_key": str(enrollment["enrollment_key"]),
-                        "document_hash": str(enrollment["document_hash"]),
-                        "old_config_hash": str(enrollment["old_config_hash"]),
-                        "new_config_hash": signed_new_hash,
-                        "new_config_bytes": signed_new_b64,
-                        "config_identity": expected_event_config_identity,
-                        "ticket_ids": list(selected_ids),
-                        "public_key_fingerprint": str(enrollment["public_key_fingerprint"]),
-                        "operator_id": str(enrollment["operator_id"]),
-                        "reason": str(enrollment["reason"]),
-                    }
-                    if len(matching) != 1 or matching[0] != expected_event or document.get("ticket_ids") != list(selected_ids) or document.get("old_config_hash") != enrollment["old_config_hash"]:
+                        if not isinstance(payload, dict) or payload.get("enrollment_key") != enrollment["enrollment_key"]:
+                            continue
+                        try:
+                            validate_completion_event_payload(
+                                payload,
+                                enrollment_key=str(enrollment["enrollment_key"]),
+                                document=document_bytes,
+                                detached_signature=str(enrollment["detached_signature"]),
+                                config_identity=expected_event_config_identity,
+                                ticket_ids=list(selected_ids),
+                                public_key_fingerprint=str(enrollment["public_key_fingerprint"]),
+                                operator_id=str(enrollment["operator_id"]),
+                                reason=str(enrollment["reason"]),
+                            )
+                            if str(event["actor_id"]) == str(enrollment["operator_id"]):
+                                matching.append(payload)
+                        except (ValueError, TypeError, KeyError, json.JSONDecodeError, binascii.Error):
+                            continue
+                    if len(matching) != 1 or document.get("ticket_ids") != list(selected_ids) or document.get("old_config_hash") != enrollment["old_config_hash"]:
                         return {"ticket_id": ticket_id, "reason": "signer enrollment reconciliation required: enrollment event is missing, forged, or outside signed config authority"}
                     binding = self.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
                     evidence = self.connection.execute("SELECT * FROM runtime_signer_enrollments WHERE enrollment_key=? AND ticket_id=?", (enrollment["enrollment_key"], ticket_id)).fetchone()

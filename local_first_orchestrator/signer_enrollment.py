@@ -123,6 +123,51 @@ def parse_enrollment_document(document: dict[str, Any] | bytes | str) -> tuple[d
     return parsed, _canonical_document(parsed)
 
 
+def build_completion_event_payload(*, enrollment_key: str, document: dict[str, Any] | bytes | str, detached_signature: bytes | str, config_identity: dict[str, Any], ticket_ids: list[str] | tuple[str, ...], public_key_fingerprint: str, operator_id: str, reason: str) -> dict[str, Any]:
+    """Build the single canonical payload for a completed signer enrollment."""
+    document_obj, document_bytes = parse_enrollment_document(document)
+    if type(config_identity) is not dict:
+        raise ValueError("enrollment completion config identity must be an object")
+    if type(public_key_fingerprint) is not str or not public_key_fingerprint:
+        raise ValueError("enrollment completion signer fingerprint is required")
+    if type(enrollment_key) is not str or not enrollment_key:
+        raise ValueError("enrollment completion key is required")
+    if type(operator_id) is not str or not operator_id or type(reason) is not str or not reason:
+        raise ValueError("enrollment completion operator identity and reason are required")
+    try:
+        signature_bytes = base64.b64decode(detached_signature, validate=True) if isinstance(detached_signature, str) else detached_signature
+    except Exception as exc:
+        raise ValueError("enrollment completion signature is not base64") from exc
+    if type(signature_bytes) is not bytes or len(signature_bytes) != 64:
+        raise ValueError("enrollment completion signature must be exactly 64 bytes")
+    selected = list(ticket_ids)
+    if any(type(ticket_id) is not str or not ticket_id for ticket_id in selected):
+        raise ValueError("enrollment completion ticket IDs must be non-empty strings")
+    if document_obj["operator_id"] != operator_id or document_obj["reason"] != reason or document_obj["new_fingerprint"] != public_key_fingerprint or document_obj["ticket_ids"] != selected:
+        raise ValueError("enrollment completion authority differs from signed document")
+    return {
+        "enrollment_key": str(enrollment_key),
+        "document_hash": hashlib.sha256(document_bytes).hexdigest(),
+        "old_config_hash": document_obj["old_config_hash"],
+        "new_config_hash": document_obj["new_config_hash"],
+        "new_config_bytes": document_obj["new_config_bytes"],
+        "document_json": document_bytes.decode("utf-8"),
+        "detached_signature": base64.b64encode(signature_bytes).decode("ascii"),
+        "config_identity": config_identity,
+        "ticket_ids": selected,
+        "public_key_fingerprint": public_key_fingerprint,
+        "operator_id": operator_id,
+        "reason": reason,
+    }
+
+
+def validate_completion_event_payload(payload: dict[str, Any], **authority: Any) -> None:
+    """Reject any completion event not equal to the canonical authority payload."""
+    expected = build_completion_event_payload(**authority)
+    if payload != expected:
+        raise ValueError("enrollment completion event is outside signed authority")
+
+
 def _verify(document: dict[str, Any], signature: bytes | str, public_key_b64: str, fingerprint: str) -> tuple[bytes, bytes]:
     _, fingerprint, public_key = _public_key(public_key_b64, fingerprint)
     document, data = parse_enrollment_document(document)
@@ -267,7 +312,9 @@ def enroll_operator_signer(ledger: Any, *, config_path: Path, document: dict[str
             verify_identity = config_lock.stat()
             if hashlib.sha256(verify_raw).hexdigest() != new_hash or verify_obj.get("operator_signing_key_fingerprint") != fingerprint or verify_identity != written_identity:
                 raise RuntimeError("external operator config changed before binding commit; reconciliation required")
-            event_id = ledger._append_event(conn, entity_type="controller", entity_id="controller", event_type="runtime_signer_enrollment_completed", actor_id=document_obj["operator_id"], payload={"enrollment_key":key,"document_hash":hashlib.sha256(data).hexdigest(),"old_config_hash":old_hash,"new_config_hash":new_hash,"new_config_bytes":base64.b64encode(new_raw).decode("ascii"),"document_json":data.decode("utf-8"),"detached_signature":base64.b64encode(detached_signature if isinstance(detached_signature,bytes) else base64.b64decode(detached_signature)).decode("ascii"),"config_identity":written_identity,"ticket_ids":list(selected),"public_key_fingerprint":fingerprint,"operator_id":document_obj["operator_id"],"reason":document_obj["reason"]})
+            from .signer_enrollment import build_completion_event_payload
+            event_payload = build_completion_event_payload(enrollment_key=key, document=document_obj, detached_signature=detached_signature, config_identity=written_identity, ticket_ids=selected, public_key_fingerprint=fingerprint, operator_id=document_obj["operator_id"], reason=document_obj["reason"])
+            event_id = ledger._append_event(conn, entity_type="controller", entity_id="controller", event_type="runtime_signer_enrollment_completed", actor_id=document_obj["operator_id"], payload=event_payload)
             conn.execute("UPDATE runtime_signer_enrollment_intents SET status='finalized',updated_at=?,config_identity_json=? WHERE enrollment_key=? AND status='config_written'", (ledger._now(),json.dumps(written_identity,sort_keys=True,separators=(",",":")),key))
         # This seam is deliberately after COMMIT. A post-commit failure must
         # be durably quarantined, not rolled back into an apparently replayable

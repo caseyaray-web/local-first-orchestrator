@@ -150,6 +150,36 @@ class OperatorSignerEnrollmentRedTests(unittest.TestCase):
         self.assertEqual(enroll_operator_signer(ledger, config_path=config_path, document=prepared["document"], detached_signature=signature, public_key_b64=public_b64, fingerprint=fingerprint)["status"], "finalized")
         ledger.close(); tmp.cleanup()
 
+    def test_valid_finalized_enrollment_advances_to_legacy_release_revalidation(self) -> None:
+        tmp, root, ledger, config_path, prepared, signature, public_b64, fingerprint, ticket = self._enrollment_fixture()
+        enroll_operator_signer(ledger, config_path=config_path, document=prepared["document"], detached_signature=signature, public_key_b64=public_b64, fingerprint=fingerprint)
+        blocker = ledger.native_dependency_release_migration_required(signer_public_key=base64.b64decode(public_b64), signer_fingerprint=fingerprint, config_path=config_path)
+        self.assertIsNotNone(blocker)
+        self.assertNotIn("signer enrollment reconciliation required", blocker["reason"])
+        self.assertIn("legacy", blocker["reason"])
+        ledger.connection.execute("UPDATE controller_state SET paused=0 WHERE id=1")
+        ledger.connection.commit()
+        preview = preview_next(ledger, signer_public_key=base64.b64decode(public_b64), signer_fingerprint=fingerprint, signer_config_path=config_path)
+        self.assertEqual(preview.next_stage, "reconciliation_required")
+        self.assertNotIn("signer enrollment reconciliation required", preview.blocker_reason or "")
+        ledger.close(); tmp.cleanup()
+
+    def test_completion_event_document_and_signature_mutations_stop_enrollment(self) -> None:
+        for field, value in (("document_json", "{}"), ("detached_signature", base64.b64encode(b"x" * 64).decode())):
+            tmp, root, ledger, config_path, prepared, signature, public_b64, fingerprint, ticket = self._enrollment_fixture()
+            enroll_operator_signer(ledger, config_path=config_path, document=prepared["document"], detached_signature=signature, public_key_b64=public_b64, fingerprint=fingerprint)
+            ledger.connection.execute("DROP TRIGGER events_immutable_update")
+            event = ledger.connection.execute("SELECT id,payload_json FROM events WHERE event_type='runtime_signer_enrollment_completed'").fetchone()
+            payload = json.loads(event["payload_json"])
+            payload[field] = value
+            ledger.connection.execute("UPDATE events SET payload_json=? WHERE id=?", (json.dumps(payload, sort_keys=True, separators=(",", ":")), event["id"]))
+            ledger.connection.execute("UPDATE controller_state SET paused=0 WHERE id=1")
+            ledger.connection.commit()
+            blocker = ledger.native_dependency_release_migration_required(signer_public_key=base64.b64decode(public_b64), signer_fingerprint=fingerprint, config_path=config_path)
+            self.assertIsNotNone(blocker, field)
+            self.assertTrue(blocker["reason"].startswith("signer enrollment reconciliation required:"), field)
+            ledger.close(); tmp.cleanup()
+
     def test_detector_rejects_forged_finalized_enrollment_for_same_signer_altered_bytes(self) -> None:
         tmp, root, ledger, config_path, prepared, signature, public_b64, fingerprint, ticket = self._enrollment_fixture()
         enroll_operator_signer(ledger, config_path=config_path, document=prepared["document"], detached_signature=signature, public_key_b64=public_b64, fingerprint=fingerprint)
