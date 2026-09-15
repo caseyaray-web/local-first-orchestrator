@@ -33,7 +33,7 @@ from .ticket import MicroTicket, PatchBudget, VerificationProfile
 from .triage import LocalTriagePlanner, TriageCoordinator, TriageError, normalize_triage
 from .usage_governor import PaidPurpose
 from .validation import DeterministicValidator
-from .native_release_approval import APPROVAL_DOMAIN, ACTIVATION_DOMAIN, APPROVAL_VERSION, canonical_approval_bytes, canonical_activation_bytes, canonical_snapshot_json, parse_approval_document, validate_activation_post_snapshot, verify_detached_signature, fingerprint_public_key
+from .native_release_approval import APPROVAL_DOMAIN, ACTIVATION_DOMAIN, APPROVAL_VERSION, canonical_approval_bytes, canonical_activation_bytes, canonical_snapshot_json, parse_approval_document, validate_activation_continuation_snapshot, validate_activation_post_snapshot, verify_detached_signature, fingerprint_public_key
 from .native_workspace import PinnedNativeWorkspace, canonical_native_workspace_path, require_native_path_identity, validate_native_workspace_path
 
 
@@ -600,36 +600,28 @@ class LocalFirstController:
         ).fetchall()
         activated = activation[-1] if activation else None
         if activated is not None:
-            # A post-activation continuation is a narrow Hermes handoff shape,
-            # not generic completion evidence.  Require one terminal blocked
-            # handoff run strictly after acknowledgement and reject all worker,
-            # model, completion, overlap, and identity metadata drift.
-            if snapshot.task.assignee != str(activated["implementation_profile"]):
-                raise RuntimeError("Hermes activation continuation profile drift")
-            if snapshot.task.workspace_kind != "worktree" or snapshot.task.workspace_path != str(activated["canonical_worktree_path"]):
-                raise RuntimeError("Hermes activation continuation workspace drift")
-            if snapshot.branch_name != str(activated["branch"]):
-                raise RuntimeError("Hermes activation continuation branch drift")
-            if snapshot.task.status != "blocked":
-                raise RuntimeError("Hermes activation continuation task is not parked")
-            if snapshot.task.repository_identity is not None and snapshot.task.repository_identity != str(activated["repository_identity"]):
-                raise RuntimeError("Hermes activation continuation repository drift")
-            if snapshot.task.base_sha is not None and snapshot.task.base_sha != str(activated["base_sha"]):
-                raise RuntimeError("Hermes activation continuation base drift")
-            if snapshot.session_id is not None or snapshot.completed_at is not None or snapshot.current_run_id is not None:
-                raise RuntimeError("Hermes activation continuation has current or completed task authority")
-            if len(snapshot.runs) != 1:
-                raise RuntimeError("Hermes activation continuation has extra or overlapping runs")
-            candidate = snapshot.runs[0]
-            if candidate.status != "blocked" or candidate.outcome != "blocked" or candidate.summary != HANDOFF_SENTINEL:
-                raise RuntimeError("Hermes activation continuation has invalid completion shape")
-            if candidate.profile != str(activated["implementation_profile"]) or candidate.worker_pid is not None or candidate.metadata is not None:
-                raise RuntimeError("Hermes activation continuation has invalid worker/model metadata")
-            if candidate.started_at is None or candidate.ended_at is None or int(candidate.started_at) >= int(candidate.ended_at) or int(candidate.started_at) <= int(activated["acknowledged_at"]):
-                raise RuntimeError("Hermes activation continuation predates signed activation or has invalid terminal timing")
-            if hermes_run_id is not None and candidate.id != hermes_run_id:
+            # The acknowledged post snapshot is immutable authority.  Hermes may
+            # append exactly one dispatcher continuation after it; running is a
+            # live external owner and must not be reconciled or mutated here.
+            post_authority = json.loads(str(activated["post_activation_snapshot_json"] or "null"))
+            current_kind = validate_activation_continuation_snapshot(
+                post_authority,
+                asdict(snapshot),
+                acknowledged_at=int(activated["acknowledged_at"]),
+                profile=str(activated["implementation_profile"]),
+                workspace_path=str(activated["canonical_worktree_path"]),
+                branch=str(activated["branch"]),
+                repository_identity=str(activated["repository_identity"]),
+                base_sha=str(activated["base_sha"]),
+                handoff_summary=HANDOFF_SENTINEL,
+            )
+            if hermes_run_id is not None and snapshot.current_run_id != hermes_run_id:
                 raise RuntimeError("Hermes activation continuation run identity mismatch")
-            if not require_handoff:
+            if current_kind == "running":
+                if require_handoff:
+                    raise RuntimeError("Hermes activation continuation is still running")
+                return {"ticket_id": ticket_id, "external_task_id": external_task_id, "status": "externally_running", "run_id": snapshot.current_run_id}
+            if snapshot.task.status != "blocked" or not require_handoff:
                 require_handoff = True
         if require_handoff:
             candidates = [

@@ -18,6 +18,7 @@ from .states import CanonicalState
 from .runtime_metrics import RuntimeMetricsStore
 from .evidence_hash import canonical_sha256
 from .native_workspace import validate_native_workspace_path
+from .native_release_approval import canonical_snapshot_json, validate_activation_continuation_snapshot, validate_activation_post_snapshot
 
 
 SCHEDULER_STAGE_ORDER: tuple[str, ...] = (
@@ -879,8 +880,25 @@ class ProcessNextScheduler:
             board_identity = board_path.stat()
             if str(board_path) != str(activation["board_path"]) or (int(board_identity.st_dev), int(board_identity.st_ino)) != (int(activation["board_dev"]), int(activation["board_ino"])):
                 raise RuntimeError("native_dependency_release_reconciliation_required: configured board inode changed")
-            if current.task.status != "ready" or current.task.assignee != str(activation["implementation_profile"]) or current.task.workspace_kind != "worktree" or not self.board.activation_marker_present(str(activation["external_task_id"]), str(activation["activation_marker"])):
-                raise RuntimeError("native_dependency_release_reconciliation_required: acknowledged activation is not exact ready post-state")
+            try:
+                post_json = str(activation["post_activation_snapshot_json"] or "")
+                pre_json = str(activation["pre_activation_snapshot_json"] or "")
+                if not post_json or not pre_json:
+                    raise ValueError("activation snapshots are missing")
+                current_json = canonical_snapshot_json(current)
+                marker = bool(self.board.activation_marker_present(str(activation["external_task_id"]), str(activation["activation_marker"])))
+                validate_activation_post_snapshot(json.loads(pre_json), json.loads(post_json), marker_present=marker, marker=str(activation["activation_marker"]))
+                if current_json != post_json:
+                    continuation = validate_activation_continuation_snapshot(
+                        json.loads(post_json), json.loads(current_json), acknowledged_at=int(activation["updated_at"]),
+                        profile=str(activation["implementation_profile"]), workspace_path=str(activation["canonical_worktree_path"]),
+                        branch=str(activation["branch"]), repository_identity=str(activation["repository_identity"]),
+                        base_sha=str(activation["base_sha"]), handoff_summary="local-first-awaiting-reconciliation",
+                    )
+                    if continuation == "terminal":
+                        raise RuntimeError("native_dependency_release_reconciliation_required: authorized terminal Hermes handoff requires reconciliation")
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("native_dependency_release_reconciliation_required: acknowledged activation is not exact or authorized continuation") from exc
 
         reconciliation = self.ledger.next_scheduler_reconciliation(now=now)
         if reconciliation is not None and reconciliation.action == ReconciliationAction.STOP:

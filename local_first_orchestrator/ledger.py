@@ -2644,16 +2644,33 @@ class Ledger:
                 if any(ev[key] != activation[key] for key in ("request_key", "ticket_id", "revalidation_id", "activation_marker")) or ev["post_activation_snapshot_hash"] != activation["effect_snapshot_hash"] or event[0]["id"] != ev["event_id"] or canonical_sha256({k: expected[k] for k in expected if k != "evidence_hash"}) != str(ev["evidence_hash"]) or payload != expected:
                     return {"ticket_id": str(activation["ticket_id"]), "reason": "native release activation acknowledgement evidence or event hash mismatch"}
                 if board is not None:
-                    from .native_release_approval import canonical_snapshot_json, validate_activation_post_snapshot
+                    from .native_release_approval import canonical_snapshot_json, validate_activation_continuation_snapshot, validate_activation_post_snapshot
                     if not ev["post_activation_snapshot_json"]:
                         return {"ticket_id": str(activation["ticket_id"]), "reason": "native release activation canonical post snapshot is missing"}
                     current = board.execution_snapshot(str(activation["external_task_id"]))
                     current_json = canonical_snapshot_json(current)
-                    if current_json != str(ev["post_activation_snapshot_json"]) or hashlib.sha256(current_json.encode("utf-8")).hexdigest() != str(ev["post_activation_snapshot_hash"]):
-                        return {"ticket_id": str(activation["ticket_id"]), "reason": "native release activation board post snapshot/hash drift"}
-                    marker = bool(board.activation_marker_present(str(activation["external_task_id"]), str(activation["activation_marker"])))
-                    pre = json.loads(str(activation["pre_activation_snapshot_json"] or "null"))
-                    validate_activation_post_snapshot(pre, json.loads(current_json), marker_present=marker, marker=str(activation["activation_marker"]))
+                    if hashlib.sha256(current_json.encode("utf-8")).hexdigest() != str(ev["post_activation_snapshot_hash"]):
+                        pre = json.loads(str(activation["pre_activation_snapshot_json"] or "null"))
+                        marker = bool(board.activation_marker_present(str(activation["external_task_id"]), str(activation["activation_marker"])))
+                        try:
+                            validate_activation_post_snapshot(pre, json.loads(str(ev["post_activation_snapshot_json"])), marker_present=marker, marker=str(activation["activation_marker"]))
+                            continuation = validate_activation_continuation_snapshot(
+                                json.loads(str(ev["post_activation_snapshot_json"])), json.loads(current_json),
+                                acknowledged_at=int(ev["acknowledged_at"]), profile=str(activation["implementation_profile"]),
+                                workspace_path=str(activation["canonical_worktree_path"]), branch=str(activation["branch"]),
+                                repository_identity=str(activation["repository_identity"]), base_sha=str(activation["base_sha"]),
+                                handoff_summary="local-first-awaiting-reconciliation",
+                            )
+                        except Exception as exc:
+                            return {"ticket_id": str(activation["ticket_id"]), "reason": f"native release activation board continuation is invalid: {exc}"}
+                        if continuation == "terminal":
+                            return {"ticket_id": str(activation["ticket_id"]), "reason": "authorized terminal Hermes handoff requires reconciliation"}
+                    else:
+                        if current_json != str(ev["post_activation_snapshot_json"]):
+                            return {"ticket_id": str(activation["ticket_id"]), "reason": "native release activation board post snapshot drift"}
+                        pre = json.loads(str(activation["pre_activation_snapshot_json"] or "null"))
+                        marker = bool(board.activation_marker_present(str(activation["external_task_id"]), str(activation["activation_marker"])))
+                        validate_activation_post_snapshot(pre, json.loads(current_json), marker_present=marker, marker=str(activation["activation_marker"]))
                 from .native_release_approval import parse_approval_document, verify_detached_signature
                 raw = str(activation["approval_document_json"] or "").encode("utf-8")
                 sig = base64.b64decode(str(activation["detached_signature"] or ""), validate=True)
