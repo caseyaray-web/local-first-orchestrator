@@ -16,6 +16,7 @@ import stat
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 
 _CONFIG_ENV = "LOCAL_FIRST_OPERATOR_CONFIG"
@@ -167,10 +168,18 @@ def load_operator_config(path: Path | None = None) -> OperatorConfig:
     try:
         with _locked_config(config_path, write=False) as (fd, identity):
             raw_bytes = _read_verified_fd(fd, identity)
-        raw = json.loads(raw_bytes.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys,
-                         parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite JSON number")))
+        return _parse_operator_config_bytes(raw_bytes, config_path)
     except FileNotFoundError as exc:
         raise ValueError("operator dashboard is not registered") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("operator registration is not valid JSON") from exc
+
+
+def _parse_operator_config_bytes(raw_bytes: bytes, config_path: Path) -> OperatorConfig:
+    """Parse config bytes already read under a held trusted config lock."""
+    try:
+        raw = json.loads(raw_bytes.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys,
+                         parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite JSON number")))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError("operator registration is not valid JSON") from exc
     if not isinstance(raw, dict) or not _LEGACY_FIELDS <= set(raw) or set(raw) - (_LEGACY_FIELDS | _RUNTIME_FIELDS | _ROUTING_FIELDS | _PAID_FIELDS | _SIGNER_FIELDS):
@@ -199,6 +208,18 @@ def load_operator_config(path: Path | None = None) -> OperatorConfig:
     if ("operator_signing_public_key" in raw or "operator_signing_key_fingerprint" in raw) and not all(isinstance(value, str) and value.strip() for value in signer):
         raise ValueError("operator signer registration requires public key and fingerprint together")
     return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review"), *runtime, decomposition, paid_checkpoint, paid_escalation, *signer, config_path).validated(require_ledger=True)
+
+
+def _raw_config(path: Path) -> tuple[bytes, dict[str, Any], dict[str, Any] | None]:
+    with _locked_config(path, write=False) as (fd, identity):
+        raw = _read_verified_fd(fd, identity)
+    try:
+        parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("external operator config is not valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("external operator config must be an object")
+    return raw, parsed, identity
 
 
 def save_operator_config(config: OperatorConfig, path: Path | None = None) -> Path:
@@ -255,6 +276,27 @@ def _locked_config(path: Path, *, write: bool):
                 self.fd = -1
             else:
                 self.fd = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            return self.fd, self.identity
+        def read(self):
+            """Read the currently bound file without reacquiring the flock."""
+            if self.identity is None:
+                raise FileNotFoundError(self.path)
+            return _read_verified_fd(self.fd, self.identity)
+        def stat(self):
+            """Return the trusted identity of the currently bound file."""
+            if self.identity is None:
+                return None
+            current = _config_identity(self.path)
+            if current != self.identity:
+                raise ValueError("operator config identity drifted")
+            return current
+        def reopen(self):
+            """Rebind to the post-replace file while retaining the held lock."""
+            current = _config_identity(self.path)
+            if getattr(self, "fd", -1) != -1:
+                os.close(self.fd)
+            self.identity = current
+            self.fd = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
             return self.fd, self.identity
         def __exit__(self, typ, value, tb):
             if getattr(self, "fd", -1) != -1: os.close(self.fd)

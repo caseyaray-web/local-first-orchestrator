@@ -325,15 +325,18 @@ CREATE TABLE IF NOT EXISTS runtime_signer_enrollment_intents (
     enrollment_key TEXT PRIMARY KEY, operator_id TEXT NOT NULL, reason TEXT NOT NULL,
     ticket_ids_json TEXT NOT NULL, public_key_fingerprint TEXT NOT NULL,
     authority_hash TEXT NOT NULL, old_config_hash TEXT NOT NULL, new_config_hash TEXT NOT NULL,
-    selected_bindings_json TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending_config','config_written','finalized')),
-    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-);
+    selected_bindings_json TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending_config','config_written','finalized','invalidated')),
+ created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, config_identity_json TEXT,
+ document_json TEXT, document_hash TEXT, detached_signature TEXT, ledger_identity TEXT,
+ old_config_identity_json TEXT, nonce TEXT
+ );
 CREATE TABLE IF NOT EXISTS runtime_signer_enrollments (
     enrollment_key TEXT NOT NULL REFERENCES runtime_signer_enrollment_intents(enrollment_key),
     ticket_id TEXT NOT NULL REFERENCES tickets(id), operator_id TEXT NOT NULL, reason TEXT NOT NULL,
     old_binding_identity_json TEXT NOT NULL, new_binding_identity_json TEXT NOT NULL,
     public_key_fingerprint TEXT NOT NULL, authority_hash TEXT NOT NULL,
     created_at INTEGER NOT NULL, evidence_hash TEXT NOT NULL,
+    config_identity_json TEXT,
     PRIMARY KEY(enrollment_key, ticket_id)
 );
 CREATE TRIGGER IF NOT EXISTS runtime_signer_enrollments_immutable_update
@@ -1095,14 +1098,37 @@ class Ledger:
         enrollment_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(runtime_signer_enrollment_intents)")}
         for name, definition in {
             "document_json": "TEXT", "document_hash": "TEXT", "detached_signature": "TEXT",
-            "ledger_identity": "TEXT", "old_config_identity_json": "TEXT", "nonce": "TEXT",
+            "ledger_identity": "TEXT", "old_config_identity_json": "TEXT", "nonce": "TEXT", "config_identity_json": "TEXT",
         }.items():
             if name not in enrollment_columns:
                 self.connection.execute(f"ALTER TABLE runtime_signer_enrollment_intents ADD COLUMN {name} {definition}")
         evidence_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(runtime_signer_enrollments)")}
-        for name, definition in {"document_json": "TEXT", "document_hash": "TEXT", "detached_signature": "TEXT"}.items():
+        for name, definition in {"document_json": "TEXT", "document_hash": "TEXT", "detached_signature": "TEXT", "config_identity_json": "TEXT"}.items():
             if name not in evidence_columns:
                 self.connection.execute(f"ALTER TABLE runtime_signer_enrollments ADD COLUMN {name} {definition}")
+        self.connection.executescript("""
+        CREATE TRIGGER IF NOT EXISTS runtime_signer_enrollment_intents_immutable_identity
+        BEFORE UPDATE ON runtime_signer_enrollment_intents
+        WHEN OLD.enrollment_key IS NOT NEW.enrollment_key OR OLD.operator_id IS NOT NEW.operator_id
+         OR OLD.reason IS NOT NEW.reason OR OLD.ticket_ids_json IS NOT NEW.ticket_ids_json
+         OR OLD.public_key_fingerprint IS NOT NEW.public_key_fingerprint OR OLD.authority_hash IS NOT NEW.authority_hash
+         OR OLD.old_config_hash IS NOT NEW.old_config_hash OR OLD.new_config_hash IS NOT NEW.new_config_hash
+         OR OLD.selected_bindings_json IS NOT NEW.selected_bindings_json OR OLD.created_at IS NOT NEW.created_at
+         OR OLD.document_json IS NOT NEW.document_json OR OLD.document_hash IS NOT NEW.document_hash
+         OR OLD.detached_signature IS NOT NEW.detached_signature OR OLD.ledger_identity IS NOT NEW.ledger_identity
+         OR OLD.old_config_identity_json IS NOT NEW.old_config_identity_json OR OLD.nonce IS NOT NEW.nonce
+         OR (OLD.config_identity_json IS NOT NEW.config_identity_json AND NOT (OLD.config_identity_json IS NULL AND NEW.config_identity_json IS NOT NULL AND NEW.status='finalized'))
+        BEGIN SELECT RAISE(ABORT, 'runtime signer enrollment intent identity is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS runtime_signer_enrollment_intents_status_transition
+        BEFORE UPDATE OF status ON runtime_signer_enrollment_intents
+        WHEN NOT ((OLD.status='pending_config' AND NEW.status IN ('pending_config','config_written','invalidated'))
+               OR (OLD.status='config_written' AND NEW.status IN ('config_written','finalized','invalidated'))
+               OR (OLD.status='finalized' AND NEW.status IN ('finalized','invalidated'))
+               OR (OLD.status='invalidated' AND NEW.status='invalidated'))
+        BEGIN SELECT RAISE(ABORT, 'invalid runtime signer enrollment intent transition'); END;
+        CREATE TRIGGER IF NOT EXISTS runtime_signer_enrollment_intents_no_delete
+        BEFORE DELETE ON runtime_signer_enrollment_intents BEGIN SELECT RAISE(ABORT, 'runtime signer enrollment intents are append-only'); END;
+        """)
         self.connection.executescript("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_native_release_revalidation_event
             ON native_dependency_release_revalidations(revalidation_event_id)
@@ -2359,11 +2385,13 @@ class Ledger:
                 signer_public_key = None
                 signer_fingerprint = None
         fresh_config_hash = None
+        fresh_config_identity = None
         if config_path is not None and signer_fingerprint is not None:
             try:
-                from .operator_config import _raw_config
+                from .operator_config import _raw_config, _config_identity
                 fresh_raw, fresh_obj, _ = _raw_config(Path(config_path))
                 fresh_config_hash = hashlib.sha256(fresh_raw).hexdigest()
+                fresh_config_identity = _config_identity(Path(config_path))
                 if fresh_obj.get("operator_signing_key_fingerprint") != signer_fingerprint:
                     return {"ticket_id": str(rows[0]["ticket_id"]) if rows else "", "reason": "fresh external signer config differs"}
             except (OSError, ValueError):
@@ -2382,7 +2410,7 @@ class Ledger:
                 # selected ticket set before legacy execution can proceed.
                 try:
                     enrollments = self.connection.execute("""
-                        SELECT e.*, i.status, i.ticket_ids_json, i.old_config_hash, i.new_config_hash,
+                        SELECT e.*, i.status, i.ticket_ids_json, i.selected_bindings_json, i.old_config_hash, i.new_config_hash,
                                i.document_json AS intent_document_json, i.document_hash AS intent_document_hash,
                                i.detached_signature AS intent_detached_signature,
                                i.public_key_fingerprint AS intent_fingerprint, i.authority_hash AS intent_authority_hash
@@ -2414,6 +2442,10 @@ class Ledger:
                     document_bytes = str(enrollment["document_json"]).encode("utf-8")
                     if hashlib.sha256(document_bytes).hexdigest() != str(enrollment["document_hash"]):
                         return {"ticket_id": ticket_id, "reason": "legacy signer enrollment document hash drift"}
+                    signed_selected = document.get("binding_projection_release_identities")
+                    persisted_selected = json.loads(str(enrollment["selected_bindings_json"]))
+                    if signed_selected != persisted_selected:
+                        return {"ticket_id": ticket_id, "reason": "signed selected bindings differ from enrollment authority"}
                     if document.get("new_fingerprint") != signer_fingerprint or document.get("new_fingerprint") != enrollment["intent_fingerprint"] or document.get("new_fingerprint") != enrollment["public_key_fingerprint"]:
                         return {"ticket_id": ticket_id, "reason": "legacy signer enrollment fingerprint drift"}
                     signature = base64.b64decode(str(enrollment["detached_signature"]), validate=True)
@@ -2431,6 +2463,16 @@ class Ledger:
                     new_binding = json.loads(str(evidence["new_binding_identity_json"]))
                     if any(new_binding.get(key) != binding[key] for key in ("repository_path", "starting_sha", "canonical_sha", "ownership_verified", "operator_signer_fingerprint", "operator_authority_hash")):
                         return {"ticket_id": ticket_id, "reason": "legacy signer binding identity drift"}
+                    expected_selected = signed_selected.get(ticket_id) if isinstance(signed_selected, dict) else None
+                    if not isinstance(expected_selected, dict):
+                        return {"ticket_id": ticket_id, "reason": "signed binding projection release evidence mismatch"}
+                    if json.loads(str(evidence["old_binding_identity_json"])) != expected_selected.get("binding"):
+                        return {"ticket_id": ticket_id, "reason": "enrollment evidence binding differs from signed authority"}
+                    if expected_selected != {"binding": {k: binding[k] for k in ("ticket_id", "repository_path", "starting_sha", "canonical_sha", "ownership_verified")}, "projection": {k: expected_selected.get("projection", {}).get(k) for k in ("event_id", "idempotency_key", "external_task_id")}, "release": expected_selected.get("release")}:
+                        return {"ticket_id": ticket_id, "reason": "signed binding projection release evidence mismatch"}
+                    if fresh_config_identity is not None:
+                        if json.loads(str(enrollment["config_identity_json"] or "null")) != fresh_config_identity or json.loads(str(evidence["config_identity_json"] or "null")) != fresh_config_identity:
+                            return {"ticket_id": ticket_id, "reason": "fresh external signer config identity differs from finalized evidence"}
                 except _LegacyRevalidationCompatibility:
                     pass
                 except (ValueError, TypeError, KeyError, json.JSONDecodeError, binascii.Error, InvalidSignature):
