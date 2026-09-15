@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import uuid
 import sqlite3
 from dataclasses import asdict, dataclass
@@ -18,7 +19,7 @@ from .states import CanonicalState
 from .runtime_metrics import RuntimeMetricsStore
 from .evidence_hash import canonical_sha256
 from .native_workspace import validate_native_workspace_path
-from .native_release_approval import canonical_snapshot_json, validate_activation_continuation_snapshot, validate_activation_post_snapshot
+from .native_release_approval import canonical_snapshot_json, validate_activation_continuation_snapshot, validate_activation_post_snapshot, linux_process_identity, same_linux_process_identity
 
 
 SCHEDULER_STAGE_ORDER: tuple[str, ...] = (
@@ -222,6 +223,49 @@ class ProcessNextPreview:
     claim_id: str | None = None
     reconciliation_action: str | None = None
     blocker_reason: str | None = None
+    run_id: int | None = None
+    session_id: str | None = None
+
+
+def _external_running_gate(ledger: Ledger, board: Any | None, *, now: int) -> ProcessNextPreview | None:
+    """Global stop gate for a valid Hermes-owned continuation."""
+    if board is None or not hasattr(board, "execution_snapshot"):
+        return None
+    try:
+        activations = ledger.connection.execute("SELECT * FROM native_release_activation_intents WHERE status='acknowledged' ORDER BY request_key").fetchall()
+    except sqlite3.DatabaseError:
+        return ProcessNextPreview(next_stage="reconciliation_required", reconciliation_action=ReconciliationAction.STOP.value, blocker_reason="running observation schema is unavailable")
+    for activation in activations:
+        try:
+            current = board.execution_snapshot(str(activation["external_task_id"]))
+            current_json = canonical_snapshot_json(current)
+            post_json = str(activation["post_activation_snapshot_json"] or "")
+            if current_json == post_json:
+                continue
+            observation = ledger.connection.execute("SELECT * FROM native_release_activation_running_observations WHERE request_key=?", (activation["request_key"],)).fetchone()
+            kind = validate_activation_continuation_snapshot(
+                json.loads(post_json), json.loads(current_json),
+                acknowledged_at=int(activation["updated_at"]), profile=str(activation["implementation_profile"]),
+                workspace_path=str(activation["canonical_worktree_path"]), branch=str(activation["branch"]),
+                repository_identity=str(activation["repository_identity"]), base_sha=str(activation["base_sha"]),
+                handoff_summary="local-first-awaiting-reconciliation",
+                prior_running_observation=None if observation is None else dict(observation),
+            )
+            run = current.raw_runs[-1] if current.raw_runs else (asdict(current.runs[-1]) if current.runs else None)
+            if kind == "running":
+                pid = run.get("worker_pid") if isinstance(run, dict) else None
+                if type(pid) is not int:
+                    raise ValueError("running Hermes continuation has no integer PID")
+                identity = linux_process_identity(pid)
+                if observation is not None:
+                    persisted = json.loads(str(observation["process_identity_json"]))
+                    if (str(observation["snapshot_hash"]) != hashlib.sha256(current_json.encode()).hexdigest() or int(observation["run_id"]) != int(run["id"]) or str(observation["session_id"]) != str(current.session_id) or persisted != identity or not same_linux_process_identity(persisted)):
+                        raise ValueError("persisted running observation does not match live Hermes process")
+                return ProcessNextPreview(status="dry_run", next_stage="externally_running", ticket_id=str(activation["ticket_id"]), would_execute=False, would_write_board=False, run_id=int(run["id"]), session_id=str(current.session_id))
+            return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(activation["ticket_id"]), reconciliation_action="reconcile-hermes-execution", blocker_reason="authorized terminal Hermes handoff requires reconciliation")
+        except Exception as exc:
+            return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(activation["ticket_id"]), reconciliation_action=ReconciliationAction.STOP.value, blocker_reason=f"external Hermes continuation invalid: {exc}")
+    return None
 
 
 def _fresh_signer_authority(*, signer_public_key: bytes | None, signer_fingerprint: str | None, signer_config_path: Path | None) -> tuple[bytes | None, str | None]:
@@ -250,6 +294,10 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
     tick = ledger.connection.execute("SELECT lease_expires_at FROM scheduler_tick_lease WHERE id=1").fetchone()
     if tick is not None and int(tick["lease_expires_at"]) > now:
         return ProcessNextPreview(next_stage="busy")
+
+    running = _external_running_gate(ledger, board, now=now)
+    if running is not None:
+        return running
 
     reconciliation = ledger.next_scheduler_reconciliation(now=now) if hasattr(ledger, "next_scheduler_reconciliation") else None
     if reconciliation is not None and reconciliation.action == ReconciliationAction.STOP:
@@ -859,6 +907,29 @@ class ProcessNextScheduler:
             if reason.startswith("signer enrollment reconciliation required:"):
                 raise RuntimeError(reason)
             raise RuntimeError("native_dependency_release_reconciliation_required: " + reason)
+        if trusted_preview.next_stage == "externally_running":
+            # The running continuation is a global controller stop.  The first
+            # process-next tick records the immutable observation; later ticks
+            # only revalidate it and never enter any Local First stage.
+            activation = self.ledger.connection.execute(
+                "SELECT * FROM native_release_activation_intents WHERE ticket_id=? AND status='acknowledged' ORDER BY request_key LIMIT 1",
+                (trusted_preview.ticket_id,),
+            ).fetchone()
+            if activation is None:
+                raise RuntimeError("native running continuation activation disappeared")
+            snapshot = self.board.execution_snapshot(str(activation["external_task_id"]))
+            raw_run = snapshot.raw_runs[-1] if snapshot.raw_runs else asdict(snapshot.runs[-1])
+            identity = linux_process_identity(int(raw_run["worker_pid"]))
+            self.ledger.record_native_release_activation_running_observation(
+                request_key=str(activation["request_key"]), ticket_id=str(activation["ticket_id"]),
+                external_task_id=str(activation["external_task_id"]),
+                snapshot_hash=hashlib.sha256(canonical_snapshot_json(snapshot).encode()).hexdigest(),
+                run_id=int(raw_run["id"]), session_id=str(snapshot.session_id), process_identity=identity,
+                observed_at=max(now, int(activation["updated_at"]) + 1),
+                profile=str(activation["implementation_profile"]), workspace_path=str(activation["canonical_worktree_path"]),
+                branch=str(activation["branch"]), event_payload={"run_id": int(raw_run["id"]), "session_id": str(snapshot.session_id)},
+            )
+            return ProcessNextResult("externally_running", "externally_running", str(activation["ticket_id"]))
         fresh_signer_key, fresh_signer_fingerprint = _fresh_signer_authority(
             signer_public_key=self.native_dependency_release_signer_public_key,
             signer_fingerprint=self.native_dependency_release_signer_fingerprint,

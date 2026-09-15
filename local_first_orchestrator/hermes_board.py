@@ -27,6 +27,7 @@ class ExternalTicket:
     workspace_kind: str | None = None
     repository_identity: str | None = None
     base_sha: str | None = None
+    raw: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,12 @@ class ExternalExecutionSnapshot:
     current_run_id: int | None = None
     task_events: tuple[dict[str, Any], ...] = ()
     comments: tuple[Any, ...] = ()
+    # Lossless CLI representations.  Typed fields are convenience views only;
+    # authority and hashes must use these complete values.
+    raw_task: dict[str, Any] | None = None
+    raw_comments: tuple[dict[str, Any], ...] = ()
+    raw_events: tuple[dict[str, Any], ...] = ()
+    raw_runs: tuple[dict[str, Any], ...] = ()
 
 
 from .revalidation_boundary import create_revalidation_capability, revoke_revalidation_capability
@@ -186,6 +193,7 @@ class HermesBoardAdapter:
             None if row.get("workspace_kind") is None else str(row["workspace_kind"]),
             None if row.get("repository_identity") is None else str(row["repository_identity"]),
             None if row.get("base_sha") is None else str(row["base_sha"]),
+            dict(row),
         )
 
     def execution_snapshot(self, task_id: str) -> ExternalExecutionSnapshot:
@@ -194,38 +202,67 @@ class HermesBoardAdapter:
         runs = payload.get("runs") if isinstance(payload, dict) else None
         if not isinstance(row, dict) or not isinstance(runs, list):
             raise RuntimeError("Hermes execution snapshot is malformed")
-        parents = payload.get("parents", [])
-        children = payload.get("children", [])
-        if not isinstance(parents, list) or not all(isinstance(value, str) and value for value in parents):
+        parents = payload.get("parents")
+        children = payload.get("children")
+        comments = payload.get("comments", [])
+        events = payload.get("events", [])
+        if not isinstance(parents, list) or not all(type(value) is str and value for value in parents):
             raise RuntimeError("Hermes execution snapshot parent graph is malformed")
-        if not isinstance(children, list) or not all(isinstance(value, str) and value for value in children):
+        if not isinstance(children, list) or not all(type(value) is str and value for value in children):
             raise RuntimeError("Hermes execution snapshot child graph is malformed")
+        if not isinstance(comments, list) or not all(isinstance(item, dict) for item in comments):
+            raise RuntimeError("Hermes execution snapshot comments are malformed")
+        if not isinstance(events, list) or not all(isinstance(item, dict) for item in events):
+            raise RuntimeError("Hermes execution snapshot events are malformed")
+        for key in ("started_at", "completed_at", "current_run_id"):
+            if row.get(key) is not None and (type(row[key]) is not int or row[key] < 0):
+                raise RuntimeError(f"Hermes task {key} has the wrong type")
+        for key in ("session_id", "branch_name"):
+            if row.get(key) is not None and type(row[key]) is not str:
+                raise RuntimeError(f"Hermes task {key} has the wrong type")
         task = ExternalTicket(
             str(row["id"]),
             str(row.get("title") or ""),
             str(row.get("body") or ""),
             str(row.get("status") or ""),
             row.get("workspace_path"),
-            tuple(sorted(set(parents))),
-            tuple(sorted(set(children))),
+            tuple(parents),
+            tuple(children),
             None if row.get("assignee") is None else str(row["assignee"]),
             None if row.get("workspace_kind") is None else str(row["workspace_kind"]),
             None if row.get("repository_identity") is None else str(row["repository_identity"]),
             None if row.get("base_sha") is None else str(row["base_sha"]),
+            dict(row),
         )
         parsed: list[ExternalExecutionRun] = []
         for item in runs:
-            if not isinstance(item, dict) or not isinstance(item.get("id"), int):
+            if not isinstance(item, dict) or type(item.get("id")) is not int:
                 raise RuntimeError("Hermes execution run is malformed")
+            if item["id"] < 0:
+                raise RuntimeError("Hermes execution run id is invalid")
+            for key in ("status", "profile", "summary", "outcome"):
+                if item.get(key) is not None and type(item[key]) is not str:
+                    raise RuntimeError(f"Hermes execution run {key} has the wrong type")
+            for key in ("started_at", "ended_at"):
+                if item.get(key) is not None and (type(item[key]) is not int or item[key] < 0):
+                    raise RuntimeError(f"Hermes execution run {key} has the wrong type")
+            if item.get("worker_pid") is not None and (type(item["worker_pid"]) is not int or item["worker_pid"] <= 0):
+                raise RuntimeError("Hermes execution run worker_pid has the wrong type")
+            if item.get("metadata") is not None and not isinstance(item["metadata"], dict):
+                raise RuntimeError("Hermes execution run metadata has the wrong type")
+            if item.get("started_at") is None:
+                raise RuntimeError("Hermes execution run started_at is missing")
+            if item.get("ended_at") is not None and item["ended_at"] < item["started_at"]:
+                raise RuntimeError("Hermes execution run timestamps are not monotonic")
             parsed.append(ExternalExecutionRun(
                 id=int(item["id"]),
-                status=str(item.get("status") or ""),
-                outcome=None if item.get("outcome") is None else str(item["outcome"]),
-                started_at=None if item.get("started_at") is None else int(item["started_at"]),
-                ended_at=None if item.get("ended_at") is None else int(item["ended_at"]),
-                summary=None if item.get("summary") is None else str(item["summary"]),
-                profile=None if item.get("profile") is None else str(item["profile"]),
-                worker_pid=None if item.get("worker_pid") is None else int(item["worker_pid"]),
+                status=item.get("status"),
+                outcome=item.get("outcome"),
+                started_at=item.get("started_at"),
+                ended_at=item.get("ended_at"),
+                summary=item.get("summary"),
+                profile=item.get("profile"),
+                worker_pid=item.get("worker_pid"),
                 metadata=item.get("metadata"),
             ))
         return ExternalExecutionSnapshot(
@@ -234,20 +271,16 @@ class HermesBoardAdapter:
             branch_name=None if row.get("branch_name") is None else str(row["branch_name"]),
             started_at=None if row.get("started_at") is None else int(row["started_at"]),
             completed_at=None if row.get("completed_at") is None else int(row["completed_at"]),
-            runs=tuple(sorted(parsed, key=lambda run: run.id)),
+            # Hermes already supplies start/id order. Never sort or deduplicate
+            # history here: order drift is evidence, not presentation noise.
+            runs=tuple(parsed),
             repository_identity=None if row.get("repository_identity") is None else str(row["repository_identity"]),
             base_sha=None if row.get("base_sha") is None else str(row["base_sha"]),
             current_run_id=None if row.get("current_run_id") is None else int(row["current_run_id"]),
-            task_events=tuple(
-                {"kind": item.get("kind"), "payload": item.get("payload"), "created_at": item.get("created_at"), "run_id": item.get("run_id")}
-                for item in (payload.get("events", []) if isinstance(payload, dict) and isinstance(payload.get("events", []), list) else [])
-                if isinstance(item, dict)
-            ),
-            comments=tuple(
-                {"author": item.get("author"), "body": item.get("body"), "created_at": item.get("created_at")}
-                for item in (payload.get("comments", []) if isinstance(payload, dict) and isinstance(payload.get("comments", []), list) else [])
-                if isinstance(item, dict)
-            ),
+            task_events=tuple(events),
+            comments=tuple(comments),
+            raw_task=dict(row), raw_comments=tuple(comments), raw_events=tuple(events),
+            raw_runs=tuple(dict(item) for item in runs),
         )
 
     def import_candidates(self) -> list[ExternalTicket]:
@@ -257,7 +290,7 @@ class HermesBoardAdapter:
         candidates = []
         for row in rows:
             if not isinstance(row, dict):
-                continue
+                raise RuntimeError("Kanban list contains a non-object task")
             body = str(row.get("body") or "")
             if "<!-- local-first-orchestrator -->" not in body:
                 continue

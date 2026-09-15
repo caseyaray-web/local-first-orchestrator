@@ -621,6 +621,28 @@ CREATE TRIGGER IF NOT EXISTS native_release_activation_evidence_immutable_update
 BEFORE UPDATE ON native_release_activation_evidence BEGIN SELECT RAISE(ABORT, 'native release activation evidence is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS native_release_activation_evidence_immutable_delete
 BEFORE DELETE ON native_release_activation_evidence BEGIN SELECT RAISE(ABORT, 'native release activation evidence is append-only'); END;
+CREATE TABLE IF NOT EXISTS native_release_activation_running_observations (
+    observation_id TEXT PRIMARY KEY,
+    request_key TEXT NOT NULL REFERENCES native_release_activation_intents(request_key),
+    ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    external_task_id TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL,
+    run_id INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    pid INTEGER NOT NULL,
+    process_identity_json TEXT NOT NULL,
+    observed_at INTEGER NOT NULL,
+    profile TEXT NOT NULL,
+    workspace_path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    event_id INTEGER NOT NULL REFERENCES events(id),
+    evidence_hash TEXT NOT NULL,
+    UNIQUE(request_key), UNIQUE(snapshot_hash), UNIQUE(event_id)
+);
+CREATE TRIGGER IF NOT EXISTS native_release_activation_running_observations_immutable_update
+BEFORE UPDATE ON native_release_activation_running_observations BEGIN SELECT RAISE(ABORT, 'native release running observations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS native_release_activation_running_observations_immutable_delete
+BEFORE DELETE ON native_release_activation_running_observations BEGIN SELECT RAISE(ABORT, 'native release running observations are append-only'); END;
 CREATE TABLE IF NOT EXISTS tranche_completion_evidence (
     tranche_id TEXT PRIMARY KEY REFERENCES tranches(id), root_planning_sha TEXT NOT NULL,
     final_integration_sha TEXT NOT NULL, accepted_ticket_ids_json TEXT NOT NULL,
@@ -3021,6 +3043,26 @@ class Ledger:
             if row["status"] == "acknowledged": return
             if row["status"] != "pending": raise RuntimeError("native release activation effect state is not pending")
             conn.execute("UPDATE native_release_activation_intents SET status='effect_applied',effect_snapshot_hash=?,post_activation_snapshot_json=?,updated_at=? WHERE request_key=?", (snapshot_hash, snapshot_json, self._now(), request_key))
+
+    def record_native_release_activation_running_observation(self, *, request_key: str, ticket_id: str, external_task_id: str, snapshot_hash: str, run_id: int, session_id: str, process_identity: dict[str, Any], observed_at: int, profile: str, workspace_path: str, branch: str, event_payload: dict[str, Any]) -> dict[str, Any]:
+        """Append the first trusted running observation; never accept a terminal shortcut."""
+        if type(run_id) is not int or run_id < 0 or type(observed_at) is not int or observed_at < 0 or not all(isinstance(v, str) and v.strip() for v in (request_key, ticket_id, external_task_id, snapshot_hash, session_id, profile, workspace_path, branch)):
+            raise ValueError("native running observation identity is malformed")
+        if not isinstance(process_identity, dict) or set(process_identity) != {"pid", "start_ticks", "uid", "exe", "cmdline"}:
+            raise ValueError("native running observation process identity is malformed")
+        with self._transaction() as conn:
+            intent = conn.execute("SELECT * FROM native_release_activation_intents WHERE request_key=? AND ticket_id=? AND external_task_id=? AND status='acknowledged'", (request_key, ticket_id, external_task_id)).fetchone()
+            if intent is None:
+                raise RuntimeError("native running observation requires acknowledged activation")
+            prior = conn.execute("SELECT * FROM native_release_activation_running_observations WHERE request_key=?", (request_key,)).fetchone()
+            if prior is not None:
+                return dict(prior)
+            evidence = {"request_key": request_key, "ticket_id": ticket_id, "external_task_id": external_task_id, "snapshot_hash": snapshot_hash, "run_id": run_id, "session_id": session_id, "pid": process_identity["pid"], "process_identity": process_identity, "observed_at": observed_at, "profile": profile, "workspace_path": workspace_path, "branch": branch}
+            evidence_hash = canonical_sha256(evidence)
+            event_id = self._append_event(conn, entity_type="controller", entity_id="controller", event_type="native_release_activation_running_observed", actor_id="local-first-orchestrator", payload={"evidence": evidence, "evidence_hash": evidence_hash, "event_payload": event_payload})
+            observation_id = "native-running:" + evidence_hash
+            conn.execute("INSERT INTO native_release_activation_running_observations (observation_id,request_key,ticket_id,external_task_id,snapshot_hash,run_id,session_id,pid,process_identity_json,observed_at,profile,workspace_path,branch,event_id,evidence_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (observation_id, request_key, ticket_id, external_task_id, snapshot_hash, run_id, session_id, process_identity["pid"], json.dumps(process_identity, sort_keys=True, separators=(",", ":")), observed_at, profile, workspace_path, branch, event_id, evidence_hash))
+            return dict(conn.execute("SELECT * FROM native_release_activation_running_observations WHERE request_key=?", (request_key,)).fetchone())
 
     def record_native_release_revalidation(self, *, ticket_id: str, projection_event_id: int,
                                            projection_key: str, external_task_id: str,

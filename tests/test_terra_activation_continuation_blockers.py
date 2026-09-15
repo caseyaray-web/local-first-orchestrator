@@ -77,6 +77,13 @@ def test_running_continuation_is_authorized_but_not_terminal():
         validate_activation_continuation_snapshot(pre, post, acknowledged_at=20, profile="worker-code-local", workspace_path="/repo/.worktrees/T", branch="wt/T", repository_identity="/repo", base_sha="base", handoff_summary="local-first-awaiting-reconciliation")
 
 
+def test_direct_terminal_handoff_without_observed_running_is_rejected():
+    from local_first_orchestrator.native_release_approval import validate_activation_continuation_snapshot
+    pre, post = _continuation_pair("blocked")
+    with pytest.raises(ValueError, match="prior running observation"):
+        validate_activation_continuation_snapshot(pre, post, acknowledged_at=20, profile="worker-code-local", workspace_path="/repo/.worktrees/T", branch="wt/T", repository_identity="/repo", base_sha="base", handoff_summary="local-first-awaiting-reconciliation")
+
+
 def test_activation_rejects_reordered_or_altered_histories():
     pre, post = _exact_pair()
     post["comments"] = [{"id": 2, "task_id": "T", "author": "operator", "body": "prefix UNBLOCK: m", "created_at": 20}]

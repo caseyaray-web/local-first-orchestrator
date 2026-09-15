@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from typing import Any
 
 from cryptography.exceptions import InvalidSignature
@@ -16,6 +17,36 @@ APPROVAL_DOMAIN = "native-release-revalidation"
 ACTIVATION_DOMAIN = "native-release-activation"
 APPROVAL_VERSION = 1
 _REQUIRED = {"domain", "version", "operation", "request_id", "nonce", "operator_id", "reason", "authority"}
+
+
+def linux_process_identity(pid: int) -> dict[str, Any]:
+    """Return a no-follow identity for a live Linux process, or fail closed."""
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("worker PID must be a positive integer")
+    proc = f"/proc/{pid}"
+    try:
+        st = os.stat(proc, follow_symlinks=False)
+        if not os.path.isdir(proc) or st.st_uid != os.getuid():
+            raise ValueError("worker process identity is not owned by the controller")
+        fields = open(f"{proc}/stat", "rb", buffering=0).read().split()
+        if len(fields) < 22:
+            raise ValueError("worker process stat is incomplete")
+        start_ticks = int(fields[21])
+        exe = os.readlink(f"{proc}/exe")
+        cmdline = open(f"{proc}/cmdline", "rb", buffering=0).read()
+        if not exe or not cmdline:
+            raise ValueError("worker process identity is incomplete")
+    except (OSError, ValueError, IndexError) as exc:
+        raise ValueError("worker PID is not a live, identifiable Linux process") from exc
+    return {"pid": pid, "start_ticks": start_ticks, "uid": int(st.st_uid), "exe": exe, "cmdline": cmdline.hex()}
+
+
+def same_linux_process_identity(identity: dict[str, Any]) -> bool:
+    """Re-read /proc and compare every persisted identity field."""
+    try:
+        return linux_process_identity(identity["pid"]) == identity
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def _canonical_bytes(document: dict[str, Any], *, domain: str, operation: str) -> bytes:
@@ -85,9 +116,9 @@ def verify_detached_signature(document_bytes: bytes, signature: bytes, public_ke
     return True
 
 
-def validate_activation_continuation_snapshot(activation_post: dict[str, Any], current: dict[str, Any], *, acknowledged_at: int, profile: str, workspace_path: str, branch: str, repository_identity: str, base_sha: str, handoff_summary: str) -> str:
+def validate_activation_continuation_snapshot(activation_post: dict[str, Any], current: dict[str, Any], *, acknowledged_at: int, profile: str, workspace_path: str, branch: str, repository_identity: str, base_sha: str, handoff_summary: str, prior_running_observation: dict[str, Any] | None = None) -> str:
     """Validate Hermes' one-run continuation after an acknowledged activation."""
-    if not isinstance(activation_post, dict) or not isinstance(current, dict) or type(acknowledged_at) is not int:
+    if not isinstance(activation_post, dict) or not isinstance(current, dict) or type(acknowledged_at) is not int or acknowledged_at < 0:
         raise ValueError("Hermes activation continuation snapshot is malformed")
     before = json.loads(json.dumps(activation_post, sort_keys=True, separators=(",", ":")))
     after = json.loads(json.dumps(current, sort_keys=True, separators=(",", ":")))
@@ -113,41 +144,51 @@ def validate_activation_continuation_snapshot(activation_post: dict[str, Any], c
     run = later_runs[-1]
     if not isinstance(run, dict) or set(run) != {"id", "status", "outcome", "started_at", "ended_at", "summary", "profile", "worker_pid", "metadata"}:
         raise ValueError("Hermes activation continuation run shape is unsupported")
-    if run.get("profile") != profile or type(run.get("id")) is not int or run.get("started_at") is None or int(run["started_at"]) <= acknowledged_at:
+    if run.get("profile") != profile or type(run.get("id")) is not int or run.get("id") < 0 or type(run.get("started_at")) is not int or run.get("started_at") < 0 or run["started_at"] <= acknowledged_at:
         raise ValueError("Hermes activation continuation run identity or timing drift")
     if after.get("current_run_id") != run["id"] and after.get("task", {}).get("status") == "running":
         raise ValueError("Hermes activation continuation current run identity drift")
     base_task = before.get("task")
     task = after.get("task")
-    if not isinstance(base_task, dict) or not isinstance(task, dict) or {key: value for key, value in task.items() if key != "status"} != {key: value for key, value in base_task.items() if key != "status"}:
+    if not isinstance(base_task, dict) or not isinstance(task, dict):
+        raise ValueError("Hermes activation continuation task identity drift")
+    task_before = {key: value for key, value in base_task.items() if key not in {"status", "started_at"}}
+    task_after = {key: value for key, value in task.items() if key not in {"status", "started_at"}}
+    if task_after != task_before:
         raise ValueError("Hermes activation continuation task identity drift")
     if task.get("assignee") != profile or task.get("workspace_kind") != "worktree" or task.get("workspace_path") != workspace_path:
         raise ValueError("Hermes activation continuation routing or workspace drift")
     run_id = run["id"]
     if task.get("status") == "running":
-        if not isinstance(after.get("session_id"), str) or not after["session_id"].strip() or after.get("started_at") != run["started_at"] or after.get("current_run_id") != run_id:
+        if not isinstance(after.get("session_id"), str) or not after["session_id"].strip() or after.get("started_at") != run["started_at"] or after.get("current_run_id") != run_id or ("started_at" in task and task["started_at"] != run["started_at"]):
             raise ValueError("Hermes activation continuation running session identity is invalid")
         if run.get("status") != "running" or run.get("outcome") is not None or run.get("ended_at") is not None or run.get("summary") is not None or run.get("metadata") is not None or type(run.get("worker_pid")) is not int or run["worker_pid"] <= 0:
             raise ValueError("Hermes activation continuation running worker shape is invalid")
         if len(later_events) != len(prior_events) + 1 or later_events[:-1] != prior_events:
             raise ValueError("Hermes activation continuation event history was rewritten")
         event = later_events[-1]
-        if not isinstance(event, dict) or event.get("kind") != "claimed" or event.get("run_id") != run_id or not isinstance(event.get("created_at"), int) or event["created_at"] != run["started_at"] or event["created_at"] <= acknowledged_at:
+        if not isinstance(event, dict) or set(event) != {"kind", "payload", "created_at", "run_id"} or event.get("kind") != "claimed" or event.get("run_id") != run_id or type(event.get("created_at")) is not int or event["created_at"] != run["started_at"] or event["created_at"] <= acknowledged_at:
             raise ValueError("Hermes activation continuation claimed event is invalid")
         payload = event.get("payload")
-        if not isinstance(payload, dict) or set(payload) != {"lock", "expires", "run_id"} or payload.get("run_id") != run_id or not isinstance(payload.get("lock"), str) or not payload["lock"] or type(payload.get("expires")) is not int:
+        if not isinstance(payload, dict) or set(payload) != {"lock", "expires", "run_id"} or payload.get("run_id") != run_id or not isinstance(payload.get("lock"), str) or not payload["lock"] or type(payload.get("expires")) is not int or payload["expires"] < event["created_at"]:
             raise ValueError("Hermes activation continuation claimed payload is invalid")
         return "running"
     if task.get("status") == "blocked":
+        if not isinstance(prior_running_observation, dict):
+            raise ValueError("Hermes terminal handoff has no prior running observation")
         if after.get("session_id") is not None or after.get("current_run_id") is not None:
             raise ValueError("Hermes terminal handoff retains current worker authority")
-        if run.get("status") != "blocked" or run.get("outcome") != "blocked" or run.get("summary") != handoff_summary or run.get("ended_at") is None or int(run["ended_at"]) <= int(run["started_at"]) or run.get("worker_pid") is not None or run.get("metadata") is not None:
+        if run.get("status") != "blocked" or run.get("outcome") != "blocked" or run.get("summary") != handoff_summary or type(run.get("ended_at")) is not int or run["ended_at"] < 0 or run["ended_at"] <= run["started_at"] or run.get("worker_pid") is not None or run.get("metadata") is not None or ("started_at" in task and task["started_at"] != run["started_at"]):
             raise ValueError("Hermes terminal handoff run shape is invalid")
         if len(later_events) != len(prior_events) + 2 or later_events[:-2] != prior_events:
             raise ValueError("Hermes terminal handoff event history was rewritten")
         claimed, blocked = later_events[-2:]
-        if not isinstance(claimed, dict) or claimed.get("kind") != "claimed" or claimed.get("run_id") != run_id or not isinstance(blocked, dict) or blocked.get("kind") != "blocked" or blocked.get("run_id") != run_id:
+        if not isinstance(claimed, dict) or set(claimed) != {"kind", "payload", "created_at", "run_id"} or claimed.get("kind") != "claimed" or claimed.get("run_id") != run_id or not isinstance(blocked, dict) or set(blocked) != {"kind", "payload", "created_at", "run_id"} or blocked.get("kind") != "blocked" or blocked.get("run_id") != run_id:
             raise ValueError("Hermes terminal handoff events are invalid")
+        if type(claimed["created_at"]) is not int or type(blocked["created_at"]) is not int or claimed["created_at"] != run["started_at"] or blocked["created_at"] != run["ended_at"] or blocked["created_at"] <= claimed["created_at"] or blocked["payload"] != {"reason": handoff_summary}:
+            raise ValueError("Hermes terminal handoff event timing or payload is invalid")
+        if (int(prior_running_observation.get("run_id", -1)) != run_id or str(prior_running_observation.get("session_id", "")) != str(activation_post.get("session_id", "")) or int(prior_running_observation.get("pid", -1)) <= 0):
+            raise ValueError("Hermes terminal handoff is not the observed run/session lineage")
         return "terminal"
     raise ValueError("Hermes activation continuation task status is unsupported")
 
