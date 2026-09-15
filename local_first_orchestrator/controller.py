@@ -256,7 +256,7 @@ class LocalFirstController:
 
         if snapshot.task.status not in {"scheduled", "blocked"}:
             raise RuntimeError("native release revalidation card is dispatchable or final")
-        if any(value is not None for value in (snapshot.session_id, snapshot.completed_at, snapshot.current_run_id)):
+        if any(value is not None for value in (snapshot.session_id, snapshot.completed_at)):
             raise RuntimeError("native release revalidation execution evidence exists")
         forbidden = {"running", "completed", "success", "successful"}
         spawn_failed = []
@@ -615,12 +615,16 @@ class LocalFirstController:
                 base_sha=str(activated["base_sha"]),
                 handoff_summary=HANDOFF_SENTINEL,
             )
-            if hermes_run_id is not None and snapshot.current_run_id != hermes_run_id:
+            active_run_ids = [run.id for run in snapshot.runs if run.status == "running"]
+            if len(active_run_ids) > 1:
+                raise RuntimeError("Hermes activation continuation has multiple active runs")
+            active_run_id = active_run_ids[0] if active_run_ids else None
+            if hermes_run_id is not None and active_run_id != hermes_run_id:
                 raise RuntimeError("Hermes activation continuation run identity mismatch")
             if current_kind == "running":
                 if require_handoff:
                     raise RuntimeError("Hermes activation continuation is still running")
-                return {"ticket_id": ticket_id, "external_task_id": external_task_id, "status": "externally_running", "run_id": snapshot.current_run_id}
+                return {"ticket_id": ticket_id, "external_task_id": external_task_id, "status": "externally_running", "run_id": active_run_id}
             if snapshot.task.status != "blocked" or not require_handoff:
                 require_handoff = True
         if require_handoff:

@@ -157,7 +157,7 @@ def validate_activation_continuation_snapshot(activation_post: dict[str, Any], c
     after_task = after.get("task")
     if not isinstance(before_task, dict) or not isinstance(after_task, dict):
         raise ValueError("Hermes activation continuation snapshot is incomplete")
-    for key in ("session_id", "started_at", "current_run_id"):
+    for key in ("session_id", "started_at"):
         if key not in before_task or key not in after_task:
             raise ValueError("Hermes activation continuation snapshot is incomplete")
     if after_task.get("branch_name") != branch or after_task.get("repository_identity") not in {None, repository_identity} or after_task.get("base_sha") not in {None, base_sha}:
@@ -177,11 +177,9 @@ def validate_activation_continuation_snapshot(activation_post: dict[str, Any], c
         raise ValueError("Hermes activation continuation run shape is unsupported")
     if run.get("profile") != profile or type(run.get("id")) is not int or run.get("id") < 0 or type(run.get("started_at")) is not int or run.get("started_at") < 0 or run["started_at"] <= acknowledged_at:
         raise ValueError("Hermes activation continuation run identity or timing drift")
-    if after_task.get("current_run_id") != run["id"] and after_task.get("status") == "running":
-        raise ValueError("Hermes activation continuation current run identity drift")
     base_task = before_task
     task = after_task
-    runtime_task_fields = {"status", "started_at", "completed_at", "session_id", "current_run_id"}
+    runtime_task_fields = {"status", "started_at", "completed_at", "session_id"}
     task_before = {key: value for key, value in base_task.items() if key not in runtime_task_fields}
     task_after = {key: value for key, value in task.items() if key not in runtime_task_fields}
     if task_after != task_before:
@@ -190,7 +188,7 @@ def validate_activation_continuation_snapshot(activation_post: dict[str, Any], c
         raise ValueError("Hermes activation continuation routing or workspace drift")
     run_id = run["id"]
     if task.get("status") == "running":
-        if not isinstance(task.get("session_id"), str) or not task["session_id"].strip() or task.get("started_at") != run["started_at"] or task.get("current_run_id") != run_id:
+        if not isinstance(task.get("session_id"), str) or not task["session_id"].strip() or task.get("started_at") != run["started_at"]:
             raise ValueError("Hermes activation continuation running session identity is invalid")
         if run.get("status") != "running" or run.get("outcome") is not None or run.get("ended_at") is not None or run.get("summary") is not None or run.get("metadata") is not None or type(run.get("worker_pid")) is not int or run["worker_pid"] <= 0:
             raise ValueError("Hermes activation continuation running worker shape is invalid")
@@ -208,7 +206,7 @@ def validate_activation_continuation_snapshot(activation_post: dict[str, Any], c
     if task.get("status") == "blocked":
         if not isinstance(prior_running_observation, dict):
             raise ValueError("Hermes terminal handoff has no prior running observation")
-        if task.get("session_id") is not None or task.get("current_run_id") is not None:
+        if task.get("session_id") is not None:
             raise ValueError("Hermes terminal handoff retains current worker authority")
         if run.get("status") != "blocked" or run.get("outcome") != "blocked" or run.get("summary") != handoff_summary or type(run.get("ended_at")) is not int or run["ended_at"] < 0 or run["ended_at"] <= run["started_at"] or run.get("worker_pid") is not None or run.get("metadata") is not None or task.get("started_at") != run["started_at"]:
             raise ValueError("Hermes terminal handoff run shape is invalid")
@@ -254,7 +252,7 @@ def validate_activation_continuation_snapshot(activation_post: dict[str, Any], c
         immutable_terminal = {k: v for k, v in task.items() if k not in runtime_task_fields}
         if immutable_observed != immutable_terminal:
             raise ValueError("Hermes terminal handoff observation task identity drift")
-        if observed_task.get("session_id") != prior_running_observation["session_id"] or observed_task.get("current_run_id") != run_id or observed_run.get("worker_pid") != int(prior_running_observation["pid"]):
+        if observed_task.get("session_id") != prior_running_observation["session_id"] or observed_run.get("worker_pid") != int(prior_running_observation["pid"]):
             raise ValueError("Hermes terminal handoff observation session or PID drift")
         if prior_running_observation.get("snapshot_hash") != hashlib.sha256(raw_observation.encode("utf-8")).hexdigest():
             raise ValueError("Hermes terminal handoff observation snapshot hash drift")

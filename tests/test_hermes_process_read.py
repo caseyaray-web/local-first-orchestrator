@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json,os,stat,subprocess,unittest
+import json,os,shutil,stat,subprocess,unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from local_first_orchestrator.hermes_board import HermesBoardAdapter
@@ -103,4 +103,41 @@ class ProcessReadTests(unittest.TestCase):
    [str(self.exe),'kanban','--board','board','unblock','1','--reason','local-first completion K'],
    [str(self.exe),'kanban','--board','board','complete','1','--result','local-first projection K'],
   ])
+ def test_locked_reader_is_byte_canonical_with_complete_real_cli_history(self):
+  from hermes_cli.sqlite_util import open_db
+  from tests.hermes_board_fixture import initialize_board
+  from local_first_orchestrator.native_release_approval import canonical_snapshot_json
+  board_path=Path(self.t.name)/'kanban'/'boards'/'board'/'kanban.db'
+  board_path.parent.mkdir(parents=True)
+  initialize_board(board_path, task_id='T', status='blocked')
+  with open_db(board_path, db_label='kanban:board', busy_timeout_ms=5000, wal=False, check_same_thread=False) as conn:
+   for i in range(61):
+    conn.execute('INSERT INTO task_events (task_id,kind,payload,created_at,run_id) VALUES (?,?,?,?,?)', ('T',f'event-{i}',json.dumps({'i':i}),i+2, None))
+   for i in range(2):
+    conn.execute('INSERT INTO task_comments (task_id,author,body,created_at) VALUES (?,?,?,?)', ('T','author',f'comment-{i}',i+1))
+   conn.execute('DELETE FROM task_runs WHERE task_id=?', ('T',))
+   conn.execute('INSERT INTO task_runs(task_id,profile,step_key,status,claim_lock,claim_expires,worker_pid,max_runtime_seconds,last_heartbeat_at,started_at,ended_at,outcome,summary,metadata,error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', ('T','worker-code-local',None,'completed',None,None,None,None,None,50,60,'completed','previous',None,None))
+   conn.execute('INSERT INTO task_runs(task_id,profile,step_key,status,claim_lock,claim_expires,worker_pid,max_runtime_seconds,last_heartbeat_at,started_at,ended_at,outcome,summary,metadata,error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', ('T','worker-code-local',None,'running','lock',99,1234,None,None,100,None,None,None,None,None))
+   conn.execute('UPDATE tasks SET status=?,session_id=?,started_at=? WHERE id=?', ('blocked','session-T',100,'T'))
+   conn.execute('INSERT INTO tasks (id,title,body,assignee,status,priority,created_by,created_at,workspace_kind,workspace_path,branch_name) VALUES (?,?,?,?,?,?,?,?,?,?,?)', ('P','parent','','impl','done',1,'test',1,'worktree','/tmp/p','main'))
+   conn.execute('INSERT INTO tasks (id,title,body,assignee,status,priority,created_by,created_at,workspace_kind,workspace_path,branch_name) VALUES (?,?,?,?,?,?,?,?,?,?,?)', ('C','child','','impl','todo',1,'test',1,'worktree','/tmp/c','main'))
+   conn.execute('INSERT INTO task_links(parent_id,child_id) VALUES (?,?)', ('P','T'))
+   conn.execute('INSERT INTO task_links(parent_id,child_id) VALUES (?,?)', ('T','C'))
+   conn.commit()
+  executable=shutil.which('hermes') or '/home/ocadmin/.local/bin/hermes'
+  env={**os.environ,'HERMES_HOME':self.t.name}
+  cli=subprocess.run((executable,'kanban','--board','board','show','T','--json'),env=env,text=True,capture_output=True,check=True)
+  actual=json.loads(cli.stdout)
+  self.assertNotIn('current_run_id',actual['task'])
+  self.assertEqual(actual['task']['status'],'blocked')
+  self.assertEqual([r['status'] for r in actual['runs']],['completed','running'])
+  self.assertTrue(actual['comments'])
+  self.assertTrue(actual['parents'])
+  self.assertTrue(actual['children'])
+  self.assertEqual(actual['latest_summary'],'previous')
+  adapter=HermesBoardAdapter(executable=executable,board='board',board_db_path=board_path)
+  with open_db(board_path, db_label='kanban:board', busy_timeout_ms=5000, wal=False, check_same_thread=False) as conn:
+   locked=adapter._snapshot_from_connection(conn,'T').raw_snapshot
+  self.assertEqual(canonical_snapshot_json(actual),canonical_snapshot_json(locked))
+
 if __name__=='__main__':unittest.main()

@@ -11,9 +11,8 @@ def _snapshot(*, comments=None, events=None, status="scheduled"):
     return {
         "task": {"id": "T", "status": status, "title": "x", "body": "b",
                   "workspace_path": None, "assignee": None, "workspace_kind": None,
-                  "repository_identity": None, "base_sha": None, "session_id": None,
-                  "branch_name": "main", "started_at": None, "completed_at": None,
-                  "current_run_id": None},
+                  "session_id": None, "branch_name": "main", "started_at": None,
+                  "completed_at": None},
         "comments": [] if comments is None else comments,
         "events": [] if events is None else events,
         "parents": [],
@@ -63,7 +62,6 @@ def _continuation_pair(status="running"):
     post["runs"].append(run)
     post["task"]["started_at"] = 30
     post["task"]["session_id"] = "session-T" if status == "running" else None
-    post["task"]["current_run_id"] = 7 if status == "running" else None
     post["events"].append({"kind": "claimed", "payload": {"lock": "lock-T", "expires": 90, "run_id": 7}, "created_at": 30, "run_id": 7})
     if status == "blocked":
         post["latest_summary"] = "local-first-awaiting-reconciliation"

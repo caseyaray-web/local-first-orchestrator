@@ -15,10 +15,9 @@ def raw_snapshot_from_typed(snapshot, *, comments=(), events=(), latest_summary=
     raw_task = {
         "id": task.id, "title": task.title, "body": task.body, "status": task.status,
         "workspace_path": task.workspace_path, "assignee": task.assignee,
-        "workspace_kind": task.workspace_kind, "repository_identity": snapshot.repository_identity,
-        "base_sha": snapshot.base_sha, "session_id": snapshot.session_id,
+        "workspace_kind": task.workspace_kind, "session_id": snapshot.session_id,
         "branch_name": snapshot.branch_name, "started_at": snapshot.started_at,
-        "completed_at": snapshot.completed_at, "current_run_id": snapshot.current_run_id,
+        "completed_at": snapshot.completed_at,
     }
     runs = [{"id": r.id, "status": r.status, "outcome": r.outcome, "started_at": r.started_at,
              "ended_at": r.ended_at, "summary": r.summary, "profile": r.profile,

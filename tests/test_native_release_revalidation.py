@@ -365,7 +365,7 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
 
     def test_production_schema_snapshot_with_inert_history_derives_repo_and_base_authority(self) -> None:
         with self._open_board() as connection:
-            connection.execute("UPDATE tasks SET status='scheduled', started_at=?, completed_at=NULL, session_id=NULL, current_run_id=NULL WHERE id=?", (30, self.external_id))
+            connection.execute("UPDATE tasks SET status='scheduled', started_at=?, completed_at=NULL, session_id=NULL WHERE id=?", (30, self.external_id))
             connection.commit()
         self.seed_run(status="blocked", outcome="blocked", summary="legacy containment", started_at=1, ended_at=2)
         self.seed_run(status="blocked", outcome="blocked", summary="second legacy containment", started_at=3, ended_at=4)
@@ -386,7 +386,7 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
             with self.subTest(field=field):
                 with self._open_board() as connection:
                     connection.execute("DELETE FROM task_runs WHERE task_id=?", (self.external_id,))
-                    connection.execute("UPDATE tasks SET status='scheduled', started_at=30, completed_at=NULL, session_id=NULL, current_run_id=NULL WHERE id=?", (self.external_id,))
+                    connection.execute("UPDATE tasks SET status='scheduled', started_at=30, completed_at=NULL, session_id=NULL WHERE id=?", (self.external_id,))
                     connection.commit()
                 self.seed_run(status="blocked", outcome="blocked", summary="legacy containment", started_at=1, ended_at=2)
                 self.seed_run(status="blocked", outcome="blocked", summary="second legacy containment", started_at=3, ended_at=4)
@@ -437,7 +437,7 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
 
     def test_controller_activation_persists_intent_before_one_board_effect(self) -> None:
         with self._open_board() as connection:
-            connection.execute("UPDATE tasks SET status='scheduled', started_at=NULL, completed_at=NULL, session_id=NULL, current_run_id=NULL WHERE id=?", (self.external_id,))
+            connection.execute("UPDATE tasks SET status='scheduled', started_at=NULL, completed_at=NULL, session_id=NULL WHERE id=?", (self.external_id,))
             connection.commit()
         self.adapter = _TestHermesBoardAdapter(board=self.board_name, executable=sys.executable, board_db_path=self.board_db, canonical_repository=self.repo, allow_writes=True)
         self.adapter.repository_identity = str(self.repo)
@@ -464,7 +464,7 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
 
     def test_after_unblock_crash_replays_ready_post_state_without_reunblocking(self) -> None:
         with self._open_board() as connection:
-            connection.execute("UPDATE tasks SET status='scheduled', started_at=NULL, completed_at=NULL, session_id=NULL, current_run_id=NULL WHERE id=?", (self.external_id,))
+            connection.execute("UPDATE tasks SET status='scheduled', started_at=NULL, completed_at=NULL, session_id=NULL WHERE id=?", (self.external_id,))
             connection.commit()
         self.adapter = _TestHermesBoardAdapter(board=self.board_name, executable=sys.executable, board_db_path=self.board_db, canonical_repository=self.repo, allow_writes=True)
         self.adapter.repository_identity = str(self.repo)

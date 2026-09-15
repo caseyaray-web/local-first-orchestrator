@@ -117,17 +117,21 @@ class HermesBoardAdapter:
             raw_task = _task_to_dict(task)
             runs = kanban_db.list_runs(connection, task_id)
             comments = kanban_db.list_comments(connection, task_id)
-            events = kanban_db.list_events(connection, task_id)[-50:]
+            events = kanban_db.list_events(connection, task_id)
             latest_summary = kanban_db.latest_summary(connection, task_id)
         except (sqlite3.DatabaseError, KeyError, AttributeError, TypeError) as exc:
             raise RuntimeError("Hermes Kanban execution snapshot read failed") from exc
         external_runs = tuple(ExternalExecutionRun(int(run.id), str(run.status or ""), None if run.outcome is None else str(run.outcome), int(run.started_at) if run.started_at is not None else None, None if run.ended_at is None else int(run.ended_at), None if run.summary is None else str(run.summary), None if run.profile is None else str(run.profile), None if run.worker_pid is None else int(run.worker_pid), run.metadata) for run in runs)
+        active_runs = [run for run in external_runs if run.status == "running"]
+        if str(task.status or "") == "running" and len(active_runs) != 1:
+            raise RuntimeError("Hermes running task execution evidence drift: exactly one active run required")
+        derived_run_id = active_runs[0].id if len(active_runs) == 1 else None
         raw_snapshot = {"task": raw_task, "latest_summary": latest_summary, "parents": list(parents), "children": list(children), "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments], "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events], "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs]}
         return ExternalExecutionSnapshot(
             task=ExternalTicket(str(task.id), str(task.title or ""), str(task.body or ""), str(task.status or ""), task.workspace_path, parents=parents, children=children, assignee=task.assignee, workspace_kind=task.workspace_kind),
             session_id=raw_task.get("session_id"), branch_name=raw_task.get("branch_name"), started_at=raw_task.get("started_at"), completed_at=raw_task.get("completed_at"),
             runs=external_runs, repository_identity=None, base_sha=None,
-            current_run_id=raw_task.get("current_run_id"), raw_snapshot=raw_snapshot,
+            current_run_id=derived_run_id, raw_snapshot=raw_snapshot,
             raw_task=raw_task, raw_comments=tuple(raw_snapshot["comments"]), raw_events=tuple(raw_snapshot["events"]), raw_runs=tuple(raw_snapshot["runs"]),
         )
 
@@ -219,7 +223,7 @@ class HermesBoardAdapter:
             raise RuntimeError("Hermes execution snapshot comments are malformed")
         if not isinstance(events, list) or not all(isinstance(item, dict) for item in events):
             raise RuntimeError("Hermes execution snapshot events are malformed")
-        for key in ("started_at", "completed_at", "current_run_id"):
+        for key in ("started_at", "completed_at"):
             if row.get(key) is not None and (type(row[key]) is not int or row[key] < 0):
                 raise RuntimeError(f"Hermes task {key} has the wrong type")
         for key in ("session_id", "branch_name"):
@@ -270,6 +274,10 @@ class HermesBoardAdapter:
                 worker_pid=item.get("worker_pid"),
                 metadata=item.get("metadata"),
             ))
+        active_runs = [run for run in parsed if run.status == "running"]
+        if task.status == "running" and len(active_runs) != 1:
+            raise RuntimeError("Hermes running task execution evidence drift: exactly one active run required")
+        derived_run_id = active_runs[0].id if len(active_runs) == 1 else None
         return ExternalExecutionSnapshot(
             task=task,
             session_id=None if row.get("session_id") is None else str(row["session_id"]),
@@ -281,7 +289,7 @@ class HermesBoardAdapter:
             runs=tuple(parsed),
             repository_identity=None if row.get("repository_identity") is None else str(row["repository_identity"]),
             base_sha=None if row.get("base_sha") is None else str(row["base_sha"]),
-            current_run_id=None if row.get("current_run_id") is None else int(row["current_run_id"]),
+            current_run_id=derived_run_id,
             task_events=tuple(events),
             comments=tuple(comments),
             raw_task=dict(row), raw_comments=tuple(comments), raw_events=tuple(events),
