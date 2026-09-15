@@ -133,6 +133,16 @@ class PinnedNativeWorkspace:
             return
         _require_fd_path(self.target, self.target_fd, "target", self.target_identity)
 
+    def final_revalidate(self) -> None:
+        """Perform the last authority check while every pinned FD is held."""
+        if self.target_fd is None or self.target_git_metadata_fd is None:
+            raise RuntimeError("native workspace STOP: final workspace pin is incomplete")
+        self.revalidate(target_must_exist=True)
+        # This rereads target/.git through target_fd and, for a pinned child,
+        # refuses to reopen the child by pathname.
+        self.target_git_fd()
+        self.revalidate(target_must_exist=True)
+
     def pin_existing_target(self, *, already_created: bool = False) -> None:
         if not already_created:
             self.revalidate(target_must_exist=False)
@@ -193,20 +203,22 @@ class PinnedNativeWorkspace:
             content = bytearray()
             while chunk := os.read(metadata_file_fd, 4096):
                 content.extend(chunk)
-            raw = bytes(content).decode("utf-8").strip()
+            try:
+                raw = bytes(content).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise RuntimeError("native workspace STOP: target Git metadata is invalid") from exc
         finally:
             os.close(metadata_file_fd)
-        if not raw.startswith("gitdir: "):
+        prefix = "gitdir: "
+        if not raw.startswith(prefix):
             raise RuntimeError("native workspace STOP: target Git metadata is invalid")
-        raw_gitdir = raw[8:]
-        gitdir = Path(raw_gitdir) if os.path.isabs(raw_gitdir) else self.target / raw_gitdir
-        gitdir = Path(os.path.normpath(os.fspath(gitdir)))
-        if gitdir.parent != self.admin_parent:
-            raise RuntimeError("native workspace STOP: target Git metadata escapes pinned repository")
-        metadata_id = gitdir.name
-        self._validate_metadata_id(metadata_id)
-        if metadata_id != self.target.name:
-            raise RuntimeError("native workspace STOP: Git worktree administrative ID is ambiguous")
+        raw_gitdir = raw[len(prefix):]
+        if not raw_gitdir.endswith("\n"):
+            raise RuntimeError("native workspace STOP: target Git metadata newline policy is invalid")
+        raw_gitdir = raw_gitdir[:-1]
+        if "\n" in raw_gitdir or raw_gitdir != str(self._metadata_path(self.target.name)):
+            raise RuntimeError("native workspace STOP: target Git metadata path spelling is not exact")
+        metadata_id = self.target.name
         if self.target_git_metadata_fd is not None:
             self.revalidate(target_must_exist=True)
             return self.target_git_metadata_fd
@@ -217,7 +229,7 @@ class PinnedNativeWorkspace:
             raise RuntimeError("native workspace STOP: target Git metadata is unavailable") from exc
         try:
             identity = _fd_identity(fd)
-            _require_fd_path(gitdir, fd, "target Git metadata", identity)
+            _require_fd_path(self._metadata_path(metadata_id), fd, "target Git metadata", identity)
             self.target_git_metadata_fd = fd
             self.target_git_metadata_identity = identity
             self.target_git_metadata_id = metadata_id

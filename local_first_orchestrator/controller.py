@@ -581,21 +581,18 @@ class LocalFirstController:
             if target.exists():
                 pin.pin_existing_target(already_created=True)
                 target_git_fd = pin.target_git_fd()
-                try:
-                    target_root = Path(pin.git("rev-parse", "--show-toplevel", target=True, git_fd_override=target_git_fd).stdout.strip()).resolve(strict=True)
-                    common_raw = pin.git("rev-parse", "--git-common-dir", target=True, git_fd_override=target_git_fd).stdout.strip()
-                    target_common = (target / common_raw).resolve(strict=True) if not Path(common_raw).is_absolute() else Path(common_raw).resolve(strict=True)
-                    repo_common_raw = pin.git("rev-parse", "--git-common-dir").stdout.strip()
-                    repo_common = (repository / repo_common_raw).resolve(strict=True) if not Path(repo_common_raw).is_absolute() else Path(repo_common_raw).resolve(strict=True)
-                    head = pin.git("rev-parse", "HEAD", target=True, git_fd_override=target_git_fd).stdout.strip()
-                    actual_branch = pin.git("branch", "--show-current", target=True, git_fd_override=target_git_fd).stdout.strip()
-                    status = pin.git("status", "--porcelain=v1", target=True, git_fd_override=target_git_fd).stdout.strip()
-                finally:
-                    pin.close_target_git_metadata()
+                target_root = Path(pin.git("rev-parse", "--show-toplevel", target=True, git_fd_override=target_git_fd).stdout.strip()).resolve(strict=True)
+                common_raw = pin.git("rev-parse", "--git-common-dir", target=True, git_fd_override=target_git_fd).stdout.strip()
+                target_common = (target / common_raw).resolve(strict=True) if not Path(common_raw).is_absolute() else Path(common_raw).resolve(strict=True)
+                repo_common_raw = pin.git("rev-parse", "--git-common-dir").stdout.strip()
+                repo_common = (repository / repo_common_raw).resolve(strict=True) if not Path(repo_common_raw).is_absolute() else Path(repo_common_raw).resolve(strict=True)
+                head = pin.git("rev-parse", "HEAD", target=True, git_fd_override=target_git_fd).stdout.strip()
+                actual_branch = pin.git("branch", "--show-current", target=True, git_fd_override=target_git_fd).stdout.strip()
+                status = pin.git("status", "--porcelain=v1", target=True, git_fd_override=target_git_fd).stdout.strip()
                 if target_root != target or target_common != repo_common or head != base_sha or actual_branch != branch or status:
                     raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: existing worktree drift")
                 validate_native_workspace_path(target, repository=repository, external_task_id=external_task_id)
-                pin.revalidate(target_must_exist=True)
+                pin.final_revalidate()
                 return {"workspace_path": str(target), "branch_name": branch, "base_sha": base_sha}
 
             pin.revalidate(target_must_exist=False)
@@ -609,20 +606,17 @@ class LocalFirstController:
                 pin.git("worktree", "add", "-q", "-b", branch, external_task_id, base_sha, creates_target=True, cwd_fd_override=pin.worktree_parent_fd)
             pin.pin_existing_target(already_created=True)
             target_git_fd = pin.target_git_fd()
-            try:
-                target_root = Path(pin.git("rev-parse", "--show-toplevel", target=True, git_fd_override=target_git_fd).stdout.strip()).resolve(strict=True)
-                common_raw = pin.git("rev-parse", "--git-common-dir", target=True, git_fd_override=target_git_fd).stdout.strip()
-                target_common = (target / common_raw).resolve(strict=True) if not Path(common_raw).is_absolute() else Path(common_raw).resolve(strict=True)
-                repo_common_raw = pin.git("rev-parse", "--git-common-dir").stdout.strip()
-                repo_common = (repository / repo_common_raw).resolve(strict=True) if not Path(repo_common_raw).is_absolute() else Path(repo_common_raw).resolve(strict=True)
-                head = pin.git("rev-parse", "HEAD", target=True, git_fd_override=target_git_fd).stdout.strip()
-                actual_branch = pin.git("branch", "--show-current", target=True, git_fd_override=target_git_fd).stdout.strip()
-            finally:
-                pin.close_target_git_metadata()
+            target_root = Path(pin.git("rev-parse", "--show-toplevel", target=True, git_fd_override=target_git_fd).stdout.strip()).resolve(strict=True)
+            common_raw = pin.git("rev-parse", "--git-common-dir", target=True, git_fd_override=target_git_fd).stdout.strip()
+            target_common = (target / common_raw).resolve(strict=True) if not Path(common_raw).is_absolute() else Path(common_raw).resolve(strict=True)
+            repo_common_raw = pin.git("rev-parse", "--git-common-dir").stdout.strip()
+            repo_common = (repository / repo_common_raw).resolve(strict=True) if not Path(repo_common_raw).is_absolute() else Path(repo_common_raw).resolve(strict=True)
+            head = pin.git("rev-parse", "HEAD", target=True, git_fd_override=target_git_fd).stdout.strip()
+            actual_branch = pin.git("branch", "--show-current", target=True, git_fd_override=target_git_fd).stdout.strip()
             if target_root != target or target_common != repo_common or head != base_sha or actual_branch != branch:
                 raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: created worktree drift")
             validate_native_workspace_path(target, repository=repository, external_task_id=external_task_id)
-            pin.revalidate(target_must_exist=True)
+            pin.final_revalidate()
             return {"workspace_path": str(target), "branch_name": branch, "base_sha": base_sha}
 
     def dry_run(self, task_id: str) -> dict[str, object]:

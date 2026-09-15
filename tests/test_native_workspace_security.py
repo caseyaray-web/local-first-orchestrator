@@ -72,6 +72,45 @@ class NativeWorkspaceAdministrativePinTests(unittest.TestCase):
             finally:
                 pin.close_target_git_metadata()
 
+    def test_target_gitdir_requires_exact_durable_spelling(self) -> None:
+        with PinnedNativeWorkspace.open(self.repo, self.target) as pin:
+            self._add_worktree(pin)
+            pin.pin_existing_target(already_created=True)
+            target_git = self.target / ".git"
+            exact = str(self.repo / ".git" / "worktrees" / "TASK-1")
+            aliases = (
+                f"gitdir: {exact}/./TASK-1\n",
+                f"gitdir: {exact}/../TASK-1\n",
+                f"gitdir: {exact}//TASK-1\n",
+                f"gitdir: {exact}/TASK-1/\n",
+                "gitdir: .git\n",
+                f"gitdir: {exact.upper()}\n",
+                f"gitdir: {exact} \n",
+                f"gitdir: {exact}\t\n",
+                f"gitdir: {exact}",
+                f"gitdir: {exact}\n\n",
+                f"GITDIR: {exact}\n",
+            )
+            for payload in aliases:
+                target_git.write_text(payload, encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "metadata|Git"):
+                    pin.target_git_fd()
+            target_git.write_text(f"gitdir: {exact}\n", encoding="utf-8")
+            self.assertIsInstance(pin.target_git_fd(), int)
+
+    def test_final_validator_rejects_metadata_child_swap_after_last_git_probe(self) -> None:
+        with PinnedNativeWorkspace.open(self.repo, self.target) as pin:
+            self._add_worktree(pin)
+            pin.pin_existing_target(already_created=True)
+            pin.target_git_fd()
+            child = self.repo / ".git" / "worktrees" / "TASK-1"
+            replacement = self.root / "metadata-final-replacement"
+            shutil.copytree(child, replacement)
+            child.rename(self.root / "metadata-original")
+            replacement.rename(child)
+            with self.assertRaisesRegex(RuntimeError, "identity|STOP"):
+                pin.final_revalidate()
+
 
 if __name__ == "__main__":
     unittest.main()

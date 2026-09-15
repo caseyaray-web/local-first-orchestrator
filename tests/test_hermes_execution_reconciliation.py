@@ -227,6 +227,51 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
         )
         self.assertFalse(self.ledger.connection.execute("SELECT 1 FROM events WHERE event_type LIKE '%worktree%'").fetchone())
 
+    def test_prepare_creation_stops_on_metadata_child_copy_swap_after_branch_validation(self) -> None:
+        real_run = subprocess.run
+        swapped = False
+        child = self.repo / ".git" / "worktrees" / "H-1"
+
+        def swapping_run(*args, **kwargs):
+            nonlocal swapped
+            command = tuple(args[0] if args else (kwargs.get("args") or ()))
+            result = real_run(*args, **kwargs)
+            if not swapped and "branch" in command and "--show-current" in command:
+                swapped = True
+                replacement = self.root / "metadata-copy-after-branch"
+                shutil.copytree(child, replacement)
+                child.rename(self.root / "metadata-original-after-branch")
+                replacement.rename(child)
+            return result
+
+        with patch("local_first_orchestrator.controller.subprocess.run", side_effect=swapping_run):
+            with self.assertRaisesRegex(RuntimeError, "identity|STOP|reconciliation"):
+                self.controller.prepare_hermes_dispatch_worktree(self.ticket_id, "H-1")
+        self.assertTrue(swapped)
+
+    def test_prepare_replay_stops_on_metadata_child_copy_swap_after_status_validation(self) -> None:
+        self.controller.prepare_hermes_dispatch_worktree(self.ticket_id, "H-1")
+        real_run = subprocess.run
+        swapped = False
+        child = self.repo / ".git" / "worktrees" / "H-1"
+
+        def swapping_run(*args, **kwargs):
+            nonlocal swapped
+            command = tuple(args[0] if args else (kwargs.get("args") or ()))
+            result = real_run(*args, **kwargs)
+            if not swapped and "status" in command and "--porcelain=v1" in command:
+                swapped = True
+                replacement = self.root / "metadata-copy-after-status"
+                shutil.copytree(child, replacement)
+                child.rename(self.root / "metadata-original-after-status")
+                replacement.rename(child)
+            return result
+
+        with patch("local_first_orchestrator.controller.subprocess.run", side_effect=swapping_run):
+            with self.assertRaisesRegex(RuntimeError, "identity|STOP|reconciliation"):
+                self.controller.prepare_hermes_dispatch_worktree(self.ticket_id, "H-1")
+        self.assertTrue(swapped)
+
     def test_prepare_hermes_dispatch_worktree_uses_advanced_tranche_integration_head(self) -> None:
         subprocess.run(("git", "checkout", "--", "app.py"), cwd=self.repo, check=True)
         self.ledger.connection.execute("INSERT INTO features(id,title,objective,status,created_at,updated_at) VALUES ('F','f','f','planned',1,1)")
