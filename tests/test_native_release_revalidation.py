@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -170,10 +171,10 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
             self.approval_cache[reason] = (document, signature)
         return self.controller.revalidate_native_release(self.ticket, operator_id="operator", reason=reason, implementation_profile="impl", approval_document=document, detached_signature=signature, signer_public_key=self.signer_public_key, signer_fingerprint=self.signer_fingerprint)
 
-    def seed_run(self, *, status: str, outcome: str, summary: str, started_at: int | None, ended_at: int | None, profile: str | None = None, worker_pid: int | None = None) -> None:
+    def seed_run(self, *, status: str, outcome: str, summary: str, started_at: int | None, ended_at: int | None, profile: str | None = None, worker_pid: int | None = None, metadata: object = None) -> None:
         self._assert_parent_identity_unchanged()
         with self._open_board() as connection:
-            connection.execute("INSERT INTO task_runs(task_id,profile,step_key,status,claim_lock,claim_expires,worker_pid,max_runtime_seconds,last_heartbeat_at,started_at,ended_at,outcome,summary,metadata,error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (self.external_id, profile, None, status, None, None, worker_pid, None, None, started_at or 1, ended_at, outcome, summary, None, None))
+            connection.execute("INSERT INTO task_runs(task_id,profile,step_key,status,claim_lock,claim_expires,worker_pid,max_runtime_seconds,last_heartbeat_at,started_at,ended_at,outcome,summary,metadata,error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (self.external_id, profile, None, status, None, None, worker_pid, None, None, started_at, ended_at, outcome, summary, None if metadata is None else json.dumps(metadata, separators=(",", ":")), None))
             connection.commit()
 
     def test_test_database_is_owned_by_fixture_root_and_fixed_filename(self) -> None:
@@ -277,8 +278,48 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         with self._open_board() as connection:
             connection.execute("DELETE FROM task_runs WHERE task_id=?", (self.external_id,))
             connection.commit()
-        self.seed_run(status="spawn_failed", outcome="spawn_failed", summary="could not spawn", started_at=None, ended_at=None)
+        with self._open_board() as connection:
+            connection.execute("UPDATE tasks SET status='scheduled', started_at=1 WHERE id=?", (self.external_id,))
+            connection.commit()
+        self.seed_run(status="spawn_failed", outcome="spawn_failed", summary="could not spawn", started_at=1, ended_at=2, profile="impl", metadata={"failures": 1, "retry_status": "ready"})
         self.signed_revalidate(reason="verify")
+
+    def test_production_schema_snapshot_with_inert_history_derives_repo_and_base_authority(self) -> None:
+        with self._open_board() as connection:
+            connection.execute("UPDATE tasks SET status='scheduled', started_at=?, completed_at=NULL, session_id=NULL, current_run_id=NULL WHERE id=?", (30, self.external_id))
+            connection.commit()
+        self.seed_run(status="blocked", outcome="blocked", summary="legacy containment", started_at=1, ended_at=2)
+        self.seed_run(status="blocked", outcome="blocked", summary="second legacy containment", started_at=3, ended_at=4)
+        self.seed_run(status="spawn_failed", outcome="spawn_failed", summary="could not spawn", started_at=30, ended_at=31, profile="impl", metadata={"failures": 1, "retry_status": "ready"})
+        self.seed_run(status="scheduled", outcome="scheduled", summary="maintenance", started_at=32, ended_at=33, profile="impl")
+        self.adapter = HermesBoardAdapter(board=self.board_name, executable=sys.executable, board_db_path=self.board_db, canonical_repository=self.repo)
+        self.controller = LocalFirstController(self.ledger, self.adapter, self.controller.config)
+        result = self.signed_revalidate(reason="production-shaped")
+        self.assertEqual(result["ticket_id"], self.ticket)
+
+    def test_production_history_rejects_each_unsafe_run_field(self) -> None:
+        fields = (
+            ("status", "running"), ("outcome", "completed"), ("worker_pid", 999),
+            ("profile", "other-profile"), ("started_at", 100), ("ended_at", 0),
+            ("metadata", json.dumps({"unexpected": True})),
+        )
+        for index, (field, value) in enumerate(fields):
+            with self.subTest(field=field):
+                with self._open_board() as connection:
+                    connection.execute("DELETE FROM task_runs WHERE task_id=?", (self.external_id,))
+                    connection.execute("UPDATE tasks SET status='scheduled', started_at=30, completed_at=NULL, session_id=NULL, current_run_id=NULL WHERE id=?", (self.external_id,))
+                    connection.commit()
+                self.seed_run(status="blocked", outcome="blocked", summary="legacy containment", started_at=1, ended_at=2)
+                self.seed_run(status="blocked", outcome="blocked", summary="second legacy containment", started_at=3, ended_at=4)
+                self.seed_run(status="spawn_failed", outcome="spawn_failed", summary="could not spawn", started_at=30, ended_at=31, profile="impl", metadata={"failures": 1, "retry_status": "ready"})
+                self.seed_run(status="scheduled", outcome="scheduled", summary="maintenance", started_at=32, ended_at=33, profile="impl")
+                with self._open_board() as connection:
+                    connection.execute(f"UPDATE task_runs SET {field}=? WHERE id=(SELECT id FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1)", (value, self.external_id))
+                    connection.commit()
+                self.adapter = HermesBoardAdapter(board=self.board_name, executable=sys.executable, board_db_path=self.board_db, canonical_repository=self.repo)
+                self.controller = LocalFirstController(self.ledger, self.adapter, self.controller.config)
+                with self.assertRaisesRegex(RuntimeError, "execution evidence|ambiguous|inert|terminal"):
+                    self.controller.prepare_native_release_revalidation(self.ticket, operator_id="operator", reason=f"unsafe-{index}", implementation_profile="impl")
 
     def test_unpaused_and_worktree_drift_rollback_without_event(self) -> None:
         self.ledger.resume("operator", reason="test")

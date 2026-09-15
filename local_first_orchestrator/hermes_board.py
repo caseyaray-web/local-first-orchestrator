@@ -52,6 +52,7 @@ class ExternalExecutionSnapshot:
     runs: tuple[ExternalExecutionRun, ...]
     repository_identity: str | None = None
     base_sha: str | None = None
+    current_run_id: int | None = None
 
 
 from .revalidation_boundary import create_revalidation_capability, revoke_revalidation_capability
@@ -112,6 +113,7 @@ class HermesBoardAdapter:
             task=ExternalTicket(str(task.id), str(task.title or ""), str(task.body or ""), str(task.status or ""), task.workspace_path, parents=parents, children=children, assignee=task.assignee, workspace_kind=task.workspace_kind, repository_identity=optional("repository_identity"), base_sha=optional("base_sha")),
             session_id=optional("session_id", task.session_id), branch_name=task.branch_name, started_at=task.started_at, completed_at=task.completed_at,
             runs=external_runs, repository_identity=optional("repository_identity"), base_sha=optional("base_sha"),
+            current_run_id=optional("current_run_id", getattr(task, "current_run_id", None)),
         )
 
     @contextmanager
@@ -232,6 +234,7 @@ class HermesBoardAdapter:
             runs=tuple(sorted(parsed, key=lambda run: run.id)),
             repository_identity=None if row.get("repository_identity") is None else str(row["repository_identity"]),
             base_sha=None if row.get("base_sha") is None else str(row["base_sha"]),
+            current_run_id=None if row.get("current_run_id") is None else int(row["current_run_id"]),
         )
 
     def import_candidates(self) -> list[ExternalTicket]:

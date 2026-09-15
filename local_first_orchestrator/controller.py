@@ -192,32 +192,82 @@ class LocalFirstController:
         except ValueError as exc:
             raise RuntimeError("native release revalidation worktree drift") from exc
         try:
-            top = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
-            head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
-            branch = subprocess.run(("git", "branch", "--show-current"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            git = lambda *args: subprocess.run(("git", *args), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            top = git("rev-parse", "--show-toplevel")
+            head = git("rev-parse", "HEAD")
+            branch = git("branch", "--show-current")
+            common_dir = Path(git("rev-parse", "--git-common-dir"))
+            if not common_dir.is_absolute():
+                common_dir = (expected_path / common_dir).resolve()
+            else:
+                common_dir = common_dir.resolve()
+            git_dir = Path(git("rev-parse", "--git-dir"))
+            if not git_dir.is_absolute():
+                git_dir = (expected_path / git_dir).resolve()
+            else:
+                git_dir = git_dir.resolve()
+            commondir_file = Path(git("rev-parse", "--git-path", "commondir"))
+            if not commondir_file.is_absolute():
+                commondir_file = (expected_path / commondir_file).resolve()
+            else:
+                commondir_file = commondir_file.resolve()
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeError("native release revalidation worktree verification failed") from exc
-        snapshot_base = snapshot.base_sha or snapshot.task.base_sha
-        snapshot_repository = snapshot.repository_identity or snapshot.task.repository_identity
-        if top != str(expected_path) or head != expected_base or branch != (snapshot.branch_name or "") or snapshot_base != expected_base or snapshot_repository != str(repository):
+        canonical_git = (repository / ".git").resolve()
+        if (top != str(expected_path) or head != expected_base or branch != (snapshot.branch_name or "")
+                or common_dir != canonical_git or not commondir_file.is_file()
+                or git_dir == canonical_git or not str(git_dir).startswith(str(canonical_git / "worktrees") + "/")):
             raise RuntimeError("native release revalidation branch/base/repository drift")
         if expected_branch is not None and branch != expected_branch:
             raise RuntimeError("native release revalidation branch/base/repository drift")
-        forbidden = {"running", "completed", "success", "successful"}
+
+        # Repository/base fields are optional in real Hermes schemas.  When a
+        # schema has them, every non-null copy is an assertion, never a source
+        # of authority.  Authority comes from the registered binding and Git.
+        for observed_repository in (snapshot.repository_identity, snapshot.task.repository_identity):
+            if observed_repository is not None and observed_repository != str(repository):
+                raise RuntimeError("native release revalidation branch/base/repository drift")
+        for observed_base in (snapshot.base_sha, snapshot.task.base_sha):
+            if observed_base is not None and observed_base != expected_base:
+                raise RuntimeError("native release revalidation branch/base/repository drift")
+
         if snapshot.task.status not in {"scheduled", "blocked"}:
             raise RuntimeError("native release revalidation card is dispatchable or final")
-        if any(value is not None for value in (snapshot.session_id, snapshot.started_at, snapshot.completed_at)):
+        if any(value is not None for value in (snapshot.session_id, snapshot.completed_at, snapshot.current_run_id)):
             raise RuntimeError("native release revalidation execution evidence exists")
-        gate = "Local First execution gate: authoritative dependencies/runtime authorization not satisfied"
+        forbidden = {"running", "completed", "success", "successful"}
+        spawn_failed = []
+        scheduled = []
         for run in snapshot.runs:
-            if run.status in forbidden or (run.outcome or "").lower() in forbidden or run.worker_pid is not None or run.profile is not None or run.metadata is not None:
+            if run.status in forbidden or (run.outcome or "").lower() in forbidden or run.worker_pid is not None:
                 raise RuntimeError("native release revalidation execution evidence exists")
-            if run.status == "blocked" and not (run.outcome == "blocked" and str(run.summary or "") == gate and (run.started_at, run.ended_at) in {(None, None), (run.started_at, run.started_at)}):
-                raise RuntimeError("native release revalidation blocked run is not inert")
-            if run.status == "spawn_failed" and run.outcome not in {None, "spawn_failed"}:
-                raise RuntimeError("native release revalidation spawn evidence is ambiguous")
-            if run.status not in {"blocked", "spawn_failed"}:
+            terminal = run.started_at is not None and run.ended_at is not None and run.ended_at >= run.started_at
+            if not terminal:
+                raise RuntimeError("native release revalidation run is not terminal")
+            if run.status == "blocked":
+                if run.outcome != "blocked" or run.profile is not None or run.metadata is not None:
+                    raise RuntimeError("native release revalidation blocked run is not inert")
+            elif run.status == "spawn_failed":
+                if run.outcome not in {None, "spawn_failed"} or run.profile != implementation_profile:
+                    raise RuntimeError("native release revalidation spawn evidence is ambiguous")
+                if not isinstance(run.metadata, dict) or set(run.metadata) != {"failures", "retry_status"} or type(run.metadata["failures"]) is not int or run.metadata["failures"] <= 0 or run.metadata["retry_status"] != "ready":
+                    raise RuntimeError("native release revalidation spawn evidence is ambiguous")
+                spawn_failed.append(run)
+            elif run.status == "scheduled":
+                if snapshot.task.status != "scheduled" or run.outcome != "scheduled" or run.profile != implementation_profile or run.metadata is not None:
+                    raise RuntimeError("native release revalidation scheduled run is ambiguous")
+                scheduled.append(run)
+            else:
                 raise RuntimeError("native release revalidation run evidence is ambiguous")
+        if len(spawn_failed) > 1 or len(scheduled) > 1:
+            raise RuntimeError("native release revalidation overlapping current runs")
+        if (spawn_failed or scheduled) and snapshot.task.status != "scheduled":
+            raise RuntimeError("native release revalidation current task is not scheduled")
+        if snapshot.started_at is not None:
+            if len(spawn_failed) != 1 or snapshot.started_at != spawn_failed[0].started_at:
+                raise RuntimeError("native release revalidation top-level start evidence is ambiguous")
+        elif spawn_failed:
+            raise RuntimeError("native release revalidation top-level start evidence is missing")
         return branch, canonical_sha256(asdict(snapshot))
 
     def revalidate_native_release(self, ticket_id: str, *, operator_id: str | None = None, reason: str | None = None,
