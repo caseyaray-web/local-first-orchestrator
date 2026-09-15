@@ -27,6 +27,13 @@ _PAID_FIELDS = frozenset({"paid_checkpoint", "paid_escalation"})
 _SIGNER_FIELDS = frozenset({"operator_signing_public_key", "operator_signing_key_fingerprint"})
 
 
+def operator_authority_hash_from_fingerprint(fingerprint: str) -> str:
+    """Canonical runtime-binding authority hash for a verified signer fingerprint."""
+    if type(fingerprint) is not str:
+        raise ValueError("operator signer fingerprint must be text")
+    return hashlib.sha256(fingerprint.encode("ascii")).hexdigest()
+
+
 def default_config_path() -> Path:
     value = os.environ.get(_CONFIG_ENV)
     return Path(value).expanduser() if value else Path.home() / ".hermes" / "local-first-orchestrator" / "operator-config.json"
@@ -93,7 +100,7 @@ class OperatorConfig:
 
     @property
     def operator_authority_hash(self) -> str:
-        return hashlib.sha256((self.operator_signing_key_fingerprint or "").encode("ascii")).hexdigest()
+        return operator_authority_hash_from_fingerprint(self.operator_signing_key_fingerprint or "")
 
     def decomposition_route(self, cost_class: str) -> ModelRegistration:
         routes = dict(self.decomposition)

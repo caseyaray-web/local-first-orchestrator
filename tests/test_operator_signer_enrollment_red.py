@@ -182,6 +182,46 @@ class OperatorSignerEnrollmentRedTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "signer enrollment reconciliation required"):
             ProcessNextScheduler(ledger, NoSideEffectsBoard(), worker_id="fixture", lease_seconds=30, clock=lambda: 100, native_dependency_release_signer_public_key=base64.b64decode(public_b64), native_dependency_release_signer_fingerprint=fingerprint, native_dependency_release_signer_config_path=config_path).process_next()
         ledger.close(); tmp.cleanup()
+    def test_detector_stops_on_every_mutable_intent_authority_field(self) -> None:
+        fields = {
+            "document_json": "{}", "document_hash": "f" * 64, "detached_signature": base64.b64encode(b"x" * 64).decode(),
+            "ledger_identity": "/tmp/forged-ledger.db", "nonce": "forged-nonce", "operator_id": "forged-operator",
+            "reason": "forged-reason", "ticket_ids_json": "[]", "public_key_fingerprint": "f" * 64,
+            "authority_hash": "f" * 64, "old_config_hash": "f" * 64, "new_config_hash": "f" * 64,
+            "new_config_bytes": base64.b64encode(b"forged").decode(), "selected_bindings_json": "{}",
+            "old_config_identity_json": "{}",
+        }
+        for field, value in fields.items():
+            tmp, root, ledger, config_path, prepared, signature, public_b64, fingerprint, ticket = self._enrollment_fixture()
+            enroll_operator_signer(ledger, config_path=config_path, document=prepared["document"], detached_signature=signature, public_key_b64=public_b64, fingerprint=fingerprint)
+            ledger.connection.executescript("DROP TRIGGER runtime_signer_enrollment_intents_immutable_identity;")
+            ledger.connection.execute(f"UPDATE runtime_signer_enrollment_intents SET {field}=?", (value,))
+            ledger.connection.execute("UPDATE controller_state SET paused=0 WHERE id=1")
+            ledger.connection.commit()
+            before = ledger.connection.execute("SELECT operator_signer_fingerprint,operator_authority_hash FROM runtime_bindings WHERE ticket_id=?", (ticket,)).fetchone()
+            blocker = ledger.native_dependency_release_migration_required(signer_public_key=base64.b64decode(public_b64), signer_fingerprint=fingerprint, config_path=config_path)
+            self.assertIsNotNone(blocker, field)
+            self.assertTrue(blocker["reason"].startswith("signer enrollment reconciliation required:"), field)
+            self.assertEqual(preview_next(ledger, signer_public_key=base64.b64decode(public_b64), signer_fingerprint=fingerprint, signer_config_path=config_path).next_stage, "reconciliation_required")
+            class NoSideEffectsBoard:
+                timeout_seconds = 1
+            with self.assertRaisesRegex(RuntimeError, "signer enrollment reconciliation required"):
+                ProcessNextScheduler(ledger, NoSideEffectsBoard(), worker_id="fixture", lease_seconds=30, clock=lambda: 100, native_dependency_release_signer_public_key=base64.b64decode(public_b64), native_dependency_release_signer_fingerprint=fingerprint, native_dependency_release_signer_config_path=config_path).process_next()
+            self.assertEqual(ledger.connection.execute("SELECT operator_signer_fingerprint,operator_authority_hash FROM runtime_bindings WHERE ticket_id=?", (ticket,)).fetchone(), before)
+            ledger.close(); tmp.cleanup()
+
+    def test_detector_derives_binding_authority_hash_not_evidence_hash(self) -> None:
+        tmp, root, ledger, config_path, prepared, signature, public_b64, fingerprint, ticket = self._enrollment_fixture()
+        enroll_operator_signer(ledger, config_path=config_path, document=prepared["document"], detached_signature=signature, public_key_b64=public_b64, fingerprint=fingerprint)
+        forged = "f" * 64
+        ledger.connection.executescript("DROP TRIGGER runtime_signer_enrollments_immutable_update; DROP TRIGGER runtime_bindings_signer_immutable;")
+        ledger.connection.execute("UPDATE runtime_bindings SET operator_authority_hash=? WHERE ticket_id=?", (forged, ticket))
+        ledger.connection.execute("UPDATE runtime_signer_enrollments SET new_binding_identity_json=json_set(new_binding_identity_json,'$.operator_authority_hash',?), authority_hash=? WHERE ticket_id=?", (forged, forged, ticket))
+        ledger.connection.commit()
+        blocker = ledger.native_dependency_release_migration_required(signer_public_key=base64.b64decode(public_b64), signer_fingerprint=fingerprint, config_path=config_path)
+        self.assertIsNotNone(blocker)
+        self.assertTrue(blocker["reason"].startswith("signer enrollment reconciliation required:"))
+        ledger.close(); tmp.cleanup()
 
 
 if __name__ == "__main__":

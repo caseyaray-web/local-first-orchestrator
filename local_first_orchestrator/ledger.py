@@ -2371,6 +2371,99 @@ class Ledger:
         row = self.connection.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (ticket_id,)).fetchone()
         return dict(row) if row else None
 
+    def _signer_enrollment_integrity_blocker(self, *, signer_public_key: bytes, signer_fingerprint: str, fresh_config_raw: bytes | None, fresh_config_identity: dict[str, Any] | None, fresh_config_obj: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Validate the signed enrollment envelope before any release fallback runs.
+
+        Every ledger copy is an assertion about one canonical signed document.  The
+        signer key and the freshly read operator config are the only authority; DB
+        fields, including evidence authority_hash values, are never inputs to the
+        expected identity.
+        """
+        try:
+            from .native_release_approval import fingerprint_public_key
+            from .signer_enrollment import parse_enrollment_document
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+            expected_authority_hash = hashlib.sha256(signer_fingerprint.encode("ascii")).hexdigest()
+            if fingerprint_public_key(signer_public_key) != signer_fingerprint:
+                return {"ticket_id": "", "reason": "signer enrollment reconciliation required: signer fingerprint does not match fresh signer key"}
+            if fresh_config_obj is not None and (fresh_config_obj.get("operator_signing_key_fingerprint") != signer_fingerprint or fresh_config_obj.get("operator_signing_public_key") != base64.b64encode(signer_public_key).decode("ascii")):
+                return {"ticket_id": "", "reason": "signer enrollment reconciliation required: fresh signer config authority differs"}
+            intents = self.connection.execute("SELECT * FROM runtime_signer_enrollment_intents WHERE status IN ('pending_config','config_written','finalized') ORDER BY enrollment_key").fetchall()
+            for intent in intents:
+                ticket_hint = str(intent["ticket_ids_json"] or "")
+                try:
+                    document_raw = str(intent["document_json"]).encode("utf-8")
+                    document, canonical = parse_enrollment_document(document_raw)
+                    if canonical != document_raw or hashlib.sha256(canonical).hexdigest() != str(intent["document_hash"]):
+                        raise ValueError("intent signed document bytes or hash drift")
+                    signature_b64 = str(intent["detached_signature"])
+                    signature = base64.b64decode(signature_b64, validate=True)
+                    Ed25519PublicKey.from_public_bytes(signer_public_key).verify(signature, canonical)
+                    selected = document["ticket_ids"]
+                    selected_json = json.loads(str(intent["ticket_ids_json"]))
+                    signed_selected = document["binding_projection_release_identities"]
+                    persisted_selected = json.loads(str(intent["selected_bindings_json"]))
+                    expected = {
+                        "operator_id": document["operator_id"], "reason": document["reason"],
+                        "ticket_ids_json": json.dumps(selected, separators=(",", ":")),
+                        "public_key_fingerprint": signer_fingerprint, "authority_hash": expected_authority_hash,
+                        "old_config_hash": document["old_config_hash"], "new_config_hash": document["new_config_hash"],
+                        "new_config_bytes": document["new_config_bytes"], "selected_bindings_json": json.dumps(signed_selected, sort_keys=True, separators=(",", ":")),
+                        "ledger_identity": document["ledger_identity"], "old_config_identity_json": json.dumps(document["old_config_identity"], sort_keys=True, separators=(",", ":")),
+                        "nonce": document["nonce"],
+                    }
+                    for field, value in expected.items():
+                        actual = intent[field]
+                        if field in {"selected_bindings_json", "old_config_identity_json"}:
+                            if json.loads(str(actual)) != json.loads(value): raise ValueError(f"intent {field} drift")
+                        elif str(actual) != str(value):
+                            if field in {"new_config_hash", "new_config_bytes"}:
+                                raise ValueError("signed new config differs from intent")
+                            raise ValueError(f"intent {field} drift")
+                    if selected_json != selected or persisted_selected != signed_selected or intent["status"] != "finalized":
+                        raise ValueError("intent status or signed ticket set drift")
+                    if fresh_config_raw is not None:
+                        signed_new = base64.b64decode(document["new_config_bytes"], validate=True)
+                        if signed_new != fresh_config_raw or hashlib.sha256(signed_new).hexdigest() != document["new_config_hash"]:
+                            raise ValueError("signed config bytes differ from fresh config")
+                    if fresh_config_identity is not None and json.loads(str(intent["config_identity_json"] or "null")) != fresh_config_identity:
+                        raise ValueError("finalized config identity drift")
+                    evidence = self.connection.execute("SELECT * FROM runtime_signer_enrollments WHERE enrollment_key=? ORDER BY ticket_id", (intent["enrollment_key"],)).fetchall()
+                    if len(evidence) != len(selected) or {str(row["ticket_id"]) for row in evidence} != set(str(ticket) for ticket in selected) or len({str(row["ticket_id"]) for row in evidence}) != len(selected):
+                        raise ValueError("enrollment evidence is missing, duplicated, or cross-linked")
+                    events = self.connection.execute("SELECT * FROM events WHERE entity_type='controller' AND entity_id='controller' AND event_type='runtime_signer_enrollment_completed' AND json_extract(payload_json,'$.enrollment_key')=? ORDER BY id", (intent["enrollment_key"],)).fetchall()
+                    if len(events) != 1:
+                        raise ValueError("enrollment completion event is missing or duplicated")
+                    if intent["updated_at"] < events[0]["created_at"] or any(row["created_at"] != intent["created_at"] for row in evidence):
+                        raise ValueError("enrollment finalized timestamps drifted")
+                    event_payload = json.loads(str(events[0]["payload_json"]))
+                    expected_event = {"enrollment_key": str(intent["enrollment_key"]), "document_hash": str(intent["document_hash"]), "old_config_hash": document["old_config_hash"], "new_config_hash": document["new_config_hash"], "new_config_bytes": document["new_config_bytes"], "document_json": document_raw.decode("utf-8"), "detached_signature": str(intent["detached_signature"]), "config_identity": json.loads(str(intent["config_identity_json"])), "ticket_ids": list(selected), "public_key_fingerprint": signer_fingerprint, "operator_id": document["operator_id"], "reason": document["reason"]}
+                    if event_payload != expected_event or str(events[0]["actor_id"]) != document["operator_id"]:
+                        raise ValueError("enrollment completion event is outside signed authority")
+                    for evidence_row in evidence:
+                        if any(evidence_row[field] != intent[field] for field in ("document_json", "document_hash", "detached_signature")):
+                            raise ValueError("per-ticket signed document drift")
+                        if evidence_row["operator_id"] != document["operator_id"] or evidence_row["reason"] != document["reason"] or evidence_row["public_key_fingerprint"] != signer_fingerprint or evidence_row["authority_hash"] != expected_authority_hash:
+                            raise ValueError("per-ticket signer identity drift")
+                        expected_binding = signed_selected.get(str(evidence_row["ticket_id"]))
+                        if not isinstance(expected_binding, dict): raise ValueError("signed ticket cross-link drift")
+                        old_binding = json.loads(str(evidence_row["old_binding_identity_json"]))
+                        new_binding = json.loads(str(evidence_row["new_binding_identity_json"]))
+                        binding = self.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (evidence_row["ticket_id"],)).fetchone()
+                        if binding is None or old_binding != expected_binding.get("binding"):
+                            raise ValueError("binding evidence does not match signed authority")
+                        immutable = ("ticket_id", "repository_path", "starting_sha", "canonical_sha", "ownership_verified")
+                        expected_new = {key: binding[key] for key in immutable} | {"operator_signer_fingerprint": signer_fingerprint, "operator_authority_hash": expected_authority_hash}
+                        if new_binding != expected_new or any(binding[key] != expected_binding["binding"].get(key) for key in immutable) or binding["operator_signer_fingerprint"] != signer_fingerprint or binding["operator_authority_hash"] != expected_authority_hash:
+                            raise ValueError("runtime binding authority or immutable identity drift")
+                        if evidence_row["config_identity_json"] != intent["config_identity_json"]:
+                            raise ValueError("evidence config identity drift")
+                except Exception as exc:
+                    return {"ticket_id": ticket_hint, "reason": f"signer enrollment reconciliation required: {exc}"}
+        except Exception as exc:
+            return {"ticket_id": "", "reason": f"signer enrollment reconciliation required: {exc}"}
+        return None
+
     def native_dependency_release_migration_required(self, *, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None, config_path: Path | None = None) -> dict[str, Any] | None:
         """Find legacy releases that cannot authorize downstream execution."""
         rows = self.connection.execute("SELECT * FROM native_dependency_releases ORDER BY ticket_id").fetchall()
@@ -2398,15 +2491,28 @@ class Ledger:
         fresh_config_hash = None
         fresh_config_identity = None
         fresh_config_raw = None
+        fresh_config_obj = None
         if config_path is not None and signer_fingerprint is not None:
             try:
                 from .operator_config import _raw_config
                 fresh_config_raw, fresh_obj, fresh_config_identity = _raw_config(Path(config_path))
+                fresh_config_obj = fresh_obj
                 fresh_config_hash = hashlib.sha256(fresh_config_raw).hexdigest()
                 if fresh_obj.get("operator_signing_key_fingerprint") != signer_fingerprint:
                     return {"ticket_id": str(rows[0]["ticket_id"]) if rows else "", "reason": "signer enrollment reconciliation required: fresh external signer config differs"}
             except (OSError, ValueError):
                 return {"ticket_id": str(rows[0]["ticket_id"]) if rows else "", "reason": "signer enrollment reconciliation required: fresh external signer config is unavailable"}
+        integrity_blocker = None
+        if signer_public_key is not None and signer_fingerprint:
+            integrity_blocker = self._signer_enrollment_integrity_blocker(
+                signer_public_key=signer_public_key,
+                signer_fingerprint=signer_fingerprint,
+                fresh_config_raw=fresh_config_raw,
+                fresh_config_identity=fresh_config_identity,
+                fresh_config_obj=fresh_config_obj,
+            )
+        if integrity_blocker is not None:
+            return integrity_blocker
         for row in rows:
             try:
                 authority = json.loads(str(row["routing_authority_json"] or "{}"))
