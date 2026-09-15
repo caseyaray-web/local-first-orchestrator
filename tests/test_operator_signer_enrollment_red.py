@@ -12,10 +12,43 @@ from tempfile import TemporaryDirectory
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from local_first_orchestrator.ledger import Ledger
-from local_first_orchestrator.operator_config import enroll_operator_signer
+from local_first_orchestrator.operator_config import enroll_operator_signer, load_operator_config
+from local_first_orchestrator.signer_enrollment import (
+    ENROLLMENT_DOMAIN, ENROLLMENT_VERSION, parse_enrollment_document,
+    _canonical_document, _verify,
+)
 
 
 class OperatorSignerEnrollmentRedTests(unittest.TestCase):
+    def test_enrollment_document_is_canonical_duplicate_free_and_detached_signed(self) -> None:
+        private = Ed25519PrivateKey.generate(); public = private.public_key().public_bytes_raw()
+        public_b64 = base64.b64encode(public).decode(); fingerprint = hashlib.sha256(public).hexdigest()
+        document = {
+            "domain": ENROLLMENT_DOMAIN, "version": ENROLLMENT_VERSION, "operation": "enroll-operator-signer",
+            "ledger_identity": "/tmp/fixture-ledger.db", "old_config_identity": {"dev": 1, "ino": 2, "uid": os.getuid(), "mode": 0o600, "path": "/tmp/operator.json"},
+            "old_config_hash": "a" * 64, "new_public_key": public_b64, "new_fingerprint": fingerprint,
+            "ticket_ids": ["ticket-1"], "binding_projection_release_identities": {"ticket-1": {"binding": {}, "projection": {}, "release": {}}},
+            "operator_id": "operator", "reason": "legacy migration", "nonce": "nonce-1",
+        }
+        encoded = _canonical_document(document)
+        signature = private.sign(encoded)
+        self.assertEqual(parse_enrollment_document(encoded)[0], document)
+        self.assertEqual(_verify(document, signature, public_b64, fingerprint)[0], encoded)
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            parse_enrollment_document(encoded.replace(b'"nonce":"nonce-1"', b'"nonce":"nonce-1","nonce":"nonce-2"'))
+
+    def test_config_duplicate_null_and_symlink_inputs_stop_before_registration(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp); target = root / "target.json"; link = root / "operator.json"
+            target.write_text('{"ledger_path":"x","ledger_path":"y"}')
+            link.symlink_to(target)
+            with self.assertRaises((ValueError, OSError)):
+                load_operator_config(link)
+            target.unlink(); link.unlink()
+            target.write_text('{"ledger_path":null}')
+            with self.assertRaises(ValueError):
+                load_operator_config(target)
+
     def test_enrollment_api_is_paused_and_never_accepts_private_key(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

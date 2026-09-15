@@ -10,6 +10,10 @@ import hashlib
 import base64
 import json
 import os
+import errno
+import fcntl
+import stat
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -71,6 +75,7 @@ class OperatorConfig:
     paid_escalation: ModelRegistration | None = None
     operator_signing_public_key: str | None = None
     operator_signing_key_fingerprint: str | None = None
+    config_path: Path | None = None
 
     @property
     def signer_public_key_bytes(self) -> bytes:
@@ -115,7 +120,7 @@ class OperatorConfig:
             raise ValueError("operator signer registration requires public key and fingerprint together")
         if self.operator_signing_public_key is not None:
             self.signer_public_key_bytes
-        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review, self.worktree_root, self.artifact_root, self.implementation_timeout_seconds, self.review_timeout_seconds, self.decomposition, self.paid_checkpoint, self.paid_escalation, self.operator_signing_public_key, self.operator_signing_key_fingerprint)
+        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review, self.worktree_root, self.artifact_root, self.implementation_timeout_seconds, self.review_timeout_seconds, self.decomposition, self.paid_checkpoint, self.paid_escalation, self.operator_signing_public_key, self.operator_signing_key_fingerprint, self.config_path)
 
     @property
     def execution_configured(self) -> bool:
@@ -160,10 +165,13 @@ class OperatorConfig:
 def load_operator_config(path: Path | None = None) -> OperatorConfig:
     config_path = path or default_config_path()
     try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        with _locked_config(config_path, write=False) as (fd, identity):
+            raw_bytes = _read_verified_fd(fd, identity)
+        raw = json.loads(raw_bytes.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys,
+                         parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite JSON number")))
     except FileNotFoundError as exc:
         raise ValueError("operator dashboard is not registered") from exc
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError("operator registration is not valid JSON") from exc
     if not isinstance(raw, dict) or not _LEGACY_FIELDS <= set(raw) or set(raw) - (_LEGACY_FIELDS | _RUNTIME_FIELDS | _ROUTING_FIELDS | _PAID_FIELDS | _SIGNER_FIELDS):
         raise ValueError("operator registration has unexpected fields")
@@ -188,9 +196,9 @@ def load_operator_config(path: Path | None = None) -> OperatorConfig:
     paid_checkpoint = ModelRegistration.parse(raw["paid_checkpoint"], "paid_checkpoint") if "paid_checkpoint" in raw else None
     paid_escalation = ModelRegistration.parse(raw["paid_escalation"], "paid_escalation") if "paid_escalation" in raw else None
     signer = (raw.get("operator_signing_public_key"), raw.get("operator_signing_key_fingerprint"))
-    if any(value is not None for value in signer) and not all(isinstance(value, str) and value.strip() for value in signer):
+    if ("operator_signing_public_key" in raw or "operator_signing_key_fingerprint" in raw) and not all(isinstance(value, str) and value.strip() for value in signer):
         raise ValueError("operator signer registration requires public key and fingerprint together")
-    return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review"), *runtime, decomposition, paid_checkpoint, paid_escalation, *signer).validated(require_ledger=True)
+    return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review"), *runtime, decomposition, paid_checkpoint, paid_escalation, *signer, config_path).validated(require_ledger=True)
 
 
 def save_operator_config(config: OperatorConfig, path: Path | None = None) -> Path:
@@ -200,10 +208,93 @@ def save_operator_config(config: OperatorConfig, path: Path | None = None) -> Pa
     checked.runtime_config()
     config_path = path or default_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = config_path.with_suffix(config_path.suffix + ".tmp")
-    temporary.write_text(json.dumps(checked.as_json(), sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(config_path)
+    with _locked_config(config_path, write=True) as (_, identity):
+        _atomic_config_replace(config_path, (json.dumps(checked.as_json(), sort_keys=True, indent=2) + "\n").encode("utf-8"), identity)
     return config_path
+
+
+def _reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("operator registration contains duplicate JSON keys")
+        result[key] = value
+    return result
+
+
+def _config_identity(path: Path, *, allow_missing: bool = False):
+    path = Path(path).expanduser()
+    parent = path.parent
+    parent_stat = os.stat(parent, follow_symlinks=False)
+    if not stat.S_ISDIR(parent_stat.st_mode):
+        raise ValueError("operator config parent is not a directory")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        if allow_missing:
+            return None
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise ValueError("operator config must be an owner-only regular file")
+        return {"dev": st.st_dev, "ino": st.st_ino, "uid": st.st_uid, "mode": stat.S_IMODE(st.st_mode), "path": str(path.resolve(strict=True))}
+    finally:
+        os.close(fd)
+
+
+def _locked_config(path: Path, *, write: bool):
+    class Lock:
+        def __enter__(self):
+            self.path = Path(path).expanduser()
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.lock_fd = os.open(str(self.path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
+            self.identity = _config_identity(self.path, allow_missing=write)
+            if self.identity is None:
+                self.fd = -1
+            else:
+                self.fd = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            return self.fd, self.identity
+        def __exit__(self, typ, value, tb):
+            if getattr(self, "fd", -1) != -1: os.close(self.fd)
+            fcntl.flock(self.lock_fd, fcntl.LOCK_UN); os.close(self.lock_fd)
+    return Lock()
+
+
+def _read_verified_fd(fd, identity):
+    if fd < 0 or identity is None:
+        raise FileNotFoundError
+    before = os.fstat(fd)
+    if (before.st_dev, before.st_ino, before.st_uid, stat.S_IMODE(before.st_mode)) != (identity["dev"], identity["ino"], identity["uid"], identity["mode"]):
+        raise ValueError("operator config identity drifted")
+    os.lseek(fd, 0, os.SEEK_SET)
+    data = b""
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk: break
+        data += chunk
+    after = os.fstat(fd)
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        raise ValueError("operator config changed while reading")
+    return data
+
+
+def _atomic_config_replace(path: Path, data: bytes, identity) -> None:
+    if identity is not None and _config_identity(path) != identity:
+        raise ValueError("operator config identity drifted before write")
+    mode = 0o600 if identity is None else identity["mode"]
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=str(path.parent))
+    try:
+        os.fchmod(fd, mode); os.write(fd, data); os.fsync(fd); os.close(fd); fd = -1
+        os.replace(temp_name, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try: os.fsync(directory)
+        finally: os.close(directory)
+    finally:
+        if fd != -1: os.close(fd)
+        try: os.unlink(temp_name)
+        except FileNotFoundError: pass
 
 
 def enroll_operator_signer(*args, **kwargs):

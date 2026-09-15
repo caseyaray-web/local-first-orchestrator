@@ -352,6 +352,7 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         native_dependency_release_repository=str(registered.canonical_repository),
         native_dependency_release_signer_public_key=registered.signer_public_key_bytes if registered.operator_signing_public_key else None,
         native_dependency_release_signer_fingerprint=registered.operator_signing_key_fingerprint,
+        native_dependency_release_signer_config_path=registered.config_path,
         implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(
             ticket_id, repository=registered.canonical_repository
         ),
@@ -560,6 +561,15 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     enroll_signer.add_argument("--public-key", required=True, help="base64 raw Ed25519 public key; private keys are never read")
     enroll_signer.add_argument("--fingerprint", required=True, help="lowercase SHA-256 public-key fingerprint")
     enroll_signer.add_argument("--ticket-id", action="append", dest="ticket_ids", required=True, help="explicit legacy ticket ID; repeatable")
+    enroll_signer.add_argument("--document-file", help="canonical document emitted by prepare-operator-signer-enrollment")
+    enroll_signer.add_argument("--signature-file", help="64-byte detached signature made by the new key")
+    prepare_signer=commands.add_parser("prepare-operator-signer-enrollment", help="read-only: emit canonical external signer enrollment document")
+    prepare_signer.add_argument("--operator-id", required=True)
+    prepare_signer.add_argument("--reason", required=True)
+    prepare_signer.add_argument("--public-key", required=True)
+    prepare_signer.add_argument("--fingerprint", required=True)
+    prepare_signer.add_argument("--ticket-id", action="append", dest="ticket_ids", required=True)
+    prepare_signer.add_argument("--output-file")
     prepare_native=commands.add_parser("prepare-native-release-revalidation", help="read-only: emit canonical approval document; never signs or mutates")
     prepare_native.add_argument("--task-id", required=True)
     prepare_native.add_argument("--operator-id", required=True)
@@ -839,8 +849,20 @@ def run_command(args: argparse.Namespace) -> int:
             if config_path is None:
                 from .operator_config import default_config_path
                 config_path = default_config_path()
-            result = enroll_operator_signer(ledger, config_path=config_path, operator_id=args.operator_id, reason=args.reason, ticket_ids=tuple(args.ticket_ids), public_key_b64=args.public_key, fingerprint=args.fingerprint)
+            if not args.document_file or not args.signature_file:
+                raise ValueError("enroll-operator-signer requires --document-file and --signature-file")
+            result = enroll_operator_signer(ledger, config_path=config_path, document=Path(args.document_file).read_bytes(), detached_signature=Path(args.signature_file).read_bytes(), public_key_b64=args.public_key, fingerprint=args.fingerprint)
             print(json.dumps(result, sort_keys=True))
+        elif args.command=="prepare-operator-signer-enrollment":
+            if args.ad_hoc_runtime: raise ValueError("signer enrollment preparation requires registered operator configuration")
+            from .signer_enrollment import prepare_operator_signer_enrollment
+            config_path = Path(args.operator_config_path) if args.operator_config_path else __import__("local_first_orchestrator.operator_config", fromlist=["default_config_path"]).default_config_path()
+            prepared = prepare_operator_signer_enrollment(ledger, config_path=config_path, operator_id=args.operator_id, reason=args.reason, ticket_ids=tuple(args.ticket_ids), public_key_b64=args.public_key, fingerprint=args.fingerprint)
+            if args.output_file:
+                Path(args.output_file).write_bytes(prepared["document_bytes"])
+                print(json.dumps({"document_hash": prepared["document_hash"], "output_file": args.output_file}, sort_keys=True))
+            else:
+                sys.stdout.buffer.write(prepared["document_bytes"])
         elif args.command=="prepare-native-release-revalidation":
             if args.ad_hoc_runtime: raise ValueError("native release preparation requires registered operator runtime")
             if not args.hermes_executable or not args.board: raise ValueError("native release preparation requires --hermes-executable and --board")

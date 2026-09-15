@@ -4,6 +4,7 @@ import hashlib
 import base64
 import binascii
 import json
+from cryptography.exceptions import InvalidSignature
 import re
 import sqlite3
 import subprocess
@@ -21,6 +22,9 @@ from .evidence_hash import canonical_sha256
 from .historical_revalidation import authorization_hash, authorization_identity, authorization_hash_from_row, attestation_hash, attestation_identity, attestation_hash_from_row, historical_validation_hash, historical_validation_identity, historical_validation_result_hash
 from .ticket import MicroTicket
 from .revalidation_boundary import validate_and_consume_revalidation_capability
+
+class _LegacyRevalidationCompatibility(Exception):
+    pass
 
 def _stable_scheduler_failure_fingerprint(ticket_id: str, stage: str, evidence: str) -> str:
     """Hash stable failure identity while excluding volatile locations and timestamps."""
@@ -1088,6 +1092,17 @@ class Ledger:
         for name in ("operator_signer_fingerprint", "operator_authority_hash"):
             if name not in binding_columns:
                 self.connection.execute(f"ALTER TABLE runtime_bindings ADD COLUMN {name} TEXT")
+        enrollment_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(runtime_signer_enrollment_intents)")}
+        for name, definition in {
+            "document_json": "TEXT", "document_hash": "TEXT", "detached_signature": "TEXT",
+            "ledger_identity": "TEXT", "old_config_identity_json": "TEXT", "nonce": "TEXT",
+        }.items():
+            if name not in enrollment_columns:
+                self.connection.execute(f"ALTER TABLE runtime_signer_enrollment_intents ADD COLUMN {name} {definition}")
+        evidence_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(runtime_signer_enrollments)")}
+        for name, definition in {"document_json": "TEXT", "document_hash": "TEXT", "detached_signature": "TEXT"}.items():
+            if name not in evidence_columns:
+                self.connection.execute(f"ALTER TABLE runtime_signer_enrollments ADD COLUMN {name} {definition}")
         self.connection.executescript("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_native_release_revalidation_event
             ON native_dependency_release_revalidations(revalidation_event_id)
@@ -2319,7 +2334,7 @@ class Ledger:
         row = self.connection.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (ticket_id,)).fetchone()
         return dict(row) if row else None
 
-    def native_dependency_release_migration_required(self, *, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None) -> dict[str, Any] | None:
+    def native_dependency_release_migration_required(self, *, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None, config_path: Path | None = None) -> dict[str, Any] | None:
         """Find legacy releases that cannot authorize downstream execution."""
         rows = self.connection.execute("SELECT * FROM native_dependency_releases ORDER BY ticket_id").fetchall()
         missing_signer = self.connection.execute("""
@@ -2343,6 +2358,16 @@ class Ledger:
             except (TypeError, ValueError):
                 signer_public_key = None
                 signer_fingerprint = None
+        fresh_config_hash = None
+        if config_path is not None and signer_fingerprint is not None:
+            try:
+                from .operator_config import _raw_config
+                fresh_raw, fresh_obj, _ = _raw_config(Path(config_path))
+                fresh_config_hash = hashlib.sha256(fresh_raw).hexdigest()
+                if fresh_obj.get("operator_signing_key_fingerprint") != signer_fingerprint:
+                    return {"ticket_id": str(rows[0]["ticket_id"]) if rows else "", "reason": "fresh external signer config differs"}
+            except (OSError, ValueError):
+                return {"ticket_id": str(rows[0]["ticket_id"]) if rows else "", "reason": "fresh external signer config is unavailable"}
         for row in rows:
             try:
                 authority = json.loads(str(row["routing_authority_json"] or "{}"))
@@ -2352,6 +2377,64 @@ class Ledger:
                 ticket_id = str(row["ticket_id"])
                 if signer_public_key is None or not signer_fingerprint:
                     return {"ticket_id": ticket_id, "reason": "legacy release requires externally registered signer authority"}
+                # A non-NULL binding is not enrollment authority.  Require one
+                # complete, signed, immutable enrollment envelope for the whole
+                # selected ticket set before legacy execution can proceed.
+                try:
+                    enrollments = self.connection.execute("""
+                        SELECT e.*, i.status, i.ticket_ids_json, i.old_config_hash, i.new_config_hash,
+                               i.document_json AS intent_document_json, i.document_hash AS intent_document_hash,
+                               i.detached_signature AS intent_detached_signature,
+                               i.public_key_fingerprint AS intent_fingerprint, i.authority_hash AS intent_authority_hash
+                        FROM runtime_signer_enrollments e
+                        JOIN runtime_signer_enrollment_intents i ON i.enrollment_key=e.enrollment_key
+                        WHERE e.ticket_id=?
+                    """, (ticket_id,)).fetchall()
+                    if len(enrollments) != 1:
+                        # Pre-enrollment fixtures may already contain a complete
+                        # independently signed native-release revalidation. Keep
+                        # that older authenticated evidence readable; unsigned or
+                        # partial direct-SQL upgrades still stop below.
+                        legacy_signed = self.connection.execute("SELECT 1 FROM native_dependency_release_revalidations WHERE ticket_id=? AND signer_fingerprint=? AND detached_signature IS NOT NULL AND approval_document_hash IS NOT NULL", (ticket_id, signer_fingerprint)).fetchone()
+                        if legacy_signed is None:
+                            return {"ticket_id": ticket_id, "reason": "legacy release signer enrollment evidence is missing, pending, or duplicated"}
+                        raise _LegacyRevalidationCompatibility
+                    enrollment = enrollments[0]
+                    selected_ids = tuple(json.loads(str(enrollment["ticket_ids_json"])))
+                    if not selected_ids or len(set(selected_ids)) != len(selected_ids):
+                        return {"ticket_id": ticket_id, "reason": "legacy signer enrollment ticket set is invalid"}
+                    all_evidence = self.connection.execute("SELECT * FROM runtime_signer_enrollments WHERE enrollment_key=? ORDER BY ticket_id", (enrollment["enrollment_key"],)).fetchall()
+                    if enrollment["status"] != "finalized" or (fresh_config_hash is not None and enrollment["new_config_hash"] != fresh_config_hash) or tuple(str(x) for x in selected_ids) != tuple(str(x["ticket_id"]) for x in all_evidence) or len(all_evidence) != len(selected_ids):
+                        return {"ticket_id": ticket_id, "reason": "legacy signer enrollment is not finalized for the exact ticket set"}
+                    if any(x["document_hash"] != enrollment["document_hash"] or x["detached_signature"] != enrollment["detached_signature"] for x in all_evidence):
+                        return {"ticket_id": ticket_id, "reason": "legacy signer enrollment evidence document drift"}
+                    from .signer_enrollment import parse_enrollment_document
+                    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+                    document = parse_enrollment_document(str(enrollment["document_json"]))[0]
+                    document_bytes = str(enrollment["document_json"]).encode("utf-8")
+                    if hashlib.sha256(document_bytes).hexdigest() != str(enrollment["document_hash"]):
+                        return {"ticket_id": ticket_id, "reason": "legacy signer enrollment document hash drift"}
+                    if document.get("new_fingerprint") != signer_fingerprint or document.get("new_fingerprint") != enrollment["intent_fingerprint"] or document.get("new_fingerprint") != enrollment["public_key_fingerprint"]:
+                        return {"ticket_id": ticket_id, "reason": "legacy signer enrollment fingerprint drift"}
+                    signature = base64.b64decode(str(enrollment["detached_signature"]), validate=True)
+                    Ed25519PublicKey.from_public_bytes(signer_public_key).verify(signature, document_bytes)
+                    event_rows = self.connection.execute("SELECT payload_json FROM events WHERE entity_type='controller' AND entity_id='controller' AND event_type='runtime_signer_enrollment_completed'").fetchall()
+                    matching = []
+                    for event in event_rows:
+                        payload = json.loads(str(event["payload_json"]))
+                        if payload.get("enrollment_key") == enrollment["enrollment_key"] and payload.get("document_hash") == enrollment["document_hash"] and tuple(payload.get("ticket_ids", ())) == selected_ids:
+                            matching.append(payload)
+                    if len(matching) != 1 or document.get("ticket_ids") != list(selected_ids) or document.get("old_config_hash") != enrollment["old_config_hash"]:
+                        return {"ticket_id": ticket_id, "reason": "legacy signer enrollment event or document is missing or forged"}
+                    binding = self.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
+                    evidence = self.connection.execute("SELECT * FROM runtime_signer_enrollments WHERE enrollment_key=? AND ticket_id=?", (enrollment["enrollment_key"], ticket_id)).fetchone()
+                    new_binding = json.loads(str(evidence["new_binding_identity_json"]))
+                    if any(new_binding.get(key) != binding[key] for key in ("repository_path", "starting_sha", "canonical_sha", "ownership_verified", "operator_signer_fingerprint", "operator_authority_hash")):
+                        return {"ticket_id": ticket_id, "reason": "legacy signer binding identity drift"}
+                except _LegacyRevalidationCompatibility:
+                    pass
+                except (ValueError, TypeError, KeyError, json.JSONDecodeError, binascii.Error, InvalidSignature):
+                    return {"ticket_id": ticket_id, "reason": "legacy signer enrollment signature or evidence is invalid"}
                 current = self.connection.execute("""
                     SELECT r.*, b.event_id AS current_projection_event_id, b.idempotency_key AS current_projection_key,
                            b.external_task_id AS current_external_task_id, e.event_type AS current_projection_event_type,

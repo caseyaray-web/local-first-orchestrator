@@ -221,7 +221,7 @@ class ProcessNextPreview:
     reconciliation_action: str | None = None
 
 
-def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None, board: Any | None = None) -> ProcessNextPreview:
+def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None, signer_config_path: Path | None = None, board: Any | None = None) -> ProcessNextPreview:
     """Read the next eligible control stage without claiming or mutating it."""
     now = Ledger._now() if now is None else now
     paused = ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
@@ -239,7 +239,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
             claim_id=reconciliation.claim_id,
             reconciliation_action=reconciliation.action.value,
         )
-    migration = ledger.native_dependency_release_migration_required(signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint) if hasattr(ledger, "native_dependency_release_migration_required") else None
+    migration = ledger.native_dependency_release_migration_required(signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint, config_path=signer_config_path) if hasattr(ledger, "native_dependency_release_migration_required") else None
     if migration is not None:
         return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(migration["ticket_id"]), reconciliation_action=ReconciliationAction.STOP.value)
     legacy = ledger.connection.execute("SELECT ticket_id,external_task_id,snapshot_hash FROM native_dependency_release_revalidations r JOIN native_dependency_releases l USING(ticket_id) WHERE json_extract(l.routing_authority_json,'$.profile') IS NULL").fetchall()
@@ -710,7 +710,7 @@ def preview_database(database: Path, *, now: int | None = None, operator_config:
                 signer_fingerprint = operator_config.operator_signing_key_fingerprint
             except (TypeError, ValueError):
                 signer_public_key = signer_fingerprint = None
-        return preview_next(readonly_ledger, now=now, signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint, board=board)
+        return preview_next(readonly_ledger, now=now, signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint, signer_config_path=getattr(operator_config, "config_path", None), board=board)
     except sqlite3.DatabaseError:
         return ProcessNextPreview(next_stage="no_work")
     finally:
@@ -736,6 +736,7 @@ class ProcessNextScheduler:
         native_dependency_release_repository: str | None = None,
         native_dependency_release_signer_public_key: bytes | None = None,
         native_dependency_release_signer_fingerprint: str | None = None,
+        native_dependency_release_signer_config_path: Path | None = None,
         implementation_runner: Callable[[str], dict[str, Any]] | None = None,
         validation_runner: Callable[[str], dict[str, Any]] | None = None,
         review_runner: Callable[[str], dict[str, Any]] | None = None,
@@ -770,6 +771,7 @@ class ProcessNextScheduler:
         self.native_dependency_release_repository = native_dependency_release_repository
         self.native_dependency_release_signer_public_key = native_dependency_release_signer_public_key
         self.native_dependency_release_signer_fingerprint = native_dependency_release_signer_fingerprint
+        self.native_dependency_release_signer_config_path = native_dependency_release_signer_config_path
         self.implementation_runner = implementation_runner
         self.validation_runner = validation_runner
         self.review_runner = review_runner
@@ -832,10 +834,10 @@ class ProcessNextScheduler:
                 if run.status not in {"blocked", "spawn_failed"}:
                     raise RuntimeError("native_dependency_release_reconciliation_required: current external run is ambiguous")
 
-        trusted_preview = preview_next(self.ledger, now=now, signer_public_key=self.native_dependency_release_signer_public_key, signer_fingerprint=self.native_dependency_release_signer_fingerprint, board=self.board)
+        trusted_preview = preview_next(self.ledger, now=now, signer_public_key=self.native_dependency_release_signer_public_key, signer_fingerprint=self.native_dependency_release_signer_fingerprint, signer_config_path=self.native_dependency_release_signer_config_path, board=self.board)
         if trusted_preview.next_stage == "reconciliation_required":
             raise RuntimeError("native_dependency_release_reconciliation_required: trusted current board proof unavailable")
-        migration = self.ledger.native_dependency_release_migration_required(signer_public_key=self.native_dependency_release_signer_public_key, signer_fingerprint=self.native_dependency_release_signer_fingerprint)
+        migration = self.ledger.native_dependency_release_migration_required(signer_public_key=self.native_dependency_release_signer_public_key, signer_fingerprint=self.native_dependency_release_signer_fingerprint, config_path=self.native_dependency_release_signer_config_path)
         if migration is not None:
             raise RuntimeError(
                 "native_dependency_release_reconciliation_required: legacy release routing authority requires paused operator revalidation"
