@@ -32,6 +32,7 @@ from .triage import LocalTriagePlanner, TriageCoordinator, TriageError, normaliz
 from .usage_governor import PaidPurpose
 from .validation import DeterministicValidator
 from .native_release_approval import APPROVAL_DOMAIN, APPROVAL_VERSION, canonical_approval_bytes, parse_approval_document, verify_detached_signature, fingerprint_public_key
+from .native_workspace import canonical_native_workspace_path, require_native_path_identity, validate_native_workspace_path
 
 
 @dataclass(frozen=True)
@@ -185,34 +186,49 @@ class LocalFirstController:
             raise RuntimeError("native release revalidation snapshot drift")
         if snapshot.task.assignee != implementation_profile or snapshot.task.workspace_kind != "worktree":
             raise RuntimeError("native release revalidation routing drift")
-        if expected_path is None or not expected_path.is_dir():
+        if expected_path is None:
             raise RuntimeError("native release revalidation worktree drift")
+        _, workspace_identity = validate_native_workspace_path(
+            snapshot.task.workspace_path or "", repository=repository, external_task_id=external_task_id,
+        )
+        assert workspace_identity is not None
         try:
-            expected_path.relative_to((repository / ".worktrees").resolve())
-        except ValueError as exc:
-            raise RuntimeError("native release revalidation worktree drift") from exc
+            repository_stat = repository.stat()
+        except OSError as exc:
+            raise RuntimeError("native release revalidation repository identity unavailable") from exc
+        repository_identity = (repository_stat.st_dev, repository_stat.st_ino)
+
+        def assert_stable() -> None:
+            require_native_path_identity(expected_path, workspace_identity)
+            try:
+                current = repository.stat()
+            except OSError as exc:
+                raise RuntimeError("native release revalidation repository identity changed") from exc
+            if (current.st_dev, current.st_ino) != repository_identity:
+                raise RuntimeError("native release revalidation repository identity changed")
+
+        def git(*args: str) -> str:
+            assert_stable()
+            try:
+                result = subprocess.run(("git", *args), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15)
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RuntimeError("native release revalidation worktree verification failed") from exc
+            assert_stable()
+            return result.stdout.strip()
+
+        top = git("rev-parse", "--show-toplevel")
+        head = git("rev-parse", "HEAD")
+        branch = git("branch", "--show-current")
         try:
-            git = lambda *args: subprocess.run(("git", *args), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
-            top = git("rev-parse", "--show-toplevel")
-            head = git("rev-parse", "HEAD")
-            branch = git("branch", "--show-current")
             common_dir = Path(git("rev-parse", "--git-common-dir"))
-            if not common_dir.is_absolute():
-                common_dir = (expected_path / common_dir).resolve()
-            else:
-                common_dir = common_dir.resolve()
+            common_dir = (expected_path / common_dir).resolve(strict=True) if not common_dir.is_absolute() else common_dir.resolve(strict=True)
             git_dir = Path(git("rev-parse", "--git-dir"))
-            if not git_dir.is_absolute():
-                git_dir = (expected_path / git_dir).resolve()
-            else:
-                git_dir = git_dir.resolve()
+            git_dir = (expected_path / git_dir).resolve(strict=True) if not git_dir.is_absolute() else git_dir.resolve(strict=True)
             commondir_file = Path(git("rev-parse", "--git-path", "commondir"))
-            if not commondir_file.is_absolute():
-                commondir_file = (expected_path / commondir_file).resolve()
-            else:
-                commondir_file = commondir_file.resolve()
-        except (OSError, subprocess.SubprocessError) as exc:
+            commondir_file = (expected_path / commondir_file).resolve(strict=True) if not commondir_file.is_absolute() else commondir_file.resolve(strict=True)
+        except OSError as exc:
             raise RuntimeError("native release revalidation worktree verification failed") from exc
+        assert_stable()
         canonical_git = (repository / ".git").resolve()
         if (top != str(expected_path) or head != expected_base or branch != (snapshot.branch_name or "")
                 or common_dir != canonical_git or not commondir_file.is_file()
@@ -319,7 +335,27 @@ class LocalFirstController:
         snapshot = _trusted_board_capability.snapshot
         repository = self.config.repository.resolve(strict=True)
         expected_base = str(self.ledger.runtime_binding(ticket_id)["starting_sha"])
-        expected_path = Path(str(snapshot.task.workspace_path)).expanduser().resolve() if snapshot.task.workspace_path else None
+        expected_path = canonical_native_workspace_path(repository, external_task_id)
+        _, workspace_identity = validate_native_workspace_path(
+            snapshot.task.workspace_path or "", repository=repository, external_task_id=external_task_id,
+        )
+        assert workspace_identity is not None
+        try:
+            repository_stat = repository.stat()
+        except OSError as exc:
+            raise RuntimeError("native release revalidation repository identity unavailable") from exc
+        repository_identity = (repository_stat.st_dev, repository_stat.st_ino)
+
+        def assert_stable() -> None:
+            require_native_path_identity(expected_path, workspace_identity)
+            try:
+                current = repository.stat()
+            except OSError as exc:
+                raise RuntimeError("native release revalidation repository identity changed") from exc
+            if (current.st_dev, current.st_ino) != repository_identity:
+                raise RuntimeError("native release revalidation repository identity changed")
+
+        assert_stable()
         branch, initial_snapshot_hash = self._validate_native_release_snapshot(snapshot, external_task_id=external_task_id, implementation_profile=implementation_profile, repository=repository, expected_base=expected_base, expected_path=expected_path)
         release = self.ledger.native_dependency_release(ticket_id)
         graph = self.ledger.native_dependency_graph(ticket_id)
@@ -514,7 +550,12 @@ class LocalFirstController:
             raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: external identity drift")
         adapter = GitWorktreeAdapter(repository, worktree_root)
         base_sha = adapter.resolve_execution_base(ticket.get("tranche_id") or None, str(binding["starting_sha"]))
-        target = (repository / ".worktrees" / external_task_id).resolve(strict=False)
+        target, _ = validate_native_workspace_path(
+            canonical_native_workspace_path(repository, external_task_id),
+            repository=repository,
+            external_task_id=external_task_id,
+            require_existing=False,
+        )
         branch = f"wt/{external_task_id}"
 
         def git(*args: str, cwd: Path = repository, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -534,6 +575,7 @@ class LocalFirstController:
             status = git("status", "--porcelain=v1", cwd=target).stdout.strip()
             if target_root != target or target_common != repo_common or head != base_sha or actual_branch != branch or status:
                 raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: existing worktree drift")
+            validate_native_workspace_path(target, repository=repository, external_task_id=external_task_id)
             return {"workspace_path": str(target), "branch_name": branch, "base_sha": base_sha}
 
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -544,6 +586,7 @@ class LocalFirstController:
             git("worktree", "add", "-q", str(target), branch)
         else:
             git("worktree", "add", "-q", "-b", branch, str(target), base_sha)
+        validate_native_workspace_path(target, repository=repository, external_task_id=external_task_id)
         return {"workspace_path": str(target), "branch_name": branch, "base_sha": base_sha}
 
     def dry_run(self, task_id: str) -> dict[str, object]:

@@ -17,6 +17,7 @@ from .state_projection import StateProjectionWorker
 from .states import CanonicalState
 from .runtime_metrics import RuntimeMetricsStore
 from .evidence_hash import canonical_sha256
+from .native_workspace import validate_native_workspace_path
 
 
 SCHEDULER_STAGE_ORDER: tuple[str, ...] = (
@@ -824,8 +825,18 @@ class ProcessNextScheduler:
                 raise RuntimeError("native_dependency_release_reconciliation_required: current external snapshot drift")
             if snapshot.task.status not in {"scheduled", "blocked"} or any(value is not None for value in (snapshot.session_id, snapshot.started_at, snapshot.completed_at)):
                 raise RuntimeError("native_dependency_release_reconciliation_required: current external task is unsafe")
-            if snapshot.task.assignee != str(row["implementation_profile"]) or snapshot.task.workspace_kind != "worktree" or str(Path(str(snapshot.task.workspace_path)).expanduser().resolve()) != str(row["canonical_worktree_path"]):
+            if snapshot.task.assignee != str(row["implementation_profile"]) or snapshot.task.workspace_kind != "worktree":
                 raise RuntimeError("native_dependency_release_reconciliation_required: current external routing drift")
+            try:
+                workspace, _ = validate_native_workspace_path(
+                    snapshot.task.workspace_path or "",
+                    repository=Path(str(self.native_dependency_release_repository)),
+                    external_task_id=str(row["external_task_id"]),
+                )
+                if str(workspace) != str(row["canonical_worktree_path"]):
+                    raise RuntimeError("native dependency release canonical workspace drift")
+            except (RuntimeError, ValueError) as exc:
+                raise RuntimeError("native_dependency_release_reconciliation_required: current external routing drift") from exc
             if (snapshot.branch_name or "") != str(row["branch"]) or (snapshot.base_sha or snapshot.task.base_sha) != str(row["base_sha"]) or (snapshot.repository_identity or snapshot.task.repository_identity) != str(row["repository_identity"]):
                 raise RuntimeError("native_dependency_release_reconciliation_required: current external authority drift")
             forbidden = {"running", "completed", "success", "successful"}

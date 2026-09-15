@@ -15,7 +15,8 @@ class RoutingAuthorityBoundaryTests(unittest.TestCase):
     def test_final_unblock_read_rejects_routing_drift(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
-            workspace = root / ".worktrees" / "prepared"
+            workspace = root / ".worktrees" / "child"
+            workspace.mkdir(parents=True)
             first = {"id": "child", "status": "blocked", "body": HANDOFF_MARKER, "assignee": "impl", "workspace_kind": "worktree", "workspace_path": str(workspace)}
             changed = {**first, "assignee": "changed"}
             shown = [first, changed]

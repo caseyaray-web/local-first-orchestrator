@@ -56,6 +56,7 @@ class ExternalExecutionSnapshot:
 
 
 from .revalidation_boundary import create_revalidation_capability, revoke_revalidation_capability
+from .native_workspace import validate_native_workspace_path, canonical_native_workspace_path
 
 
 class HermesBoardAdapter:
@@ -327,17 +328,15 @@ class HermesBoardAdapter:
         """Verify the externally resolved handoff against operator-owned authority."""
         if self.implementation_profile is None or self.canonical_repository is None:
             raise RuntimeError("native release authority is not configured")
-        expected = str(Path(expected_workspace_path).expanduser().resolve())
-        actual = None if task.workspace_path is None else str(Path(task.workspace_path).expanduser().resolve())
-        expected_root = (self.canonical_repository / ".worktrees").resolve()
-        try:
-            Path(expected).relative_to(expected_root)
-        except ValueError as exc:
-            raise RuntimeError("native release authority mismatch") from exc
-        if task.assignee != self.implementation_profile or task.workspace_kind != "worktree" or actual != expected:
+        expected = canonical_native_workspace_path(self.canonical_repository, task.id)
+        if expected_workspace_path != str(expected):
             raise RuntimeError("native release authority mismatch")
-        assert actual is not None
-        return {"profile": self.implementation_profile, "workspace_kind": "worktree", "workspace_path": actual}
+        validate_native_workspace_path(
+            task.workspace_path or "", repository=self.canonical_repository, external_task_id=task.id,
+        )
+        if task.assignee != self.implementation_profile or task.workspace_kind != "worktree":
+            raise RuntimeError("native release authority mismatch")
+        return {"profile": self.implementation_profile, "workspace_kind": "worktree", "workspace_path": str(expected)}
 
     def link_dependency(self, parent_task_id: str, child_task_id: str) -> None:
         if not self.allow_writes:

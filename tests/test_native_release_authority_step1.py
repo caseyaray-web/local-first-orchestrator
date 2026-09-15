@@ -67,14 +67,18 @@ class NativeReleaseAuthorityStep1Tests(unittest.TestCase):
                 adapter.verify_native_release_task(task, expected_workspace_path=expected["workspace_path"])
 
     def test_release_authority_accepts_exact_prepared_worktree(self):
-        adapter = HermesBoardAdapter(
-            executable="/bin/true", board="isolated", implementation_profile="worker-code-local",
-            canonical_repository=Path("/repo"),
-        )
-        task = ExternalTicket("T-1", "title", "", "blocked", "/repo/.worktrees/T-1", assignee="worker-code-local", workspace_kind="worktree")
-        self.assertEqual(adapter.verify_native_release_task(task, expected_workspace_path="/repo/.worktrees/T-1"), {
-            "profile": "worker-code-local", "workspace_kind": "worktree", "workspace_path": "/repo/.worktrees/T-1",
-        })
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / ".worktrees" / "T-1"
+            workspace.mkdir(parents=True)
+            adapter = HermesBoardAdapter(
+                executable="/bin/true", board="isolated", implementation_profile="worker-code-local",
+                canonical_repository=root,
+            )
+            task = ExternalTicket("T-1", "title", "", "blocked", str(workspace), assignee="worker-code-local", workspace_kind="worktree")
+            self.assertEqual(adapter.verify_native_release_task(task, expected_workspace_path=str(workspace)), {
+                "profile": "worker-code-local", "workspace_kind": "worktree", "workspace_path": str(workspace),
+            })
 
     def test_expired_claim_rejects_operator_route_drift(self):
         with TemporaryDirectory() as tmp:

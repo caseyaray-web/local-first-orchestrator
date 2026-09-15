@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -17,7 +19,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from hermes_cli.sqlite_util import open_db
 
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
-from local_first_orchestrator.hermes_board import HermesBoardAdapter, ExternalExecutionSnapshot
+import local_first_orchestrator.controller as controller_module
+from local_first_orchestrator.hermes_board import HermesBoardAdapter, ExternalExecutionSnapshot, ExternalTicket
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.states import CanonicalState
 from local_first_orchestrator.native_release_approval import (
@@ -176,6 +179,80 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         with self._open_board() as connection:
             connection.execute("INSERT INTO task_runs(task_id,profile,step_key,status,claim_lock,claim_expires,worker_pid,max_runtime_seconds,last_heartbeat_at,started_at,ended_at,outcome,summary,metadata,error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (self.external_id, profile, None, status, None, None, worker_pid, None, None, started_at, ended_at, outcome, summary, None if metadata is None else json.dumps(metadata, separators=(",", ":")), None))
             connection.commit()
+
+    def _direct_native_adapter(self) -> HermesBoardAdapter:
+        return HermesBoardAdapter(
+            board=self.board_name,
+            executable=sys.executable,
+            board_db_path=self.board_db,
+            canonical_repository=self.repo,
+            implementation_profile="impl",
+        )
+
+    def _direct_task(self, workspace_path: str) -> ExternalTicket:
+        return ExternalTicket(
+            self.external_id, "TK-1", "legacy native release", "blocked", workspace_path,
+            assignee="impl", workspace_kind="worktree",
+        )
+
+    def test_direct_verifier_rejects_symlink_alias_without_resolving_it(self) -> None:
+        alias = self.repo / ".worktrees" / "alias"
+        alias.symlink_to(self.worktree, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "authority mismatch"):
+            self._direct_native_adapter().verify_native_release_task(
+                self._direct_task(str(alias)), expected_workspace_path=str(self.worktree)
+            )
+
+    def test_direct_verifier_rejects_nested_symlink_component(self) -> None:
+        original = self.repo / ".worktrees"
+        real_root = self.repo / ".worktrees-real"
+        original.rename(real_root)
+        original.symlink_to(real_root, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "authority mismatch"):
+            self._direct_native_adapter().verify_native_release_task(
+                self._direct_task(str(self.worktree)), expected_workspace_path=str(self.worktree)
+            )
+
+    def test_direct_verifier_rejects_lexical_aliases(self) -> None:
+        adapter = self._direct_native_adapter()
+        spellings = (
+            str(self.worktree) + "/.",
+            str(self.worktree) + "/",
+            str(self.worktree.parent / "x") + "/../" + self.worktree.name,
+            self.worktree.name,
+        )
+        for spelling in spellings:
+            with self.subTest(spelling=spelling), self.assertRaisesRegex(RuntimeError, "authority mismatch"):
+                adapter.verify_native_release_task(self._direct_task(spelling), expected_workspace_path=str(self.worktree))
+
+    def test_release_rejects_unrelated_repository_at_exact_expected_root(self) -> None:
+        subprocess.run(("git", "worktree", "remove", "--force", str(self.worktree)), cwd=self.repo, check=True)
+        self.worktree.mkdir(parents=True)
+        subprocess.run(("git", "init", "-q"), cwd=self.worktree, check=True)
+        (self.worktree / "UNRELATED").write_text("unrelated\n")
+        subprocess.run(("git", "add", "UNRELATED"), cwd=self.worktree, check=True)
+        subprocess.run(("git", "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "unrelated"), cwd=self.worktree, check=True)
+        with self.assertRaisesRegex(RuntimeError, "worktree verification failed|branch/base/repository drift"):
+            self.signed_revalidate(reason="unrelated-repository")
+
+    def test_release_stops_when_expected_target_is_swapped_during_git_validation(self) -> None:
+        original_run = controller_module.subprocess.run
+        swapped = False
+
+        def swapping_run(*args, **kwargs):
+            nonlocal swapped
+            result = original_run(*args, **kwargs)
+            cwd = kwargs.get("cwd")
+            if not swapped and cwd == self.worktree and args and args[0][0:2] == ("git", "rev-parse"):
+                swapped = True
+                shutil.rmtree(self.worktree)
+                self.worktree.mkdir()
+            return result
+
+        with patch.object(controller_module.subprocess, "run", side_effect=swapping_run):
+            with self.assertRaisesRegex(RuntimeError, "identity"):
+                self.signed_revalidate(reason="target-swap")
+        self.assertTrue(swapped)
 
     def test_test_database_is_owned_by_fixture_root_and_fixed_filename(self) -> None:
         self._assert_parent_identity_unchanged()
