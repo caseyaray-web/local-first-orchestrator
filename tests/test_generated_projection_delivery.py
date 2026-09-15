@@ -15,7 +15,8 @@ from local_first_orchestrator.generated_projection import (
     GeneratedProjectionDeliveryPolicy,
     GeneratedProjectionWorker,
 )
-from local_first_orchestrator.hermes_board import ExternalExecutionRun, ExternalExecutionSnapshot, ExternalTicket, HermesBoardAdapter
+from local_first_orchestrator.hermes_board import ExternalExecutionSnapshot, ExternalExecutionRun, ExternalTicket, HermesBoardAdapter
+from tests.hermes_board_fixture import raw_snapshot_from_typed
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.states import CanonicalState
 from tests.test_decomposition import Plans
@@ -525,6 +526,10 @@ class GeneratedProjectionDeliveryTests(unittest.TestCase):
                     task=ExternalTicket(external_task_id, ticket_id, "legacy", "done", None),
                     session_id="legacy-session", branch_name="legacy-branch",
                     started_at=10, completed_at=20, runs=(),
+                    raw_snapshot=raw_snapshot_from_typed(ExternalExecutionSnapshot(
+                        task=ExternalTicket(external_task_id, ticket_id, "legacy", "done", None),
+                        session_id="legacy-session", branch_name="legacy-branch", started_at=10, completed_at=20, runs=(),
+                    )),
                 )
 
         board = ReadOnlyExecutionBoard()
@@ -584,6 +589,11 @@ class GeneratedProjectionDeliveryTests(unittest.TestCase):
                     session_id="executed-session", branch_name="executed-branch",
                     started_at=None, completed_at=20,
                     runs=(ExternalExecutionRun(7, "completed", "completed", None, 20, "finished", None, None),),
+                    raw_snapshot=raw_snapshot_from_typed(ExternalExecutionSnapshot(
+                        task=ExternalTicket(external_task_id, ticket_id, "legacy", "blocked", None),
+                        session_id="executed-session", branch_name="executed-branch", started_at=None, completed_at=20,
+                        runs=(ExternalExecutionRun(7, "completed", "completed", None, 20, "finished", None, None),),
+                    )),
                 )
 
         root = Path(self.temp.name)
@@ -614,6 +624,12 @@ class GeneratedProjectionDeliveryTests(unittest.TestCase):
                         "Local First execution gate: authoritative dependencies/runtime authorization not satisfied",
                         None, None, None,
                     ),),
+                    raw_snapshot=raw_snapshot_from_typed(ExternalExecutionSnapshot(
+                        task=ExternalTicket(external_task_id, ticket_id, "legacy", "blocked", None),
+                        session_id=None, branch_name=None, started_at=None, completed_at=None,
+                        runs=(ExternalExecutionRun(7, "blocked", "blocked", 100, 100,
+                            "Local First execution gate: authoritative dependencies/runtime authorization not satisfied", None, None, None),),
+                    )),
                 )
 
         root = Path(self.temp.name)
@@ -636,6 +652,10 @@ class GeneratedProjectionDeliveryTests(unittest.TestCase):
                 return ExternalExecutionSnapshot(
                     task=ExternalTicket(external_task_id, ticket_id, "legacy", "blocked", None),
                     session_id=None, branch_name=None, started_at=None, completed_at=None, runs=(),
+                    raw_snapshot=raw_snapshot_from_typed(ExternalExecutionSnapshot(
+                        task=ExternalTicket(external_task_id, ticket_id, "legacy", "blocked", None),
+                        session_id=None, branch_name=None, started_at=None, completed_at=None, runs=(),
+                    )),
                 )
 
         root = Path(self.temp.name)

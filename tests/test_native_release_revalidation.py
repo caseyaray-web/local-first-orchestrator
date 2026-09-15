@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 import shutil
@@ -447,6 +448,11 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         revalidation = self.signed_revalidate(reason="activation-controller")
         marker = f"local-first-native-release-activation:{revalidation['revalidation_id']}:controller-request"
         ready = replace(scheduled, task=replace(scheduled.task, status="ready"), comments=({"author": "operator", "body": f"UNBLOCK: {marker}", "created_at": 20},), task_events=({"run_id": None, "kind": "unblocked", "payload": None, "created_at": 21},))
+        ready_raw = copy.deepcopy(scheduled.raw_snapshot)
+        ready_raw["task"]["status"] = "ready"
+        ready_raw["comments"].append({"author": "operator", "body": f"UNBLOCK: {marker}", "created_at": 20})
+        ready_raw["events"].append({"run_id": None, "kind": "unblocked", "payload": None, "created_at": 21})
+        ready = replace(ready, raw_snapshot=ready_raw)
         with patch.object(self.adapter, "execution_snapshot", side_effect=(scheduled, scheduled, ready, ready)), patch.object(self.adapter, "activate_native_release", return_value=ready) as mutate, patch.object(self.adapter, "activation_marker_present", return_value=True):
             prepared = self.controller.prepare_native_release_activation(self.ticket, revalidation_id=str(revalidation["revalidation_id"]), operator_id="operator", reason="activate-controller", request_key="controller-request")
             approval = parse_approval_document(prepared["canonical_document"])
@@ -473,6 +479,11 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         signature = self.signing_key.sign(canonical_activation_bytes(approval))
         marker = f"local-first-native-release-activation:{revalidation['revalidation_id']}:after-unblock-request"
         ready = replace(scheduled, task=replace(scheduled.task, status="ready"), comments=({"author": "operator", "body": f"UNBLOCK: {marker}", "created_at": 20},), task_events=({"run_id": None, "kind": "unblocked", "payload": None, "created_at": 21},))
+        ready_raw = copy.deepcopy(scheduled.raw_snapshot)
+        ready_raw["task"]["status"] = "ready"
+        ready_raw["comments"].append({"author": "operator", "body": f"UNBLOCK: {marker}", "created_at": 20})
+        ready_raw["events"].append({"run_id": None, "kind": "unblocked", "payload": None, "created_at": 21})
+        ready = replace(ready, raw_snapshot=ready_raw)
         with patch.object(self.adapter, "execution_snapshot", side_effect=(scheduled, ready)), patch.object(self.adapter, "activate_native_release", return_value=ready) as mutate, patch.object(self.adapter, "activation_marker_present", return_value=True):
             with self.assertRaisesRegex(RuntimeError, "CRASH_AFTER_UNBLOCK"):
                 self.controller.activate_native_release_revalidation(self.ticket, revalidation_id=str(revalidation["revalidation_id"]), operator_id="operator", reason="after-unblock-crash-activation", request_key="after-unblock-request", approval_document=approval, detached_signature=signature)

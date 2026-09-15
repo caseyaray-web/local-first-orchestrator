@@ -1,43 +1,16 @@
 import os
-import sqlite3
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.hermes_board import HermesBoardAdapter
-
-
-_SCHEMA = """
-CREATE TABLE tasks (
-    id TEXT PRIMARY KEY, title TEXT, body TEXT, assignee TEXT, status TEXT,
-    priority INTEGER, created_by TEXT, created_at INTEGER, started_at INTEGER,
-    completed_at INTEGER, workspace_kind TEXT, workspace_path TEXT,
-    claim_lock TEXT, claim_expires INTEGER, tenant TEXT, branch_name TEXT,
-    session_id TEXT, current_run_id INTEGER
-);
-CREATE TABLE task_links (parent_id TEXT NOT NULL, child_id TEXT NOT NULL,
-    PRIMARY KEY(parent_id, child_id));
-CREATE TABLE task_runs (
-    id INTEGER PRIMARY KEY, task_id TEXT, profile TEXT, status TEXT,
-    outcome TEXT, started_at INTEGER, ended_at INTEGER, summary TEXT,
-    worker_pid INTEGER, metadata TEXT
-);
-"""
+from tests.hermes_board_fixture import initialize_board
 
 
 class TerraRevalidationRegressionTests(unittest.TestCase):
     def _board(self, directory: Path, name: str = "board.db") -> Path:
         path = directory / name
-        connection = sqlite3.connect(path)
-        connection.executescript(_SCHEMA)
-        connection.execute(
-            "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("EXT-1", "title", "body", "impl", "blocked", 1, "test", 1,
-             None, None, "worktree", "/tmp/wt", None, None, None, "main", None, None),
-        )
-        connection.commit()
-        connection.close()
-        return path
+        return initialize_board(path, task_id="EXT-1")
 
     def _adapter(self, path: Path) -> HermesBoardAdapter:
         return HermesBoardAdapter(board="default", executable="/bin/true", board_db_path=path)
