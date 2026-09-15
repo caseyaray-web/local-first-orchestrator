@@ -54,26 +54,7 @@ class ExternalExecutionSnapshot:
     base_sha: str | None = None
 
 
-class _BoardRevalidationCapability:
-    """Adapter-owned proof that an IMMEDIATE transaction is still held."""
-
-    __slots__ = ("snapshot", "_adapter", "_connection", "_token", "_task_id", "_active")
-
-    def __init__(self, adapter: "HermesBoardAdapter", connection: sqlite3.Connection, task_id: str, snapshot: ExternalExecutionSnapshot, token: object) -> None:
-        self.snapshot, self._adapter, self._connection, self._token = snapshot, adapter, connection, token
-        self._task_id, self._active = task_id, True
-
-    def _verify_for_ledger(self, task_id: str, external_task_id: str) -> None:
-        if not self._active or self._token is not self._adapter._revalidation_token:
-            raise PermissionError("trusted board revalidation capability is inactive or unproven")
-        if external_task_id != self.snapshot.task.id:
-            raise PermissionError("trusted board revalidation capability identity mismatch")
-        current = self._adapter._snapshot_from_connection(self._connection, self._task_id)
-        if current != self.snapshot:
-            raise RuntimeError("native release revalidation board snapshot drift before ledger commit")
-
-    def close(self) -> None:
-        self._active = False
+from .revalidation_boundary import create_revalidation_capability, revoke_revalidation_capability
 
 
 class HermesBoardAdapter:
@@ -91,7 +72,6 @@ class HermesBoardAdapter:
         self.implementation_profile = implementation_profile
         self.canonical_repository = None if canonical_repository is None else Path(canonical_repository).expanduser().resolve()
         self.board_db_path = None if board_db_path is None else Path(board_db_path).expanduser().resolve()
-        self._revalidation_token: object | None = None
 
     def _resolved_board_db_path(self) -> Path:
         if self.board_db_path is not None:
@@ -141,17 +121,14 @@ class HermesBoardAdapter:
             connection = open_db(path, db_label=f"kanban:{self.board}", busy_timeout_ms=int(self.timeout_seconds * 1000), wal=False, check_same_thread=False)
         except Exception as exc:
             raise RuntimeError("trusted board revalidation cannot open the configured local SQLite board") from exc
-        token = object()
         try:
             connection.execute("BEGIN IMMEDIATE")
             snapshot = self._snapshot_from_connection(connection, task_id)
-            self._revalidation_token = token
-            capability = _BoardRevalidationCapability(self, connection, task_id, snapshot, token)
+            capability = create_revalidation_capability(self, connection, path, task_id, snapshot, self.board)
             try:
                 yield capability
             finally:
-                capability.close()
-                self._revalidation_token = None
+                revoke_revalidation_capability(capability)
             connection.execute("COMMIT")
         except Exception:
             try:

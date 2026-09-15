@@ -20,7 +20,7 @@ from .states import CanonicalState, validate_transition
 from .evidence_hash import canonical_sha256
 from .historical_revalidation import authorization_hash, authorization_identity, authorization_hash_from_row, attestation_hash, attestation_identity, attestation_hash_from_row, historical_validation_hash, historical_validation_identity, historical_validation_result_hash
 from .ticket import MicroTicket
-
+from .revalidation_boundary import validate_and_consume_revalidation_capability
 
 def _stable_scheduler_failure_fingerprint(ticket_id: str, stage: str, evidence: str) -> str:
     """Hash stable failure identity while excluding volatile locations and timestamps."""
@@ -2460,7 +2460,7 @@ class Ledger:
                                            _trusted_board_capability: Any | None = None) -> dict[str, Any]:
         if not all(isinstance(value, str) and value.strip() for value in (ticket_id, projection_key, external_task_id, implementation_profile, repository_identity, canonical_worktree_path, branch, base_sha, snapshot_hash, operator_id, reason)):
             raise ValueError("native release revalidation requires non-empty identity and reason")
-        if _trusted_board_capability is None or not hasattr(_trusted_board_capability, "_verify_for_ledger"):
+        if _trusted_board_capability is None:
             raise PermissionError("native release revalidation requires a trusted board transaction")
         from .native_release_approval import parse_approval_document, verify_detached_signature
         if not isinstance(approval_document_json, str) or not approval_document_json.strip() or not isinstance(approval_document_hash, str) or not approval_document_hash.strip() or not isinstance(detached_signature, bytes) or not isinstance(signer_fingerprint, str) or not signer_fingerprint.strip() or not isinstance(signer_public_key, bytes):
@@ -2507,7 +2507,10 @@ class Ledger:
                 raise ValueError("native release approval document is stale or copied")
             if conn.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND status='claimed' UNION SELECT 1 FROM tickets WHERE id=? AND lease_owner IS NOT NULL", (ticket_id, ticket_id)).fetchone() is not None:
                 raise ValueError("native release revalidation refuses active lease or claim")
-            _trusted_board_capability._verify_for_ledger(ticket_id, external_task_id)
+            validate_and_consume_revalidation_capability(
+                _trusted_board_capability, task_id=ticket_id, external_task_id=external_task_id,
+                expected_snapshot_hash=snapshot_hash,
+            )
             values = (implementation_profile, repository_identity, canonical_worktree_path, branch, base_sha, snapshot_hash, operator_id, reason)
             existing_ticket = conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE ticket_id=?", (ticket_id,)).fetchone()
             if existing_ticket is not None:

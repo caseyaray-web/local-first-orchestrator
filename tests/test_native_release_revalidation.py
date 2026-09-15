@@ -127,7 +127,34 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         self.ledger.close()
         self.temp.cleanup()
 
-    def test_direct_controller_omission_is_rejected_before_mutation(self) -> None:
+    def test_direct_ledger_fake_verify_method_cannot_authorize_stale_board(self) -> None:
+        prepared = self.controller.prepare_native_release_revalidation(self.ticket, operator_id="operator", reason="verify", implementation_profile="impl")
+        document = parse_approval_document(prepared["canonical_document"])
+        canonical = canonical_approval_bytes(document)
+        signature = self.signing_key.sign(canonical)
+        authority = document["authority"]
+        projection = authority["projection"]
+        class F:
+            def _verify_for_ledger(self, *_args: object, **_kwargs: object) -> None:
+                pass
+        with self.assertRaisesRegex(PermissionError, "exact trusted board capability"):
+            with self.adapter.revalidation(self.external_id) as capability:
+                capability._connection.execute("UPDATE tasks SET status='running' WHERE id=?", (self.external_id,))
+                self.ledger.record_native_release_revalidation(
+                    ticket_id=self.ticket, projection_event_id=int(projection["event_id"]),
+                    projection_key=str(projection["key"]), external_task_id=self.external_id,
+                    implementation_profile=str(authority["implementation_profile"]),
+                    repository_identity=str(authority["repository_identity"]),
+                    canonical_worktree_path=str(authority["canonical_worktree_path"]),
+                    branch=str(authority["branch"]), base_sha=str(authority["base_sha"]),
+                    snapshot_hash=str(authority["snapshot_hash"]), operator_id="operator", reason="verify",
+                    approval_document_json=canonical.decode(), approval_document_hash=hashlib.sha256(canonical).hexdigest(),
+                    detached_signature=signature, signer_fingerprint=self.signer_fingerprint,
+                    signer_public_key=self.signer_public_key, _trusted_board_capability=F(),
+                )
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM native_dependency_release_revalidations").fetchone()[0], 0)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM events WHERE event_type='native_dependency_release_revalidated'").fetchone()[0], 0)
+
         with self.assertRaisesRegex(RuntimeError, "trusted local SQLite board adapter"):
             LocalFirstController(self.ledger, object(), self.controller.config).revalidate_native_release(self.ticket, operator_id="operator", reason="verify", implementation_profile="impl")
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM native_dependency_release_revalidations").fetchone()[0], 0)
