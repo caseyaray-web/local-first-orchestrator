@@ -182,6 +182,34 @@ def _verify(document: dict[str, Any], signature: bytes | str, public_key_b64: st
     return data, raw_sig
 
 
+def _repository_identity(repository: Path) -> dict[str, int | str]:
+    """Return a no-follow identity for an exact, stable repository path."""
+    path = Path(repository)
+    text = str(path)
+    if not path.is_absolute() or os.path.normpath(text) != text:
+        raise ValueError("canonical repository must be absolute and lexically normalized")
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            component_stat = os.lstat(current)
+        except OSError as exc:
+            raise ValueError("canonical repository path is unavailable") from exc
+        if stat.S_ISLNK(component_stat.st_mode):
+            raise ValueError("canonical repository path contains a symlink component")
+    try:
+        resolved = path.resolve(strict=True)
+        final_stat = os.lstat(path)
+        resolved_stat = os.lstat(resolved)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("canonical repository path is unavailable") from exc
+    if resolved != path or (final_stat.st_dev, final_stat.st_ino) != (resolved_stat.st_dev, resolved_stat.st_ino):
+        raise ValueError("canonical repository path identity changed")
+    if not stat.S_ISDIR(final_stat.st_mode):
+        raise ValueError("canonical repository is not a directory")
+    return {"path": text, "dev": int(final_stat.st_dev), "ino": int(final_stat.st_ino)}
+
+
 def _bound_commit(repository: Path, value: Any, field: str) -> str:
     """Verify a bound full commit ID without consulting or changing checkout state."""
     if type(value) is not str or re.fullmatch(r"[0-9a-f]{40}", value) is None:
@@ -200,10 +228,8 @@ def _bound_commit(repository: Path, value: Any, field: str) -> str:
 def _eligible(ledger: Any, ticket_ids: tuple[str, ...], repository: Path) -> dict[str, dict[str, Any]]:
     if not ticket_ids or len(set(ticket_ids)) != len(ticket_ids): raise ValueError("explicit ticket IDs must be non-empty and unique")
     out = {}
-    try:
-        registered_repository = repository.expanduser().resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise ValueError("registered canonical repository is unavailable") from exc
+    registered_identity = _repository_identity(repository)
+    registered_repository = Path(str(registered_identity["path"]))
     for ticket_id in ticket_ids:
         ticket = ledger.connection.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
         binding = ledger.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
@@ -212,18 +238,20 @@ def _eligible(ledger: Any, ticket_ids: tuple[str, ...], repository: Path) -> dic
         try: authority = json.loads(str(release["routing_authority_json"] or "{}"))
         except json.JSONDecodeError as exc: raise ValueError("legacy release authority is malformed") from exc
         if authority != {} or binding["operator_signer_fingerprint"] is not None or binding["operator_authority_hash"] is not None: raise ValueError(f"ticket {ticket_id} is not an unbound legacy release")
-        try:
-            bound_repository = Path(str(binding["repository_path"])).expanduser().resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
-            raise ValueError(f"ticket {ticket_id} runtime binding repository is invalid") from exc
-        if bound_repository != registered_repository or int(binding["ownership_verified"]) != 1:
+        bound_text = str(binding["repository_path"])
+        if not os.path.isabs(bound_text) or os.path.normpath(bound_text) != bound_text or bound_text != str(registered_repository):
+            raise ValueError(f"ticket {ticket_id} runtime binding repository is not the exact registered path")
+        bound_identity = _repository_identity(Path(bound_text))
+        if bound_identity != registered_identity or int(binding["ownership_verified"]) != 1:
             raise ValueError(f"ticket {ticket_id} runtime binding is not registered and owned")
         _bound_commit(registered_repository, binding["starting_sha"], "starting_sha")
         _bound_commit(registered_repository, binding["canonical_sha"], "canonical_sha")
+        if _repository_identity(registered_repository) != registered_identity:
+            raise ValueError("canonical repository identity changed during commit validation")
         projection = ledger.connection.execute("""SELECT b.*,e.event_type,e.entity_type,e.entity_id FROM board_projection_outbox b JOIN events e ON e.id=b.event_id WHERE b.ticket_id=? AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL AND b.superseded_at IS NULL AND b.external_task_id IS NOT NULL""", (ticket_id,)).fetchall()
         if str(ticket["state"]) not in {"draft", "ready_local"} or len(projection) != 1 or projection[0]["entity_type"] != "ticket" or projection[0]["entity_id"] != ticket_id or projection[0]["event_type"] not in {"generated_microticket_created", "generated_microticket_projection_recovered"}: raise ValueError(f"ticket {ticket_id} has ambiguous projection")
         p = dict(projection[0])
-        out[ticket_id] = {"binding": {k: binding[k] for k in ("ticket_id", "repository_path", "starting_sha", "canonical_sha", "ownership_verified")}, "projection": {"event_id": int(p["event_id"]), "idempotency_key": str(p["idempotency_key"]), "external_task_id": str(p["external_task_id"])}, "release": {k: release[k] for k in ("ticket_id", "graph_hash", "child_external_id", "parent_completion_hash", "routing_authority_json", "hermes_status")}}
+        out[ticket_id] = {"binding": {k: binding[k] for k in ("ticket_id", "repository_path", "starting_sha", "canonical_sha", "ownership_verified")} | {"repository_identity": registered_identity}, "projection": {"event_id": int(p["event_id"]), "idempotency_key": str(p["idempotency_key"]), "external_task_id": str(p["external_task_id"])}, "release": {k: release[k] for k in ("ticket_id", "graph_hash", "child_external_id", "parent_completion_hash", "routing_authority_json", "hermes_status")}}
     return out
 
 
@@ -325,7 +353,7 @@ def enroll_operator_signer(ledger: Any, *, config_path: Path, document: dict[str
             if intent is None or intent["status"] not in {"pending_config","config_written"}: raise RuntimeError("signer enrollment intent is not recoverable")
             for ticket_id in selected:
                 binding = conn.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone(); old = selected_bindings[ticket_id]["binding"]
-                actual = {k: binding[k] for k in old}
+                actual = {k: binding[k] for k in old if k in binding.keys()} | {"repository_identity": _repository_identity(Path(str(binding["repository_path"]))) }
                 if actual != old or binding["operator_signer_fingerprint"] is not None or binding["operator_authority_hash"] is not None: raise RuntimeError("runtime binding drift during signer enrollment")
             if failure_injector: failure_injector("before_binding_update")
             for ticket_id in selected:

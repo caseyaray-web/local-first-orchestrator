@@ -82,6 +82,55 @@ class OperatorSignerEnrollmentRedTests(unittest.TestCase):
                     _eligible(ledger, (ticket,), root / "repo")
                 ledger.close(); tmp.cleanup()
 
+    def test_binding_repository_identity_is_lexical_and_no_follow(self) -> None:
+        cases = ("relative", "normalized", "direct_symlink", "nested_component_symlink")
+        for case in cases:
+            with self.subTest(case=case):
+                tmp, root, ledger, config_path, prepared, signature, public_b64, fingerprint, ticket = self._enrollment_fixture()
+                repo = root / "repo"
+                if case == "relative":
+                    forged = "repo"
+                elif case == "normalized":
+                    forged = str(repo) + "/."
+                elif case == "direct_symlink":
+                    alias = root / "repo-alias"; alias.symlink_to(repo); forged = str(alias)
+                else:
+                    real_parent = root / "real-parent"; real_parent.mkdir()
+                    moved = real_parent / "repo"; repo.rename(moved)
+                    alias_parent = root / "alias-parent"; alias_parent.symlink_to(real_parent)
+                    forged = str(alias_parent / "repo")
+                ledger.connection.execute("UPDATE runtime_bindings SET repository_path=? WHERE ticket_id=?", (forged, ticket))
+                ledger.connection.commit()
+                with self.assertRaises(ValueError):
+                    _eligible(ledger, (ticket,), repo)
+                ledger.close(); tmp.cleanup()
+
+    def test_repository_replacement_during_commit_validation_fails_closed(self) -> None:
+        tmp, root, ledger, config_path, prepared, signature, public_b64, fingerprint, ticket = self._enrollment_fixture()
+        repo = root / "repo"
+        original = repo
+        replacement = root / "replacement"
+        replacement.mkdir()
+        subprocess.run(("git", "init", "-q"), cwd=replacement, check=True)
+        (replacement / "README").write_text("replacement\n")
+        subprocess.run(("git", "add", "README"), cwd=replacement, check=True)
+        subprocess.run(("git", "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "replacement"), cwd=replacement, check=True)
+        from unittest.mock import patch
+        import local_first_orchestrator.signer_enrollment as enrollment
+        real_bound_commit = enrollment._bound_commit
+        replaced = False
+        def replace_before_validation(repository, value, field):
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                original.rename(root / "original")
+                original.symlink_to(replacement)
+            return real_bound_commit(repository, value, field)
+        with patch.object(enrollment, "_bound_commit", replace_before_validation):
+            with self.assertRaises(ValueError):
+                _eligible(ledger, (ticket,), repo)
+        ledger.close(); tmp.cleanup()
+
     def test_enrollment_document_is_canonical_duplicate_free_and_detached_signed(self) -> None:
         private = Ed25519PrivateKey.generate(); public = private.public_key().public_bytes_raw()
         public_b64 = base64.b64encode(public).decode(); fingerprint = hashlib.sha256(public).hexdigest()
@@ -287,6 +336,24 @@ class OperatorSignerEnrollmentRedTests(unittest.TestCase):
         ledger.connection.commit()
         blocker = ledger.native_dependency_release_migration_required(signer_public_key=base64.b64decode(public_b64), signer_fingerprint=fingerprint, config_path=config_path)
         self.assertIsNotNone(blocker)
+        self.assertTrue(blocker["reason"].startswith("signer enrollment reconciliation required:"))
+        ledger.close(); tmp.cleanup()
+
+    def test_detector_stops_on_post_enrollment_repository_replacement(self) -> None:
+        tmp, root, ledger, config_path, prepared, signature, public_b64, fingerprint, ticket = self._enrollment_fixture()
+        enroll_operator_signer(ledger, config_path=config_path, document=prepared["document"], detached_signature=signature, public_key_b64=public_b64, fingerprint=fingerprint)
+        repo = root / "repo"
+        replacement = root / "replacement"
+        repo.rename(root / "original")
+        replacement.mkdir()
+        subprocess.run(("git", "init", "-q"), cwd=replacement, check=True)
+        (replacement / "README").write_text("replacement\n")
+        subprocess.run(("git", "add", "README"), cwd=replacement, check=True)
+        subprocess.run(("git", "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "replacement"), cwd=replacement, check=True)
+        repo.symlink_to(replacement)
+        blocker = ledger.native_dependency_release_migration_required(signer_public_key=base64.b64decode(public_b64), signer_fingerprint=fingerprint, config_path=config_path)
+        self.assertIsNotNone(blocker)
+        assert blocker is not None
         self.assertTrue(blocker["reason"].startswith("signer enrollment reconciliation required:"))
         ledger.close(); tmp.cleanup()
 

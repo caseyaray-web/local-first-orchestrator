@@ -2371,7 +2371,7 @@ class Ledger:
         row = self.connection.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (ticket_id,)).fetchone()
         return dict(row) if row else None
 
-    def _signer_enrollment_integrity_blocker(self, *, signer_public_key: bytes, signer_fingerprint: str, fresh_config_raw: bytes | None, fresh_config_identity: dict[str, Any] | None, fresh_config_obj: dict[str, Any] | None) -> dict[str, Any] | None:
+    def _signer_enrollment_integrity_blocker(self, *, signer_public_key: bytes, signer_fingerprint: str, fresh_config_raw: bytes | None, fresh_config_identity: dict[str, Any] | None, fresh_config_obj: dict[str, Any] | None, config_path: Path | None) -> dict[str, Any] | None:
         """Validate the signed enrollment envelope before any release fallback runs.
 
         Every ledger copy is an assertion about one canonical signed document.  The
@@ -2381,8 +2381,12 @@ class Ledger:
         """
         try:
             from .native_release_approval import fingerprint_public_key
-            from .signer_enrollment import parse_enrollment_document
+            from .signer_enrollment import parse_enrollment_document, _repository_identity
+            from .operator_config import load_operator_config
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+            fresh_repository_identity = None
+            if config_path is not None:
+                fresh_repository_identity = _repository_identity(load_operator_config(Path(config_path)).canonical_repository)
             expected_authority_hash = hashlib.sha256(signer_fingerprint.encode("ascii")).hexdigest()
             if fingerprint_public_key(signer_public_key) != signer_fingerprint:
                 return {"ticket_id": "", "reason": "signer enrollment reconciliation required: signer fingerprint does not match fresh signer key"}
@@ -2463,8 +2467,10 @@ class Ledger:
                         binding = self.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (evidence_row["ticket_id"],)).fetchone()
                         if binding is None or old_binding != expected_binding.get("binding"):
                             raise ValueError("binding evidence does not match signed authority")
+                        if fresh_repository_identity is None or expected_binding["binding"].get("repository_identity") != fresh_repository_identity:
+                            raise ValueError("canonical repository identity drift")
                         immutable = ("ticket_id", "repository_path", "starting_sha", "canonical_sha", "ownership_verified")
-                        expected_new = {key: binding[key] for key in immutable} | {"operator_signer_fingerprint": signer_fingerprint, "operator_authority_hash": expected_authority_hash}
+                        expected_new = {key: binding[key] for key in immutable} | {"repository_identity": expected_binding["binding"]["repository_identity"], "operator_signer_fingerprint": signer_fingerprint, "operator_authority_hash": expected_authority_hash}
                         if new_binding != expected_new or any(binding[key] != expected_binding["binding"].get(key) for key in immutable) or binding["operator_signer_fingerprint"] != signer_fingerprint or binding["operator_authority_hash"] != expected_authority_hash:
                             raise ValueError("runtime binding authority or immutable identity drift")
                         if evidence_row["config_identity_json"] != intent["config_identity_json"]:
@@ -2503,11 +2509,15 @@ class Ledger:
         fresh_config_identity = None
         fresh_config_raw = None
         fresh_config_obj = None
+        fresh_repository_identity = None
         if config_path is not None and signer_fingerprint is not None:
             try:
                 from .operator_config import _raw_config
                 fresh_config_raw, fresh_obj, fresh_config_identity = _raw_config(Path(config_path))
                 fresh_config_obj = fresh_obj
+                from .signer_enrollment import _repository_identity
+                from .operator_config import load_operator_config
+                fresh_repository_identity = _repository_identity(load_operator_config(Path(config_path)).canonical_repository)
                 fresh_config_hash = hashlib.sha256(fresh_config_raw).hexdigest()
                 if fresh_obj.get("operator_signing_key_fingerprint") != signer_fingerprint:
                     return {"ticket_id": str(rows[0]["ticket_id"]) if rows else "", "reason": "signer enrollment reconciliation required: fresh external signer config differs"}
@@ -2521,6 +2531,7 @@ class Ledger:
                 fresh_config_raw=fresh_config_raw,
                 fresh_config_identity=fresh_config_identity,
                 fresh_config_obj=fresh_config_obj,
+                config_path=config_path,
             )
         if integrity_blocker is not None:
             return integrity_blocker
@@ -2628,14 +2639,14 @@ class Ledger:
                     binding = self.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
                     evidence = self.connection.execute("SELECT * FROM runtime_signer_enrollments WHERE enrollment_key=? AND ticket_id=?", (enrollment["enrollment_key"], ticket_id)).fetchone()
                     new_binding = json.loads(str(evidence["new_binding_identity_json"]))
-                    if any(new_binding.get(key) != binding[key] for key in ("repository_path", "starting_sha", "canonical_sha", "ownership_verified", "operator_signer_fingerprint", "operator_authority_hash")):
+                    if any(new_binding.get(key) != binding[key] for key in ("repository_path", "starting_sha", "canonical_sha", "ownership_verified", "operator_signer_fingerprint", "operator_authority_hash")) or new_binding.get("repository_identity") != fresh_repository_identity:
                         return {"ticket_id": ticket_id, "reason": "legacy signer binding identity drift"}
                     expected_selected = signed_selected.get(ticket_id) if isinstance(signed_selected, dict) else None
                     if not isinstance(expected_selected, dict):
                         return {"ticket_id": ticket_id, "reason": "signed binding projection release evidence mismatch"}
                     if json.loads(str(evidence["old_binding_identity_json"])) != expected_selected.get("binding"):
                         return {"ticket_id": ticket_id, "reason": "enrollment evidence binding differs from signed authority"}
-                    if expected_selected != {"binding": {k: binding[k] for k in ("ticket_id", "repository_path", "starting_sha", "canonical_sha", "ownership_verified")}, "projection": {k: expected_selected.get("projection", {}).get(k) for k in ("event_id", "idempotency_key", "external_task_id")}, "release": expected_selected.get("release")}:
+                    if expected_selected != {"binding": {k: binding[k] for k in ("ticket_id", "repository_path", "starting_sha", "canonical_sha", "ownership_verified")} | {"repository_identity": fresh_repository_identity}, "projection": {k: expected_selected.get("projection", {}).get(k) for k in ("event_id", "idempotency_key", "external_task_id")}, "release": expected_selected.get("release")}:
                         return {"ticket_id": ticket_id, "reason": "signed binding projection release evidence mismatch"}
                     current_release = self.connection.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (ticket_id,)).fetchone()
                     current_projection = self.connection.execute("""
