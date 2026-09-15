@@ -249,18 +249,6 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
     migration = ledger.native_dependency_release_migration_required(signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint, config_path=signer_config_path) if hasattr(ledger, "native_dependency_release_migration_required") else None
     if migration is not None:
         return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(migration["ticket_id"]), reconciliation_action=ReconciliationAction.STOP.value, blocker_reason=str(migration["reason"]))
-    legacy = ledger.connection.execute("SELECT ticket_id,external_task_id,snapshot_hash FROM native_dependency_release_revalidations r JOIN native_dependency_releases l USING(ticket_id) WHERE json_extract(l.routing_authority_json,'$.profile') IS NULL").fetchall()
-    if legacy:
-        if board is None or not hasattr(board, "revalidation"):
-            return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(legacy[0]["ticket_id"]), reconciliation_action=ReconciliationAction.STOP.value)
-        try:
-            for row in legacy:
-                with board.revalidation(str(row["ticket_id"]), str(row["external_task_id"])) as proof:
-                    if canonical_sha256(asdict(proof.snapshot)) != str(row["snapshot_hash"]):
-                        raise RuntimeError("board snapshot drift")
-        except Exception:
-            return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(legacy[0]["ticket_id"]), reconciliation_action=ReconciliationAction.STOP.value)
-
     generated = ledger.connection.execute(
         "SELECT ticket_id FROM board_projection_outbox WHERE operation='create_microticket' AND terminal_error IS NULL "
         "AND acknowledged_at IS NULL AND superseded_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) "

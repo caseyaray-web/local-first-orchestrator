@@ -308,6 +308,36 @@ class HermesBoardAdapter:
                 return
             self._run("schedule", ticket_id, f"local-first projection {state.value} ({idempotency_key})")
 
+    def activation_marker_present(self, ticket_id: str, marker: str) -> bool:
+        try:
+            from hermes_cli.sqlite_util import open_db
+            with open_db(self._resolved_board_db_path(), db_label=f"kanban:{self.board}", busy_timeout_ms=int(self.timeout_seconds * 1000), wal=False, check_same_thread=False) as connection:
+                rows = connection.execute("SELECT payload FROM task_events WHERE task_id=? AND payload LIKE ? ORDER BY id", (ticket_id, f"%{marker}%")).fetchall()
+                return len(rows) == 1 and marker in str(rows[0]["payload"])
+        except Exception as exc:
+            raise RuntimeError("native release activation marker read unavailable") from exc
+
+    def activate_native_release(self, ticket_id: str, *, activation_marker: str, expected_routing: dict[str, str]) -> ExternalTicket:
+        """Perform exactly one supported scheduled-to-ready Hermes mutation."""
+        if not self.allow_writes:
+            raise PermissionError("real board writes require --allow-board-writes")
+        if not activation_marker or not isinstance(expected_routing, dict):
+            raise ValueError("native release activation requires marker and routing")
+        task = self.get_task(ticket_id)
+        self.verify_native_release_task(task, expected_workspace_path=expected_routing["workspace_path"])
+        if task.status == "ready":
+            raise RuntimeError("native release activation requires the exact scheduled side effect marker")
+        if task.status != "scheduled":
+            raise RuntimeError(f"native release activation target has incompatible state: {task.status}")
+        if {"profile": task.assignee, "workspace_kind": task.workspace_kind, "workspace_path": task.workspace_path} != {"profile": expected_routing.get("profile"), "workspace_kind": expected_routing.get("workspace_kind"), "workspace_path": expected_routing.get("workspace_path")}:
+            raise RuntimeError("native release activation routing drift")
+        self._run("unblock", ticket_id, "--reason", activation_marker)
+        updated = self.get_task(ticket_id)
+        self.verify_native_release_task(updated, expected_workspace_path=expected_routing["workspace_path"])
+        if updated.status != "ready":
+            raise RuntimeError("native release activation did not produce ready state")
+        return updated
+
     def create_microticket(self, title: str, body: str, *, idempotency_key: str) -> str:
         if not self.allow_writes:
             raise PermissionError("real board writes require --allow-board-writes")

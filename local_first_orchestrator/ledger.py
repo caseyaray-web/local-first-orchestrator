@@ -563,6 +563,45 @@ CREATE TRIGGER IF NOT EXISTS native_dependency_release_revalidations_immutable_u
 BEFORE UPDATE ON native_dependency_release_revalidations BEGIN SELECT RAISE(ABORT, 'native dependency release revalidations are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS native_dependency_release_revalidations_immutable_delete
 BEFORE DELETE ON native_dependency_release_revalidations BEGIN SELECT RAISE(ABORT, 'native dependency release revalidations are append-only'); END;
+CREATE TABLE IF NOT EXISTS native_release_activation_intents (
+    request_key TEXT PRIMARY KEY,
+    ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    revalidation_id TEXT NOT NULL REFERENCES native_dependency_release_revalidations(revalidation_id),
+    external_task_id TEXT NOT NULL,
+    pre_activation_snapshot_hash TEXT NOT NULL,
+    implementation_profile TEXT NOT NULL,
+    repository_identity TEXT NOT NULL,
+    canonical_worktree_path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    operator_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    activation_marker TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    effect_snapshot_hash TEXT,
+    activation_event_id INTEGER REFERENCES events(id),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_native_release_activation_revalidation
+    ON native_release_activation_intents(revalidation_id);
+CREATE TRIGGER IF NOT EXISTS native_release_activation_intents_immutable_identity
+BEFORE UPDATE OF ticket_id,revalidation_id,external_task_id,pre_activation_snapshot_hash,implementation_profile,repository_identity,canonical_worktree_path,branch,base_sha,operator_id,reason,activation_marker,created_at
+ON native_release_activation_intents BEGIN SELECT RAISE(ABORT, 'native release activation intent identity is immutable'); END;
+CREATE TABLE IF NOT EXISTS native_release_activation_evidence (
+    request_key TEXT PRIMARY KEY REFERENCES native_release_activation_intents(request_key),
+    ticket_id TEXT NOT NULL,
+    revalidation_id TEXT NOT NULL,
+    activation_marker TEXT NOT NULL,
+    post_activation_snapshot_hash TEXT NOT NULL,
+    event_id INTEGER NOT NULL REFERENCES events(id),
+    evidence_hash TEXT NOT NULL,
+    acknowledged_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS native_release_activation_evidence_immutable_update
+BEFORE UPDATE ON native_release_activation_evidence BEGIN SELECT RAISE(ABORT, 'native release activation evidence is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS native_release_activation_evidence_immutable_delete
+BEFORE DELETE ON native_release_activation_evidence BEGIN SELECT RAISE(ABORT, 'native release activation evidence is append-only'); END;
 CREATE TABLE IF NOT EXISTS tranche_completion_evidence (
     tranche_id TEXT PRIMARY KEY REFERENCES tranches(id), root_planning_sha TEXT NOT NULL,
     final_integration_sha TEXT NOT NULL, accepted_ticket_ids_json TEXT NOT NULL,
@@ -2481,7 +2520,7 @@ class Ledger:
             return {"ticket_id": "", "reason": f"signer enrollment reconciliation required: {exc}"}
         return None
 
-    def native_dependency_release_migration_required(self, *, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None, config_path: Path | None = None) -> dict[str, Any] | None:
+    def native_dependency_release_migration_required(self, *, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None, config_path: Path | None = None, require_activation: bool = True) -> dict[str, Any] | None:
         """Find legacy releases that cannot authorize downstream execution."""
         rows = self.connection.execute("SELECT * FROM native_dependency_releases ORDER BY ticket_id").fetchall()
         missing_signer = self.connection.execute("""
@@ -2702,6 +2741,10 @@ class Ledger:
                     valid = []
                 if len(current) != 1 or len(valid) != 1:
                     return {"ticket_id": ticket_id, "reason": "legacy release routing authority requires paused operator revalidation"}
+                if require_activation:
+                    activation = self.connection.execute("SELECT status FROM native_release_activation_intents WHERE ticket_id=? AND revalidation_id=?", (ticket_id, valid[0]["revalidation_id"])).fetchall()
+                    if len(activation) != 1 or activation[0]["status"] != "acknowledged":
+                        return {"ticket_id": ticket_id, "reason": "legacy release requires acknowledged native release activation"}
         return None
 
     @staticmethod
@@ -2804,6 +2847,60 @@ class Ledger:
             and str(row["evidence_hash"]) == canonical_sha256(document)
         )
         return result
+
+    def prepare_native_release_activation_intent(self, *, ticket_id: str, revalidation_id: str, external_task_id: str, pre_activation_snapshot_hash: str, implementation_profile: str, repository_identity: str, canonical_worktree_path: str, branch: str, base_sha: str, operator_id: str, reason: str, request_key: str) -> dict[str, Any]:
+        """Persist one paused activation intent before any Hermes board effect."""
+        values = (ticket_id, revalidation_id, external_task_id, pre_activation_snapshot_hash, implementation_profile, repository_identity, canonical_worktree_path, branch, base_sha, operator_id, reason, request_key)
+        if not all(isinstance(value, str) and value.strip() for value in values):
+            raise ValueError("native release activation requires complete identity, reason, and request key")
+        marker = f"local-first-native-release-activation:{revalidation_id}:{request_key}"
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not bool(paused["paused"]):
+                raise PermissionError("native release activation requires Local First paused")
+            row = conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=? AND ticket_id=?", (revalidation_id, ticket_id)).fetchone()
+            if row is None:
+                raise ValueError("native release activation requires the exact revalidation")
+            existing = conn.execute("SELECT * FROM native_release_activation_intents WHERE request_key=? OR revalidation_id=?", (request_key, revalidation_id)).fetchall()
+            if existing:
+                if len(existing) != 1:
+                    raise RuntimeError("native release activation intent is duplicated")
+                prior = existing[0]
+                if tuple(prior[key] for key in ("ticket_id","revalidation_id","external_task_id","pre_activation_snapshot_hash","implementation_profile","repository_identity","canonical_worktree_path","branch","base_sha","operator_id","reason","activation_marker")) != (*values[:-1], marker):
+                    raise ValueError("native release activation replay conflicts")
+                return dict(prior)
+            now = self._now()
+            event_id = self._append_event(conn, entity_type="controller", entity_id="controller", event_type="native_dependency_release_activation_intent_created", actor_id=operator_id, payload={"request_key": request_key, "revalidation_id": revalidation_id, "ticket_id": ticket_id, "activation_marker": marker})
+            conn.execute("""INSERT INTO native_release_activation_intents
+                (request_key,ticket_id,revalidation_id,external_task_id,pre_activation_snapshot_hash,implementation_profile,repository_identity,canonical_worktree_path,branch,base_sha,operator_id,reason,activation_marker,status,activation_event_id,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?)""", (request_key, *values[:-1], marker, event_id, now, now))
+            return dict(conn.execute("SELECT * FROM native_release_activation_intents WHERE request_key=?", (request_key,)).fetchone())
+
+    def acknowledge_native_release_activation(self, request_key: str, *, post_activation_snapshot_hash: str) -> dict[str, Any]:
+        if not isinstance(request_key, str) or not request_key.strip() or not isinstance(post_activation_snapshot_hash, str) or not post_activation_snapshot_hash.strip():
+            raise ValueError("native release activation acknowledgement requires identity and snapshot")
+        with self._transaction() as conn:
+            intent = conn.execute("SELECT * FROM native_release_activation_intents WHERE request_key=?", (request_key,)).fetchone()
+            if intent is None:
+                raise KeyError(request_key)
+            if intent["status"] == "acknowledged":
+                return dict(intent)
+            if intent["status"] not in {"pending", "effect_applied"}:
+                raise RuntimeError("native release activation intent is not replayable")
+            evidence = {"request_key": request_key, "ticket_id": intent["ticket_id"], "revalidation_id": intent["revalidation_id"], "activation_marker": intent["activation_marker"], "post_activation_snapshot_hash": post_activation_snapshot_hash}
+            evidence_hash = canonical_sha256(evidence)
+            event_id = self._append_event(conn, entity_type="controller", entity_id="controller", event_type="native_dependency_release_activation_acknowledged", actor_id=intent["operator_id"], payload={**evidence, "evidence_hash": evidence_hash})
+            conn.execute("INSERT INTO native_release_activation_evidence(request_key,ticket_id,revalidation_id,activation_marker,post_activation_snapshot_hash,event_id,evidence_hash,acknowledged_at) VALUES (?,?,?,?,?,?,?,?)", (*evidence.values(), event_id, evidence_hash, self._now()))
+            conn.execute("UPDATE native_release_activation_intents SET status='acknowledged',effect_snapshot_hash=?,updated_at=? WHERE request_key=?", (post_activation_snapshot_hash, self._now(), request_key))
+            return dict(conn.execute("SELECT * FROM native_release_activation_intents WHERE request_key=?", (request_key,)).fetchone())
+
+    def mark_native_release_activation_effect(self, request_key: str, snapshot_hash: str) -> None:
+        with self._transaction() as conn:
+            row = conn.execute("SELECT status FROM native_release_activation_intents WHERE request_key=?", (request_key,)).fetchone()
+            if row is None: raise KeyError(request_key)
+            if row["status"] == "acknowledged": return
+            if row["status"] != "pending": raise RuntimeError("native release activation effect state is not pending")
+            conn.execute("UPDATE native_release_activation_intents SET status='effect_applied',effect_snapshot_hash=?,updated_at=? WHERE request_key=?", (snapshot_hash, self._now(), request_key))
 
     def record_native_release_revalidation(self, *, ticket_id: str, projection_event_id: int,
                                            projection_key: str, external_task_id: str,

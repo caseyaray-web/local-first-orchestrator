@@ -400,6 +400,53 @@ class LocalFirstController:
         )
         return result
 
+    def activate_native_release_revalidation(self, ticket_id: str, *, revalidation_id: str, operator_id: str, reason: str, request_key: str) -> dict[str, Any]:
+        """Activate one exact signed legacy revalidation; never dispatch or unpause."""
+        if not hasattr(self.board, "activate_native_release") or not hasattr(self.board, "execution_snapshot"):
+            raise RuntimeError("native release activation requires supported Hermes board mutation and snapshot")
+        if not self.board.allow_writes:
+            raise PermissionError("native release activation requires --allow-board-writes")
+        row = self.ledger.connection.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=? AND ticket_id=?", (revalidation_id, ticket_id)).fetchone()
+        if row is None:
+            raise ValueError("native release activation requires the exact signed revalidation")
+        existing_intent = self.ledger.connection.execute("SELECT * FROM native_release_activation_intents WHERE request_key=? OR revalidation_id=?", (request_key, revalidation_id)).fetchall()
+        if len(existing_intent) > 1:
+            raise RuntimeError("native release activation intent is duplicated")
+        if existing_intent and existing_intent[0]["status"] == "acknowledged":
+            return dict(existing_intent[0])
+        if self.ledger.native_dependency_release_migration_required(signer_public_key=self.config.operator_signer_public_key, signer_fingerprint=self.config.operator_signer_fingerprint, require_activation=False) is not None:
+            raise RuntimeError("native release activation requires valid current signed revalidation authority")
+        snapshot = self.board.execution_snapshot(str(row["external_task_id"]))
+        if existing_intent and existing_intent[0]["status"] == "effect_applied":
+            if snapshot.task.status != "ready":
+                raise RuntimeError("native release activation effect is not replayable")
+            return self.ledger.acknowledge_native_release_activation(request_key, post_activation_snapshot_hash=canonical_sha256(asdict(snapshot)))
+        actual_hash = canonical_sha256(asdict(snapshot))
+        if actual_hash != str(row["snapshot_hash"]) or snapshot.task.status != "scheduled":
+            raise RuntimeError("native release activation pre-activation snapshot drift")
+        intent = self.ledger.prepare_native_release_activation_intent(
+            ticket_id=ticket_id, revalidation_id=revalidation_id, external_task_id=str(row["external_task_id"]),
+            pre_activation_snapshot_hash=actual_hash, implementation_profile=str(row["implementation_profile"]),
+            repository_identity=str(row["repository_identity"]), canonical_worktree_path=str(row["canonical_worktree_path"]),
+            branch=str(row["branch"]), base_sha=str(row["base_sha"]), operator_id=operator_id, reason=reason, request_key=request_key)
+        marker = str(intent["activation_marker"])
+        if intent["status"] == "acknowledged":
+            return intent
+        if intent["status"] == "pending" and snapshot.task.status == "ready":
+            if not getattr(self.board, "activation_marker_present", lambda *_: False)(str(row["external_task_id"]), marker):
+                raise RuntimeError("native release activation side effect is unmarked or ambiguous")
+        if intent["status"] == "pending":
+            self.board.activate_native_release(str(row["external_task_id"]), activation_marker=marker, expected_routing={"profile": str(row["implementation_profile"]), "workspace_kind": "worktree", "workspace_path": str(row["canonical_worktree_path"])})
+            post = self.board.execution_snapshot(str(row["external_task_id"]))
+            post_hash = canonical_sha256(asdict(post))
+            if post.task.status != "ready" or not getattr(self.board, "activation_marker_present", lambda *_: False)(str(row["external_task_id"]), marker):
+                raise RuntimeError("native release activation side effect is not exact")
+            self.ledger.mark_native_release_activation_effect(request_key, post_hash)
+        post = self.board.execution_snapshot(str(row["external_task_id"]))
+        if post.task.status != "ready":
+            raise RuntimeError("native release activation acknowledgement requires ready task")
+        return self.ledger.acknowledge_native_release_activation(request_key, post_activation_snapshot_hash=canonical_sha256(asdict(post)))
+
     def prepare_native_release_revalidation(self, ticket_id: str, *, operator_id: str, reason: str, implementation_profile: str) -> dict[str, Any]:
         """Read-only first step; never writes ledger, board, repository, or invokes a model."""
         return self.revalidate_native_release(ticket_id, operator_id=operator_id, reason=reason, implementation_profile=implementation_profile, _prepare_only=True)
