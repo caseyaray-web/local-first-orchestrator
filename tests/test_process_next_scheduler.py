@@ -52,6 +52,15 @@ class NativeBoard(Board):
         self.tasks: dict[str, dict[str, object]] = {}
         self.link_calls: list[tuple[str, str]] = []
         self.fail_after_link_once = False
+        self.fail_before_park_once = False
+
+    def park_native_dependency_child(self, ticket_id: str, *, idempotency_key: str) -> None:
+        if self.fail_before_park_once:
+            self.fail_before_park_once = False
+            raise RuntimeError("simulated park transport loss")
+        self.set_state(ticket_id, CanonicalState.BLOCKED, idempotency_key=idempotency_key)
+        if ticket_id in self.tasks:
+            self.tasks[ticket_id]["status"] = "blocked"
 
     def add_task(self, task_id: str, *, status: str, body: str = "") -> None:
         self.tasks[task_id] = {"status": status, "body": body, "parents": set(), "children": set()}
@@ -296,9 +305,48 @@ class ProcessNextSchedulerTests(unittest.TestCase):
 
         self.assertEqual((result.stage, result.ticket_id), ("native_dependency_graph", child))
         self.assertEqual(board.get_task("external-child").parents, ("external-parent",))
-        self.assertEqual(board.get_task("external-child").status, "todo")
-        self.assertEqual(board.states[-1][0:2], ("external-child", "ready_local"))
+        self.assertEqual(board.get_task("external-child").status, "blocked")
+        self.assertEqual(board.states[-1][0:2], ("external-child", "blocked"))
         self.assertEqual(self.ledger.get_ticket(child)["state"], "draft")
+
+    def test_native_graph_parks_attacker_routed_handoff_without_release_evidence(self) -> None:
+        board = NativeBoard()
+        parent = self.ticket("parent", state=CanonicalState.ACCEPTED)
+        child = self.ticket("child", dependencies=(parent,))
+        board.add_task("external-parent", status="done")
+        board.add_task("external-child", status="ready", body=HANDOFF_MARKER)
+        result = ProcessNextScheduler(self.ledger, board, worker_id="native", lease_seconds=30, clock=lambda: 100).process_next()
+        self.assertEqual((result.stage, result.ticket_id), ("native_dependency_graph", child))
+        self.assertEqual(board.get_task("external-child").status, "blocked")
+        self.assertIsNone(self.ledger.native_dependency_release(child))
+        self.assertEqual(self.ledger.get_ticket(child)["state"], "draft")
+
+    def test_native_graph_retries_transient_park_failure_before_recording_graph(self) -> None:
+        board = NativeBoard()
+        parent = self.ticket("parent", state=CanonicalState.ACCEPTED)
+        child = self.ticket("child", dependencies=(parent,))
+        board.add_task("external-parent", status="done")
+        board.add_task("external-child", status="todo", body=HANDOFF_MARKER)
+        board.fail_before_park_once = True
+        result = ProcessNextScheduler(self.ledger, board, worker_id="native", lease_seconds=30, clock=lambda: 100).process_next()
+        self.assertEqual((result.stage, result.ticket_id), ("native_dependency_graph", child))
+        self.assertEqual(board.get_task("external-child").status, "blocked")
+        self.assertIsNotNone(self.ledger.native_dependency_graph(child))
+
+    def test_legacy_native_release_authority_is_a_scheduler_stop_gate(self) -> None:
+        board = NativeBoard()
+        root = self.ticket("legacy-root")
+        with self.ledger._transaction() as conn:
+            event_id = self.ledger._append_event(conn, entity_type="ticket", entity_id=root, event_type="generated_microticket_created", actor_id="test", to_state="draft", payload={"ticket_id": root})
+        self.ledger.enqueue_generated_create_projection(root, event_id, {"ticket_id": root}, "legacy-create")
+        self.ledger.connection.execute("UPDATE board_projection_outbox SET acknowledged_at=100,external_task_id='external-legacy-root' WHERE ticket_id=? AND event_id=? AND operation='create_microticket'", (root, event_id))
+        with self.ledger._transaction() as conn:
+            identity = self.ledger._native_dependency_graph_identity(conn, root)
+            conn.execute("INSERT INTO native_dependency_graphs(ticket_id,child_external_id,local_dependency_ids_json,parent_external_ids_json,graph_hash,verified_at) VALUES (?,?,?,?,?,100)", (root, "external-legacy-root", "[]", "[]", identity["graph_hash"]))
+            conn.execute("INSERT INTO native_dependency_releases(ticket_id,graph_hash,child_external_id,parent_completion_hash,routing_authority_json,hermes_status,observed_at) VALUES (?,?,?,?,?,?,100)", (root, identity["graph_hash"], "external-legacy-root", "legacy", "{}", "ready"))
+        self.assertEqual(preview_next(self.ledger, now=100).next_stage, "reconciliation_required")
+        with self.assertRaisesRegex(RuntimeError, "native_dependency_release_reconciliation_required"):
+            ProcessNextScheduler(self.ledger, board, worker_id="native", lease_seconds=30, clock=lambda: 100).process_next()
 
     def test_generated_activation_runner_uses_dependency_readiness_slot(self) -> None:
         calls: list[str] = []

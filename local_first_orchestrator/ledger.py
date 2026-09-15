@@ -2230,6 +2230,18 @@ class Ledger:
         row = self.connection.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (ticket_id,)).fetchone()
         return dict(row) if row else None
 
+    def native_dependency_release_migration_required(self) -> dict[str, Any] | None:
+        """Find legacy releases that cannot authorize downstream execution."""
+        rows = self.connection.execute("SELECT ticket_id,routing_authority_json FROM native_dependency_releases ORDER BY ticket_id").fetchall()
+        for row in rows:
+            try:
+                authority = json.loads(str(row["routing_authority_json"] or "{}"))
+            except json.JSONDecodeError:
+                authority = None
+            if not isinstance(authority, dict) or not authority.get("profile") or not authority.get("canonical_repository"):
+                return {"ticket_id": str(row["ticket_id"]), "reason": "legacy release routing authority requires paused operator revalidation"}
+        return None
+
     def _native_dependency_graph_identity(self, conn: sqlite3.Connection, ticket_id: str) -> dict[str, Any]:
         ticket = conn.execute("SELECT id,dependencies_json FROM tickets WHERE id=?", (ticket_id,)).fetchone()
         if ticket is None:

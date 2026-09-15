@@ -252,6 +252,17 @@ class HermesBoardAdapter:
             raise ValueError("valid distinct dependency task ids required")
         self._run("link", parent_task_id, child_task_id)
 
+    def park_native_dependency_child(self, ticket_id: str, *, idempotency_key: str) -> None:
+        """Durably keep a linked handoff child non-dispatchable until release."""
+        if not self.allow_writes:
+            raise PermissionError("real board writes require --allow-board-writes")
+        task = self.get_task(ticket_id)
+        if task.status == "blocked":
+            return
+        if task.status in {"done", "running"}:
+            raise RuntimeError("native dependency graph cannot park an active or completed child")
+        self._run("block", ticket_id, f"native dependency graph parked ({idempotency_key})", "--kind", "needs_input")
+
     def add_comment(self, ticket_id: str, comment: str) -> None:
         if not self.allow_writes:
             raise PermissionError("real board writes require --allow-board-writes")

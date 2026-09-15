@@ -238,6 +238,9 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
             claim_id=reconciliation.claim_id,
             reconciliation_action=reconciliation.action.value,
         )
+    migration = ledger.native_dependency_release_migration_required() if hasattr(ledger, "native_dependency_release_migration_required") else None
+    if migration is not None:
+        return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(migration["ticket_id"]), reconciliation_action=ReconciliationAction.STOP.value)
 
     generated = ledger.connection.execute(
         "SELECT ticket_id FROM board_projection_outbox WHERE operation='create_microticket' AND terminal_error IS NULL "
@@ -780,6 +783,11 @@ class ProcessNextScheduler:
             self.ledger.release_scheduler_tick(self.worker_id, lease_token)
 
     def _process_claimed_tick(self, now: int, execution_owner: str) -> ProcessNextResult:
+        migration = self.ledger.native_dependency_release_migration_required()
+        if migration is not None:
+            raise RuntimeError(
+                "native_dependency_release_reconciliation_required: legacy release routing authority requires paused operator revalidation"
+            )
         reconciliation = self.ledger.next_scheduler_reconciliation(now=now)
         if reconciliation is not None and reconciliation.action == ReconciliationAction.STOP:
             family = self.ledger._scheduler_stage_family(reconciliation.stage)
@@ -1079,9 +1087,27 @@ class ProcessNextScheduler:
                     actual_parents = sorted(set(getattr(task, "parents", ())))
                     if actual_parents != expected_parents:
                         raise RuntimeError("native_dependency_graph_reconciliation_required: Hermes graph did not converge")
-                    if expected_parents and HANDOFF_MARKER in str(getattr(task, "body", "")) and str(getattr(task, "status", "")) == "blocked":
-                        self.board.set_state(child_external_id, CanonicalState.READY_LOCAL, idempotency_key=f"native-graph-release:{identity['graph_hash']}")
+                    if expected_parents and HANDOFF_MARKER in str(getattr(task, "body", "")):
+                        parker = getattr(self.board, "park_native_dependency_child", None)
+                        if parker is None:
+                            raise RuntimeError("native_dependency_graph_reconciliation_required: native park adapter is missing")
+                        try:
+                            parker(child_external_id, idempotency_key=f"native-graph-park:{identity['graph_hash']}")
+                        except Exception:
+                            # A transport error may have happened before or after the
+                            # remote block. Read back, then retry the same idempotent
+                            # park only when the child is still dispatchable.
+                            task_after_failure = self.board.get_task(child_external_id)
+                            if str(getattr(task_after_failure, "status", "")) != "blocked":
+                                try:
+                                    parker(child_external_id, idempotency_key=f"native-graph-park:{identity['graph_hash']}")
+                                except Exception as retry_exc:
+                                    raise RuntimeError("native_dependency_graph_reconciliation_required: child park outcome is unknown") from retry_exc
+                            else:
+                                task = task_after_failure
                         task = self.board.get_task(child_external_id)
+                        if str(getattr(task, "status", "")) != "blocked":
+                            raise RuntimeError("native_dependency_graph_reconciliation_required: child is not durably parked")
                     graph_result = {
                         "ticket_id": ticket_id,
                         "candidate_identity": identity,
