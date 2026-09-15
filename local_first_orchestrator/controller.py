@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import time
 import uuid
+import secrets
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -30,6 +31,7 @@ from .ticket import MicroTicket, PatchBudget, VerificationProfile
 from .triage import LocalTriagePlanner, TriageCoordinator, TriageError, normalize_triage
 from .usage_governor import PaidPurpose
 from .validation import DeterministicValidator
+from .native_release_approval import APPROVAL_DOMAIN, APPROVAL_VERSION, canonical_approval_bytes, parse_approval_document, verify_detached_signature, fingerprint_public_key
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,8 @@ class RuntimeConfig:
     lease_seconds: int = 1800
     implementation_timeout_seconds: int = 300
     review_timeout_seconds: int = 300
+    operator_signer_fingerprint: str | None = None
+    operator_authority_hash: str | None = None
 
     def canonical_repository(self, candidate: Path) -> Path:
         path = Path(candidate).resolve(strict=True)
@@ -113,7 +117,7 @@ class LocalFirstController:
         base=subprocess.run(("git","rev-parse","HEAD"),cwd=repo,text=True,capture_output=True,check=True).stdout.strip()
         existing=self.ledger.connection.execute("SELECT id FROM tickets WHERE external_id=?",(card.id,)).fetchone()
         ticket_id=str(existing["id"]) if existing else self.ledger.create_ticket(title=card.title,external_id=card.id,state=CanonicalState.READY_LOCAL,contract=ticket.contract())
-        self.ledger.bind_runtime(ticket_id,str(repo),base)
+        self.ledger.bind_runtime(ticket_id,str(repo),base, operator_signer_fingerprint=self.config.operator_signer_fingerprint, operator_authority_hash=self.config.operator_authority_hash)
         return ticket_id
 
     def import_scheduled_cards(self) -> list[str]: return [self.import_card(c) for c in self.board.import_candidates()]
@@ -171,12 +175,14 @@ class LocalFirstController:
             reason=reason,
         )
 
-    def revalidate_native_release(self, ticket_id: str, *, operator_id: str, reason: str,
-                                  implementation_profile: str) -> dict[str, Any]:
+    def revalidate_native_release(self, ticket_id: str, *, operator_id: str | None = None, reason: str | None = None,
+                                  implementation_profile: str, approval_document: dict[str, Any] | None = None,
+                                  detached_signature: bytes | None = None, signer_public_key: bytes | None = None,
+                                  signer_fingerprint: str | None = None, _prepare_only: bool = False) -> dict[str, Any]:
         """Append-only operator proof for one legacy native release."""
         if not hasattr(self.board, "execution_snapshot"):
             raise RuntimeError("native release revalidation requires execution snapshot support")
-        if not operator_id.strip() or not reason.strip() or not implementation_profile.strip():
+        if not isinstance(operator_id, str) or not operator_id.strip() or not isinstance(reason, str) or not reason.strip() or not implementation_profile.strip():
             raise ValueError("operator identity, reason, and implementation profile required")
         projection = self.ledger.connection.execute("""
             SELECT event_id,idempotency_key,external_task_id FROM board_projection_outbox
@@ -226,13 +232,52 @@ class LocalFirstController:
                 raise RuntimeError("native release revalidation spawn evidence is ambiguous")
             if run.status not in {"blocked", "spawn_failed"}:
                 raise RuntimeError("native release revalidation run evidence is ambiguous")
+        release = self.ledger.native_dependency_release(ticket_id)
+        graph = self.ledger.native_dependency_graph(ticket_id)
+        binding = self.ledger.runtime_binding(ticket_id)
+        if self.config.operator_signer_fingerprint and (binding.get("operator_signer_fingerprint") != self.config.operator_signer_fingerprint or binding.get("operator_authority_hash") != self.config.operator_authority_hash):
+            raise PermissionError("registered runtime signer authority is not bound to this ticket")
+        document = {
+            "domain": APPROVAL_DOMAIN, "version": APPROVAL_VERSION,
+            "operation": "revalidate-native-release", "request_id": secrets.token_urlsafe(24),
+            "nonce": secrets.token_urlsafe(24), "operator_id": operator_id, "reason": reason,
+            "authority": {"ledger_identity": str(self.ledger.database.resolve()), "ticket_id": ticket_id,
+                "release": release, "graph": graph, "projection": {"event_id": int(projection["event_id"]), "key": str(projection["idempotency_key"]), "external_id": external_task_id},
+                "implementation_profile": implementation_profile, "repository_identity": str(repository), "canonical_worktree_path": str(expected_path),
+                "branch": branch, "base_sha": expected_base, "snapshot_hash": canonical_sha256(asdict(snapshot)),
+                "runtime_authority_hash": binding.get("operator_authority_hash")},
+        }
+        if approval_document is not None:
+            supplied_document = parse_approval_document(canonical_approval_bytes(approval_document))
+            if supplied_document["authority"] != document["authority"]:
+                raise ValueError("approval document is stale or does not match current state")
+            document = supplied_document
+        canonical = canonical_approval_bytes(document)
+        if _prepare_only:
+            return {"document": document, "canonical_document": canonical.decode("utf-8"), "approval_hash": hashlib.sha256(canonical).hexdigest()}
+        if approval_document is not None:
+            if signer_public_key is None or detached_signature is None or not signer_fingerprint:
+                raise PermissionError("native release revalidation requires detached operator signature")
+            supplied = canonical_approval_bytes(approval_document)
+            if supplied != canonical:
+                raise ValueError("approval document is stale or does not match current state")
+            verify_detached_signature(supplied, detached_signature, signer_public_key, signer_fingerprint)
+        elif self.config.operator_signer_fingerprint:
+            raise PermissionError("native release revalidation requires detached operator signature")
         return self.ledger.record_native_release_revalidation(
             ticket_id=ticket_id, projection_event_id=int(projection["event_id"]),
             projection_key=str(projection["idempotency_key"]), external_task_id=external_task_id,
             implementation_profile=implementation_profile, repository_identity=str(repository),
             canonical_worktree_path=str(expected_path), branch=branch, base_sha=expected_base,
             snapshot_hash=canonical_sha256(asdict(snapshot)), operator_id=operator_id, reason=reason,
+            approval_document_json=canonical.decode("utf-8") if approval_document is not None else None,
+            approval_document_hash=hashlib.sha256(canonical).hexdigest() if approval_document is not None else None,
+            detached_signature=detached_signature, signer_fingerprint=signer_fingerprint, signer_public_key=signer_public_key,
         )
+
+    def prepare_native_release_revalidation(self, ticket_id: str, *, operator_id: str, reason: str, implementation_profile: str) -> dict[str, Any]:
+        """Read-only first step; never writes ledger, board, repository, or invokes a model."""
+        return self.revalidate_native_release(ticket_id, operator_id=operator_id, reason=reason, implementation_profile=implementation_profile, _prepare_only=True)
 
     def reconcile_hermes_execution(self, external_task_id: str, *, hermes_run_id: int | None = None, require_handoff: bool = False) -> dict[str, Any]:
         """Bind one completed dispatcher-owned Hermes run into Local First.

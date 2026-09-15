@@ -220,7 +220,7 @@ class ProcessNextPreview:
     reconciliation_action: str | None = None
 
 
-def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPreview:
+def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None) -> ProcessNextPreview:
     """Read the next eligible control stage without claiming or mutating it."""
     now = Ledger._now() if now is None else now
     paused = ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
@@ -238,7 +238,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None) -> ProcessNextPrevie
             claim_id=reconciliation.claim_id,
             reconciliation_action=reconciliation.action.value,
         )
-    migration = ledger.native_dependency_release_migration_required() if hasattr(ledger, "native_dependency_release_migration_required") else None
+    migration = ledger.native_dependency_release_migration_required(signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint) if hasattr(ledger, "native_dependency_release_migration_required") else None
     if migration is not None:
         return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(migration["ticket_id"]), reconciliation_action=ReconciliationAction.STOP.value)
 
@@ -714,6 +714,8 @@ class ProcessNextScheduler:
         native_dependency_release_prepare_runner: Callable[[str, str], dict[str, Any]] | None = None,
         native_dependency_release_profile: str | None = None,
         native_dependency_release_repository: str | None = None,
+        native_dependency_release_signer_public_key: bytes | None = None,
+        native_dependency_release_signer_fingerprint: str | None = None,
         implementation_runner: Callable[[str], dict[str, Any]] | None = None,
         validation_runner: Callable[[str], dict[str, Any]] | None = None,
         review_runner: Callable[[str], dict[str, Any]] | None = None,
@@ -746,6 +748,8 @@ class ProcessNextScheduler:
         self.native_dependency_release_prepare_runner = native_dependency_release_prepare_runner
         self.native_dependency_release_profile = native_dependency_release_profile
         self.native_dependency_release_repository = native_dependency_release_repository
+        self.native_dependency_release_signer_public_key = native_dependency_release_signer_public_key
+        self.native_dependency_release_signer_fingerprint = native_dependency_release_signer_fingerprint
         self.implementation_runner = implementation_runner
         self.validation_runner = validation_runner
         self.review_runner = review_runner
@@ -783,7 +787,7 @@ class ProcessNextScheduler:
             self.ledger.release_scheduler_tick(self.worker_id, lease_token)
 
     def _process_claimed_tick(self, now: int, execution_owner: str) -> ProcessNextResult:
-        migration = self.ledger.native_dependency_release_migration_required()
+        migration = self.ledger.native_dependency_release_migration_required(signer_public_key=self.native_dependency_release_signer_public_key, signer_fingerprint=self.native_dependency_release_signer_fingerprint)
         if migration is not None:
             raise RuntimeError(
                 "native_dependency_release_reconciliation_required: legacy release routing authority requires paused operator revalidation"

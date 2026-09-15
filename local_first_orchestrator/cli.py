@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ from .ledger import Ledger
 from .local_qwen import LOCAL_QWEN_MODEL, LOCAL_QWEN_PROVIDER, LocalQwenAdapter
 from .operator_config import ModelRegistration, OperatorConfig, default_execution_roots, load_operator_config, save_operator_config
 from .runtime_metrics import RuntimeMetricsStore
+from .native_release_approval import parse_approval_document
 from .paid_model import HermesPaidModelAdapter
 from .scheduler import ProcessNextScheduler, preview_database, scheduler_observability
 from .states import CanonicalState
@@ -347,6 +349,8 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         native_dependency_release_prepare_runner=lambda ticket_id, external_task_id: ctl.prepare_hermes_dispatch_worktree(ticket_id, external_task_id),
         native_dependency_release_profile=registered.implementation.profile,
         native_dependency_release_repository=str(registered.canonical_repository),
+        native_dependency_release_signer_public_key=registered.signer_public_key_bytes if registered.operator_signing_public_key else None,
+        native_dependency_release_signer_fingerprint=registered.operator_signing_key_fingerprint,
         implementation_runner=lambda ticket_id: ctl.execute_implementation_model_only(
             ticket_id, repository=registered.canonical_repository
         ),
@@ -547,6 +551,13 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     native_revalidate.add_argument("--task-id", required=True)
     native_revalidate.add_argument("--operator-id", required=True)
     native_revalidate.add_argument("--reason", required=True)
+    native_revalidate.add_argument("--approval-file")
+    native_revalidate.add_argument("--signature-file")
+    prepare_native=commands.add_parser("prepare-native-release-revalidation", help="read-only: emit canonical approval document; never signs or mutates")
+    prepare_native.add_argument("--task-id", required=True)
+    prepare_native.add_argument("--operator-id", required=True)
+    prepare_native.add_argument("--reason", required=True)
+    prepare_native.add_argument("--output-file")
     confirm_cleanup=commands.add_parser("confirm-retired-attempt-cleanup", help="verify separately-authorized cleanup; never removes files")
     confirm_cleanup.add_argument("--task-id", required=True)
     confirm_cleanup.add_argument("--operator-id", default="local-first-cli")
@@ -559,6 +570,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     register.add_argument("--review-profile", default="worker-code-local")
     register.add_argument("--review-provider", default=LOCAL_QWEN_PROVIDER)
     register.add_argument("--review-model", default=LOCAL_QWEN_MODEL)
+    register.add_argument("--operator-signing-public-key", help="base64 Ed25519 public key; private keys are never accepted")
+    register.add_argument("--operator-signing-key-fingerprint", help="sha256 fingerprint of the registered public key")
     register.add_argument("--decomposition-local-profile")
     register.add_argument("--decomposition-local-provider")
     register.add_argument("--decomposition-local-model")
@@ -766,6 +779,8 @@ def run_command(args: argparse.Namespace) -> int:
                 decomposition=tuple(sorted(decomposition_routes.items())),
                 paid_checkpoint=paid_routes.get("checkpoint"),
                 paid_escalation=paid_routes.get("escalation"),
+                operator_signing_public_key=args.operator_signing_public_key,
+                operator_signing_key_fingerprint=args.operator_signing_key_fingerprint,
             )
             path=save_operator_config(config, Path(args.config_path) if args.config_path else None)
             print(json.dumps({"registered": str(path)}, sort_keys=True))
@@ -799,7 +814,25 @@ def run_command(args: argparse.Namespace) -> int:
             if args.ad_hoc_runtime: raise ValueError("native release revalidation requires registered operator runtime")
             if not args.hermes_executable or not args.board: raise ValueError("native release revalidation requires --hermes-executable and --board")
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
-            print(json.dumps(ctl.revalidate_native_release(args.task_id, operator_id=args.operator_id, reason=args.reason, implementation_profile=registered.implementation.profile), sort_keys=True))
+            if not args.approval_file or not args.signature_file:
+                raise ValueError("revalidate-native-release requires --approval-file and --signature-file")
+            document_bytes = Path(args.approval_file).read_bytes()
+            document = parse_approval_document(document_bytes)
+            if document["operator_id"] != args.operator_id or document["reason"] != args.reason:
+                raise ValueError("CLI operator identity/reason must match signed approval document")
+            result = ctl.revalidate_native_release(args.task_id, operator_id=args.operator_id, reason=args.reason, implementation_profile=registered.implementation.profile, approval_document=document, detached_signature=Path(args.signature_file).read_bytes(), signer_public_key=registered.signer_public_key_bytes, signer_fingerprint=registered.operator_signing_key_fingerprint)
+            print(json.dumps(result, sort_keys=True))
+        elif args.command=="prepare-native-release-revalidation":
+            if args.ad_hoc_runtime: raise ValueError("native release preparation requires registered operator runtime")
+            if not args.hermes_executable or not args.board: raise ValueError("native release preparation requires --hermes-executable and --board")
+            ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
+            prepared = ctl.prepare_native_release_revalidation(args.task_id, operator_id=args.operator_id, reason=args.reason, implementation_profile=registered.implementation.profile)
+            encoded = prepared["canonical_document"].encode("utf-8")
+            if args.output_file:
+                Path(args.output_file).write_bytes(encoded)
+                print(json.dumps({"approval_hash": prepared["approval_hash"], "output_file": args.output_file}, sort_keys=True))
+            else:
+                sys.stdout.write(prepared["canonical_document"])
         elif args.command=="confirm-retired-attempt-cleanup":
             if args.ad_hoc_runtime: raise ValueError("cleanup confirmation requires registered operator runtime")
             ctl, _ = _registered_controller(ledger,args,allow_board_writes=False)

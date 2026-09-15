@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+import binascii
 import json
 import re
 import sqlite3
@@ -302,7 +304,8 @@ CREATE TABLE IF NOT EXISTS model_calls (
 );
 CREATE TABLE IF NOT EXISTS runtime_bindings (
     ticket_id TEXT PRIMARY KEY REFERENCES tickets(id), repository_path TEXT NOT NULL,
-    starting_sha TEXT NOT NULL, ownership_verified INTEGER NOT NULL, created_at INTEGER NOT NULL
+    starting_sha TEXT NOT NULL, ownership_verified INTEGER NOT NULL, created_at INTEGER NOT NULL,
+    operator_signer_fingerprint TEXT, operator_authority_hash TEXT
 );
 CREATE TABLE IF NOT EXISTS runtime_stages (
     ticket_id TEXT NOT NULL REFERENCES tickets(id), stage TEXT NOT NULL, detail TEXT NOT NULL,
@@ -514,7 +517,11 @@ CREATE TABLE IF NOT EXISTS native_dependency_release_revalidations (
     created_at INTEGER NOT NULL,
     revalidation_event_id INTEGER REFERENCES events(id),
     event_key TEXT,
-    evidence_hash TEXT
+    evidence_hash TEXT,
+    approval_document_json TEXT,
+    approval_document_hash TEXT,
+    detached_signature TEXT,
+    signer_fingerprint TEXT
 );
 CREATE TRIGGER IF NOT EXISTS native_dependency_release_revalidations_immutable_update
 BEFORE UPDATE ON native_dependency_release_revalidations BEGIN SELECT RAISE(ABORT, 'native dependency release revalidations are append-only'); END;
@@ -1045,9 +1052,13 @@ class Ledger:
         if "routing_authority_json" not in release_columns:
             self.connection.execute("ALTER TABLE native_dependency_releases ADD COLUMN routing_authority_json TEXT NOT NULL DEFAULT '{}'")
         revalidation_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(native_dependency_release_revalidations)")}
-        for name, definition in (("revalidation_event_id", "INTEGER"), ("event_key", "TEXT"), ("evidence_hash", "TEXT")):
+        for name, definition in (("revalidation_event_id", "INTEGER"), ("event_key", "TEXT"), ("evidence_hash", "TEXT"), ("approval_document_json", "TEXT"), ("approval_document_hash", "TEXT"), ("detached_signature", "TEXT"), ("signer_fingerprint", "TEXT")):
             if name not in revalidation_columns:
                 self.connection.execute(f"ALTER TABLE native_dependency_release_revalidations ADD COLUMN {name} {definition}")
+        binding_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(runtime_bindings)")}
+        for name in ("operator_signer_fingerprint", "operator_authority_hash"):
+            if name not in binding_columns:
+                self.connection.execute(f"ALTER TABLE runtime_bindings ADD COLUMN {name} TEXT")
         self.connection.executescript("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_native_release_revalidation_event
             ON native_dependency_release_revalidations(revalidation_event_id)
@@ -1561,17 +1572,17 @@ class Ledger:
             event_id = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="retired_attempt_cleanup_confirmed", actor_id=operator_id, payload={"retired_attempt":retired_attempt_number,"checked_paths":json.loads(encoded_paths)})
             return {"ticket_id":ticket_id,"retired_attempt_number":retired_attempt_number,"status":"confirmed","event_id":event_id}
 
-    def bind_runtime(self, ticket_id: str, repository_path: str, starting_sha: str, canonical_sha: str | None = None, ownership_verified: int = 1) -> dict[str, Any]:
-        requested = (str(repository_path), str(starting_sha), str(canonical_sha or starting_sha), int(ownership_verified))
+    def bind_runtime(self, ticket_id: str, repository_path: str, starting_sha: str, canonical_sha: str | None = None, ownership_verified: int = 1, operator_signer_fingerprint: str | None = None, operator_authority_hash: str | None = None) -> dict[str, Any]:
+        requested = (str(repository_path), str(starting_sha), str(canonical_sha or starting_sha), int(ownership_verified), operator_signer_fingerprint, operator_authority_hash)
         def verify(row: sqlite3.Row) -> dict[str, Any]:
-            actual = (str(row["repository_path"]), str(row["starting_sha"]), str(row["canonical_sha"]), int(row["ownership_verified"]))
+            actual = (str(row["repository_path"]), str(row["starting_sha"]), str(row["canonical_sha"]), int(row["ownership_verified"]), row["operator_signer_fingerprint"], row["operator_authority_hash"])
             if actual != requested: raise ValueError("conflicting runtime binding")
             return dict(row)
         try:
             with self._transaction() as conn:
                 existing = conn.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
                 if existing is not None: return verify(existing)
-                conn.execute("INSERT INTO runtime_bindings(ticket_id, repository_path, starting_sha, canonical_sha, ownership_verified, created_at) VALUES (?, ?, ?, ?, ?, ?)", (ticket_id, *requested, self._now()))
+                conn.execute("INSERT INTO runtime_bindings(ticket_id, repository_path, starting_sha, canonical_sha, ownership_verified, created_at, operator_signer_fingerprint, operator_authority_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (ticket_id, *requested[:4], self._now(), *requested[4:]))
                 return verify(conn.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone())
         except sqlite3.IntegrityError:
             existing = self.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
@@ -2279,7 +2290,7 @@ class Ledger:
         row = self.connection.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (ticket_id,)).fetchone()
         return dict(row) if row else None
 
-    def native_dependency_release_migration_required(self) -> dict[str, Any] | None:
+    def native_dependency_release_migration_required(self, *, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None) -> dict[str, Any] | None:
         """Find legacy releases that cannot authorize downstream execution."""
         rows = self.connection.execute("SELECT * FROM native_dependency_releases ORDER BY ticket_id").fetchall()
         for row in rows:
@@ -2304,7 +2315,7 @@ class Ledger:
                     LEFT JOIN events re ON re.id=r.revalidation_event_id
                     WHERE r.ticket_id=?
                 """, (ticket_id,)).fetchall()
-                valid = [item for item in current if self._native_release_revalidation_row_valid(item, row)]
+                valid = [item for item in current if self._native_release_revalidation_row_valid(item, row, signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint)]
                 linked_keys = {str(item["event_key"]) for item in current if item["event_key"] is not None}
                 linked_events = self.connection.execute(
                     "SELECT id,payload_json FROM events WHERE entity_type='controller' AND entity_id='controller' AND event_type='native_dependency_release_revalidated'"
@@ -2351,7 +2362,7 @@ class Ledger:
         }
 
     @classmethod
-    def _native_release_revalidation_row_valid(cls, row: sqlite3.Row, release: sqlite3.Row) -> bool:
+    def _native_release_revalidation_row_valid(cls, row: sqlite3.Row, release: sqlite3.Row, *, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None) -> bool:
         try:
             authority = json.loads(str(row["release_routing_authority_json"]))
             payload = json.loads(str(row["linked_event_payload"]))
@@ -2362,6 +2373,17 @@ class Ledger:
             return False
         expected_event_key = "native-release-revalidated:" + str(row["revalidation_id"])
         expected_payload = {"event_key": expected_event_key, "revalidation_id": str(row["revalidation_id"]), "evidence_hash": str(row["evidence_hash"]), "evidence": document}
+        if row["approval_document_hash"] is not None:
+            expected_payload.update({"approval_document_hash": str(row["approval_document_hash"]), "signer_fingerprint": str(row["signer_fingerprint"])})
+            try:
+                from .native_release_approval import parse_approval_document, verify_detached_signature
+                raw = str(row["approval_document_json"]).encode("utf-8")
+                if signer_public_key is None or signer_fingerprint is None or hashlib.sha256(raw).hexdigest() != str(row["approval_document_hash"]):
+                    return False
+                parse_approval_document(raw)
+                verify_detached_signature(raw, base64.b64decode(str(row["detached_signature"]), validate=True), signer_public_key, signer_fingerprint)
+            except (ValueError, TypeError, binascii.Error):
+                return False
         return (
             isinstance(authority, dict) and authority == {}
             and str(row["release_graph_hash"]) == str(release["graph_hash"])
@@ -2391,7 +2413,10 @@ class Ledger:
                                            projection_key: str, external_task_id: str,
                                            implementation_profile: str, repository_identity: str,
                                            canonical_worktree_path: str, branch: str, base_sha: str,
-                                           snapshot_hash: str, operator_id: str, reason: str) -> dict[str, Any]:
+                                           snapshot_hash: str, operator_id: str, reason: str,
+                                           approval_document_json: str | None = None, approval_document_hash: str | None = None,
+                                           detached_signature: bytes | None = None, signer_fingerprint: str | None = None,
+                                           signer_public_key: bytes | None = None) -> dict[str, Any]:
         if not all(isinstance(value, str) and value.strip() for value in (ticket_id, projection_key, external_task_id, implementation_profile, repository_identity, canonical_worktree_path, branch, base_sha, snapshot_hash, operator_id, reason)):
             raise ValueError("native release revalidation requires non-empty identity and reason")
         with self._transaction() as conn:
@@ -2441,7 +2466,7 @@ class Ledger:
                     JOIN runtime_bindings rb ON rb.ticket_id=r.ticket_id
                     WHERE r.revalidation_id=?
                 """, (existing_ticket["revalidation_id"],)).fetchone()
-                if linked is None or not self._native_release_revalidation_row_valid(linked, release):
+                if linked is None or not self._native_release_revalidation_row_valid(linked, release, signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint):
                     raise RuntimeError("native release revalidation reconciliation required")
                 return dict(existing_ticket)
             identity = {"ticket_id": ticket_id, "projection_event_id": projection_event_id, "projection_key": projection_key, "external_task_id": external_task_id, "release_graph_hash": release["graph_hash"], "release_child_external_id": release["child_external_id"], "release_parent_completion_hash": release["parent_completion_hash"], "release_routing_authority_json": release["routing_authority_json"], "release_hermes_status": release["hermes_status"], "release_observed_at": int(release["observed_at"]), "implementation_profile": implementation_profile, "repository_identity": repository_identity, "canonical_worktree_path": canonical_worktree_path, "branch": branch, "base_sha": base_sha, "snapshot_hash": snapshot_hash, "operator_id": operator_id, "reason": reason}
@@ -2451,6 +2476,8 @@ class Ledger:
             evidence = self._native_release_evidence_document(evidence_row)
             evidence_hash = canonical_sha256(evidence)
             event_payload = {"event_key": event_key, "revalidation_id": revalidation_id, "evidence_hash": evidence_hash, "evidence": evidence}
+            if approval_document_hash is not None:
+                event_payload.update({"approval_document_hash": approval_document_hash, "signer_fingerprint": signer_fingerprint})
             prior = conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=?", (revalidation_id,)).fetchone()
             if prior is not None:
                 expected = tuple(prior[key] for key in ("implementation_profile", "repository_identity", "canonical_worktree_path", "branch", "base_sha", "snapshot_hash", "operator_id", "reason"))
@@ -2463,8 +2490,8 @@ class Ledger:
                 raise ValueError("native release revalidation duplicate or drifted")
             event_id = self._append_event(conn, entity_type="controller", entity_id="controller", event_type="native_dependency_release_revalidated", actor_id=operator_id, payload=event_payload)
             conn.execute("""INSERT INTO native_dependency_release_revalidations
-                (revalidation_id,ticket_id,release_graph_hash,release_child_external_id,release_parent_completion_hash,release_routing_authority_json,release_hermes_status,release_observed_at,projection_event_id,projection_key,external_task_id,implementation_profile,repository_identity,canonical_worktree_path,branch,base_sha,snapshot_hash,operator_id,reason,created_at,revalidation_event_id,event_key,evidence_hash)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (revalidation_id,ticket_id,release["graph_hash"],release["child_external_id"],release["parent_completion_hash"],release["routing_authority_json"],release["hermes_status"],release["observed_at"],projection_event_id,projection_key,external_task_id,*values,self._now(),event_id,event_key,evidence_hash))
+                (revalidation_id,ticket_id,release_graph_hash,release_child_external_id,release_parent_completion_hash,release_routing_authority_json,release_hermes_status,release_observed_at,projection_event_id,projection_key,external_task_id,implementation_profile,repository_identity,canonical_worktree_path,branch,base_sha,snapshot_hash,operator_id,reason,created_at,revalidation_event_id,event_key,evidence_hash,approval_document_json,approval_document_hash,detached_signature,signer_fingerprint)
+                VALUES (?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?)""", (revalidation_id,ticket_id,release["graph_hash"],release["child_external_id"],release["parent_completion_hash"],release["routing_authority_json"],release["hermes_status"],release["observed_at"],projection_event_id,projection_key,external_task_id,*values,self._now(),event_id,event_key,evidence_hash,approval_document_json,approval_document_hash,base64.b64encode(detached_signature).decode("ascii") if detached_signature else None,signer_fingerprint))
             self._inject_failure("after_native_release_revalidation")
             return dict(conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=?", (revalidation_id,)).fetchone())
 

@@ -7,6 +7,7 @@ HTTP.  Older registrations remain readable, but cannot construct execution.
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import os
 from dataclasses import asdict, dataclass
@@ -18,6 +19,7 @@ _LEGACY_FIELDS = frozenset({"ledger_path", "canonical_repository", "repository_a
 _RUNTIME_FIELDS = frozenset({"worktree_root", "artifact_root", "implementation_timeout_seconds", "review_timeout_seconds"})
 _ROUTING_FIELDS = frozenset({"decomposition"})
 _PAID_FIELDS = frozenset({"paid_checkpoint", "paid_escalation"})
+_SIGNER_FIELDS = frozenset({"operator_signing_public_key", "operator_signing_key_fingerprint"})
 
 
 def default_config_path() -> Path:
@@ -67,6 +69,25 @@ class OperatorConfig:
     decomposition: tuple[tuple[str, ModelRegistration], ...] = ()
     paid_checkpoint: ModelRegistration | None = None
     paid_escalation: ModelRegistration | None = None
+    operator_signing_public_key: str | None = None
+    operator_signing_key_fingerprint: str | None = None
+
+    @property
+    def signer_public_key_bytes(self) -> bytes:
+        if not self.operator_signing_public_key or not self.operator_signing_key_fingerprint:
+            raise ValueError("external operator signer authority is not registered")
+        try:
+            key = base64.b64decode(self.operator_signing_public_key, validate=True)
+        except Exception as exc:
+            raise ValueError("registered operator signing public key is invalid") from exc
+        from .native_release_approval import fingerprint_public_key
+        if fingerprint_public_key(key) != self.operator_signing_key_fingerprint:
+            raise ValueError("registered operator signer fingerprint mismatch")
+        return key
+
+    @property
+    def operator_authority_hash(self) -> str:
+        return hashlib.sha256((self.operator_signing_key_fingerprint or "").encode("ascii")).hexdigest()
 
     def decomposition_route(self, cost_class: str) -> ModelRegistration:
         routes = dict(self.decomposition)
@@ -90,7 +111,11 @@ class OperatorConfig:
             raise ValueError("execution_runtime_not_configured")
         if self.worktree_root is not None and (not isinstance(self.worktree_root, Path) or not isinstance(self.artifact_root, Path) or not isinstance(self.implementation_timeout_seconds, int) or not isinstance(self.review_timeout_seconds, int)):
             raise ValueError("execution_runtime_not_configured")
-        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review, self.worktree_root, self.artifact_root, self.implementation_timeout_seconds, self.review_timeout_seconds, self.decomposition, self.paid_checkpoint, self.paid_escalation)
+        if (self.operator_signing_public_key is None) != (self.operator_signing_key_fingerprint is None):
+            raise ValueError("operator signer registration requires public key and fingerprint together")
+        if self.operator_signing_public_key is not None:
+            self.signer_public_key_bytes
+        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review, self.worktree_root, self.artifact_root, self.implementation_timeout_seconds, self.review_timeout_seconds, self.decomposition, self.paid_checkpoint, self.paid_escalation, self.operator_signing_public_key, self.operator_signing_key_fingerprint)
 
     @property
     def execution_configured(self) -> bool:
@@ -102,7 +127,7 @@ class OperatorConfig:
             raise ValueError("execution_runtime_not_configured")
         from .controller import RuntimeConfig
         assert self.worktree_root is not None and self.artifact_root is not None and self.implementation_timeout_seconds is not None and self.review_timeout_seconds is not None
-        config = RuntimeConfig(self.canonical_repository, self.worktree_root, self.artifact_root, self.repository_allowlist, implementation_timeout_seconds=self.implementation_timeout_seconds, review_timeout_seconds=self.review_timeout_seconds)
+        config = RuntimeConfig(self.canonical_repository, self.worktree_root, self.artifact_root, self.repository_allowlist, implementation_timeout_seconds=self.implementation_timeout_seconds, review_timeout_seconds=self.review_timeout_seconds, operator_signer_fingerprint=self.operator_signing_key_fingerprint, operator_authority_hash=self.operator_authority_hash)
         config.validate_execution_roots()
         return config
 
@@ -126,6 +151,9 @@ class OperatorConfig:
             result["paid_checkpoint"] = asdict(self.paid_checkpoint)
         if self.paid_escalation is not None:
             result["paid_escalation"] = asdict(self.paid_escalation)
+        if self.operator_signing_public_key is not None:
+            result["operator_signing_public_key"] = self.operator_signing_public_key
+            result["operator_signing_key_fingerprint"] = self.operator_signing_key_fingerprint
         return result
 
 
@@ -137,7 +165,7 @@ def load_operator_config(path: Path | None = None) -> OperatorConfig:
         raise ValueError("operator dashboard is not registered") from exc
     except json.JSONDecodeError as exc:
         raise ValueError("operator registration is not valid JSON") from exc
-    if not isinstance(raw, dict) or not _LEGACY_FIELDS <= set(raw) or set(raw) - (_LEGACY_FIELDS | _RUNTIME_FIELDS | _ROUTING_FIELDS | _PAID_FIELDS):
+    if not isinstance(raw, dict) or not _LEGACY_FIELDS <= set(raw) or set(raw) - (_LEGACY_FIELDS | _RUNTIME_FIELDS | _ROUTING_FIELDS | _PAID_FIELDS | _SIGNER_FIELDS):
         raise ValueError("operator registration has unexpected fields")
     if bool(set(raw) & _RUNTIME_FIELDS) and not _RUNTIME_FIELDS <= set(raw):
         raise ValueError("execution_runtime_not_configured")
@@ -159,7 +187,10 @@ def load_operator_config(path: Path | None = None) -> OperatorConfig:
         decomposition = tuple(sorted((str(cost), ModelRegistration.parse(value, f"decomposition.{cost}")) for cost, value in raw["decomposition"].items()))
     paid_checkpoint = ModelRegistration.parse(raw["paid_checkpoint"], "paid_checkpoint") if "paid_checkpoint" in raw else None
     paid_escalation = ModelRegistration.parse(raw["paid_escalation"], "paid_escalation") if "paid_escalation" in raw else None
-    return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review"), *runtime, decomposition, paid_checkpoint, paid_escalation).validated(require_ledger=True)
+    signer = (raw.get("operator_signing_public_key"), raw.get("operator_signing_key_fingerprint"))
+    if any(value is not None for value in signer) and not all(isinstance(value, str) and value.strip() for value in signer):
+        raise ValueError("operator signer registration requires public key and fingerprint together")
+    return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review"), *runtime, decomposition, paid_checkpoint, paid_escalation, *signer).validated(require_ledger=True)
 
 
 def save_operator_config(config: OperatorConfig, path: Path | None = None) -> Path:
