@@ -12,6 +12,7 @@ import os
 import stat
 import subprocess
 import secrets
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -181,10 +182,28 @@ def _verify(document: dict[str, Any], signature: bytes | str, public_key_b64: st
     return data, raw_sig
 
 
+def _bound_commit(repository: Path, value: Any, field: str) -> str:
+    """Verify a bound full commit ID without consulting or changing checkout state."""
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{40}", value) is None:
+        raise ValueError(f"runtime binding {field} is not an exact commit ID")
+    expression = f"{value}^{{commit}}"
+    try:
+        subprocess.run(("git", "cat-file", "-e", expression), cwd=repository, check=True, capture_output=True)
+        resolved = subprocess.run(("git", "rev-parse", "--verify", "--end-of-options", expression), cwd=repository, text=True, capture_output=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError(f"runtime binding {field} is not a commit in the registered repository") from exc
+    if resolved != value:
+        raise ValueError(f"runtime binding {field} is not an exact commit ID")
+    return value
+
+
 def _eligible(ledger: Any, ticket_ids: tuple[str, ...], repository: Path) -> dict[str, dict[str, Any]]:
     if not ticket_ids or len(set(ticket_ids)) != len(ticket_ids): raise ValueError("explicit ticket IDs must be non-empty and unique")
     out = {}
-    head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repository, text=True, capture_output=True, check=True).stdout.strip()
+    try:
+        registered_repository = repository.expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("registered canonical repository is unavailable") from exc
     for ticket_id in ticket_ids:
         ticket = ledger.connection.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
         binding = ledger.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
@@ -193,7 +212,14 @@ def _eligible(ledger: Any, ticket_ids: tuple[str, ...], repository: Path) -> dic
         try: authority = json.loads(str(release["routing_authority_json"] or "{}"))
         except json.JSONDecodeError as exc: raise ValueError("legacy release authority is malformed") from exc
         if authority != {} or binding["operator_signer_fingerprint"] is not None or binding["operator_authority_hash"] is not None: raise ValueError(f"ticket {ticket_id} is not an unbound legacy release")
-        if str(binding["repository_path"]) != str(repository) or int(binding["ownership_verified"]) != 1 or str(binding["starting_sha"]) != head: raise ValueError(f"ticket {ticket_id} runtime binding is not current and owned")
+        try:
+            bound_repository = Path(str(binding["repository_path"])).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"ticket {ticket_id} runtime binding repository is invalid") from exc
+        if bound_repository != registered_repository or int(binding["ownership_verified"]) != 1:
+            raise ValueError(f"ticket {ticket_id} runtime binding is not registered and owned")
+        _bound_commit(registered_repository, binding["starting_sha"], "starting_sha")
+        _bound_commit(registered_repository, binding["canonical_sha"], "canonical_sha")
         projection = ledger.connection.execute("""SELECT b.*,e.event_type,e.entity_type,e.entity_id FROM board_projection_outbox b JOIN events e ON e.id=b.event_id WHERE b.ticket_id=? AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL AND b.superseded_at IS NULL AND b.external_task_id IS NOT NULL""", (ticket_id,)).fetchall()
         if str(ticket["state"]) not in {"draft", "ready_local"} or len(projection) != 1 or projection[0]["entity_type"] != "ticket" or projection[0]["entity_id"] != ticket_id or projection[0]["event_type"] not in {"generated_microticket_created", "generated_microticket_projection_recovered"}: raise ValueError(f"ticket {ticket_id} has ambiguous projection")
         p = dict(projection[0])

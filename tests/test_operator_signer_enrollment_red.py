@@ -15,7 +15,7 @@ from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.operator_config import enroll_operator_signer, load_operator_config
 from local_first_orchestrator.signer_enrollment import (
     ENROLLMENT_DOMAIN, ENROLLMENT_VERSION, parse_enrollment_document,
-    _canonical_document, _verify, prepare_operator_signer_enrollment,
+    _canonical_document, _verify, _eligible, prepare_operator_signer_enrollment,
 )
 from local_first_orchestrator.scheduler import ProcessNextScheduler, preview_next
 from local_first_orchestrator.states import CanonicalState
@@ -28,10 +28,15 @@ class OperatorSignerEnrollmentRedTests(unittest.TestCase):
         (repo / "README").write_text("fixture\n")
         subprocess.run(("git", "add", "README"), cwd=repo, check=True)
         subprocess.run(("git", "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "base"), cwd=repo, check=True)
-        head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+        commit_a = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+        (repo / "README").write_text("advanced\n")
+        subprocess.run(("git", "add", "README"), cwd=repo, check=True)
+        subprocess.run(("git", "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "advanced"), cwd=repo, check=True)
+        commit_b = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+        (repo / "dirty.txt").write_text("canonical remains dirty\n")
         ledger = Ledger(root / "ledger.db"); ledger.migrate()
         ticket = ledger.create_ticket(title="legacy", state=CanonicalState.READY_LOCAL, external_id="external-legacy", contract={"objective":"x","criterion_ids":["AC-1"],"primary_symbol":"x","allowed_files":["README"],"forbidden_changes":[],"patch_budget":{"max_files":1,"max_changed_lines":1},"verification":{"commands":[]},"risk":"low","review_required":True,"max_attempts":1,"dependencies":[]})
-        ledger.bind_runtime(ticket, str(repo), head)
+        ledger.bind_runtime(ticket, str(repo), commit_a)
         with ledger._transaction() as conn:
             event = ledger._append_event(conn, entity_type="ticket", entity_id=ticket, event_type="generated_microticket_created", actor_id="test", to_state="draft", payload={"ticket_id":ticket})
             conn.execute("INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,acknowledged_at,external_task_id,operation) VALUES (?,?,?,'{}',?,1,1,?,'create_microticket')", (ticket,event,"draft","legacy-create","external-legacy"))
@@ -44,6 +49,38 @@ class OperatorSignerEnrollmentRedTests(unittest.TestCase):
         prepared = prepare_operator_signer_enrollment(ledger, config_path=config_path, operator_id="operator", reason="migration", ticket_ids=(ticket,), public_key_b64=public_b64, fingerprint=fingerprint, nonce="fixed")
         signature = private.sign(prepared["document_bytes"])
         return tmp, root, ledger, config_path, prepared, signature, public_b64, fingerprint, ticket
+
+    def test_historical_binding_enrolls_without_touching_dirty_canonical_checkout(self) -> None:
+        tmp, root, ledger, config_path, prepared, signature, public_b64, fingerprint, ticket = self._enrollment_fixture()
+        repo = root / "repo"
+        before = subprocess.run(("git", "status", "--porcelain=v1"), cwd=repo, text=True, capture_output=True, check=True).stdout
+        binding_before = dict(ledger.connection.execute("SELECT repository_path,starting_sha,canonical_sha FROM runtime_bindings WHERE ticket_id=?", (ticket,)).fetchone())
+        self.assertTrue(before)
+        self.assertNotEqual(binding_before["starting_sha"], subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip())
+        result = enroll_operator_signer(ledger, config_path=config_path, document=prepared["document"], detached_signature=signature, public_key_b64=public_b64, fingerprint=fingerprint)
+        self.assertEqual(result["status"], "finalized")
+        self.assertEqual(dict(ledger.connection.execute("SELECT repository_path,starting_sha,canonical_sha FROM runtime_bindings WHERE ticket_id=?", (ticket,)).fetchone()), binding_before)
+        self.assertEqual(subprocess.run(("git", "status", "--porcelain=v1"), cwd=repo, text=True, capture_output=True, check=True).stdout, before)
+        self.assertEqual(config_path.read_bytes(), base64.b64decode(prepared["document"]["new_config_bytes"]))
+        ledger.close(); tmp.cleanup()
+
+    def test_binding_commit_and_repository_guards_reject_forgery(self) -> None:
+        cases = (
+            ("starting_sha", ""),
+            ("starting_sha", "f" * 40),
+            ("canonical_sha", ""),
+            ("canonical_sha", "f" * 40),
+            ("repository_path", "/tmp/not-the-registered-repository"),
+            ("ownership_verified", 0),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                tmp, root, ledger, config_path, prepared, signature, public_b64, fingerprint, ticket = self._enrollment_fixture()
+                ledger.connection.execute(f"UPDATE runtime_bindings SET {field}=? WHERE ticket_id=?", (value, ticket))
+                ledger.connection.commit()
+                with self.assertRaises(ValueError):
+                    _eligible(ledger, (ticket,), root / "repo")
+                ledger.close(); tmp.cleanup()
 
     def test_enrollment_document_is_canonical_duplicate_free_and_detached_signed(self) -> None:
         private = Ed25519PrivateKey.generate(); public = private.public_key().public_bytes_raw()
