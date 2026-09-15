@@ -223,6 +223,18 @@ class ProcessNextPreview:
     blocker_reason: str | None = None
 
 
+def _fresh_signer_authority(*, signer_public_key: bytes | None, signer_fingerprint: str | None, signer_config_path: Path | None) -> tuple[bytes | None, str | None]:
+    """Reload signer authority at every scheduler decision boundary."""
+    if signer_config_path is None:
+        return signer_public_key, signer_fingerprint
+    try:
+        from .operator_config import load_operator_config
+        config = load_operator_config(Path(signer_config_path))
+        return config.signer_public_key_bytes, config.operator_signing_key_fingerprint
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("scheduler signer configuration reload failed") from exc
+
+
 def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None, signer_config_path: Path | None = None, board: Any | None = None) -> ProcessNextPreview:
     """Read the next eligible control stage without claiming or mutating it."""
     now = Ledger._now() if now is None else now
@@ -246,6 +258,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
             claim_id=reconciliation.claim_id,
             reconciliation_action=reconciliation.action.value,
         )
+    signer_public_key, signer_fingerprint = _fresh_signer_authority(signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint, signer_config_path=signer_config_path)
     migration = ledger.native_dependency_release_migration_required(signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint, config_path=signer_config_path) if hasattr(ledger, "native_dependency_release_migration_required") else None
     if migration is not None:
         return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(migration["ticket_id"]), reconciliation_action=ReconciliationAction.STOP.value, blocker_reason=str(migration["reason"]))
@@ -845,7 +858,12 @@ class ProcessNextScheduler:
             if reason.startswith("signer enrollment reconciliation required:"):
                 raise RuntimeError(reason)
             raise RuntimeError("native_dependency_release_reconciliation_required: " + reason)
-        migration = self.ledger.native_dependency_release_migration_required(signer_public_key=self.native_dependency_release_signer_public_key, signer_fingerprint=self.native_dependency_release_signer_fingerprint, config_path=self.native_dependency_release_signer_config_path)
+        fresh_signer_key, fresh_signer_fingerprint = _fresh_signer_authority(
+            signer_public_key=self.native_dependency_release_signer_public_key,
+            signer_fingerprint=self.native_dependency_release_signer_fingerprint,
+            signer_config_path=self.native_dependency_release_signer_config_path,
+        )
+        migration = self.ledger.native_dependency_release_migration_required(signer_public_key=fresh_signer_key, signer_fingerprint=fresh_signer_fingerprint, config_path=self.native_dependency_release_signer_config_path)
         if migration is not None:
             reason = str(migration["reason"])
             if reason.startswith("signer enrollment reconciliation required:"):
@@ -853,6 +871,17 @@ class ProcessNextScheduler:
             raise RuntimeError(
                 "native_dependency_release_reconciliation_required: " + reason
             )
+        # An acknowledged activation is not a board authority. Re-read the
+        # configured board and require the exact post-effect state and marker.
+        for activation in self.ledger.connection.execute("SELECT * FROM native_release_activation_intents WHERE status='acknowledged' ORDER BY request_key").fetchall():
+            current = self.board.execution_snapshot(str(activation["external_task_id"]))
+            board_path = self.board._resolved_board_db_path()
+            board_identity = board_path.stat()
+            if str(board_path) != str(activation["board_path"]) or (int(board_identity.st_dev), int(board_identity.st_ino)) != (int(activation["board_dev"]), int(activation["board_ino"])):
+                raise RuntimeError("native_dependency_release_reconciliation_required: configured board inode changed")
+            if current.task.status != "ready" or current.task.assignee != str(activation["implementation_profile"]) or current.task.workspace_kind != "worktree" or not self.board.activation_marker_present(str(activation["external_task_id"]), str(activation["activation_marker"])):
+                raise RuntimeError("native_dependency_release_reconciliation_required: acknowledged activation is not exact ready post-state")
+
         reconciliation = self.ledger.next_scheduler_reconciliation(now=now)
         if reconciliation is not None and reconciliation.action == ReconciliationAction.STOP:
             family = self.ledger._scheduler_stage_family(reconciliation.stage)

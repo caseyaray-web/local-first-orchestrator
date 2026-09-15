@@ -311,9 +311,10 @@ class HermesBoardAdapter:
     def activation_marker_present(self, ticket_id: str, marker: str) -> bool:
         try:
             from hermes_cli.sqlite_util import open_db
-            with open_db(self._resolved_board_db_path(), db_label=f"kanban:{self.board}", busy_timeout_ms=int(self.timeout_seconds * 1000), wal=False, check_same_thread=False) as connection:
-                rows = connection.execute("SELECT payload FROM task_events WHERE task_id=? AND payload LIKE ? ORDER BY id", (ticket_id, f"%{marker}%")).fetchall()
-                return len(rows) == 1 and marker in str(rows[0]["payload"])
+            path = self._resolved_board_db_path()
+            with open_db(path, db_label=f"kanban:{self.board}", busy_timeout_ms=int(self.timeout_seconds * 1000), wal=False, check_same_thread=False) as connection:
+                rows = connection.execute("SELECT body FROM task_comments WHERE task_id=? ORDER BY id", (ticket_id,)).fetchall()
+                return sum(1 for row in rows if str(row["body"]) == f"UNBLOCK: {marker}") == 1
         except Exception as exc:
             raise RuntimeError("native release activation marker read unavailable") from exc
 

@@ -13,14 +13,15 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 APPROVAL_DOMAIN = "native-release-revalidation"
+ACTIVATION_DOMAIN = "native-release-activation"
 APPROVAL_VERSION = 1
 _REQUIRED = {"domain", "version", "operation", "request_id", "nonce", "operator_id", "reason", "authority"}
 
 
-def canonical_approval_bytes(document: dict[str, Any]) -> bytes:
+def _canonical_bytes(document: dict[str, Any], *, domain: str, operation: str) -> bytes:
     if not isinstance(document, dict) or set(document) != _REQUIRED:
         raise ValueError("approval document has unexpected or missing fields")
-    if document["domain"] != APPROVAL_DOMAIN or document["version"] != APPROVAL_VERSION or document["operation"] != "revalidate-native-release":
+    if document["domain"] != domain or document["version"] != APPROVAL_VERSION or document["operation"] != operation:
         raise ValueError("approval document domain or version mismatch")
     for key in ("request_id", "nonce", "operator_id", "reason"):
         if not isinstance(document[key], str) or not document[key].strip():
@@ -28,6 +29,14 @@ def canonical_approval_bytes(document: dict[str, Any]) -> bytes:
     if not isinstance(document["authority"], dict) or not document["authority"]:
         raise ValueError("approval document authority is required")
     return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")
+
+
+def canonical_approval_bytes(document: dict[str, Any]) -> bytes:
+    return _canonical_bytes(document, domain=APPROVAL_DOMAIN, operation="revalidate-native-release")
+
+
+def canonical_activation_bytes(document: dict[str, Any]) -> bytes:
+    return _canonical_bytes(document, domain=ACTIVATION_DOMAIN, operation="activate-native-release")
 
 
 def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -47,7 +56,13 @@ def parse_approval_document(raw: bytes | str) -> dict[str, Any]:
         document = json.loads(data.decode("utf-8"), object_pairs_hook=_no_duplicates, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite JSON number")))
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError("approval document is not valid canonical JSON") from exc
-    if not isinstance(document, dict) or canonical_approval_bytes(document) != data:
+    if not isinstance(document, dict):
+        raise ValueError("approval document is not canonical JSON")
+    if document.get("domain") == ACTIVATION_DOMAIN and document.get("operation") == "activate-native-release":
+        canonical = canonical_activation_bytes(document)
+    else:
+        canonical = canonical_approval_bytes(document)
+    if canonical != data:
         raise ValueError("approval document is not canonical JSON")
     return document
 

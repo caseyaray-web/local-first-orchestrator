@@ -25,6 +25,7 @@ from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.states import CanonicalState
 from local_first_orchestrator.native_release_approval import (
     canonical_approval_bytes,
+    canonical_activation_bytes,
     fingerprint_public_key,
     parse_approval_document,
 )
@@ -424,15 +425,14 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
     def test_activation_intent_and_acknowledgement_are_append_audited(self) -> None:
         revalidation = self.signed_revalidate(reason="activation")
         intent = self.ledger.prepare_native_release_activation_intent(
-            ticket_id=self.ticket, revalidation_id=revalidation["revalidation_id"], external_task_id=self.external_id,
-            pre_activation_snapshot_hash=revalidation["snapshot_hash"], implementation_profile="impl",
+            ticket_id=self.ticket, revalidation_id=str(revalidation["revalidation_id"]), external_task_id=self.external_id,
+            pre_activation_snapshot_hash=str(revalidation["snapshot_hash"]), implementation_profile="impl",
             repository_identity=str(self.repo), canonical_worktree_path=str(self.worktree), branch="local-first/TK-1/maintenance",
             base_sha=self.base, operator_id="operator", reason="activate", request_key="activation-request-1")
         self.assertEqual(intent["status"], "pending")
-        acknowledged = self.ledger.acknowledge_native_release_activation("activation-request-1", post_activation_snapshot_hash="c" * 64)
-        self.assertEqual(acknowledged["status"], "acknowledged")
-        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM native_release_activation_evidence").fetchone()[0], 1)
-        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM events WHERE event_type='native_dependency_release_activation_acknowledged'").fetchone()[0], 1)
+        with self.assertRaisesRegex(PermissionError, "signed approval authority"):
+            self.ledger.acknowledge_native_release_activation("activation-request-1", post_activation_snapshot_hash="c" * 64)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM native_release_activation_evidence").fetchone()[0], 0)
 
     def test_controller_activation_persists_intent_before_one_board_effect(self) -> None:
         with self._open_board() as connection:
@@ -446,11 +446,37 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
             scheduled = self.adapter._snapshot_from_connection(connection, self.external_id)
         revalidation = self.signed_revalidate(reason="activation-controller")
         ready = replace(scheduled, task=replace(scheduled.task, status="ready"))
-        with patch.object(self.adapter, "execution_snapshot", side_effect=(scheduled, ready, ready)), patch.object(self.adapter, "activate_native_release", return_value=ready) as mutate, patch.object(self.adapter, "activation_marker_present", return_value=True):
-            result = self.controller.activate_native_release_revalidation(self.ticket, revalidation_id=str(revalidation["revalidation_id"]), operator_id="operator", reason="activate-controller", request_key="controller-request")
+        with patch.object(self.adapter, "execution_snapshot", side_effect=(scheduled, scheduled, ready, ready)), patch.object(self.adapter, "activate_native_release", return_value=ready) as mutate, patch.object(self.adapter, "activation_marker_present", return_value=True):
+            prepared = self.controller.prepare_native_release_activation(self.ticket, revalidation_id=str(revalidation["revalidation_id"]), operator_id="operator", reason="activate-controller", request_key="controller-request")
+            approval = parse_approval_document(prepared["canonical_document"])
+            signature = self.signing_key.sign(canonical_activation_bytes(approval))
+            result = self.controller.activate_native_release_revalidation(self.ticket, revalidation_id=str(revalidation["revalidation_id"]), operator_id="operator", reason="activate-controller", request_key="controller-request", approval_document=approval, detached_signature=signature)
         self.assertEqual(result["status"], "acknowledged")
         self.assertEqual(mutate.call_count, 1)
         self.assertEqual(self.ledger.connection.execute("SELECT status FROM native_release_activation_intents WHERE request_key='controller-request'").fetchone()[0], "acknowledged")
+
+    def test_forged_acknowledged_activation_without_evidence_is_a_migration_stop(self) -> None:
+        revalidation = self.signed_revalidate(reason="forged-activation")
+        intent = self.ledger.prepare_native_release_activation_intent(
+            ticket_id=self.ticket, revalidation_id=str(revalidation["revalidation_id"]), external_task_id=self.external_id,
+            pre_activation_snapshot_hash=str(revalidation["snapshot_hash"]), implementation_profile="impl",
+            repository_identity=str(self.repo), canonical_worktree_path=str(self.worktree), branch="local-first/TK-1/maintenance",
+            base_sha=self.base, operator_id="operator", reason="forged", request_key="forged-ack")
+        self.ledger.connection.execute("UPDATE native_release_activation_intents SET status='acknowledged',effect_snapshot_hash=? WHERE request_key=?", ("d" * 64, intent["request_key"]))
+        result = self.ledger.native_dependency_release_migration_required(signer_public_key=self.signer_public_key, signer_fingerprint=self.signer_fingerprint)
+        self.assertIsNotNone(result)
+        self.assertIn("acknowledgement", result["reason"])
+
+    def test_marker_substring_and_unrelated_event_do_not_prove_activation(self) -> None:
+        with self._open_board() as connection:
+            connection.execute("INSERT INTO task_events (task_id,kind,payload,created_at) VALUES (?,?,?,?)", (self.external_id, "comment", json.dumps({"reason": "prefix-marker", "status": "ready"}), int(time.time())))
+            connection.commit()
+        self.assertFalse(self.adapter.activation_marker_present(self.external_id, "marker"))
+
+    def test_activation_requires_external_signature_before_any_board_effect(self) -> None:
+        with self.assertRaisesRegex(PermissionError, "allow-board-writes"):
+            self.controller.activate_native_release_revalidation(self.ticket, revalidation_id="missing", operator_id="operator", reason="activate", request_key="unsigned")
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM native_release_activation_intents").fetchone()[0], 0)
 
     def test_revalidation_table_is_immutable(self) -> None:
         row = self.signed_revalidate(reason="verify")

@@ -429,26 +429,22 @@ hermes local-first-orchestrator \
 
 Deliver the replacement separately with `project-generated --allow-board-writes`. Exact replay is idempotent; changed snapshot, status, external identity, operator, or reason fails closed. Existing attempts, model/review/acceptance/integration authority, active scheduler claims, pending board effects, leases, or multiple current create identities also fail closed.
 
-### `activate-native-release`
+### `prepare-native-release-activation` / `activate-native-release`
 
-While paused, activate exactly one previously signed legacy native-release revalidation. This is the only supported scheduled-to-ready seam; it persists an intent before the bounded Hermes board mutation, records immutable acknowledgement evidence, and never dispatches or unpauses.
+While paused, activation uses a two-step external Ed25519 approval boundary. Preparation is read-only and emits canonical bytes binding the exact signed revalidation, scheduled pre-snapshot, board path/device/inode, routing, and scheduled-to-ready transition. Sign those bytes outside the plugin. The activation command requires the 64-byte detached signature and never reads or creates a private key.
 
 ```bash
-hermes local-first-orchestrator \
-  --database <ledger> \
-  --hermes-executable <absolute-hermes> \
-  --board <board> \
-  activate-native-release \
-  --task-id <local-first-ticket> \
-  --revalidation-id <signed-revalidation-id> \
-  --operator-id <operator> \
-  --reason <reason> \
-  --request-key <unique-request-key> \
-  --allow-board-writes
+hermes local-first-orchestrator --database <ledger> --hermes-executable <absolute-hermes> --board <board> \
+  prepare-native-release-activation --task-id <local-first-ticket> --revalidation-id <signed-revalidation-id> \
+  --operator-id <operator> --reason <reason> --request-key <unique-request-key> --output-file approval.json
+# sign approval.json externally, producing signature.bin
+hermes local-first-orchestrator --database <ledger> --hermes-executable <absolute-hermes> --board <board> \
+  activate-native-release --task-id <local-first-ticket> --revalidation-id <signed-revalidation-id> \
+  --operator-id <operator> --reason <reason> --request-key <unique-request-key> \
+  --approval-file approval.json --signature-file signature.bin --allow-board-writes
 ```
 
-The command requires the registered runtime, explicit board-write authorization, a current signer-enrolled signed revalidation, the exact scheduled board snapshot, and matching profile/workspace/repository authority. Replays accept only the exact durable intent and marked ready side effect.
-
+The command requires the registered runtime, explicit board-write authorization, a fresh signer configuration, the exact scheduled board snapshot, exact board inode, matching routing, and one signed evidence/event acknowledgement. Replays classify exact scheduled pre-state before effect, or exact ready post-state plus the exact marker after effect; a marker alone is never authority.
 
 ### `reconcile-hermes-execution`
 

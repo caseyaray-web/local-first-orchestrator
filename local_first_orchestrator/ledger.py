@@ -579,6 +579,13 @@ CREATE TABLE IF NOT EXISTS native_release_activation_intents (
     activation_marker TEXT NOT NULL UNIQUE,
     status TEXT NOT NULL,
     effect_snapshot_hash TEXT,
+    approval_document_json TEXT,
+    approval_document_hash TEXT,
+    detached_signature TEXT,
+    signer_fingerprint TEXT,
+    board_path TEXT,
+    board_dev INTEGER,
+    board_ino INTEGER,
     activation_event_id INTEGER REFERENCES events(id),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -586,8 +593,17 @@ CREATE TABLE IF NOT EXISTS native_release_activation_intents (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_native_release_activation_revalidation
     ON native_release_activation_intents(revalidation_id);
 CREATE TRIGGER IF NOT EXISTS native_release_activation_intents_immutable_identity
-BEFORE UPDATE OF ticket_id,revalidation_id,external_task_id,pre_activation_snapshot_hash,implementation_profile,repository_identity,canonical_worktree_path,branch,base_sha,operator_id,reason,activation_marker,created_at
-ON native_release_activation_intents BEGIN SELECT RAISE(ABORT, 'native release activation intent identity is immutable'); END;
+BEFORE UPDATE ON native_release_activation_intents
+WHEN OLD.ticket_id IS NOT NEW.ticket_id OR OLD.revalidation_id IS NOT NEW.revalidation_id
+ OR OLD.external_task_id IS NOT NEW.external_task_id OR OLD.pre_activation_snapshot_hash IS NOT NEW.pre_activation_snapshot_hash
+ OR OLD.implementation_profile IS NOT NEW.implementation_profile OR OLD.repository_identity IS NOT NEW.repository_identity
+ OR OLD.canonical_worktree_path IS NOT NEW.canonical_worktree_path OR OLD.branch IS NOT NEW.branch OR OLD.base_sha IS NOT NEW.base_sha
+ OR OLD.operator_id IS NOT NEW.operator_id OR OLD.reason IS NOT NEW.reason OR OLD.activation_marker IS NOT NEW.activation_marker
+ OR OLD.created_at IS NOT NEW.created_at OR OLD.approval_document_json IS NOT NEW.approval_document_json
+ OR OLD.approval_document_hash IS NOT NEW.approval_document_hash OR OLD.detached_signature IS NOT NEW.detached_signature
+ OR OLD.signer_fingerprint IS NOT NEW.signer_fingerprint OR OLD.board_path IS NOT NEW.board_path
+ OR OLD.board_dev IS NOT NEW.board_dev OR OLD.board_ino IS NOT NEW.board_ino
+BEGIN SELECT RAISE(ABORT, 'native release activation intent identity is immutable'); END;
 CREATE TABLE IF NOT EXISTS native_release_activation_evidence (
     request_key TEXT PRIMARY KEY REFERENCES native_release_activation_intents(request_key),
     ticket_id TEXT NOT NULL,
@@ -1133,6 +1149,32 @@ class Ledger:
         for name, definition in (("revalidation_event_id", "INTEGER"), ("event_key", "TEXT"), ("evidence_hash", "TEXT"), ("approval_document_json", "TEXT"), ("approval_document_hash", "TEXT"), ("detached_signature", "TEXT"), ("signer_fingerprint", "TEXT")):
             if name not in revalidation_columns:
                 self.connection.execute(f"ALTER TABLE native_dependency_release_revalidations ADD COLUMN {name} {definition}")
+        activation_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(native_release_activation_intents)")}
+        for name, definition in {
+            "approval_document_json": "TEXT", "approval_document_hash": "TEXT", "detached_signature": "TEXT",
+            "signer_fingerprint": "TEXT", "board_path": "TEXT", "board_dev": "INTEGER", "board_ino": "INTEGER",
+        }.items():
+            if name not in activation_columns:
+                self.connection.execute(f"ALTER TABLE native_release_activation_intents ADD COLUMN {name} {definition}")
+        activation_trigger = self.connection.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='native_release_activation_intents_immutable_identity'").fetchone()
+        if activation_trigger is not None and "BEFORE UPDATE OF" in str(activation_trigger["sql"]):
+            self.connection.executescript("""
+        DROP TRIGGER IF EXISTS native_release_activation_intents_immutable_identity;
+        CREATE TRIGGER native_release_activation_intents_immutable_identity
+        BEFORE UPDATE ON native_release_activation_intents
+        WHEN OLD.ticket_id IS NOT NEW.ticket_id OR OLD.revalidation_id IS NOT NEW.revalidation_id
+          OR OLD.external_task_id IS NOT NEW.external_task_id OR OLD.pre_activation_snapshot_hash IS NOT NEW.pre_activation_snapshot_hash
+          OR OLD.implementation_profile IS NOT NEW.implementation_profile OR OLD.repository_identity IS NOT NEW.repository_identity
+          OR OLD.canonical_worktree_path IS NOT NEW.canonical_worktree_path OR OLD.branch IS NOT NEW.branch OR OLD.base_sha IS NOT NEW.base_sha
+          OR OLD.operator_id IS NOT NEW.operator_id OR OLD.reason IS NOT NEW.reason OR OLD.activation_marker IS NOT NEW.activation_marker
+          OR OLD.created_at IS NOT NEW.created_at OR OLD.approval_document_json IS NOT NEW.approval_document_json
+          OR OLD.approval_document_hash IS NOT NEW.approval_document_hash OR OLD.detached_signature IS NOT NEW.detached_signature
+          OR OLD.signer_fingerprint IS NOT NEW.signer_fingerprint OR OLD.board_path IS NOT NEW.board_path
+          OR OLD.board_dev IS NOT NEW.board_dev OR OLD.board_ino IS NOT NEW.board_ino
+        BEGIN SELECT RAISE(ABORT, 'native release activation intent identity is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS native_release_activation_intents_no_delete
+        BEFORE DELETE ON native_release_activation_intents BEGIN SELECT RAISE(ABORT, 'native release activation intents are append-only'); END;
+        """)
         binding_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(runtime_bindings)")}
         for name in ("operator_signer_fingerprint", "operator_authority_hash"):
             if name not in binding_columns:
@@ -2556,9 +2598,10 @@ class Ledger:
                 fresh_config_obj = fresh_obj
                 from .signer_enrollment import _repository_identity
                 from .operator_config import load_operator_config
-                fresh_repository_identity = _repository_identity(load_operator_config(Path(config_path)).canonical_repository)
+                fresh_loaded = load_operator_config(Path(config_path))
+                fresh_repository_identity = _repository_identity(fresh_loaded.canonical_repository)
                 fresh_config_hash = hashlib.sha256(fresh_config_raw).hexdigest()
-                if fresh_obj.get("operator_signing_key_fingerprint") != signer_fingerprint:
+                if fresh_obj.get("operator_signing_key_fingerprint") != signer_fingerprint or fresh_loaded.signer_public_key_bytes != signer_public_key:
                     return {"ticket_id": str(rows[0]["ticket_id"]) if rows else "", "reason": "signer enrollment reconciliation required: fresh external signer config differs"}
             except (OSError, ValueError):
                 return {"ticket_id": str(rows[0]["ticket_id"]) if rows else "", "reason": "signer enrollment reconciliation required: fresh external signer config is unavailable"}
@@ -2574,6 +2617,40 @@ class Ledger:
             )
         if integrity_blocker is not None:
             return integrity_blocker
+        # Activation status is never authority.  Acknowledgement is valid only
+        # when the immutable intent, one evidence row, and one immutable event
+        # form the exact same signed envelope.
+        for activation in self.connection.execute("SELECT * FROM native_release_activation_intents WHERE status='acknowledged' ORDER BY request_key").fetchall():
+            try:
+                evidence = self.connection.execute("SELECT * FROM native_release_activation_evidence WHERE request_key=?", (activation["request_key"],)).fetchall()
+                if len(evidence) != 1:
+                    return {"ticket_id": str(activation["ticket_id"]), "reason": "native release activation acknowledgement evidence is missing or duplicated"}
+                ev = evidence[0]
+                event = self.connection.execute("SELECT * FROM events WHERE id=? AND entity_type='controller' AND entity_id='controller' AND event_type='native_dependency_release_activation_acknowledged'", (ev["event_id"],)).fetchall()
+                if len(event) != 1:
+                    return {"ticket_id": str(activation["ticket_id"]), "reason": "native release activation acknowledgement event is missing or forged"}
+                payload = json.loads(str(event[0]["payload_json"]))
+                expected = {"request_key": str(activation["request_key"]), "ticket_id": str(activation["ticket_id"]), "revalidation_id": str(activation["revalidation_id"]), "activation_marker": str(activation["activation_marker"]), "post_activation_snapshot_hash": str(activation["effect_snapshot_hash"]), "evidence_hash": str(ev["evidence_hash"])}
+                if any(ev[key] != activation[key] for key in ("request_key", "ticket_id", "revalidation_id", "activation_marker")) or ev["post_activation_snapshot_hash"] != activation["effect_snapshot_hash"] or event[0]["id"] != ev["event_id"] or canonical_sha256({k: expected[k] for k in expected if k != "evidence_hash"}) != str(ev["evidence_hash"]) or payload != expected:
+                    return {"ticket_id": str(activation["ticket_id"]), "reason": "native release activation acknowledgement evidence or event hash mismatch"}
+                from .native_release_approval import parse_approval_document, verify_detached_signature
+                raw = str(activation["approval_document_json"] or "").encode("utf-8")
+                sig = base64.b64decode(str(activation["detached_signature"] or ""), validate=True)
+                if hashlib.sha256(raw).hexdigest() != str(activation["approval_document_hash"]) or str(activation["signer_fingerprint"]) != str(signer_fingerprint):
+                    raise ValueError("activation signed document hash or signer drift")
+                document = parse_approval_document(raw)
+                signed = document["authority"]
+                expected_signed = {"ticket_id": str(activation["ticket_id"]), "revalidation_id": str(activation["revalidation_id"]), "external_task_id": str(activation["external_task_id"]), "implementation_profile": str(activation["implementation_profile"]), "repository_identity": str(activation["repository_identity"]), "canonical_worktree_path": str(activation["canonical_worktree_path"]), "branch": str(activation["branch"]), "base_sha": str(activation["base_sha"]), "pre_snapshot_hash": str(activation["pre_activation_snapshot_hash"]), "activation_marker": str(activation["activation_marker"])}
+                if any(signed.get(key) != value for key, value in expected_signed.items()) or signed.get("board", {}).get("path") != str(activation["board_path"]) or int(signed.get("board", {}).get("dev", -1)) != int(activation["board_dev"]) or int(signed.get("board", {}).get("ino", -1)) != int(activation["board_ino"]):
+                    raise ValueError("activation signed document does not match intent")
+                verify_detached_signature(raw, sig, signer_public_key, str(activation["signer_fingerprint"]))
+            except Exception as exc:
+                return {"ticket_id": str(activation["ticket_id"]), "reason": f"native release activation authority is invalid: {exc}"}
+        # A caller-supplied key/fingerprint is insufficient for an otherwise
+        # valid activation. Migration and scheduling must freshly reload the
+        # external signer configuration file.
+        if self.connection.execute("SELECT 1 FROM native_release_activation_intents WHERE status='acknowledged' LIMIT 1").fetchone() is not None and config_path is None:
+            return {"ticket_id": str(rows[0]["ticket_id"]) if rows else "", "reason": "native release activation requires freshly loaded external signer configuration"}
         for row in rows:
             try:
                 authority = json.loads(str(row["routing_authority_json"] or "{}"))
@@ -2848,7 +2925,7 @@ class Ledger:
         )
         return result
 
-    def prepare_native_release_activation_intent(self, *, ticket_id: str, revalidation_id: str, external_task_id: str, pre_activation_snapshot_hash: str, implementation_profile: str, repository_identity: str, canonical_worktree_path: str, branch: str, base_sha: str, operator_id: str, reason: str, request_key: str) -> dict[str, Any]:
+    def prepare_native_release_activation_intent(self, *, ticket_id: str, revalidation_id: str, external_task_id: str, pre_activation_snapshot_hash: str, implementation_profile: str, repository_identity: str, canonical_worktree_path: str, branch: str, base_sha: str, operator_id: str, reason: str, request_key: str, approval_document_json: str | None = None, approval_document_hash: str | None = None, detached_signature: bytes | None = None, signer_fingerprint: str | None = None, board_path: str | None = None, board_dev: int | None = None, board_ino: int | None = None) -> dict[str, Any]:
         """Persist one paused activation intent before any Hermes board effect."""
         values = (ticket_id, revalidation_id, external_task_id, pre_activation_snapshot_hash, implementation_profile, repository_identity, canonical_worktree_path, branch, base_sha, operator_id, reason, request_key)
         if not all(isinstance(value, str) and value.strip() for value in values):
@@ -2872,8 +2949,8 @@ class Ledger:
             now = self._now()
             event_id = self._append_event(conn, entity_type="controller", entity_id="controller", event_type="native_dependency_release_activation_intent_created", actor_id=operator_id, payload={"request_key": request_key, "revalidation_id": revalidation_id, "ticket_id": ticket_id, "activation_marker": marker})
             conn.execute("""INSERT INTO native_release_activation_intents
-                (request_key,ticket_id,revalidation_id,external_task_id,pre_activation_snapshot_hash,implementation_profile,repository_identity,canonical_worktree_path,branch,base_sha,operator_id,reason,activation_marker,status,activation_event_id,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?)""", (request_key, *values[:-1], marker, event_id, now, now))
+                (request_key,ticket_id,revalidation_id,external_task_id,pre_activation_snapshot_hash,implementation_profile,repository_identity,canonical_worktree_path,branch,base_sha,operator_id,reason,activation_marker,status,approval_document_json,approval_document_hash,detached_signature,signer_fingerprint,board_path,board_dev,board_ino,activation_event_id,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?,?,?, ?,?,?)""", (request_key, *values[:-1], marker, approval_document_json, approval_document_hash, None if detached_signature is None else base64.b64encode(detached_signature).decode("ascii"), signer_fingerprint, board_path, board_dev, board_ino, event_id, now, now))
             return dict(conn.execute("SELECT * FROM native_release_activation_intents WHERE request_key=?", (request_key,)).fetchone())
 
     def acknowledge_native_release_activation(self, request_key: str, *, post_activation_snapshot_hash: str) -> dict[str, Any]:
@@ -2883,6 +2960,8 @@ class Ledger:
             intent = conn.execute("SELECT * FROM native_release_activation_intents WHERE request_key=?", (request_key,)).fetchone()
             if intent is None:
                 raise KeyError(request_key)
+            if not all(intent[key] for key in ("approval_document_json", "approval_document_hash", "detached_signature", "signer_fingerprint", "board_path", "board_dev", "board_ino")):
+                raise PermissionError("native release activation acknowledgement requires signed approval authority")
             if intent["status"] == "acknowledged":
                 return dict(intent)
             if intent["status"] not in {"pending", "effect_applied"}:
@@ -2890,8 +2969,11 @@ class Ledger:
             evidence = {"request_key": request_key, "ticket_id": intent["ticket_id"], "revalidation_id": intent["revalidation_id"], "activation_marker": intent["activation_marker"], "post_activation_snapshot_hash": post_activation_snapshot_hash}
             evidence_hash = canonical_sha256(evidence)
             event_id = self._append_event(conn, entity_type="controller", entity_id="controller", event_type="native_dependency_release_activation_acknowledged", actor_id=intent["operator_id"], payload={**evidence, "evidence_hash": evidence_hash})
+            self._inject_failure("after_ack_event")
             conn.execute("INSERT INTO native_release_activation_evidence(request_key,ticket_id,revalidation_id,activation_marker,post_activation_snapshot_hash,event_id,evidence_hash,acknowledged_at) VALUES (?,?,?,?,?,?,?,?)", (*evidence.values(), event_id, evidence_hash, self._now()))
+            self._inject_failure("after_ack_evidence")
             conn.execute("UPDATE native_release_activation_intents SET status='acknowledged',effect_snapshot_hash=?,updated_at=? WHERE request_key=?", (post_activation_snapshot_hash, self._now(), request_key))
+            self._inject_failure("after_ack_commit")
             return dict(conn.execute("SELECT * FROM native_release_activation_intents WHERE request_key=?", (request_key,)).fetchone())
 
     def mark_native_release_activation_effect(self, request_key: str, snapshot_hash: str) -> None:

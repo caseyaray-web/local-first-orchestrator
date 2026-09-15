@@ -32,7 +32,7 @@ from .ticket import MicroTicket, PatchBudget, VerificationProfile
 from .triage import LocalTriagePlanner, TriageCoordinator, TriageError, normalize_triage
 from .usage_governor import PaidPurpose
 from .validation import DeterministicValidator
-from .native_release_approval import APPROVAL_DOMAIN, APPROVAL_VERSION, canonical_approval_bytes, parse_approval_document, verify_detached_signature, fingerprint_public_key
+from .native_release_approval import APPROVAL_DOMAIN, ACTIVATION_DOMAIN, APPROVAL_VERSION, canonical_approval_bytes, canonical_activation_bytes, parse_approval_document, verify_detached_signature, fingerprint_public_key
 from .native_workspace import PinnedNativeWorkspace, canonical_native_workspace_path, require_native_path_identity, validate_native_workspace_path
 
 
@@ -48,6 +48,7 @@ class RuntimeConfig:
     operator_signer_fingerprint: str | None = None
     operator_authority_hash: str | None = None
     operator_signer_public_key: bytes | None = None
+    operator_config_path: Path | None = None
 
     def canonical_repository(self, candidate: Path) -> Path:
         path = Path(candidate).resolve(strict=True)
@@ -100,6 +101,10 @@ class LocalFirstController:
         self.ledger, self.board, self.config = ledger, board, config
         self.local_model = local_model or LocalQwenAdapter()
         self.fault_injector = fault_injector
+
+    def _inject_failure(self, point: str) -> None:
+        if self.fault_injector is not None:
+            self.fault_injector(point)
 
     def _parse_card(self, card: Any) -> MicroTicket:
         if card.status != "scheduled": raise ValueError("ineligible card: status must be scheduled")
@@ -400,35 +405,93 @@ class LocalFirstController:
         )
         return result
 
-    def activate_native_release_revalidation(self, ticket_id: str, *, revalidation_id: str, operator_id: str, reason: str, request_key: str) -> dict[str, Any]:
-        """Activate one exact signed legacy revalidation; never dispatch or unpause."""
+    def prepare_native_release_activation(self, ticket_id: str, *, revalidation_id: str, operator_id: str, reason: str, request_key: str) -> dict[str, Any]:
+        """Emit exact activation bytes for an external operator signature; never mutates state."""
+        row = self.ledger.connection.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=? AND ticket_id=?", (revalidation_id, ticket_id)).fetchone()
+        if row is None:
+            raise ValueError("native release activation requires the exact signed revalidation")
+        if self.ledger.native_dependency_release_migration_required(signer_public_key=self.config.operator_signer_public_key, signer_fingerprint=self.config.operator_signer_fingerprint, config_path=self.config.operator_config_path, require_activation=False) is not None:
+            raise RuntimeError("native release activation requires valid current signed revalidation authority")
+        snapshot = self.board.execution_snapshot(str(row["external_task_id"]))
+        if snapshot.task.status != "scheduled":
+            raise RuntimeError("native release activation preparation requires exact scheduled pre-state")
+        board_path = self.board._resolved_board_db_path()
+        identity = board_path.stat()
+        snapshot_data = json.loads(json.dumps(asdict(snapshot), sort_keys=True))
+        authority = {"ticket_id": ticket_id, "revalidation_id": revalidation_id, "external_task_id": str(row["external_task_id"]), "implementation_profile": str(row["implementation_profile"]), "repository_identity": str(row["repository_identity"]), "canonical_worktree_path": str(row["canonical_worktree_path"]), "branch": str(row["branch"]), "base_sha": str(row["base_sha"]), "pre_snapshot_hash": str(row["snapshot_hash"]), "pre_snapshot": snapshot_data, "transition": {"from": "scheduled", "to": "ready"}, "board": {"path": str(board_path), "dev": int(identity.st_dev), "ino": int(identity.st_ino)}, "activation_marker": f"local-first-native-release-activation:{revalidation_id}:{request_key}"}
+        document = {"domain": ACTIVATION_DOMAIN, "version": APPROVAL_VERSION, "operation": "activate-native-release", "request_id": request_key, "nonce": secrets.token_urlsafe(24), "operator_id": operator_id, "reason": reason, "authority": authority}
+        canonical = canonical_activation_bytes(document)
+        return {"document": document, "canonical_document": canonical.decode("utf-8"), "approval_hash": hashlib.sha256(canonical).hexdigest()}
+
+    def activate_native_release_revalidation(self, ticket_id: str, *, revalidation_id: str, operator_id: str, reason: str, request_key: str, approval_document: dict[str, Any] | None = None, detached_signature: bytes | None = None) -> dict[str, Any]:
+        """Activate one exact externally signed legacy revalidation; never dispatch or unpause."""
         if not hasattr(self.board, "activate_native_release") or not hasattr(self.board, "execution_snapshot"):
             raise RuntimeError("native release activation requires supported Hermes board mutation and snapshot")
         if not self.board.allow_writes:
             raise PermissionError("native release activation requires --allow-board-writes")
+        if approval_document is None or detached_signature is None:
+            raise PermissionError("native release activation requires detached operator approval")
+        if self.config.operator_config_path is not None:
+            from .operator_config import load_operator_config
+            fresh = load_operator_config(self.config.operator_config_path)
+            if fresh.signer_public_key_bytes != self.config.operator_signer_public_key or fresh.operator_signing_key_fingerprint != self.config.operator_signer_fingerprint:
+                raise PermissionError("native release activation external signer configuration changed")
+        approval_bytes = canonical_activation_bytes(approval_document)
+        verify_detached_signature(approval_bytes, detached_signature, self.config.operator_signer_public_key or b"", self.config.operator_signer_fingerprint or "")
+        if approval_document["operator_id"] != operator_id or approval_document["reason"] != reason or approval_document["request_id"] != request_key:
+            raise ValueError("native release activation approval identity mismatch")
         row = self.ledger.connection.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=? AND ticket_id=?", (revalidation_id, ticket_id)).fetchone()
         if row is None:
             raise ValueError("native release activation requires the exact signed revalidation")
         existing_intent = self.ledger.connection.execute("SELECT * FROM native_release_activation_intents WHERE request_key=? OR revalidation_id=?", (request_key, revalidation_id)).fetchall()
         if len(existing_intent) > 1:
             raise RuntimeError("native release activation intent is duplicated")
-        if existing_intent and existing_intent[0]["status"] == "acknowledged":
-            return dict(existing_intent[0])
-        if self.ledger.native_dependency_release_migration_required(signer_public_key=self.config.operator_signer_public_key, signer_fingerprint=self.config.operator_signer_fingerprint, require_activation=False) is not None:
+        if self.ledger.native_dependency_release_migration_required(signer_public_key=self.config.operator_signer_public_key, signer_fingerprint=self.config.operator_signer_fingerprint, config_path=self.config.operator_config_path, require_activation=False) is not None:
             raise RuntimeError("native release activation requires valid current signed revalidation authority")
+        # This is an optimistic cross-process boundary: the supported Hermes CLI
+        # owns the mutation, so the adapter cannot hold its SQLite transaction
+        # across the subprocess.  Pin the configured path and inode before each
+        # lock/read/effect checkpoint and reject every replacement, including a
+        # same-byte replacement that would otherwise look harmless.
+        board_path = self.board._resolved_board_db_path()
+        before_pre_lock = board_path.stat()
+        self._inject_failure("before_pre_lock")
         snapshot = self.board.execution_snapshot(str(row["external_task_id"]))
-        if existing_intent and existing_intent[0]["status"] == "effect_applied":
-            if snapshot.task.status != "ready":
-                raise RuntimeError("native release activation effect is not replayable")
-            return self.ledger.acknowledge_native_release_activation(request_key, post_activation_snapshot_hash=canonical_sha256(asdict(snapshot)))
+        after_pre_lock = self.board._resolved_board_db_path().stat()
+        if (int(before_pre_lock.st_dev), int(before_pre_lock.st_ino)) != (int(after_pre_lock.st_dev), int(after_pre_lock.st_ino)):
+            raise RuntimeError("native release activation board inode changed during pre-lock")
+        self._inject_failure("after_pre_lock")
+
+        def exact_ready(intent_row: Any) -> bool:
+            return snapshot.task.status == "ready" and getattr(self.board, "activation_marker_present", lambda *_: False)(str(row["external_task_id"]), str(intent_row["activation_marker"]))
+
+        if existing_intent and existing_intent[0]["status"] in {"acknowledged", "effect_applied"}:
+            intent_row = existing_intent[0]
+            if intent_row["approval_document_json"] != approval_bytes.decode("utf-8") or intent_row["approval_document_hash"] != hashlib.sha256(approval_bytes).hexdigest() or intent_row["signer_fingerprint"] != self.config.operator_signer_fingerprint:
+                raise RuntimeError("native release activation replay approval conflicts")
+            if not exact_ready(intent_row):
+                raise RuntimeError("native release activation replay is not exact ready post-state")
+            self._inject_failure("after_marker")
+            if intent_row["status"] == "effect_applied":
+                self._inject_failure("before_ack")
+                result = self.ledger.acknowledge_native_release_activation(request_key, post_activation_snapshot_hash=canonical_sha256(asdict(snapshot)))
+                self._inject_failure("after_ack")
+                return result
+            return dict(intent_row)
         actual_hash = canonical_sha256(asdict(snapshot))
+        board_stat = after_pre_lock
+        snapshot_data = json.loads(json.dumps(asdict(snapshot), sort_keys=True))
+        expected_authority = {"ticket_id": ticket_id, "revalidation_id": revalidation_id, "external_task_id": str(row["external_task_id"]), "implementation_profile": str(row["implementation_profile"]), "repository_identity": str(row["repository_identity"]), "canonical_worktree_path": str(row["canonical_worktree_path"]), "branch": str(row["branch"]), "base_sha": str(row["base_sha"]), "pre_snapshot_hash": str(row["snapshot_hash"]), "pre_snapshot": snapshot_data, "transition": {"from": "scheduled", "to": "ready"}, "board": {"path": str(board_path), "dev": int(board_stat.st_dev), "ino": int(board_stat.st_ino)}, "activation_marker": f"local-first-native-release-activation:{revalidation_id}:{request_key}"}
+        if approval_document["authority"] != expected_authority:
+            raise RuntimeError("native release activation approval is stale or cross-ticket")
         if actual_hash != str(row["snapshot_hash"]) or snapshot.task.status != "scheduled":
             raise RuntimeError("native release activation pre-activation snapshot drift")
         intent = self.ledger.prepare_native_release_activation_intent(
             ticket_id=ticket_id, revalidation_id=revalidation_id, external_task_id=str(row["external_task_id"]),
             pre_activation_snapshot_hash=actual_hash, implementation_profile=str(row["implementation_profile"]),
             repository_identity=str(row["repository_identity"]), canonical_worktree_path=str(row["canonical_worktree_path"]),
-            branch=str(row["branch"]), base_sha=str(row["base_sha"]), operator_id=operator_id, reason=reason, request_key=request_key)
+            branch=str(row["branch"]), base_sha=str(row["base_sha"]), operator_id=operator_id, reason=reason, request_key=request_key,
+            approval_document_json=approval_bytes.decode("utf-8"), approval_document_hash=hashlib.sha256(approval_bytes).hexdigest(), detached_signature=detached_signature, signer_fingerprint=self.config.operator_signer_fingerprint, board_path=str(board_path), board_dev=int(board_stat.st_dev), board_ino=int(board_stat.st_ino))
         marker = str(intent["activation_marker"])
         if intent["status"] == "acknowledged":
             return intent
@@ -436,8 +499,17 @@ class LocalFirstController:
             if not getattr(self.board, "activation_marker_present", lambda *_: False)(str(row["external_task_id"]), marker):
                 raise RuntimeError("native release activation side effect is unmarked or ambiguous")
         if intent["status"] == "pending":
+            released_pre_lock = self.board._resolved_board_db_path().stat()
+            if (int(released_pre_lock.st_dev), int(released_pre_lock.st_ino)) != (int(board_stat.st_dev), int(board_stat.st_ino)):
+                raise RuntimeError("native release activation board inode changed between pre-lock and effect")
+            self._inject_failure("before_effect")
             self.board.activate_native_release(str(row["external_task_id"]), activation_marker=marker, expected_routing={"profile": str(row["implementation_profile"]), "workspace_kind": "worktree", "workspace_path": str(row["canonical_worktree_path"])})
+            self._inject_failure("after_unblock")
+            after_effect = self.board._resolved_board_db_path().stat()
+            if (int(after_effect.st_dev), int(after_effect.st_ino)) != (int(board_stat.st_dev), int(board_stat.st_ino)):
+                raise RuntimeError("native release activation board inode changed after effect")
             post = self.board.execution_snapshot(str(row["external_task_id"]))
+            self._inject_failure("after_marker")
             post_hash = canonical_sha256(asdict(post))
             if post.task.status != "ready" or not getattr(self.board, "activation_marker_present", lambda *_: False)(str(row["external_task_id"]), marker):
                 raise RuntimeError("native release activation side effect is not exact")
@@ -445,7 +517,13 @@ class LocalFirstController:
         post = self.board.execution_snapshot(str(row["external_task_id"]))
         if post.task.status != "ready":
             raise RuntimeError("native release activation acknowledgement requires ready task")
-        return self.ledger.acknowledge_native_release_activation(request_key, post_activation_snapshot_hash=canonical_sha256(asdict(post)))
+        before_ack = self.board._resolved_board_db_path().stat()
+        if (int(before_ack.st_dev), int(before_ack.st_ino)) != (int(board_stat.st_dev), int(board_stat.st_ino)):
+            raise RuntimeError("native release activation board inode changed before acknowledgement")
+        self._inject_failure("before_ack")
+        result = self.ledger.acknowledge_native_release_activation(request_key, post_activation_snapshot_hash=canonical_sha256(asdict(post)))
+        self._inject_failure("after_ack")
+        return result
 
     def prepare_native_release_revalidation(self, ticket_id: str, *, operator_id: str, reason: str, implementation_profile: str) -> dict[str, Any]:
         """Read-only first step; never writes ledger, board, repository, or invokes a model."""
@@ -480,6 +558,45 @@ class LocalFirstController:
         ticket_id = str(ticket_row["id"])
         if self.ledger.resolve_external_task_id(ticket_id) != external_task_id:
             raise RuntimeError("Hermes execution external identity conflict")
+        activation = self.ledger.connection.execute(
+            """SELECT i.*, e.acknowledged_at FROM native_release_activation_intents i
+               JOIN native_release_activation_evidence e ON e.request_key=i.request_key
+               WHERE i.external_task_id=? AND i.status='acknowledged' ORDER BY e.acknowledged_at DESC""",
+            (external_task_id,),
+        ).fetchall()
+        activated = activation[-1] if activation else None
+        if activated is not None:
+            # A post-activation continuation is a narrow Hermes handoff shape,
+            # not generic completion evidence.  Require one terminal blocked
+            # handoff run strictly after acknowledgement and reject all worker,
+            # model, completion, overlap, and identity metadata drift.
+            if snapshot.task.assignee != str(activated["implementation_profile"]):
+                raise RuntimeError("Hermes activation continuation profile drift")
+            if snapshot.task.workspace_kind != "worktree" or snapshot.task.workspace_path != str(activated["canonical_worktree_path"]):
+                raise RuntimeError("Hermes activation continuation workspace drift")
+            if snapshot.branch_name != str(activated["branch"]):
+                raise RuntimeError("Hermes activation continuation branch drift")
+            if snapshot.task.status != "blocked":
+                raise RuntimeError("Hermes activation continuation task is not parked")
+            if snapshot.task.repository_identity is not None and snapshot.task.repository_identity != str(activated["repository_identity"]):
+                raise RuntimeError("Hermes activation continuation repository drift")
+            if snapshot.task.base_sha is not None and snapshot.task.base_sha != str(activated["base_sha"]):
+                raise RuntimeError("Hermes activation continuation base drift")
+            if snapshot.session_id is not None or snapshot.completed_at is not None or snapshot.current_run_id is not None:
+                raise RuntimeError("Hermes activation continuation has current or completed task authority")
+            if len(snapshot.runs) != 1:
+                raise RuntimeError("Hermes activation continuation has extra or overlapping runs")
+            candidate = snapshot.runs[0]
+            if candidate.status != "blocked" or candidate.outcome != "blocked" or candidate.summary != HANDOFF_SENTINEL:
+                raise RuntimeError("Hermes activation continuation has invalid completion shape")
+            if candidate.profile != str(activated["implementation_profile"]) or candidate.worker_pid is not None or candidate.metadata is not None:
+                raise RuntimeError("Hermes activation continuation has invalid worker/model metadata")
+            if candidate.started_at is None or candidate.ended_at is None or int(candidate.started_at) >= int(candidate.ended_at) or int(candidate.started_at) <= int(activated["acknowledged_at"]):
+                raise RuntimeError("Hermes activation continuation predates signed activation or has invalid terminal timing")
+            if hermes_run_id is not None and candidate.id != hermes_run_id:
+                raise RuntimeError("Hermes activation continuation run identity mismatch")
+            if not require_handoff:
+                require_handoff = True
         if require_handoff:
             candidates = [
                 run for run in snapshot.runs
