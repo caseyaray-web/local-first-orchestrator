@@ -6,7 +6,7 @@ import sqlite3
 import subprocess
 from contextlib import contextmanager
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
 from .comment_delivery import MarkerLookup
@@ -62,6 +62,7 @@ class ExternalExecutionSnapshot:
     raw_comments: tuple[dict[str, Any], ...] = ()
     raw_events: tuple[dict[str, Any], ...] = ()
     raw_runs: tuple[dict[str, Any], ...] = ()
+    raw_snapshot: dict[str, Any] | None = None
 
 
 from .revalidation_boundary import create_revalidation_capability, revoke_revalidation_capability
@@ -124,6 +125,7 @@ class HermesBoardAdapter:
             session_id=optional("session_id", task.session_id), branch_name=task.branch_name, started_at=task.started_at, completed_at=task.completed_at,
             runs=external_runs, repository_identity=optional("repository_identity"), base_sha=optional("base_sha"),
             current_run_id=optional("current_run_id", getattr(task, "current_run_id", None)),
+            raw_snapshot={"task": dict(raw_task) if raw_task is not None else {}, "parents": list(parents), "children": list(children), "comments": [], "events": [], "runs": [asdict(run) for run in external_runs]},
         )
 
     @contextmanager
@@ -280,7 +282,7 @@ class HermesBoardAdapter:
             task_events=tuple(events),
             comments=tuple(comments),
             raw_task=dict(row), raw_comments=tuple(comments), raw_events=tuple(events),
-            raw_runs=tuple(dict(item) for item in runs),
+            raw_runs=tuple(dict(item) for item in runs), raw_snapshot=dict(payload),
         )
 
     def import_candidates(self) -> list[ExternalTicket]:

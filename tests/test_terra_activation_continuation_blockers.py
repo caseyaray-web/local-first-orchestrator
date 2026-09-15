@@ -77,6 +77,47 @@ def test_running_continuation_is_authorized_but_not_terminal():
         validate_activation_continuation_snapshot(pre, post, acknowledged_at=20, profile="worker-code-local", workspace_path="/repo/.worktrees/T", branch="wt/T", repository_identity="/repo", base_sha="base", handoff_summary="local-first-awaiting-reconciliation")
 
 
+def test_canonical_snapshot_preserves_unknown_root_and_nested_fields():
+    from local_first_orchestrator.native_release_approval import canonical_snapshot_json
+    snapshot = _snapshot()
+    snapshot["latest_summary"] = {"future": ["value", {"nested": True}]}
+    snapshot["task"]["future_task_field"] = {"x": 1}
+    snapshot["runs"].append({"id": 1, "status": "done", "started_at": 1, "future_run_field": [3, 2, 1]})
+    first = canonical_snapshot_json(snapshot)
+    snapshot["latest_summary"]["future"].append("changed")
+    assert first != canonical_snapshot_json(snapshot)
+
+
+def test_continuation_rejects_unknown_field_drift_everywhere():
+    from local_first_orchestrator.native_release_approval import validate_activation_continuation_snapshot
+    pre, post = _continuation_pair()
+    for location in ("root", "task", "run", "event"):
+        before, after = copy.deepcopy(pre), copy.deepcopy(post)
+        if location == "root":
+            before["future"] = "same"; after["future"] = "changed"
+        elif location == "task":
+            before["task"]["future"] = "same"; after["task"]["future"] = "changed"
+        elif location == "run":
+            before["runs"].append({"id": 99, "status": "old", "started_at": 1, "future": "same"})
+            after["runs"].append({"id": 99, "status": "old", "started_at": 1, "future": "changed"})
+        else:
+            before["task_events"].append({"kind": "old", "future": "same"})
+            after["task_events"].append({"kind": "old", "future": "changed"})
+        with pytest.raises(ValueError):
+            validate_activation_continuation_snapshot(before, after, acknowledged_at=20, profile="worker-code-local", workspace_path="/repo/.worktrees/T", branch="wt/T", repository_identity="/repo", base_sha="base", handoff_summary="local-first-awaiting-reconciliation")
+
+
+def test_terminal_handoff_uses_observed_running_session_lineage():
+    from local_first_orchestrator.native_release_approval import validate_activation_continuation_snapshot
+    activation_post, _ = _continuation_pair()
+    _, terminal = _continuation_pair("blocked")
+    observation = {"run_id": 7, "session_id": "session-T", "pid": 1234, "snapshot_json": "running"}
+    assert validate_activation_continuation_snapshot(activation_post, terminal, acknowledged_at=20, profile="worker-code-local", workspace_path="/repo/.worktrees/T", branch="wt/T", repository_identity="/repo", base_sha="base", handoff_summary="local-first-awaiting-reconciliation", prior_running_observation=observation) == "terminal"
+    observation["run_id"] = 8
+    with pytest.raises(ValueError):
+        validate_activation_continuation_snapshot(activation_post, terminal, acknowledged_at=20, profile="worker-code-local", workspace_path="/repo/.worktrees/T", branch="wt/T", repository_identity="/repo", base_sha="base", handoff_summary="local-first-awaiting-reconciliation", prior_running_observation=observation)
+
+
 def test_direct_terminal_handoff_without_observed_running_is_rejected():
     from local_first_orchestrator.native_release_approval import validate_activation_continuation_snapshot
     pre, post = _continuation_pair("blocked")

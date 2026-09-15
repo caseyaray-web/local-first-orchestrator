@@ -243,6 +243,14 @@ def _external_running_gate(ledger: Ledger, board: Any | None, *, now: int) -> Pr
             if current_json == post_json:
                 continue
             observation = ledger.connection.execute("SELECT * FROM native_release_activation_running_observations WHERE request_key=?", (activation["request_key"],)).fetchone()
+            if observation is not None:
+                linked = ledger.connection.execute("SELECT * FROM events WHERE id=? AND event_type='native_release_activation_running_observed' AND entity_type='controller' AND entity_id='controller'", (observation["event_id"],)).fetchone()
+                if linked is None:
+                    raise ValueError("running observation event linkage is invalid")
+                event_payload = json.loads(str(linked["payload_json"]))
+                evidence = event_payload.get("evidence") if isinstance(event_payload, dict) else None
+                if not isinstance(evidence, dict) or event_payload.get("evidence_hash") != observation["evidence_hash"] or canonical_sha256(evidence) != str(observation["evidence_hash"]):
+                    raise ValueError("running observation evidence is forged")
             kind = validate_activation_continuation_snapshot(
                 json.loads(post_json), json.loads(current_json),
                 acknowledged_at=int(activation["updated_at"]), profile=str(activation["implementation_profile"]),
@@ -259,7 +267,7 @@ def _external_running_gate(ledger: Ledger, board: Any | None, *, now: int) -> Pr
                 identity = linux_process_identity(pid)
                 if observation is not None:
                     persisted = json.loads(str(observation["process_identity_json"]))
-                    if (str(observation["snapshot_hash"]) != hashlib.sha256(current_json.encode()).hexdigest() or int(observation["run_id"]) != int(run["id"]) or str(observation["session_id"]) != str(current.session_id) or persisted != identity or not same_linux_process_identity(persisted)):
+                    if (str(observation["snapshot_hash"]) != hashlib.sha256(current_json.encode()).hexdigest() or not observation["snapshot_json"] or str(observation["snapshot_json"]) != current_json or int(observation["run_id"]) != int(run["id"]) or str(observation["session_id"]) != str(current.session_id) or persisted != identity or not same_linux_process_identity(persisted)):
                         raise ValueError("persisted running observation does not match live Hermes process")
                 return ProcessNextPreview(status="dry_run", next_stage="externally_running", ticket_id=str(activation["ticket_id"]), would_execute=False, would_write_board=False, run_id=int(run["id"]), session_id=str(current.session_id))
             return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(activation["ticket_id"]), reconciliation_action="reconcile-hermes-execution", blocker_reason="authorized terminal Hermes handoff requires reconciliation")
@@ -923,7 +931,7 @@ class ProcessNextScheduler:
             self.ledger.record_native_release_activation_running_observation(
                 request_key=str(activation["request_key"]), ticket_id=str(activation["ticket_id"]),
                 external_task_id=str(activation["external_task_id"]),
-                snapshot_hash=hashlib.sha256(canonical_snapshot_json(snapshot).encode()).hexdigest(),
+                snapshot_hash=hashlib.sha256(canonical_snapshot_json(snapshot).encode()).hexdigest(), snapshot_json=canonical_snapshot_json(snapshot),
                 run_id=int(raw_run["id"]), session_id=str(snapshot.session_id), process_identity=identity,
                 observed_at=max(now, int(activation["updated_at"]) + 1),
                 profile=str(activation["implementation_profile"]), workspace_path=str(activation["canonical_worktree_path"]),

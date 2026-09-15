@@ -19,6 +19,11 @@ APPROVAL_VERSION = 1
 _REQUIRED = {"domain", "version", "operation", "request_id", "nonce", "operator_id", "reason", "authority"}
 
 
+def _history(root: dict[str, Any], canonical: str, legacy: str) -> Any:
+    """Read the CLI spelling while retaining the raw root for authority."""
+    return root.get(canonical) if canonical in root else root.get(legacy)
+
+
 def linux_process_identity(pid: int) -> dict[str, Any]:
     """Return a no-follow identity for a live Linux process, or fail closed."""
     if type(pid) is not int or pid <= 0:
@@ -122,6 +127,12 @@ def validate_activation_continuation_snapshot(activation_post: dict[str, Any], c
         raise ValueError("Hermes activation continuation snapshot is malformed")
     before = json.loads(json.dumps(activation_post, sort_keys=True, separators=(",", ":")))
     after = json.loads(json.dumps(current, sort_keys=True, separators=(",", ":")))
+    # Compare the complete raw root first.  Only fields owned by Hermes'
+    # documented lifecycle transition may differ; typed projections are never
+    # used as a substitute for this check.
+    root_allowed = {"session_id", "started_at", "current_run_id"}
+    if {k: before.get(k) for k in before if k not in root_allowed and k not in {"task", "runs", "task_events", "events"}} != {k: after.get(k) for k in after if k not in root_allowed and k not in {"task", "runs", "task_events", "events"}}:
+        raise ValueError("Hermes activation continuation unknown root field drift")
     if before.get("task", {}).get("status") != "ready":
         raise ValueError("Hermes activation continuation does not start from acknowledged ready state")
     if before.get("comments") != after.get("comments"):
@@ -135,14 +146,14 @@ def validate_activation_continuation_snapshot(activation_post: dict[str, Any], c
         raise ValueError("Hermes activation continuation completed the task")
     prior_runs = before.get("runs")
     later_runs = after.get("runs")
-    prior_events = before.get("task_events")
-    later_events = after.get("task_events")
+    prior_events = _history(before, "events", "task_events")
+    later_events = _history(after, "events", "task_events")
     if not isinstance(prior_runs, list) or not isinstance(later_runs, list) or not isinstance(prior_events, list) or not isinstance(later_events, list):
         raise ValueError("Hermes activation continuation histories are malformed")
     if later_runs[:len(prior_runs)] != prior_runs or len(later_runs) != len(prior_runs) + 1:
         raise ValueError("Hermes activation continuation has missing, extra, or rewritten runs")
     run = later_runs[-1]
-    if not isinstance(run, dict) or set(run) != {"id", "status", "outcome", "started_at", "ended_at", "summary", "profile", "worker_pid", "metadata"}:
+    if not isinstance(run, dict) or not {"id", "status", "outcome", "started_at", "ended_at", "summary", "profile", "worker_pid", "metadata"}.issubset(run):
         raise ValueError("Hermes activation continuation run shape is unsupported")
     if run.get("profile") != profile or type(run.get("id")) is not int or run.get("id") < 0 or type(run.get("started_at")) is not int or run.get("started_at") < 0 or run["started_at"] <= acknowledged_at:
         raise ValueError("Hermes activation continuation run identity or timing drift")
@@ -187,8 +198,10 @@ def validate_activation_continuation_snapshot(activation_post: dict[str, Any], c
             raise ValueError("Hermes terminal handoff events are invalid")
         if type(claimed["created_at"]) is not int or type(blocked["created_at"]) is not int or claimed["created_at"] != run["started_at"] or blocked["created_at"] != run["ended_at"] or blocked["created_at"] <= claimed["created_at"] or blocked["payload"] != {"reason": handoff_summary}:
             raise ValueError("Hermes terminal handoff event timing or payload is invalid")
-        if (int(prior_running_observation.get("run_id", -1)) != run_id or str(prior_running_observation.get("session_id", "")) != str(activation_post.get("session_id", "")) or int(prior_running_observation.get("pid", -1)) <= 0):
+        if (int(prior_running_observation.get("run_id", -1)) != run_id or not isinstance(prior_running_observation.get("session_id"), str) or not prior_running_observation["session_id"].strip() or int(prior_running_observation.get("pid", -1)) <= 0):
             raise ValueError("Hermes terminal handoff is not the observed run/session lineage")
+        if not isinstance(prior_running_observation.get("snapshot_json"), str) or not prior_running_observation["snapshot_json"].strip():
+            raise ValueError("Hermes terminal handoff has incomplete running snapshot evidence")
         return "terminal"
     raise ValueError("Hermes activation continuation task status is unsupported")
 
@@ -196,7 +209,11 @@ def validate_activation_continuation_snapshot(activation_post: dict[str, Any], c
 def canonical_snapshot_json(snapshot: Any) -> str:
     """Serialize a board execution snapshot without losing scalar identity."""
     from dataclasses import asdict, is_dataclass
-    value = asdict(snapshot) if is_dataclass(snapshot) else snapshot
+    value = getattr(snapshot, "raw_snapshot", None) if is_dataclass(snapshot) else snapshot
+    if value is None:
+        value = asdict(snapshot) if is_dataclass(snapshot) else snapshot
+    if not isinstance(value, dict):
+        raise ValueError("Hermes execution snapshot root must be an object")
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
 
 
@@ -220,8 +237,8 @@ def validate_activation_post_snapshot(pre_snapshot: dict[str, Any], post_snapsho
         before["task"]["status"] = after["task"]["status"]
         prior_comments = before["comments"]
         later_comments = after["comments"]
-        prior_events = before["task_events"]
-        later_events = after["task_events"]
+        prior_events = _history(before, "events", "task_events")
+        later_events = _history(after, "events", "task_events")
     except (KeyError, TypeError) as exc:
         raise ValueError("native release activation snapshot is malformed") from exc
     if not isinstance(prior_comments, list) or not isinstance(later_comments, list) or not isinstance(prior_events, list) or not isinstance(later_events, list):
@@ -241,7 +258,8 @@ def validate_activation_post_snapshot(pre_snapshot: dict[str, Any], post_snapsho
     if appended_event != {"kind": "unblocked", "payload": None, "created_at": appended_event.get("created_at"), "run_id": None} or type(appended_event["created_at"]) is not int or appended_event["created_at"] < appended_comment["created_at"]:
         raise ValueError("native release activation appended event is not the exact supported unblock event")
     before["comments"] = later_comments
-    before["task_events"] = later_events
+    event_key = "events" if "events" in before else "task_events"
+    before[event_key] = later_events
     if before != after:
         raise ValueError("native release activation post-state has unauthorized mutation")
     return hashlib.sha256(canonical_snapshot_json(post_snapshot).encode("utf-8")).hexdigest()

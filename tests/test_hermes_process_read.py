@@ -67,7 +67,7 @@ class ProcessReadTests(unittest.TestCase):
    calls.append(list(argv))
    payload={
     'task':{'id':'1','title':'x','body':'','status':'scheduled','workspace_path':'/repo','session_id':'s1','branch_name':'worker/x','started_at':10,'completed_at':20},
-    'parents':['p1'],'children':['c1'],'comments':[],
+    'parents':['p1'],'children':['c1'],'comments':[], 'latest_summary':{'future':{'value':3}}, 'future_root':{'opaque':['x',2]},
     'runs':[{'id':7,'status':'completed','outcome':'completed','started_at':10,'ended_at':20,'summary':'worker completed','profile':'worker-code','worker_pid':123,'metadata':{'source':'dispatcher'}}],
    }
    return subprocess.CompletedProcess(argv,0,json.dumps(payload),'')
@@ -76,6 +76,8 @@ class ProcessReadTests(unittest.TestCase):
   self.assertEqual(snap.task.id,'1'); self.assertEqual(snap.task.parents,('p1',)); self.assertEqual(snap.task.children,('c1',))
   self.assertEqual(snap.session_id,'s1'); self.assertEqual(snap.branch_name,'worker/x')
   self.assertEqual(snap.runs[0].id,7); self.assertEqual(snap.runs[0].profile,'worker-code'); self.assertEqual(snap.runs[0].metadata,{'source':'dispatcher'})
+  self.assertEqual(snap.raw_snapshot['latest_summary'], {'future': {'value': 3}})
+  self.assertEqual(snap.raw_snapshot['future_root'], {'opaque': ['x', 2]})
   self.assertEqual(calls,[[str(self.exe),'kanban','--board','board','show','1','--json']])
  def test_nonterminal_state_projection_is_idempotent_when_already_scheduled(self):
   calls=[]
