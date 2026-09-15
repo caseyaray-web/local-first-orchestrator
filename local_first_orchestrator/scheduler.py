@@ -259,7 +259,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
             reconciliation_action=reconciliation.action.value,
         )
     signer_public_key, signer_fingerprint = _fresh_signer_authority(signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint, signer_config_path=signer_config_path)
-    migration = ledger.native_dependency_release_migration_required(signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint, config_path=signer_config_path) if hasattr(ledger, "native_dependency_release_migration_required") else None
+    migration = ledger.native_dependency_release_migration_required(signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint, config_path=signer_config_path, board=board) if hasattr(ledger, "native_dependency_release_migration_required") else None
     if migration is not None:
         return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(migration["ticket_id"]), reconciliation_action=ReconciliationAction.STOP.value, blocker_reason=str(migration["reason"]))
     generated = ledger.connection.execute(

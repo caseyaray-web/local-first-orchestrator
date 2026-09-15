@@ -53,6 +53,8 @@ class ExternalExecutionSnapshot:
     repository_identity: str | None = None
     base_sha: str | None = None
     current_run_id: int | None = None
+    task_events: tuple[dict[str, Any], ...] = ()
+    comments: tuple[str, ...] = ()
 
 
 from .revalidation_boundary import create_revalidation_capability, revoke_revalidation_capability
@@ -236,6 +238,8 @@ class HermesBoardAdapter:
             repository_identity=None if row.get("repository_identity") is None else str(row["repository_identity"]),
             base_sha=None if row.get("base_sha") is None else str(row["base_sha"]),
             current_run_id=None if row.get("current_run_id") is None else int(row["current_run_id"]),
+            task_events=tuple(dict(item) for item in (payload.get("events", []) if isinstance(payload, dict) and isinstance(payload.get("events", []), list) else [])),
+            comments=tuple(str(item.get("body") or "") for item in (payload.get("comments", []) if isinstance(payload, dict) and isinstance(payload.get("comments", []), list) and all(isinstance(item, dict) for item in payload.get("comments", [])) else [])),
         )
 
     def import_candidates(self) -> list[ExternalTicket]:

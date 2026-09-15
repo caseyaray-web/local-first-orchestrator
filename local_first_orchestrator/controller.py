@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import re
 import json
 import os
@@ -32,7 +33,7 @@ from .ticket import MicroTicket, PatchBudget, VerificationProfile
 from .triage import LocalTriagePlanner, TriageCoordinator, TriageError, normalize_triage
 from .usage_governor import PaidPurpose
 from .validation import DeterministicValidator
-from .native_release_approval import APPROVAL_DOMAIN, ACTIVATION_DOMAIN, APPROVAL_VERSION, canonical_approval_bytes, canonical_activation_bytes, parse_approval_document, verify_detached_signature, fingerprint_public_key
+from .native_release_approval import APPROVAL_DOMAIN, ACTIVATION_DOMAIN, APPROVAL_VERSION, canonical_approval_bytes, canonical_activation_bytes, canonical_snapshot_json, parse_approval_document, validate_activation_post_snapshot, verify_detached_signature, fingerprint_public_key
 from .native_workspace import PinnedNativeWorkspace, canonical_native_workspace_path, require_native_path_identity, validate_native_workspace_path
 
 
@@ -462,22 +463,54 @@ class LocalFirstController:
             raise RuntimeError("native release activation board inode changed during pre-lock")
         self._inject_failure("after_pre_lock")
 
-        def exact_ready(intent_row: Any) -> bool:
-            return snapshot.task.status == "ready" and getattr(self.board, "activation_marker_present", lambda *_: False)(str(row["external_task_id"]), str(intent_row["activation_marker"]))
+        def marker_present(marker: str) -> bool:
+            return bool(getattr(self.board, "activation_marker_present", lambda *_: False)(str(row["external_task_id"]), marker))
 
-        if existing_intent and existing_intent[0]["status"] in {"acknowledged", "effect_applied"}:
+        def signed_authority(intent_row: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+            """Validate the persisted signed envelope without using board state."""
+            raw = str(intent_row["approval_document_json"] or "").encode("utf-8")
+            if not raw or hashlib.sha256(raw).hexdigest() != str(intent_row["approval_document_hash"]):
+                raise RuntimeError("native release activation replay approval is invalid")
+            document = parse_approval_document(raw)
+            verify_detached_signature(raw, base64.b64decode(str(intent_row["detached_signature"]), validate=True), self.config.operator_signer_public_key or b"", str(intent_row["signer_fingerprint"]))
+            authority = document["authority"]
+            immutable = {"ticket_id": ticket_id, "revalidation_id": revalidation_id, "external_task_id": str(row["external_task_id"]), "implementation_profile": str(row["implementation_profile"]), "repository_identity": str(row["repository_identity"]), "canonical_worktree_path": str(row["canonical_worktree_path"]), "branch": str(row["branch"]), "base_sha": str(row["base_sha"]), "pre_snapshot_hash": str(row["snapshot_hash"]), "activation_marker": str(intent_row["activation_marker"])}
+            if any(authority.get(key) != value for key, value in immutable.items()):
+                raise RuntimeError("native release activation replay approval conflicts")
+            pre = authority.get("pre_snapshot")
+            if not isinstance(pre, dict) or hashlib.sha256(canonical_snapshot_json(pre).encode("utf-8")).hexdigest() != str(row["snapshot_hash"]):
+                raise RuntimeError("native release activation signed pre-state is invalid")
+            return document, pre
+
+        if existing_intent:
             intent_row = existing_intent[0]
             if intent_row["approval_document_json"] != approval_bytes.decode("utf-8") or intent_row["approval_document_hash"] != hashlib.sha256(approval_bytes).hexdigest() or intent_row["signer_fingerprint"] != self.config.operator_signer_fingerprint:
                 raise RuntimeError("native release activation replay approval conflicts")
-            if not exact_ready(intent_row):
-                raise RuntimeError("native release activation replay is not exact ready post-state")
-            self._inject_failure("after_marker")
-            if intent_row["status"] == "effect_applied":
+            _, signed_pre = signed_authority(intent_row)
+            current_json = canonical_snapshot_json(snapshot)
+            pre_match = snapshot.task.status == "scheduled" and current_json == canonical_snapshot_json(signed_pre)
+            post_match = snapshot.task.status == "ready" and marker_present(str(intent_row["activation_marker"]))
+            if post_match:
+                try:
+                    validate_activation_post_snapshot(signed_pre, asdict(snapshot), marker_present=True, marker=str(intent_row["activation_marker"]))
+                except ValueError as exc:
+                    raise RuntimeError("native release activation replay post-state is not exact") from exc
+            elif not pre_match:
+                raise RuntimeError("native release activation replay state is ambiguous or stale")
+            if intent_row["status"] == "acknowledged":
+                if not post_match:
+                    raise RuntimeError("native release activation acknowledgement is not exact post-state")
+                return dict(intent_row)
+            if post_match:
+                post_json = canonical_snapshot_json(snapshot)
+                post_hash = validate_activation_post_snapshot(signed_pre, asdict(snapshot), marker_present=True, marker=str(intent_row["activation_marker"]))
+                if intent_row["status"] == "pending":
+                    self.ledger.mark_native_release_activation_effect(request_key, post_hash, post_json)
+                self._inject_failure("after_marker")
                 self._inject_failure("before_ack")
-                result = self.ledger.acknowledge_native_release_activation(request_key, post_activation_snapshot_hash=canonical_sha256(asdict(snapshot)))
+                result = self.ledger.acknowledge_native_release_activation(request_key, post_activation_snapshot_hash=post_hash, post_activation_snapshot_json=post_json)
                 self._inject_failure("after_ack")
                 return result
-            return dict(intent_row)
         actual_hash = canonical_sha256(asdict(snapshot))
         board_stat = after_pre_lock
         snapshot_data = json.loads(json.dumps(asdict(snapshot), sort_keys=True))
@@ -490,14 +523,11 @@ class LocalFirstController:
             ticket_id=ticket_id, revalidation_id=revalidation_id, external_task_id=str(row["external_task_id"]),
             pre_activation_snapshot_hash=actual_hash, implementation_profile=str(row["implementation_profile"]),
             repository_identity=str(row["repository_identity"]), canonical_worktree_path=str(row["canonical_worktree_path"]),
-            branch=str(row["branch"]), base_sha=str(row["base_sha"]), operator_id=operator_id, reason=reason, request_key=request_key,
+            branch=str(row["branch"]), base_sha=str(row["base_sha"]), operator_id=operator_id, reason=reason, request_key=request_key, pre_activation_snapshot_json=canonical_snapshot_json(snapshot_data),
             approval_document_json=approval_bytes.decode("utf-8"), approval_document_hash=hashlib.sha256(approval_bytes).hexdigest(), detached_signature=detached_signature, signer_fingerprint=self.config.operator_signer_fingerprint, board_path=str(board_path), board_dev=int(board_stat.st_dev), board_ino=int(board_stat.st_ino))
         marker = str(intent["activation_marker"])
         if intent["status"] == "acknowledged":
             return intent
-        if intent["status"] == "pending" and snapshot.task.status == "ready":
-            if not getattr(self.board, "activation_marker_present", lambda *_: False)(str(row["external_task_id"]), marker):
-                raise RuntimeError("native release activation side effect is unmarked or ambiguous")
         if intent["status"] == "pending":
             released_pre_lock = self.board._resolved_board_db_path().stat()
             if (int(released_pre_lock.st_dev), int(released_pre_lock.st_ino)) != (int(board_stat.st_dev), int(board_stat.st_ino)):
@@ -510,10 +540,12 @@ class LocalFirstController:
                 raise RuntimeError("native release activation board inode changed after effect")
             post = self.board.execution_snapshot(str(row["external_task_id"]))
             self._inject_failure("after_marker")
-            post_hash = canonical_sha256(asdict(post))
-            if post.task.status != "ready" or not getattr(self.board, "activation_marker_present", lambda *_: False)(str(row["external_task_id"]), marker):
-                raise RuntimeError("native release activation side effect is not exact")
-            self.ledger.mark_native_release_activation_effect(request_key, post_hash)
+            post_json = canonical_snapshot_json(post)
+            try:
+                post_hash = validate_activation_post_snapshot(snapshot_data, asdict(post), marker_present=marker_present(marker), marker=marker)
+            except ValueError as exc:
+                raise RuntimeError("native release activation side effect is not exact") from exc
+            self.ledger.mark_native_release_activation_effect(request_key, post_hash, post_json)
         post = self.board.execution_snapshot(str(row["external_task_id"]))
         if post.task.status != "ready":
             raise RuntimeError("native release activation acknowledgement requires ready task")
@@ -521,7 +553,9 @@ class LocalFirstController:
         if (int(before_ack.st_dev), int(before_ack.st_ino)) != (int(board_stat.st_dev), int(board_stat.st_ino)):
             raise RuntimeError("native release activation board inode changed before acknowledgement")
         self._inject_failure("before_ack")
-        result = self.ledger.acknowledge_native_release_activation(request_key, post_activation_snapshot_hash=canonical_sha256(asdict(post)))
+        post_json = canonical_snapshot_json(post)
+        post_hash = validate_activation_post_snapshot(snapshot_data, asdict(post), marker_present=marker_present(marker), marker=marker)
+        result = self.ledger.acknowledge_native_release_activation(request_key, post_activation_snapshot_hash=post_hash, post_activation_snapshot_json=post_json)
         self._inject_failure("after_ack")
         return result
 

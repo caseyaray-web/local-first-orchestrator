@@ -83,3 +83,51 @@ def verify_detached_signature(document_bytes: bytes, signature: bytes, public_ke
     except (InvalidSignature, ValueError) as exc:
         raise ValueError("detached operator signature verification failed") from exc
     return True
+
+
+def canonical_snapshot_json(snapshot: Any) -> str:
+    """Serialize a board execution snapshot without losing scalar identity."""
+    from dataclasses import asdict, is_dataclass
+    value = asdict(snapshot) if is_dataclass(snapshot) else snapshot
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+
+
+def validate_activation_post_snapshot(pre_snapshot: dict[str, Any], post_snapshot: dict[str, Any], *, marker_present: bool, marker: str | None = None) -> str:
+    """Allow only Hermes' scheduled-to-ready activation delta.
+
+    This deliberately compares the complete signed snapshot.  The status scalar
+    is the sole permitted board change; the marker is validated separately by
+    the adapter because it lives in the comments table.
+    """
+    if not isinstance(pre_snapshot, dict) or not isinstance(post_snapshot, dict):
+        raise ValueError("native release activation snapshot is malformed")
+    if not marker_present:
+        raise ValueError("native release activation marker is missing or duplicated")
+    before = json.loads(json.dumps(pre_snapshot, sort_keys=True, separators=(",", ":")))
+    after = json.loads(json.dumps(post_snapshot, sort_keys=True, separators=(",", ":")))
+    try:
+        if before["task"]["status"] != "scheduled" or after["task"]["status"] != "ready":
+            raise ValueError("native release activation status delta is not scheduled-to-ready")
+        before["task"]["status"] = after["task"]["status"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("native release activation snapshot is malformed") from exc
+    # Hermes appends one deterministic comment and one unblock event.  These
+    # are the only history changes activation itself may create.
+    if marker is not None and before.get("comments") != after.get("comments"):
+        expected_comments = list(before.get("comments", [])) + [f"UNBLOCK: {marker}"]
+        if after.get("comments") != expected_comments:
+            raise ValueError("native release activation comment history was rewritten")
+        before["comments"] = after["comments"]
+    if marker is not None and before.get("task_events") != after.get("task_events"):
+        prior_events = list(before.get("task_events", []))
+        later_events = list(after.get("task_events", []))
+        if len(later_events) != len(prior_events) + 1 or later_events[:len(prior_events)] != prior_events:
+            raise ValueError("native release activation task event history was rewritten")
+        appended = later_events[-1]
+        event_text = json.dumps(appended, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        if not isinstance(appended, dict) or "unblock" not in str(appended.get("kind", "")).lower() or marker not in event_text:
+            raise ValueError("native release activation appended event is not the supported unblock event")
+        before["task_events"] = later_events
+    if before != after:
+        raise ValueError("native release activation post-state has unauthorized mutation")
+    return hashlib.sha256(canonical_snapshot_json(post_snapshot).encode("utf-8")).hexdigest()

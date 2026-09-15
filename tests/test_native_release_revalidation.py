@@ -455,6 +455,33 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         self.assertEqual(mutate.call_count, 1)
         self.assertEqual(self.ledger.connection.execute("SELECT status FROM native_release_activation_intents WHERE request_key='controller-request'").fetchone()[0], "acknowledged")
 
+    def test_after_unblock_crash_replays_ready_post_state_without_reunblocking(self) -> None:
+        with self._open_board() as connection:
+            connection.execute("UPDATE tasks SET status='scheduled', started_at=NULL, completed_at=NULL, session_id=NULL, current_run_id=NULL WHERE id=?", (self.external_id,))
+            connection.commit()
+        self.adapter = _TestHermesBoardAdapter(board=self.board_name, executable=sys.executable, board_db_path=self.board_db, canonical_repository=self.repo, allow_writes=True)
+        self.adapter.repository_identity = str(self.repo)
+        self.adapter.base_sha = self.base
+        self.controller = LocalFirstController(self.ledger, self.adapter, self.controller.config, fault_injector=lambda point: (_ for _ in ()).throw(RuntimeError("CRASH_AFTER_UNBLOCK")) if point == "after_unblock" else None)
+        with self._open_board() as connection:
+            scheduled = self.adapter._snapshot_from_connection(connection, self.external_id)
+        revalidation = self.signed_revalidate(reason="after-unblock-crash")
+        with patch.object(self.adapter, "execution_snapshot", return_value=scheduled):
+            prepared = self.controller.prepare_native_release_activation(self.ticket, revalidation_id=str(revalidation["revalidation_id"]), operator_id="operator", reason="after-unblock-crash-activation", request_key="after-unblock-request")
+        approval = parse_approval_document(prepared["canonical_document"])
+        signature = self.signing_key.sign(canonical_activation_bytes(approval))
+        ready = replace(scheduled, task=replace(scheduled.task, status="ready"))
+        with patch.object(self.adapter, "execution_snapshot", side_effect=(scheduled, ready)), patch.object(self.adapter, "activate_native_release", return_value=ready) as mutate, patch.object(self.adapter, "activation_marker_present", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "CRASH_AFTER_UNBLOCK"):
+                self.controller.activate_native_release_revalidation(self.ticket, revalidation_id=str(revalidation["revalidation_id"]), operator_id="operator", reason="after-unblock-crash-activation", request_key="after-unblock-request", approval_document=approval, detached_signature=signature)
+        self.assertEqual(self.ledger.connection.execute("SELECT status FROM native_release_activation_intents WHERE request_key=?", ("after-unblock-request",)).fetchone()[0], "pending")
+        self.controller.fault_injector = None
+        with patch.object(self.adapter, "execution_snapshot", return_value=ready), patch.object(self.adapter, "activate_native_release", return_value=ready) as replay_mutate, patch.object(self.adapter, "activation_marker_present", return_value=True):
+            result = self.controller.activate_native_release_revalidation(self.ticket, revalidation_id=str(revalidation["revalidation_id"]), operator_id="operator", reason="after-unblock-crash-activation", request_key="after-unblock-request", approval_document=approval, detached_signature=signature)
+        self.assertEqual(result["status"], "acknowledged")
+        self.assertEqual(mutate.call_count + replay_mutate.call_count, 1)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM native_release_activation_evidence WHERE request_key=?", ("after-unblock-request",)).fetchone()[0], 1)
+
     def test_forged_acknowledged_activation_without_evidence_is_a_migration_stop(self) -> None:
         revalidation = self.signed_revalidate(reason="forged-activation")
         intent = self.ledger.prepare_native_release_activation_intent(
