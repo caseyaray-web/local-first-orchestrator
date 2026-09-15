@@ -491,6 +491,32 @@ CREATE TRIGGER IF NOT EXISTS native_dependency_releases_immutable_update
 BEFORE UPDATE ON native_dependency_releases BEGIN SELECT RAISE(ABORT, 'native dependency release evidence is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS native_dependency_releases_immutable_delete
 BEFORE DELETE ON native_dependency_releases BEGIN SELECT RAISE(ABORT, 'native dependency release evidence is append-only'); END;
+CREATE TABLE IF NOT EXISTS native_dependency_release_revalidations (
+    revalidation_id TEXT PRIMARY KEY,
+    ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    release_graph_hash TEXT NOT NULL,
+    release_child_external_id TEXT NOT NULL,
+    release_parent_completion_hash TEXT NOT NULL,
+    release_routing_authority_json TEXT NOT NULL,
+    release_hermes_status TEXT NOT NULL,
+    release_observed_at INTEGER NOT NULL,
+    projection_event_id INTEGER NOT NULL,
+    projection_key TEXT NOT NULL,
+    external_task_id TEXT NOT NULL,
+    implementation_profile TEXT NOT NULL,
+    repository_identity TEXT NOT NULL,
+    canonical_worktree_path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL,
+    operator_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS native_dependency_release_revalidations_immutable_update
+BEFORE UPDATE ON native_dependency_release_revalidations BEGIN SELECT RAISE(ABORT, 'native dependency release revalidations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS native_dependency_release_revalidations_immutable_delete
+BEFORE DELETE ON native_dependency_release_revalidations BEGIN SELECT RAISE(ABORT, 'native dependency release revalidations are append-only'); END;
 CREATE TABLE IF NOT EXISTS tranche_completion_evidence (
     tranche_id TEXT PRIMARY KEY REFERENCES tranches(id), root_planning_sha TEXT NOT NULL,
     final_integration_sha TEXT NOT NULL, accepted_ticket_ids_json TEXT NOT NULL,
@@ -2232,15 +2258,112 @@ class Ledger:
 
     def native_dependency_release_migration_required(self) -> dict[str, Any] | None:
         """Find legacy releases that cannot authorize downstream execution."""
-        rows = self.connection.execute("SELECT ticket_id,routing_authority_json FROM native_dependency_releases ORDER BY ticket_id").fetchall()
+        rows = self.connection.execute("SELECT * FROM native_dependency_releases ORDER BY ticket_id").fetchall()
         for row in rows:
             try:
                 authority = json.loads(str(row["routing_authority_json"] or "{}"))
             except json.JSONDecodeError:
                 authority = None
             if not isinstance(authority, dict) or not authority.get("profile") or not authority.get("canonical_repository"):
-                return {"ticket_id": str(row["ticket_id"]), "reason": "legacy release routing authority requires paused operator revalidation"}
+                ticket_id = str(row["ticket_id"])
+                current = self.connection.execute("""
+                    SELECT r.*, b.event_id AS current_projection_event_id, b.idempotency_key AS current_projection_key,
+                           b.external_task_id AS current_external_task_id, e.event_type AS current_projection_event_type,
+                           rb.repository_path AS binding_repository_path
+                    FROM native_dependency_release_revalidations r
+                    JOIN board_projection_outbox b ON b.ticket_id=r.ticket_id AND b.operation='create_microticket'
+                      AND b.superseded_at IS NULL AND b.acknowledged_at IS NOT NULL
+                    JOIN events e ON e.id=b.event_id AND e.entity_type='ticket' AND e.entity_id=r.ticket_id
+                    JOIN runtime_bindings rb ON rb.ticket_id=r.ticket_id
+                    WHERE r.ticket_id=?
+                """, (ticket_id,)).fetchall()
+                valid = [item for item in current if self._native_release_revalidation_row_valid(item, row)]
+                if len(current) != 1 or len(valid) != 1:
+                    return {"ticket_id": ticket_id, "reason": "legacy release routing authority requires paused operator revalidation"}
         return None
+
+    @staticmethod
+    def _native_release_revalidation_row_valid(row: sqlite3.Row, release: sqlite3.Row) -> bool:
+        try:
+            authority = json.loads(str(row["release_routing_authority_json"]))
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return (
+            isinstance(authority, dict) and authority == {}
+            and str(row["release_graph_hash"]) == str(release["graph_hash"])
+            and str(row["release_child_external_id"]) == str(release["child_external_id"])
+            and str(row["release_parent_completion_hash"]) == str(release["parent_completion_hash"])
+            and str(row["release_hermes_status"]) == str(release["hermes_status"])
+            and int(row["projection_event_id"]) == int(row["current_projection_event_id"])
+            and str(row["projection_key"]).strip() == str(row["current_projection_key"])
+            and str(row["external_task_id"]) == str(row["current_external_task_id"])
+            and str(row["current_projection_event_type"]) in {"generated_microticket_created", "generated_microticket_projection_recovered"}
+            and str(row["repository_identity"]) == str(row["binding_repository_path"])
+            and str(row["external_task_id"]) == str(release["child_external_id"])
+            and str(row["repository_identity"]).strip() != ""
+            and str(row["canonical_worktree_path"]).strip() != ""
+            and str(row["branch"]).strip() != ""
+            and len(str(row["base_sha"])) == 40
+            and len(str(row["snapshot_hash"])) == 64
+        )
+
+    def record_native_release_revalidation(self, *, ticket_id: str, projection_event_id: int,
+                                           projection_key: str, external_task_id: str,
+                                           implementation_profile: str, repository_identity: str,
+                                           canonical_worktree_path: str, branch: str, base_sha: str,
+                                           snapshot_hash: str, operator_id: str, reason: str) -> dict[str, Any]:
+        if not all(isinstance(value, str) and value.strip() for value in (ticket_id, projection_key, external_task_id, implementation_profile, repository_identity, canonical_worktree_path, branch, base_sha, snapshot_hash, operator_id, reason)):
+            raise ValueError("native release revalidation requires non-empty identity and reason")
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not bool(paused["paused"]):
+                raise PermissionError("native release revalidation requires Local First paused")
+            release = conn.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if release is None:
+                raise ValueError("native release revalidation requires an existing release")
+            try:
+                if json.loads(str(release["routing_authority_json"] or "{}")) != {}:
+                    raise ValueError("native release revalidation requires a legacy release")
+            except json.JSONDecodeError as exc:
+                raise ValueError("native release routing authority is malformed") from exc
+            projection = conn.execute("""
+                SELECT b.*,e.event_type,e.entity_type,e.entity_id FROM board_projection_outbox b JOIN events e ON e.id=b.event_id
+                WHERE b.ticket_id=? AND b.operation='create_microticket' AND b.superseded_at IS NULL
+                  AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL
+            """, (ticket_id,)).fetchall()
+            if len(projection) != 1 or int(projection[0]["event_id"]) != projection_event_id or projection[0]["idempotency_key"] != projection_key or projection[0]["external_task_id"] != external_task_id or projection[0]["event_type"] not in {"generated_microticket_created", "generated_microticket_projection_recovered"}:
+                raise ValueError("native release revalidation requires exactly one current acknowledged generated projection")
+            binding = conn.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if binding is None or str(binding["repository_path"]) != repository_identity:
+                raise ValueError("native release revalidation runtime identity mismatch")
+            if conn.execute("SELECT 1 FROM attempts WHERE ticket_id=? UNION SELECT 1 FROM model_invocations WHERE ticket_id=? UNION SELECT 1 FROM model_stage_artifacts WHERE ticket_id=? UNION SELECT 1 FROM review_candidates WHERE ticket_id=? UNION SELECT 1 FROM review_results WHERE ticket_id=? UNION SELECT 1 FROM review_findings WHERE ticket_id=? UNION SELECT 1 FROM accepted_candidates WHERE ticket_id=? UNION SELECT 1 FROM accepted_evidence WHERE ticket_id=? UNION SELECT 1 FROM git_commit_intents WHERE ticket_id=? UNION SELECT 1 FROM git_commit_evidence WHERE ticket_id=? UNION SELECT 1 FROM hermes_execution_reconciliations WHERE ticket_id=?", (ticket_id,)*11).fetchone() is not None:
+                raise ValueError("native release revalidation refuses lifecycle evidence")
+            if conn.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND status='claimed' UNION SELECT 1 FROM tickets WHERE id=? AND lease_owner IS NOT NULL", (ticket_id, ticket_id)).fetchone() is not None:
+                raise ValueError("native release revalidation refuses active lease or claim")
+            values = (implementation_profile, repository_identity, canonical_worktree_path, branch, base_sha, snapshot_hash, operator_id, reason)
+            existing_ticket = conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if existing_ticket is not None:
+                expected = tuple(existing_ticket[key] for key in ("projection_event_id", "projection_key", "external_task_id", "implementation_profile", "repository_identity", "canonical_worktree_path", "branch", "base_sha", "snapshot_hash", "operator_id", "reason"))
+                requested = (projection_event_id, projection_key, external_task_id, *values)
+                if expected != requested:
+                    raise ValueError("revalidation replay conflicts")
+                return dict(existing_ticket)
+            identity = {"ticket_id": ticket_id, "projection_event_id": projection_event_id, "projection_key": projection_key, "external_task_id": external_task_id, "release_graph_hash": release["graph_hash"], "snapshot_hash": snapshot_hash}
+            revalidation_id = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:32]
+            prior = conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=?", (revalidation_id,)).fetchone()
+            if prior is not None:
+                expected = tuple(prior[key] for key in ("implementation_profile", "repository_identity", "canonical_worktree_path", "branch", "base_sha", "snapshot_hash", "operator_id", "reason"))
+                if expected != values:
+                    raise ValueError("revalidation replay conflicts")
+                return dict(prior)
+            if conn.execute("SELECT 1 FROM native_dependency_release_revalidations WHERE ticket_id=?", (ticket_id,)).fetchone() is not None:
+                raise ValueError("native release revalidation duplicate or drifted")
+            conn.execute("""INSERT INTO native_dependency_release_revalidations
+                (revalidation_id,ticket_id,release_graph_hash,release_child_external_id,release_parent_completion_hash,release_routing_authority_json,release_hermes_status,release_observed_at,projection_event_id,projection_key,external_task_id,implementation_profile,repository_identity,canonical_worktree_path,branch,base_sha,snapshot_hash,operator_id,reason,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (revalidation_id,ticket_id,release["graph_hash"],release["child_external_id"],release["parent_completion_hash"],release["routing_authority_json"],release["hermes_status"],release["observed_at"],projection_event_id,projection_key,external_task_id,*values,self._now()))
+            self._inject_failure("after_native_release_revalidation")
+            self._append_event(conn, entity_type="controller", entity_id="controller", event_type="native_dependency_release_revalidated", actor_id=operator_id, payload={"ticket_id": ticket_id, "revalidation_id": revalidation_id, "projection_event_id": projection_event_id, "snapshot_hash": snapshot_hash})
+            return dict(conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=?", (revalidation_id,)).fetchone())
 
     def _native_dependency_graph_identity(self, conn: sqlite3.Connection, ticket_id: str) -> dict[str, Any]:
         ticket = conn.execute("SELECT id,dependencies_json FROM tickets WHERE id=?", (ticket_id,)).fetchone()

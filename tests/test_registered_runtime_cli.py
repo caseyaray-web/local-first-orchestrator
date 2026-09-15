@@ -109,6 +109,21 @@ class RegisteredRuntimeCliTests(unittest.TestCase):
                 "--operator-id", "casey", "--reason", "pre-native replacement",
             ])
 
+    def test_native_release_revalidation_is_registered_read_only_operation(self) -> None:
+        parser = argparse.ArgumentParser(); register_cli(parser)
+        args = parser.parse_args([
+            "--database", str(self.database), "--operator-config-path", str(self.config_path),
+            "--hermes-executable", "/bin/true", "--board", "isolated",
+            "revalidate-native-release", "--task-id", "TK-1", "--operator-id", "casey", "--reason", "legacy proof",
+        ])
+        self.assertEqual(args.command, "revalidate-native-release")
+        self.assertEqual((args.task_id, args.operator_id, args.reason), ("TK-1", "casey", "legacy proof"))
+        with self.assertRaisesRegex(ValueError, "requires registered operator runtime"):
+            cli_main([
+                "--database", str(self.database), "--ad-hoc-runtime", "--hermes-executable", "/bin/true", "--board", "isolated",
+                "revalidate-native-release", "--task-id", "TK-1", "--operator-id", "casey", "--reason", "legacy proof",
+            ])
+
     def test_operator_lifecycle_cli_pause_resume_and_status_are_durable(self) -> None:
         paused = io.StringIO()
         with contextlib.redirect_stdout(paused):

@@ -23,6 +23,8 @@ class ExternalTicket:
     children: tuple[str, ...] = ()
     assignee: str | None = None
     workspace_kind: str | None = None
+    repository_identity: str | None = None
+    base_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,8 @@ class ExternalExecutionSnapshot:
     started_at: int | None
     completed_at: int | None
     runs: tuple[ExternalExecutionRun, ...]
+    repository_identity: str | None = None
+    base_sha: str | None = None
 
 
 class HermesBoardAdapter:
@@ -94,6 +98,8 @@ class HermesBoardAdapter:
             tuple(sorted(set(children))),
             None if row.get("assignee") is None else str(row["assignee"]),
             None if row.get("workspace_kind") is None else str(row["workspace_kind"]),
+            None if row.get("repository_identity") is None else str(row["repository_identity"]),
+            None if row.get("base_sha") is None else str(row["base_sha"]),
         )
 
     def execution_snapshot(self, task_id: str) -> ExternalExecutionSnapshot:
@@ -118,6 +124,8 @@ class HermesBoardAdapter:
             tuple(sorted(set(children))),
             None if row.get("assignee") is None else str(row["assignee"]),
             None if row.get("workspace_kind") is None else str(row["workspace_kind"]),
+            None if row.get("repository_identity") is None else str(row["repository_identity"]),
+            None if row.get("base_sha") is None else str(row["base_sha"]),
         )
         parsed: list[ExternalExecutionRun] = []
         for item in runs:
@@ -141,6 +149,8 @@ class HermesBoardAdapter:
             started_at=None if row.get("started_at") is None else int(row["started_at"]),
             completed_at=None if row.get("completed_at") is None else int(row["completed_at"]),
             runs=tuple(sorted(parsed, key=lambda run: run.id)),
+            repository_identity=None if row.get("repository_identity") is None else str(row["repository_identity"]),
+            base_sha=None if row.get("base_sha") is None else str(row["base_sha"]),
         )
 
     def import_candidates(self) -> list[ExternalTicket]:

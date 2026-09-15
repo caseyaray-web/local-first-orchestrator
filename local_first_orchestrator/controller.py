@@ -171,6 +171,69 @@ class LocalFirstController:
             reason=reason,
         )
 
+    def revalidate_native_release(self, ticket_id: str, *, operator_id: str, reason: str,
+                                  implementation_profile: str) -> dict[str, Any]:
+        """Append-only operator proof for one legacy native release."""
+        if not hasattr(self.board, "execution_snapshot"):
+            raise RuntimeError("native release revalidation requires execution snapshot support")
+        if not operator_id.strip() or not reason.strip() or not implementation_profile.strip():
+            raise ValueError("operator identity, reason, and implementation profile required")
+        projection = self.ledger.connection.execute("""
+            SELECT event_id,idempotency_key,external_task_id FROM board_projection_outbox
+            WHERE ticket_id=? AND operation='create_microticket' AND superseded_at IS NULL
+              AND acknowledged_at IS NOT NULL AND external_task_id IS NOT NULL
+        """, (ticket_id,)).fetchall()
+        if len(projection) != 1:
+            raise ValueError("native release revalidation requires exactly one current projection")
+        projection = projection[0]
+        external_task_id = str(projection["external_task_id"])
+        snapshot = self.board.execution_snapshot(external_task_id)
+        if snapshot.task.id != external_task_id:
+            raise RuntimeError("native release revalidation external identity drift")
+        repository = self.config.repository.resolve(strict=True)
+        expected_base = str(self.ledger.runtime_binding(ticket_id)["starting_sha"])
+        expected_path = Path(str(snapshot.task.workspace_path)).expanduser().resolve() if snapshot.task.workspace_path else None
+        if snapshot.task.assignee != implementation_profile or snapshot.task.workspace_kind != "worktree":
+            raise RuntimeError("native release revalidation routing drift")
+        if expected_path is None or not expected_path.is_dir():
+            raise RuntimeError("native release revalidation worktree drift")
+        try:
+            expected_path.relative_to((repository / ".worktrees").resolve())
+        except ValueError as exc:
+            raise RuntimeError("native release revalidation worktree drift") from exc
+        try:
+            top = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+            branch = subprocess.run(("git", "branch", "--show-current"), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError("native release revalidation worktree verification failed") from exc
+        snapshot_base = snapshot.base_sha or snapshot.task.base_sha
+        snapshot_repository = snapshot.repository_identity or snapshot.task.repository_identity
+        if top != str(expected_path) or head != expected_base or branch != (snapshot.branch_name or "") or snapshot_base != expected_base or snapshot_repository != str(repository):
+            raise RuntimeError("native release revalidation branch/base/repository drift")
+        forbidden = {"running", "completed", "success", "successful"}
+        if snapshot.task.status not in {"scheduled", "blocked"}:
+            raise RuntimeError("native release revalidation card is dispatchable or final")
+        if any(value is not None for value in (snapshot.session_id, snapshot.started_at, snapshot.completed_at)):
+            raise RuntimeError("native release revalidation execution evidence exists")
+        gate = "Local First execution gate: authoritative dependencies/runtime authorization not satisfied"
+        for run in snapshot.runs:
+            if run.status in forbidden or (run.outcome or "").lower() in forbidden or run.worker_pid is not None or run.profile is not None or run.metadata is not None:
+                raise RuntimeError("native release revalidation execution evidence exists")
+            if run.status == "blocked" and not (run.outcome == "blocked" and str(run.summary or "") == gate and (run.started_at, run.ended_at) in {(None, None), (run.started_at, run.started_at)}):
+                raise RuntimeError("native release revalidation blocked run is not inert")
+            if run.status == "spawn_failed" and run.outcome not in {None, "spawn_failed"}:
+                raise RuntimeError("native release revalidation spawn evidence is ambiguous")
+            if run.status not in {"blocked", "spawn_failed"}:
+                raise RuntimeError("native release revalidation run evidence is ambiguous")
+        return self.ledger.record_native_release_revalidation(
+            ticket_id=ticket_id, projection_event_id=int(projection["event_id"]),
+            projection_key=str(projection["idempotency_key"]), external_task_id=external_task_id,
+            implementation_profile=implementation_profile, repository_identity=str(repository),
+            canonical_worktree_path=str(expected_path), branch=branch, base_sha=expected_base,
+            snapshot_hash=canonical_sha256(asdict(snapshot)), operator_id=operator_id, reason=reason,
+        )
+
     def reconcile_hermes_execution(self, external_task_id: str, *, hermes_run_id: int | None = None, require_handoff: bool = False) -> dict[str, Any]:
         """Bind one completed dispatcher-owned Hermes run into Local First.
 

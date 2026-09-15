@@ -543,6 +543,10 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     hermes_execution=commands.add_parser("reconcile-hermes-execution", help="bind one completed dispatcher-owned Hermes run into a Local First attempt; never launches implementation")
     hermes_execution.add_argument("--task-id", required=True, help="Hermes task id / Local First external task id")
     hermes_execution.add_argument("--run-id", type=int, help="explicit Hermes run id; required when multiple unreconciled completed worker runs exist")
+    native_revalidate=commands.add_parser("revalidate-native-release", help="paused operator-only: append exact read-only evidence for one legacy native release")
+    native_revalidate.add_argument("--task-id", required=True)
+    native_revalidate.add_argument("--operator-id", required=True)
+    native_revalidate.add_argument("--reason", required=True)
     confirm_cleanup=commands.add_parser("confirm-retired-attempt-cleanup", help="verify separately-authorized cleanup; never removes files")
     confirm_cleanup.add_argument("--task-id", required=True)
     confirm_cleanup.add_argument("--operator-id", default="local-first-cli")
@@ -791,6 +795,11 @@ def run_command(args: argparse.Namespace) -> int:
             if not args.hermes_executable or not args.board: raise ValueError("Hermes execution reconciliation requires --hermes-executable and --board")
             ctl, _ = _registered_controller(ledger,args,allow_board_writes=False)
             print(json.dumps(ctl.reconcile_hermes_execution(args.task_id,hermes_run_id=args.run_id),sort_keys=True))
+        elif args.command=="revalidate-native-release":
+            if args.ad_hoc_runtime: raise ValueError("native release revalidation requires registered operator runtime")
+            if not args.hermes_executable or not args.board: raise ValueError("native release revalidation requires --hermes-executable and --board")
+            ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
+            print(json.dumps(ctl.revalidate_native_release(args.task_id, operator_id=args.operator_id, reason=args.reason, implementation_profile=registered.implementation.profile), sort_keys=True))
         elif args.command=="confirm-retired-attempt-cleanup":
             if args.ad_hoc_runtime: raise ValueError("cleanup confirmation requires registered operator runtime")
             ctl, _ = _registered_controller(ledger,args,allow_board_writes=False)
