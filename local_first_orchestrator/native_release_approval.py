@@ -87,6 +87,13 @@ def canonical_approval_bytes(document: dict[str, Any]) -> bytes:
     return _canonical_bytes(document, domain=APPROVAL_DOMAIN, operation="revalidate-native-release")
 
 
+def revalidation_revision_identity(document_bytes: bytes) -> str:
+    """Identity for one exact signed revalidation revision."""
+    if not isinstance(document_bytes, bytes) or not document_bytes:
+        raise ValueError("signed revalidation document bytes are required")
+    return hashlib.sha256(document_bytes).hexdigest()
+
+
 def canonical_activation_bytes(document: dict[str, Any]) -> bytes:
     return _canonical_bytes(document, domain=ACTIVATION_DOMAIN, operation="activate-native-release")
 

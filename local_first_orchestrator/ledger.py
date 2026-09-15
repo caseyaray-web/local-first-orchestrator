@@ -22,6 +22,7 @@ from .evidence_hash import canonical_sha256
 from .historical_revalidation import authorization_hash, authorization_identity, authorization_hash_from_row, attestation_hash, attestation_identity, attestation_hash_from_row, historical_validation_hash, historical_validation_identity, historical_validation_result_hash
 from .ticket import MicroTicket
 from .revalidation_boundary import validate_and_consume_revalidation_capability
+from .native_release_approval import snapshot_authority
 
 class _LegacyRevalidationCompatibility(Exception):
     pass
@@ -557,12 +558,36 @@ CREATE TABLE IF NOT EXISTS native_dependency_release_revalidations (
     approval_document_json TEXT,
     approval_document_hash TEXT,
     detached_signature TEXT,
-    signer_fingerprint TEXT
+    signer_fingerprint TEXT,
+    snapshot_schema_version INTEGER NOT NULL DEFAULT 1
 );
 CREATE TRIGGER IF NOT EXISTS native_dependency_release_revalidations_immutable_update
 BEFORE UPDATE ON native_dependency_release_revalidations BEGIN SELECT RAISE(ABORT, 'native dependency release revalidations are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS native_dependency_release_revalidations_immutable_delete
 BEFORE DELETE ON native_dependency_release_revalidations BEGIN SELECT RAISE(ABORT, 'native dependency release revalidations are append-only'); END;
+CREATE TABLE IF NOT EXISTS native_dependency_release_revalidation_supersessions (
+    old_revalidation_id TEXT PRIMARY KEY REFERENCES native_dependency_release_revalidations(revalidation_id),
+    new_revalidation_id TEXT NOT NULL UNIQUE REFERENCES native_dependency_release_revalidations(revalidation_id),
+    ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    reason TEXT NOT NULL,
+    operator_id TEXT NOT NULL,
+    old_snapshot_hash TEXT NOT NULL,
+    new_snapshot_hash TEXT NOT NULL,
+    old_snapshot_schema_version INTEGER NOT NULL,
+    new_snapshot_schema_version INTEGER NOT NULL,
+    old_approval_document_json TEXT NOT NULL,
+    new_approval_document_json TEXT NOT NULL,
+    old_approval_document_hash TEXT NOT NULL,
+    new_approval_document_hash TEXT NOT NULL,
+    detached_signature TEXT NOT NULL,
+    event_id INTEGER NOT NULL REFERENCES events(id),
+    evidence_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS native_dependency_release_revalidation_supersessions_immutable_update
+BEFORE UPDATE ON native_dependency_release_revalidation_supersessions BEGIN SELECT RAISE(ABORT, 'native release revalidation supersessions are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS native_dependency_release_revalidation_supersessions_immutable_delete
+BEFORE DELETE ON native_dependency_release_revalidation_supersessions BEGIN SELECT RAISE(ABORT, 'native release revalidation supersessions are append-only'); END;
 CREATE TABLE IF NOT EXISTS native_release_activation_intents (
     request_key TEXT PRIMARY KEY,
     ticket_id TEXT NOT NULL REFERENCES tickets(id),
@@ -1182,9 +1207,10 @@ class Ledger:
         if "routing_authority_json" not in release_columns:
             self.connection.execute("ALTER TABLE native_dependency_releases ADD COLUMN routing_authority_json TEXT NOT NULL DEFAULT '{}'")
         revalidation_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(native_dependency_release_revalidations)")}
-        for name, definition in (("revalidation_event_id", "INTEGER"), ("event_key", "TEXT"), ("evidence_hash", "TEXT"), ("approval_document_json", "TEXT"), ("approval_document_hash", "TEXT"), ("detached_signature", "TEXT"), ("signer_fingerprint", "TEXT")):
+        for name, definition in (("revalidation_event_id", "INTEGER"), ("event_key", "TEXT"), ("evidence_hash", "TEXT"), ("approval_document_json", "TEXT"), ("approval_document_hash", "TEXT"), ("detached_signature", "TEXT"), ("signer_fingerprint", "TEXT"), ("snapshot_schema_version", "INTEGER NOT NULL DEFAULT 1")):
             if name not in revalidation_columns:
                 self.connection.execute(f"ALTER TABLE native_dependency_release_revalidations ADD COLUMN {name} {definition}")
+        self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_native_release_revalidation_document ON native_dependency_release_revalidations(ticket_id, approval_document_hash) WHERE approval_document_hash IS NOT NULL")
         activation_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(native_release_activation_intents)")}
         for name, definition in {
             "approval_document_json": "TEXT", "approval_document_hash": "TEXT", "detached_signature": "TEXT",
@@ -2601,6 +2627,31 @@ class Ledger:
     def native_dependency_release_migration_required(self, *, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None, config_path: Path | None = None, require_activation: bool = True, board: Any | None = None) -> dict[str, Any] | None:
         """Find legacy releases that cannot authorize downstream execution."""
         rows = self.connection.execute("SELECT * FROM native_dependency_releases ORDER BY ticket_id").fetchall()
+        # A supersession marker is authority only when its complete signed envelope
+        # and immutable event linkage survive independent verification.
+        if signer_public_key is not None and signer_fingerprint:
+            for link in self.connection.execute("SELECT * FROM native_dependency_release_revalidation_supersessions ORDER BY old_revalidation_id").fetchall():
+                try:
+                    old = self.connection.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=?", (link["old_revalidation_id"],)).fetchone()
+                    new = self.connection.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=?", (link["new_revalidation_id"],)).fetchone()
+                    event = self.connection.execute("SELECT * FROM events WHERE id=? AND entity_type='controller' AND entity_id='controller' AND event_type='native_dependency_release_revalidation_superseded'", (link["event_id"],)).fetchone()
+                    if old is None or new is None or event is None or str(old["ticket_id"]) != str(link["ticket_id"]) or str(new["ticket_id"]) != str(link["ticket_id"]):
+                        raise ValueError("supersession rows or event linkage are incomplete")
+                    from .native_release_approval import parse_approval_document, verify_detached_signature
+                    old_raw = str(old["approval_document_json"] or "").encode(); new_raw = str(new["approval_document_json"] or "").encode()
+                    if hashlib.sha256(old_raw).hexdigest() != str(old["approval_document_hash"]) or hashlib.sha256(new_raw).hexdigest() != str(new["approval_document_hash"]):
+                        raise ValueError("supersession signed document hash mismatch")
+                    parse_approval_document(old_raw); parse_approval_document(new_raw)
+                    verify_detached_signature(old_raw, base64.b64decode(str(old["detached_signature"]), validate=True), signer_public_key, str(old["signer_fingerprint"]))
+                    verify_detached_signature(new_raw, base64.b64decode(str(new["detached_signature"]), validate=True), signer_public_key, str(new["signer_fingerprint"]))
+                    payload = json.loads(str(event["payload_json"]))
+                    evidence = payload.get("evidence") if isinstance(payload, dict) else None
+                    expected_link = {"old_revalidation_id": str(old["revalidation_id"]), "new_revalidation_id": str(new["revalidation_id"]), "ticket_id": str(link["ticket_id"]), "reason": str(link["reason"]), "operator_id": str(link["operator_id"]), "old_snapshot_hash": str(old["snapshot_hash"]), "new_snapshot_hash": str(new["snapshot_hash"]), "old_snapshot_schema_version": int(old["snapshot_schema_version"] or 1), "new_snapshot_schema_version": int(new["snapshot_schema_version"] or 1), "old_approval_document_json": str(old["approval_document_json"] or ""), "new_approval_document_json": str(new["approval_document_json"] or ""), "old_approval_document_hash": str(old["approval_document_hash"] or ""), "new_approval_document_hash": str(new["approval_document_hash"] or "")}
+                    if payload.get("evidence_hash") != str(link["evidence_hash"]) or evidence != expected_link or canonical_sha256(evidence) != str(link["evidence_hash"]) or str(link["detached_signature"]) != str(new["detached_signature"]):
+                        raise ValueError("supersession event evidence is forged")
+                except Exception as exc:
+                    return {"ticket_id": str(link["ticket_id"]), "reason": f"native release revalidation supersession is invalid: {exc}"}
+
         missing_signer = self.connection.execute("""
             SELECT r.ticket_id FROM native_dependency_releases r
             JOIN runtime_bindings b ON b.ticket_id=r.ticket_id
@@ -2861,12 +2912,20 @@ class Ledger:
                            re.payload_json AS linked_event_payload
                     FROM native_dependency_release_revalidations r
                     JOIN board_projection_outbox b ON b.ticket_id=r.ticket_id AND b.operation='create_microticket'
-                      AND b.superseded_at IS NULL AND b.acknowledged_at IS NOT NULL
+                      AND b.superseded_at IS NULL AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL
                     JOIN events e ON e.id=b.event_id AND e.entity_type='ticket' AND e.entity_id=r.ticket_id
                     JOIN runtime_bindings rb ON rb.ticket_id=r.ticket_id
                     LEFT JOIN events re ON re.id=r.revalidation_event_id
-                    WHERE r.ticket_id=?
+                    WHERE r.ticket_id=? AND NOT EXISTS (SELECT 1 FROM native_dependency_release_revalidation_supersessions s WHERE s.old_revalidation_id=r.revalidation_id)
                 """, (ticket_id,)).fetchall()
+                if board is not None:
+                    try:
+                        live = board.execution_snapshot(str(current[0]["external_task_id"])) if len(current) == 1 else None
+                        live_root = snapshot_authority(live)
+                        if live_root["task"].get("status") not in {"scheduled", "blocked"} or canonical_sha256(live_root) != str(current[0]["snapshot_hash"]):
+                            return {"ticket_id": ticket_id, "reason": "legacy release current full raw Hermes snapshot drift"}
+                    except Exception as exc:
+                        return {"ticket_id": ticket_id, "reason": f"legacy release current full raw Hermes snapshot unavailable: {exc}"}
                 valid = [item for item in current if self._native_release_revalidation_row_valid(item, row, signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint)]
                 linked_keys = {str(item["event_key"]) for item in current if item["event_key"] is not None}
                 linked_events = self.connection.execute(
@@ -2960,6 +3019,7 @@ class Ledger:
                     or approval_authority.get("branch") != str(row["branch"])
                     or approval_authority.get("base_sha") != str(row["base_sha"])
                     or approval_authority.get("snapshot_hash") != str(row["snapshot_hash"])
+                    or int(approval_authority.get("snapshot_schema_version", 1)) != int(row["snapshot_schema_version"] or 1)
                     or approval_authority.get("projection") != {"event_id": int(row["projection_event_id"]), "key": str(row["projection_key"]), "external_id": str(row["external_task_id"])}
                     or approval_authority.get("release") != dict(release)):
                 return False
@@ -3133,12 +3193,10 @@ class Ledger:
                 expected_snapshot_hash=snapshot_hash,
             )
             values = (implementation_profile, repository_identity, canonical_worktree_path, branch, base_sha, snapshot_hash, operator_id, reason)
-            existing_ticket = conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE ticket_id=?", (ticket_id,)).fetchone()
-            if existing_ticket is not None:
-                expected = tuple(existing_ticket[key] for key in ("projection_event_id", "projection_key", "external_task_id", "implementation_profile", "repository_identity", "canonical_worktree_path", "branch", "base_sha", "snapshot_hash", "operator_id", "reason"))
-                requested = (projection_event_id, projection_key, external_task_id, *values)
-                if expected != requested:
-                    raise ValueError("revalidation replay conflicts")
+            approval_hash = approval_document_hash
+            # Exact signed-document lookup is the compatibility path for old deterministic IDs.
+            exact = conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE ticket_id=? AND approval_document_hash=?", (ticket_id, approval_hash)).fetchone()
+            if exact is not None:
                 linked = conn.execute("""
                     SELECT r.*, e.id AS linked_event_id, e.entity_type AS linked_event_entity_type,
                            e.entity_id AS linked_event_entity_id, e.event_type AS linked_event_type,
@@ -3146,18 +3204,30 @@ class Ledger:
                            b.event_id AS current_projection_event_id, b.idempotency_key AS current_projection_key,
                            b.external_task_id AS current_external_task_id, pe.event_type AS current_projection_event_type,
                            rb.repository_path AS binding_repository_path
-                    FROM native_dependency_release_revalidations r
-                    JOIN events e ON e.id=r.revalidation_event_id
+                    FROM native_dependency_release_revalidations r JOIN events e ON e.id=r.revalidation_event_id
                     JOIN board_projection_outbox b ON b.ticket_id=r.ticket_id AND b.operation='create_microticket' AND b.superseded_at IS NULL AND b.acknowledged_at IS NOT NULL
-                    JOIN events pe ON pe.id=b.event_id
-                    JOIN runtime_bindings rb ON rb.ticket_id=r.ticket_id
+                    JOIN events pe ON pe.id=b.event_id JOIN runtime_bindings rb ON rb.ticket_id=r.ticket_id
                     WHERE r.revalidation_id=?
-                """, (existing_ticket["revalidation_id"],)).fetchone()
+                """, (exact["revalidation_id"],)).fetchone()
                 if linked is None or not self._native_release_revalidation_row_valid(linked, release, signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint):
                     raise RuntimeError("native release revalidation reconciliation required")
-                return dict(existing_ticket)
-            identity = {"ticket_id": ticket_id, "projection_event_id": projection_event_id, "projection_key": projection_key, "external_task_id": external_task_id, "release_graph_hash": release["graph_hash"], "release_child_external_id": release["child_external_id"], "release_parent_completion_hash": release["parent_completion_hash"], "release_routing_authority_json": release["routing_authority_json"], "release_hermes_status": release["hermes_status"], "release_observed_at": int(release["observed_at"]), "implementation_profile": implementation_profile, "repository_identity": repository_identity, "canonical_worktree_path": canonical_worktree_path, "branch": branch, "base_sha": base_sha, "snapshot_hash": snapshot_hash, "operator_id": operator_id, "reason": reason}
-            revalidation_id = canonical_sha256(identity)
+                return dict(exact)
+            existing_ticket = conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE ticket_id=? AND NOT EXISTS (SELECT 1 FROM native_dependency_release_revalidation_supersessions s WHERE s.old_revalidation_id=native_dependency_release_revalidations.revalidation_id)", (ticket_id,)).fetchone()
+            schema_version = int(approval["authority"].get("snapshot_schema_version", 1))
+            old_schema = 1
+            if existing_ticket is not None:
+                old_schema = int(existing_ticket["snapshot_schema_version"] or 1)
+                immutable_keys = ("projection_event_id", "projection_key", "external_task_id", "implementation_profile", "repository_identity", "canonical_worktree_path", "branch", "base_sha")
+                if tuple(existing_ticket[key] for key in immutable_keys) != (projection_event_id, projection_key, external_task_id, *values[:5]):
+                    raise ValueError("revalidation replay conflicts")
+                if old_schema == schema_version or existing_ticket["snapshot_hash"] == snapshot_hash:
+                    raise ValueError("revalidation replay conflicts")
+                if conn.execute("SELECT 1 FROM native_release_activation_intents WHERE ticket_id=? AND revalidation_id=? AND status IN ('pending','acknowledged')", (ticket_id, existing_ticket["revalidation_id"])).fetchone() is not None:
+                    raise ValueError("activated or pending revalidation cannot be superseded")
+                linked = conn.execute("""SELECT r.*,e.id AS linked_event_id,e.entity_type AS linked_event_entity_type,e.entity_id AS linked_event_entity_id,e.event_type AS linked_event_type,e.payload_json AS linked_event_payload,b.event_id AS current_projection_event_id,b.idempotency_key AS current_projection_key,b.external_task_id AS current_external_task_id,pe.event_type AS current_projection_event_type,rb.repository_path AS binding_repository_path FROM native_dependency_release_revalidations r JOIN events e ON e.id=r.revalidation_event_id JOIN board_projection_outbox b ON b.ticket_id=r.ticket_id AND b.operation='create_microticket' AND b.superseded_at IS NULL AND b.acknowledged_at IS NOT NULL JOIN events pe ON pe.id=b.event_id JOIN runtime_bindings rb ON rb.ticket_id=r.ticket_id WHERE r.revalidation_id=?""", (existing_ticket["revalidation_id"],)).fetchone()
+                if linked is None or not self._native_release_revalidation_row_valid(linked, release, signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint):
+                    raise RuntimeError("native release revalidation reconciliation required")
+            revalidation_id = approval_hash
             event_key = "native-release-revalidated:" + revalidation_id
             evidence_row = {"ticket_id": ticket_id, "revalidation_id": revalidation_id, "event_key": event_key, "release_graph_hash": release["graph_hash"], "release_child_external_id": release["child_external_id"], "release_parent_completion_hash": release["parent_completion_hash"], "release_routing_authority_json": release["routing_authority_json"], "release_hermes_status": release["hermes_status"], "release_observed_at": release["observed_at"], "projection_event_id": projection_event_id, "projection_key": projection_key, "external_task_id": external_task_id, "implementation_profile": implementation_profile, "repository_identity": repository_identity, "canonical_worktree_path": canonical_worktree_path, "branch": branch, "base_sha": base_sha, "snapshot_hash": snapshot_hash, "operator_id": operator_id, "reason": reason}
             evidence = self._native_release_evidence_document(evidence_row)
@@ -3172,12 +3242,17 @@ class Ledger:
                 if str(prior["ticket_id"]) != ticket_id or str(prior["event_key"] or "") != event_key or str(prior["evidence_hash"] or "") != evidence_hash:
                     raise ValueError("revalidation replay conflicts")
                 return dict(prior)
-            if conn.execute("SELECT 1 FROM native_dependency_release_revalidations WHERE ticket_id=?", (ticket_id,)).fetchone() is not None:
+            if existing_ticket is None and conn.execute("SELECT 1 FROM native_dependency_release_revalidations WHERE ticket_id=?", (ticket_id,)).fetchone() is not None:
                 raise ValueError("native release revalidation duplicate or drifted")
             event_id = self._append_event(conn, entity_type="controller", entity_id="controller", event_type="native_dependency_release_revalidated", actor_id=operator_id, payload=event_payload)
             conn.execute("""INSERT INTO native_dependency_release_revalidations
-                (revalidation_id,ticket_id,release_graph_hash,release_child_external_id,release_parent_completion_hash,release_routing_authority_json,release_hermes_status,release_observed_at,projection_event_id,projection_key,external_task_id,implementation_profile,repository_identity,canonical_worktree_path,branch,base_sha,snapshot_hash,operator_id,reason,created_at,revalidation_event_id,event_key,evidence_hash,approval_document_json,approval_document_hash,detached_signature,signer_fingerprint)
-                VALUES (?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?)""", (revalidation_id,ticket_id,release["graph_hash"],release["child_external_id"],release["parent_completion_hash"],release["routing_authority_json"],release["hermes_status"],release["observed_at"],projection_event_id,projection_key,external_task_id,*values,self._now(),event_id,event_key,evidence_hash,approval_document_json,approval_document_hash,base64.b64encode(detached_signature).decode("ascii") if detached_signature else None,signer_fingerprint))
+                (revalidation_id,ticket_id,release_graph_hash,release_child_external_id,release_parent_completion_hash,release_routing_authority_json,release_hermes_status,release_observed_at,projection_event_id,projection_key,external_task_id,implementation_profile,repository_identity,canonical_worktree_path,branch,base_sha,snapshot_hash,operator_id,reason,created_at,revalidation_event_id,event_key,evidence_hash,approval_document_json,approval_document_hash,detached_signature,signer_fingerprint,snapshot_schema_version)
+                VALUES (?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?)""", (revalidation_id,ticket_id,release["graph_hash"],release["child_external_id"],release["parent_completion_hash"],release["routing_authority_json"],release["hermes_status"],release["observed_at"],projection_event_id,projection_key,external_task_id,*values,self._now(),event_id,event_key,evidence_hash,approval_document_json,approval_document_hash,base64.b64encode(detached_signature).decode("ascii") if detached_signature else None,signer_fingerprint,schema_version))
+            if existing_ticket is not None:
+                supersession_evidence = {"old_revalidation_id": str(existing_ticket["revalidation_id"]), "new_revalidation_id": revalidation_id, "ticket_id": ticket_id, "reason": reason, "operator_id": operator_id, "old_snapshot_hash": str(existing_ticket["snapshot_hash"]), "new_snapshot_hash": snapshot_hash, "old_snapshot_schema_version": old_schema, "new_snapshot_schema_version": schema_version, "old_approval_document_json": str(existing_ticket["approval_document_json"] or ""), "new_approval_document_json": approval_document_json, "old_approval_document_hash": str(existing_ticket["approval_document_hash"] or ""), "new_approval_document_hash": approval_document_hash}
+                supersession_hash = canonical_sha256(supersession_evidence)
+                supersession_event = self._append_event(conn, entity_type="controller", entity_id="controller", event_type="native_dependency_release_revalidation_superseded", actor_id=operator_id, payload={"evidence": supersession_evidence, "evidence_hash": supersession_hash, "detached_signature": base64.b64encode(detached_signature).decode("ascii")})
+                conn.execute("INSERT INTO native_dependency_release_revalidation_supersessions (old_revalidation_id,new_revalidation_id,ticket_id,reason,operator_id,old_snapshot_hash,new_snapshot_hash,old_snapshot_schema_version,new_snapshot_schema_version,old_approval_document_json,new_approval_document_json,old_approval_document_hash,new_approval_document_hash,detached_signature,event_id,evidence_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (existing_ticket["revalidation_id"],revalidation_id,ticket_id,reason,operator_id,existing_ticket["snapshot_hash"],snapshot_hash,old_schema,schema_version,existing_ticket["approval_document_json"],approval_document_json,existing_ticket["approval_document_hash"],approval_document_hash,base64.b64encode(detached_signature).decode("ascii"),supersession_event,supersession_hash,self._now()))
             self._inject_failure("after_native_release_revalidation")
             return dict(conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=?", (revalidation_id,)).fetchone())
 

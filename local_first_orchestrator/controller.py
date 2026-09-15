@@ -377,6 +377,7 @@ class LocalFirstController:
                 "release": release, "graph": graph, "projection": {"event_id": int(projection["event_id"]), "key": str(projection["idempotency_key"]), "external_id": external_task_id},
                 "implementation_profile": implementation_profile, "repository_identity": str(repository), "canonical_worktree_path": str(expected_path),
                 "branch": branch, "base_sha": expected_base, "snapshot_hash": initial_snapshot_hash,
+                "snapshot_schema_version": 2,
                 "runtime_authority_hash": binding.get("operator_authority_hash")},
         }
         if approval_document is not None:
@@ -408,7 +409,7 @@ class LocalFirstController:
 
     def prepare_native_release_activation(self, ticket_id: str, *, revalidation_id: str, operator_id: str, reason: str, request_key: str) -> dict[str, Any]:
         """Emit exact activation bytes for an external operator signature; never mutates state."""
-        row = self.ledger.connection.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=? AND ticket_id=?", (revalidation_id, ticket_id)).fetchone()
+        row = self.ledger.connection.execute("SELECT * FROM native_dependency_release_revalidations r WHERE r.revalidation_id=? AND r.ticket_id=? AND NOT EXISTS (SELECT 1 FROM native_dependency_release_revalidation_supersessions s WHERE s.old_revalidation_id=r.revalidation_id)", (revalidation_id, ticket_id)).fetchone()
         if row is None:
             raise ValueError("native release activation requires the exact signed revalidation")
         if self.ledger.native_dependency_release_migration_required(signer_public_key=self.config.operator_signer_public_key, signer_fingerprint=self.config.operator_signer_fingerprint, config_path=self.config.operator_config_path, require_activation=False) is not None:
@@ -441,7 +442,7 @@ class LocalFirstController:
         verify_detached_signature(approval_bytes, detached_signature, self.config.operator_signer_public_key or b"", self.config.operator_signer_fingerprint or "")
         if approval_document["operator_id"] != operator_id or approval_document["reason"] != reason or approval_document["request_id"] != request_key:
             raise ValueError("native release activation approval identity mismatch")
-        row = self.ledger.connection.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=? AND ticket_id=?", (revalidation_id, ticket_id)).fetchone()
+        row = self.ledger.connection.execute("SELECT * FROM native_dependency_release_revalidations r WHERE r.revalidation_id=? AND r.ticket_id=? AND NOT EXISTS (SELECT 1 FROM native_dependency_release_revalidation_supersessions s WHERE s.old_revalidation_id=r.revalidation_id)", (revalidation_id, ticket_id)).fetchone()
         if row is None:
             raise ValueError("native release activation requires the exact signed revalidation")
         existing_intent = self.ledger.connection.execute("SELECT * FROM native_release_activation_intents WHERE request_key=? OR revalidation_id=?", (request_key, revalidation_id)).fetchall()

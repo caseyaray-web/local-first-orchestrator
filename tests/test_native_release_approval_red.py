@@ -38,6 +38,17 @@ class NativeReleaseApprovalTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_approval_document(json.dumps(self.document, indent=2).encode())
 
+    def test_revalidation_revision_identity_binds_exact_signed_document(self):
+        from local_first_orchestrator.native_release_approval import revalidation_revision_identity
+
+        document = dict(self.document)
+        first = canonical_approval_bytes(document)
+        second_document = dict(document)
+        second_document["request_id"] = "req-2"
+        second = canonical_approval_bytes(second_document)
+        self.assertNotEqual(revalidation_revision_identity(first), revalidation_revision_identity(second))
+        self.assertEqual(revalidation_revision_identity(first), revalidation_revision_identity(first))
+
     def test_signature_verification_uses_pinned_key_and_canonical_bytes(self):
         encoded = canonical_approval_bytes(self.document)
         signature = self.private.sign(encoded)
