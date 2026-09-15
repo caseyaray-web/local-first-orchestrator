@@ -6,7 +6,7 @@ import sqlite3
 import subprocess
 from contextlib import contextmanager
 from pathlib import Path
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from .comment_delivery import MarkerLookup
@@ -111,21 +111,24 @@ class HermesBoardAdapter:
             task = kanban_db.get_task(connection, task_id)
             if task is None:
                 raise KeyError(task_id)
-            raw_task = connection.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-            parents = tuple(sorted(str(row["parent_id"]) for row in connection.execute("SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id", (task_id,))))
-            children = tuple(sorted(str(row["child_id"]) for row in connection.execute("SELECT child_id FROM task_links WHERE parent_id=? ORDER BY child_id", (task_id,))))
+            from hermes_cli.kanban_output import _SHOW_RUN_FIELDS, _obj_dict, _task_to_dict
+            parents = tuple(kanban_db.parent_ids(connection, task_id))
+            children = tuple(kanban_db.child_ids(connection, task_id))
+            raw_task = _task_to_dict(task)
             runs = kanban_db.list_runs(connection, task_id)
+            comments = kanban_db.list_comments(connection, task_id)
+            events = kanban_db.list_events(connection, task_id)[-50:]
+            latest_summary = kanban_db.latest_summary(connection, task_id)
         except (sqlite3.DatabaseError, KeyError, AttributeError, TypeError) as exc:
             raise RuntimeError("Hermes Kanban execution snapshot read failed") from exc
-        keys = set(raw_task.keys()) if raw_task is not None else set()
-        optional = lambda name, fallback=None: raw_task[name] if raw_task is not None and name in keys else fallback
         external_runs = tuple(ExternalExecutionRun(int(run.id), str(run.status or ""), None if run.outcome is None else str(run.outcome), int(run.started_at) if run.started_at is not None else None, None if run.ended_at is None else int(run.ended_at), None if run.summary is None else str(run.summary), None if run.profile is None else str(run.profile), None if run.worker_pid is None else int(run.worker_pid), run.metadata) for run in runs)
+        raw_snapshot = {"task": raw_task, "latest_summary": latest_summary, "parents": list(parents), "children": list(children), "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments], "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events], "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs]}
         return ExternalExecutionSnapshot(
-            task=ExternalTicket(str(task.id), str(task.title or ""), str(task.body or ""), str(task.status or ""), task.workspace_path, parents=parents, children=children, assignee=task.assignee, workspace_kind=task.workspace_kind, repository_identity=optional("repository_identity"), base_sha=optional("base_sha")),
-            session_id=optional("session_id", task.session_id), branch_name=task.branch_name, started_at=task.started_at, completed_at=task.completed_at,
-            runs=external_runs, repository_identity=optional("repository_identity"), base_sha=optional("base_sha"),
-            current_run_id=optional("current_run_id", getattr(task, "current_run_id", None)),
-            raw_snapshot={"task": dict(raw_task) if raw_task is not None else {}, "parents": list(parents), "children": list(children), "comments": [], "events": [], "runs": [asdict(run) for run in external_runs]},
+            task=ExternalTicket(str(task.id), str(task.title or ""), str(task.body or ""), str(task.status or ""), task.workspace_path, parents=parents, children=children, assignee=task.assignee, workspace_kind=task.workspace_kind),
+            session_id=raw_task.get("session_id"), branch_name=raw_task.get("branch_name"), started_at=raw_task.get("started_at"), completed_at=raw_task.get("completed_at"),
+            runs=external_runs, repository_identity=None, base_sha=None,
+            current_run_id=raw_task.get("current_run_id"), raw_snapshot=raw_snapshot,
+            raw_task=raw_task, raw_comments=tuple(raw_snapshot["comments"]), raw_events=tuple(raw_snapshot["events"]), raw_runs=tuple(raw_snapshot["runs"]),
         )
 
     @contextmanager

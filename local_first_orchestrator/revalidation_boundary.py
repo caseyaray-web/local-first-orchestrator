@@ -4,11 +4,12 @@ import os
 import secrets
 import sqlite3
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, final
 
 from .evidence_hash import canonical_sha256
+from .native_release_approval import snapshot_authority
 
 
 _CONSTRUCTOR_SENTINEL = object()
@@ -53,7 +54,7 @@ class _ExactPrivateCapability:
     def _verify_for_ledger(self, task_id: str, external_task_id: str) -> None:
         validate_and_consume_revalidation_capability(
             self, task_id=task_id, external_task_id=external_task_id,
-            expected_snapshot_hash=canonical_sha256(asdict(self.snapshot)),
+            expected_snapshot_hash=canonical_sha256(snapshot_authority(self.snapshot)),
         )
 
 
@@ -126,7 +127,7 @@ def create_revalidation_capability(
             external_task_id=external_task_id,
             board_name=board_name,
             snapshot=snapshot,
-            snapshot_hash=canonical_sha256(asdict(snapshot)),
+            snapshot_hash=canonical_sha256(snapshot_authority(snapshot)),
             nonce=secrets.token_bytes(32),
         )
         _verify_board_identity(record)

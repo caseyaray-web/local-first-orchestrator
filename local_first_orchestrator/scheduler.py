@@ -4,7 +4,7 @@ import json
 import hashlib
 import uuid
 import sqlite3
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -19,7 +19,7 @@ from .states import CanonicalState
 from .runtime_metrics import RuntimeMetricsStore
 from .evidence_hash import canonical_sha256
 from .native_workspace import validate_native_workspace_path
-from .native_release_approval import canonical_snapshot_json, validate_activation_continuation_snapshot, validate_activation_post_snapshot, linux_process_identity, same_linux_process_identity
+from .native_release_approval import canonical_snapshot_json, snapshot_authority, validate_activation_continuation_snapshot, validate_activation_post_snapshot, linux_process_identity, same_linux_process_identity
 
 
 SCHEDULER_STAGE_ORDER: tuple[str, ...] = (
@@ -259,7 +259,7 @@ def _external_running_gate(ledger: Ledger, board: Any | None, *, now: int) -> Pr
                 handoff_summary="local-first-awaiting-reconciliation",
                 prior_running_observation=None if observation is None else dict(observation),
             )
-            run = current.raw_runs[-1] if current.raw_runs else (asdict(current.runs[-1]) if current.runs else None)
+            run = snapshot_authority(current)["runs"][-1] if snapshot_authority(current).get("runs") else None
             if kind == "running":
                 pid = run.get("worker_pid") if isinstance(run, dict) else None
                 if type(pid) is not int:
@@ -267,7 +267,7 @@ def _external_running_gate(ledger: Ledger, board: Any | None, *, now: int) -> Pr
                 identity = linux_process_identity(pid)
                 if observation is not None:
                     persisted = json.loads(str(observation["process_identity_json"]))
-                    if (str(observation["snapshot_hash"]) != hashlib.sha256(current_json.encode()).hexdigest() or not observation["snapshot_json"] or str(observation["snapshot_json"]) != current_json or int(observation["run_id"]) != int(run["id"]) or str(observation["session_id"]) != str(current.session_id) or persisted != identity or not same_linux_process_identity(persisted)):
+                    if (str(observation["ticket_id"]) != str(activation["ticket_id"]) or str(observation["request_key"]) != str(activation["request_key"]) or str(observation["external_task_id"]) != str(activation["external_task_id"]) or str(observation["profile"]) != str(activation["implementation_profile"]) or str(observation["workspace_path"]) != str(activation["canonical_worktree_path"]) or str(observation["branch"]) != str(activation["branch"]) or str(observation["snapshot_hash"]) != hashlib.sha256(current_json.encode()).hexdigest() or not observation["snapshot_json"] or str(observation["snapshot_json"]) != current_json or int(observation["run_id"]) != int(run["id"]) or str(observation["session_id"]) != str(snapshot_authority(current)["task"].get("session_id")) or persisted != identity or not same_linux_process_identity(persisted)):
                         raise ValueError("persisted running observation does not match live Hermes process")
                 return ProcessNextPreview(status="dry_run", next_stage="externally_running", ticket_id=str(activation["ticket_id"]), would_execute=False, would_write_board=False, run_id=int(run["id"]), session_id=str(current.session_id))
             return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(activation["ticket_id"]), reconciliation_action="reconcile-hermes-execution", blocker_reason="authorized terminal Hermes handoff requires reconciliation")
@@ -879,7 +879,7 @@ class ProcessNextScheduler:
             if row is None:
                 raise RuntimeError("native_dependency_release_reconciliation_required: revalidation evidence missing")
             snapshot = self.board.execution_snapshot(str(row["external_task_id"]))
-            if snapshot.task.id != str(row["external_task_id"]) or canonical_sha256(asdict(snapshot)) != str(row["snapshot_hash"]):
+            if snapshot.task.id != str(row["external_task_id"]) or canonical_sha256(snapshot_authority(snapshot)) != str(row["snapshot_hash"]):
                 raise RuntimeError("native_dependency_release_reconciliation_required: current external snapshot drift")
             if snapshot.task.status not in {"scheduled", "blocked"} or any(value is not None for value in (snapshot.session_id, snapshot.started_at, snapshot.completed_at)):
                 raise RuntimeError("native_dependency_release_reconciliation_required: current external task is unsafe")
@@ -926,7 +926,7 @@ class ProcessNextScheduler:
             if activation is None:
                 raise RuntimeError("native running continuation activation disappeared")
             snapshot = self.board.execution_snapshot(str(activation["external_task_id"]))
-            raw_run = snapshot.raw_runs[-1] if snapshot.raw_runs else asdict(snapshot.runs[-1])
+            raw_run = snapshot_authority(snapshot)["runs"][-1]
             identity = linux_process_identity(int(raw_run["worker_pid"]))
             self.ledger.record_native_release_activation_running_observation(
                 request_key=str(activation["request_key"]), ticket_id=str(activation["ticket_id"]),

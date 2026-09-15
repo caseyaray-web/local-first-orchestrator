@@ -33,7 +33,7 @@ from .ticket import MicroTicket, PatchBudget, VerificationProfile
 from .triage import LocalTriagePlanner, TriageCoordinator, TriageError, normalize_triage
 from .usage_governor import PaidPurpose
 from .validation import DeterministicValidator
-from .native_release_approval import APPROVAL_DOMAIN, ACTIVATION_DOMAIN, APPROVAL_VERSION, canonical_approval_bytes, canonical_activation_bytes, canonical_snapshot_json, parse_approval_document, validate_activation_continuation_snapshot, validate_activation_post_snapshot, verify_detached_signature, fingerprint_public_key
+from .native_release_approval import APPROVAL_DOMAIN, ACTIVATION_DOMAIN, APPROVAL_VERSION, canonical_approval_bytes, canonical_activation_bytes, canonical_snapshot_json, snapshot_authority, parse_approval_document, validate_activation_continuation_snapshot, validate_activation_post_snapshot, verify_detached_signature, fingerprint_public_key
 from .native_workspace import PinnedNativeWorkspace, canonical_native_workspace_path, require_native_path_identity, validate_native_workspace_path
 
 
@@ -173,7 +173,7 @@ class LocalFirstController:
             )
             if not task_is_inert or not runs_are_inert_safety_gates:
                 raise RuntimeError("generated projection recovery requires an inert blocked card without execution evidence")
-        snapshot_hash = canonical_sha256(asdict(snapshot))
+        snapshot_hash = canonical_sha256(snapshot_authority(snapshot))
         return self.ledger.recover_generated_projection(
             ticket_id=ticket_id,
             superseded_event_id=superseded_event_id,
@@ -189,7 +189,7 @@ class LocalFirstController:
                                           expected_branch: str | None = None, expected_snapshot_hash: str | None = None) -> tuple[str, str]:
         if snapshot.task.id != external_task_id:
             raise RuntimeError("native release revalidation external identity drift")
-        if expected_snapshot_hash is not None and canonical_sha256(asdict(snapshot)) != expected_snapshot_hash:
+        if expected_snapshot_hash is not None and canonical_sha256(snapshot_authority(snapshot)) != expected_snapshot_hash:
             raise RuntimeError("native release revalidation snapshot drift")
         if snapshot.task.assignee != implementation_profile or snapshot.task.workspace_kind != "worktree":
             raise RuntimeError("native release revalidation routing drift")
@@ -291,7 +291,7 @@ class LocalFirstController:
                 raise RuntimeError("native release revalidation top-level start evidence is ambiguous")
         elif spawn_failed:
             raise RuntimeError("native release revalidation top-level start evidence is missing")
-        return branch, canonical_sha256(asdict(snapshot))
+        return branch, canonical_sha256(snapshot_authority(snapshot))
 
     def revalidate_native_release(self, ticket_id: str, *, operator_id: str | None = None, reason: str | None = None,
                                   implementation_profile: str, approval_document: dict[str, Any] | None = None,
@@ -418,7 +418,7 @@ class LocalFirstController:
             raise RuntimeError("native release activation preparation requires exact scheduled pre-state")
         board_path = self.board._resolved_board_db_path()
         identity = board_path.stat()
-        snapshot_data = json.loads(json.dumps(asdict(snapshot), sort_keys=True))
+        snapshot_data = json.loads(canonical_snapshot_json(snapshot))
         authority = {"ticket_id": ticket_id, "revalidation_id": revalidation_id, "external_task_id": str(row["external_task_id"]), "implementation_profile": str(row["implementation_profile"]), "repository_identity": str(row["repository_identity"]), "canonical_worktree_path": str(row["canonical_worktree_path"]), "branch": str(row["branch"]), "base_sha": str(row["base_sha"]), "pre_snapshot_hash": str(row["snapshot_hash"]), "pre_snapshot": snapshot_data, "transition": {"from": "scheduled", "to": "ready"}, "board": {"path": str(board_path), "dev": int(identity.st_dev), "ino": int(identity.st_ino)}, "activation_marker": f"local-first-native-release-activation:{revalidation_id}:{request_key}"}
         document = {"domain": ACTIVATION_DOMAIN, "version": APPROVAL_VERSION, "operation": "activate-native-release", "request_id": request_key, "nonce": secrets.token_urlsafe(24), "operator_id": operator_id, "reason": reason, "authority": authority}
         canonical = canonical_activation_bytes(document)
@@ -492,7 +492,7 @@ class LocalFirstController:
             post_match = snapshot.task.status == "ready" and marker_present(str(intent_row["activation_marker"]))
             if post_match:
                 try:
-                    validate_activation_post_snapshot(signed_pre, asdict(snapshot), marker_present=True, marker=str(intent_row["activation_marker"]))
+                    validate_activation_post_snapshot(signed_pre, snapshot_authority(snapshot), marker_present=True, marker=str(intent_row["activation_marker"]))
                 except ValueError as exc:
                     raise RuntimeError("native release activation replay post-state is not exact") from exc
             elif not pre_match:
@@ -503,7 +503,7 @@ class LocalFirstController:
                 return dict(intent_row)
             if post_match:
                 post_json = canonical_snapshot_json(snapshot)
-                post_hash = validate_activation_post_snapshot(signed_pre, asdict(snapshot), marker_present=True, marker=str(intent_row["activation_marker"]))
+                post_hash = validate_activation_post_snapshot(signed_pre, snapshot_authority(snapshot), marker_present=True, marker=str(intent_row["activation_marker"]))
                 if intent_row["status"] == "pending":
                     self.ledger.mark_native_release_activation_effect(request_key, post_hash, post_json)
                 self._inject_failure("after_marker")
@@ -511,9 +511,9 @@ class LocalFirstController:
                 result = self.ledger.acknowledge_native_release_activation(request_key, post_activation_snapshot_hash=post_hash, post_activation_snapshot_json=post_json)
                 self._inject_failure("after_ack")
                 return result
-        actual_hash = canonical_sha256(asdict(snapshot))
+        actual_hash = canonical_sha256(snapshot_authority(snapshot))
         board_stat = after_pre_lock
-        snapshot_data = json.loads(json.dumps(asdict(snapshot), sort_keys=True))
+        snapshot_data = json.loads(canonical_snapshot_json(snapshot))
         expected_authority = {"ticket_id": ticket_id, "revalidation_id": revalidation_id, "external_task_id": str(row["external_task_id"]), "implementation_profile": str(row["implementation_profile"]), "repository_identity": str(row["repository_identity"]), "canonical_worktree_path": str(row["canonical_worktree_path"]), "branch": str(row["branch"]), "base_sha": str(row["base_sha"]), "pre_snapshot_hash": str(row["snapshot_hash"]), "pre_snapshot": snapshot_data, "transition": {"from": "scheduled", "to": "ready"}, "board": {"path": str(board_path), "dev": int(board_stat.st_dev), "ino": int(board_stat.st_ino)}, "activation_marker": f"local-first-native-release-activation:{revalidation_id}:{request_key}"}
         if approval_document["authority"] != expected_authority:
             raise RuntimeError("native release activation approval is stale or cross-ticket")
@@ -542,7 +542,7 @@ class LocalFirstController:
             self._inject_failure("after_marker")
             post_json = canonical_snapshot_json(post)
             try:
-                post_hash = validate_activation_post_snapshot(snapshot_data, asdict(post), marker_present=marker_present(marker), marker=marker)
+                post_hash = validate_activation_post_snapshot(snapshot_data, snapshot_authority(post), marker_present=marker_present(marker), marker=marker)
             except ValueError as exc:
                 raise RuntimeError("native release activation side effect is not exact") from exc
             self.ledger.mark_native_release_activation_effect(request_key, post_hash, post_json)
@@ -554,7 +554,7 @@ class LocalFirstController:
             raise RuntimeError("native release activation board inode changed before acknowledgement")
         self._inject_failure("before_ack")
         post_json = canonical_snapshot_json(post)
-        post_hash = validate_activation_post_snapshot(snapshot_data, asdict(post), marker_present=marker_present(marker), marker=marker)
+        post_hash = validate_activation_post_snapshot(snapshot_data, snapshot_authority(post), marker_present=marker_present(marker), marker=marker)
         result = self.ledger.acknowledge_native_release_activation(request_key, post_activation_snapshot_hash=post_hash, post_activation_snapshot_json=post_json)
         self._inject_failure("after_ack")
         return result
@@ -606,7 +606,7 @@ class LocalFirstController:
             post_authority = json.loads(str(activated["post_activation_snapshot_json"] or "null"))
             current_kind = validate_activation_continuation_snapshot(
                 post_authority,
-                asdict(snapshot),
+                snapshot_authority(snapshot),
                 acknowledged_at=int(activated["acknowledged_at"]),
                 profile=str(activated["implementation_profile"]),
                 workspace_path=str(activated["canonical_worktree_path"]),
