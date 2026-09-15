@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
 from local_first_orchestrator.execution_handoff import HANDOFF_SENTINEL
@@ -153,6 +155,77 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
     def test_generated_hermes_owned_ticket_is_never_locally_claimable(self) -> None:
         self._make_generated_owned()
         self.assertIsNone(self.ledger.claim_next_scheduler_implementation("local-worker", lease_seconds=30, now=100))
+
+    def test_prepare_stops_when_git_directory_is_replaced(self) -> None:
+        original_git = self.repo / ".git-original"
+        swapped = False
+        real_run = subprocess.run
+
+        def swapping_run(*args, **kwargs):
+            nonlocal swapped
+            command = tuple(args[0] if args else (kwargs.get("args") or ()))
+            if not swapped and "rev-parse" in command and "refs/heads/wt/H-1" in command:
+                swapped = True
+                (self.repo / ".git").rename(original_git)
+                replacement_path = self.root / "git-replacement"
+                real_run(("git", "init", "-q", str(replacement_path)), check=True)
+                replacement = replacement_path / ".git"
+                replacement.rename(self.repo / ".git")
+            return real_run(*args, **kwargs)
+
+        with patch("local_first_orchestrator.controller.subprocess.run", side_effect=swapping_run):
+            with self.assertRaisesRegex(RuntimeError, "identity|STOP|reconciliation"):
+                self.controller.prepare_hermes_dispatch_worktree(self.ticket_id, "H-1")
+        self.assertTrue(swapped)
+        self.assertFalse((self.repo / ".worktrees" / "H-1").exists())
+
+    def test_prepare_stops_when_worktrees_parent_is_replaced(self) -> None:
+        original_parent = self.repo / ".worktrees-original"
+        swapped = False
+        real_run = subprocess.run
+
+        def swapping_run(*args, **kwargs):
+            nonlocal swapped
+            command = tuple(args[0] if args else (kwargs.get("args") or ()))
+            if not swapped and "rev-parse" in command and "refs/heads/wt/H-1" in command:
+                swapped = True
+                (self.repo / ".worktrees").rename(original_parent)
+                (self.repo / ".worktrees").mkdir()
+            return real_run(*args, **kwargs)
+
+        with patch("local_first_orchestrator.controller.subprocess.run", side_effect=swapping_run):
+            with self.assertRaisesRegex(RuntimeError, "identity|STOP|reconciliation"):
+                self.controller.prepare_hermes_dispatch_worktree(self.ticket_id, "H-1")
+        self.assertTrue(swapped)
+        self.assertFalse((self.repo / ".worktrees" / "H-1").exists())
+
+    def test_prepare_stops_when_repository_is_swapped_between_branch_check_and_add(self) -> None:
+        replacement = self.root / "replacement"
+        shutil.copytree(self.repo, replacement)
+        original = self.root / "original"
+        swapped = False
+        real_run = subprocess.run
+
+        def swapping_run(*args, **kwargs):
+            nonlocal swapped
+            command = tuple(args[0] if args else (kwargs.get("args") or ()))
+            if (not swapped and "rev-parse" in command and "refs/heads/wt/H-1" in command):
+                swapped = True
+                self.repo.rename(original)
+                replacement.rename(self.repo)
+            return real_run(*args, **kwargs)
+
+        with patch("local_first_orchestrator.controller.subprocess.run", side_effect=swapping_run):
+            with self.assertRaisesRegex(RuntimeError, "identity|STOP|reconciliation"):
+                self.controller.prepare_hermes_dispatch_worktree(self.ticket_id, "H-1")
+
+        self.assertTrue(swapped)
+        self.assertFalse((self.repo / ".worktrees" / "H-1").exists())
+        self.assertEqual(
+            real_run(("git", "rev-parse", "HEAD"), cwd=self.repo, text=True, capture_output=True, check=True).stdout.strip(),
+            self.base,
+        )
+        self.assertFalse(self.ledger.connection.execute("SELECT 1 FROM events WHERE event_type LIKE '%worktree%'").fetchone())
 
     def test_prepare_hermes_dispatch_worktree_uses_advanced_tranche_integration_head(self) -> None:
         subprocess.run(("git", "checkout", "--", "app.py"), cwd=self.repo, check=True)

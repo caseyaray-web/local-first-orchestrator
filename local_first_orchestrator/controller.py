@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import json
+import os
 import subprocess
 import shutil
 import sqlite3
@@ -32,7 +33,7 @@ from .triage import LocalTriagePlanner, TriageCoordinator, TriageError, normaliz
 from .usage_governor import PaidPurpose
 from .validation import DeterministicValidator
 from .native_release_approval import APPROVAL_DOMAIN, APPROVAL_VERSION, canonical_approval_bytes, parse_approval_document, verify_detached_signature, fingerprint_public_key
-from .native_workspace import canonical_native_workspace_path, require_native_path_identity, validate_native_workspace_path
+from .native_workspace import PinnedNativeWorkspace, canonical_native_workspace_path, require_native_path_identity, validate_native_workspace_path
 
 
 @dataclass(frozen=True)
@@ -542,14 +543,12 @@ class LocalFirstController:
         return {**row, "status": "reconciled"}
 
     def prepare_hermes_dispatch_worktree(self, ticket_id: str, external_task_id: str) -> dict[str, str]:
-        """Prepare Hermes' canonical task worktree at the Local First execution base."""
+        """Prepare Hermes' canonical task worktree inside pinned Git objects."""
         repository, worktree_root, _ = self.config.validate_execution_roots()
         ticket = self.ledger.get_ticket(ticket_id)
         binding = self.ledger.runtime_binding(ticket_id)
         if self.ledger.resolve_external_task_id(ticket_id) != external_task_id:
             raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: external identity drift")
-        adapter = GitWorktreeAdapter(repository, worktree_root)
-        base_sha = adapter.resolve_execution_base(ticket.get("tranche_id") or None, str(binding["starting_sha"]))
         target, _ = validate_native_workspace_path(
             canonical_native_workspace_path(repository, external_task_id),
             repository=repository,
@@ -557,37 +556,71 @@ class LocalFirstController:
             require_existing=False,
         )
         branch = f"wt/{external_task_id}"
+        with PinnedNativeWorkspace.open(repository, target) as pin:
+            planning_base = pin.git("rev-parse", "--verify", f"{binding['starting_sha']}^{{commit}}").stdout.strip()
+            tranche_id = ticket.get("tranche_id") or None
+            if tranche_id is None:
+                base_sha = planning_base
+            else:
+                ref = f"refs/local-first/tranches/{tranche_id}/integration-head"
+                if pin.git("check-ref-format", ref, check=False).returncode:
+                    raise RuntimeError("invalid tranche id for integration head")
+                current = pin.git("show-ref", "--verify", "--hash", ref, check=False)
+                if current.returncode == 0:
+                    base_sha = pin.git("rev-parse", "--verify", f"{current.stdout.strip()}^{{commit}}").stdout.strip()
+                else:
+                    created = pin.git("update-ref", ref, planning_base, "0" * 40, check=False)
+                    if created.returncode == 0:
+                        base_sha = planning_base
+                    else:
+                        current = pin.git("show-ref", "--verify", "--hash", ref, check=False)
+                        if current.returncode != 0:
+                            raise RuntimeError("unable to create tranche integration head")
+                        base_sha = pin.git("rev-parse", "--verify", f"{current.stdout.strip()}^{{commit}}").stdout.strip()
 
-        def git(*args: str, cwd: Path = repository, check: bool = True) -> subprocess.CompletedProcess[str]:
+            if target.exists():
+                pin.pin_existing_target(already_created=True)
+                target_git_fd = pin.target_git_fd()
+                try:
+                    target_root = Path(pin.git("rev-parse", "--show-toplevel", target=True, git_fd_override=target_git_fd).stdout.strip()).resolve(strict=True)
+                    common_raw = pin.git("rev-parse", "--git-common-dir", target=True, git_fd_override=target_git_fd).stdout.strip()
+                    target_common = (target / common_raw).resolve(strict=True) if not Path(common_raw).is_absolute() else Path(common_raw).resolve(strict=True)
+                    repo_common_raw = pin.git("rev-parse", "--git-common-dir").stdout.strip()
+                    repo_common = (repository / repo_common_raw).resolve(strict=True) if not Path(repo_common_raw).is_absolute() else Path(repo_common_raw).resolve(strict=True)
+                    head = pin.git("rev-parse", "HEAD", target=True, git_fd_override=target_git_fd).stdout.strip()
+                    actual_branch = pin.git("branch", "--show-current", target=True, git_fd_override=target_git_fd).stdout.strip()
+                    status = pin.git("status", "--porcelain=v1", target=True, git_fd_override=target_git_fd).stdout.strip()
+                finally:
+                    os.close(target_git_fd)
+                if target_root != target or target_common != repo_common or head != base_sha or actual_branch != branch or status:
+                    raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: existing worktree drift")
+                validate_native_workspace_path(target, repository=repository, external_task_id=external_task_id)
+                return {"workspace_path": str(target), "branch_name": branch, "base_sha": base_sha}
+
+            pin.revalidate(target_must_exist=False)
+            branch_check = pin.git("rev-parse", "--verify", f"refs/heads/{branch}", check=False)
+            if branch_check.returncode == 0 and branch_check.stdout.strip() != base_sha:
+                raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: existing branch drift")
+            if branch_check.returncode == 0:
+                pin.git("worktree", "add", "-q", external_task_id, branch, creates_target=True, cwd_fd_override=pin.worktree_parent_fd)
+            else:
+                pin.git("worktree", "add", "-q", "-b", branch, external_task_id, base_sha, creates_target=True, cwd_fd_override=pin.worktree_parent_fd)
+            pin.pin_existing_target(already_created=True)
+            target_git_fd = pin.target_git_fd()
             try:
-                return subprocess.run(("git", *args), cwd=cwd, text=True, capture_output=True, timeout=30, check=check)
-            except subprocess.CalledProcessError as exc:
-                raise RuntimeError(exc.stderr.strip() or exc.stdout.strip() or "Hermes dispatch worktree preparation failed") from exc
-
-        repo_common_raw = git("rev-parse", "--git-common-dir").stdout.strip()
-        repo_common = (repository / repo_common_raw).resolve(strict=True) if not Path(repo_common_raw).is_absolute() else Path(repo_common_raw).resolve(strict=True)
-        if target.exists():
-            target_root = Path(git("rev-parse", "--show-toplevel", cwd=target).stdout.strip()).resolve(strict=True)
-            common_raw = git("rev-parse", "--git-common-dir", cwd=target).stdout.strip()
-            target_common = (target / common_raw).resolve(strict=True) if not Path(common_raw).is_absolute() else Path(common_raw).resolve(strict=True)
-            head = git("rev-parse", "HEAD", cwd=target).stdout.strip()
-            actual_branch = git("branch", "--show-current", cwd=target).stdout.strip()
-            status = git("status", "--porcelain=v1", cwd=target).stdout.strip()
-            if target_root != target or target_common != repo_common or head != base_sha or actual_branch != branch or status:
-                raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: existing worktree drift")
+                target_root = Path(pin.git("rev-parse", "--show-toplevel", target=True, git_fd_override=target_git_fd).stdout.strip()).resolve(strict=True)
+                common_raw = pin.git("rev-parse", "--git-common-dir", target=True, git_fd_override=target_git_fd).stdout.strip()
+                target_common = (target / common_raw).resolve(strict=True) if not Path(common_raw).is_absolute() else Path(common_raw).resolve(strict=True)
+                repo_common_raw = pin.git("rev-parse", "--git-common-dir").stdout.strip()
+                repo_common = (repository / repo_common_raw).resolve(strict=True) if not Path(repo_common_raw).is_absolute() else Path(repo_common_raw).resolve(strict=True)
+                head = pin.git("rev-parse", "HEAD", target=True, git_fd_override=target_git_fd).stdout.strip()
+                actual_branch = pin.git("branch", "--show-current", target=True, git_fd_override=target_git_fd).stdout.strip()
+            finally:
+                os.close(target_git_fd)
+            if target_root != target or target_common != repo_common or head != base_sha or actual_branch != branch:
+                raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: created worktree drift")
             validate_native_workspace_path(target, repository=repository, external_task_id=external_task_id)
             return {"workspace_path": str(target), "branch_name": branch, "base_sha": base_sha}
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-        branch_check = git("rev-parse", "--verify", f"refs/heads/{branch}", check=False)
-        if branch_check.returncode == 0:
-            if branch_check.stdout.strip() != base_sha:
-                raise RuntimeError("hermes_dispatch_worktree_reconciliation_required: existing branch drift")
-            git("worktree", "add", "-q", str(target), branch)
-        else:
-            git("worktree", "add", "-q", "-b", branch, str(target), base_sha)
-        validate_native_workspace_path(target, repository=repository, external_task_id=external_task_id)
-        return {"workspace_path": str(target), "branch_name": branch, "base_sha": base_sha}
 
     def dry_run(self, task_id: str) -> dict[str, object]:
         row=self.ledger.get_ticket(task_id); binding=self.ledger.runtime_binding(task_id)
