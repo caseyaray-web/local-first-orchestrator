@@ -234,7 +234,7 @@ class LocalFirstController:
         external_task_id = str(projection[0]["external_task_id"])
         if not hasattr(self.board, "revalidation"):
             raise RuntimeError("native release revalidation requires a trusted local SQLite board adapter")
-        with self.board.revalidation(external_task_id) as board_capability:
+        with self.board.revalidation(ticket_id, external_task_id) as board_capability:
             return self._revalidate_native_release_locked(ticket_id, operator_id=operator_id, reason=reason,
                 implementation_profile=implementation_profile, approval_document=approval_document,
                 detached_signature=detached_signature, signer_public_key=signer_public_key,

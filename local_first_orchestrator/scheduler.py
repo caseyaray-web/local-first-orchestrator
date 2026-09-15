@@ -248,7 +248,7 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
             return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=str(legacy[0]["ticket_id"]), reconciliation_action=ReconciliationAction.STOP.value)
         try:
             for row in legacy:
-                with board.revalidation(str(row["external_task_id"])) as proof:
+                with board.revalidation(str(row["ticket_id"]), str(row["external_task_id"])) as proof:
                     if canonical_sha256(asdict(proof.snapshot)) != str(row["snapshot_hash"]):
                         raise RuntimeError("board snapshot drift")
         except Exception:

@@ -71,7 +71,9 @@ class HermesBoardAdapter:
         self.runner, self.executable, self.board, self.allow_writes, self.timeout_seconds, self.output_limit = runner, str(path), board, allow_writes, timeout_seconds, output_limit
         self.implementation_profile = implementation_profile
         self.canonical_repository = None if canonical_repository is None else Path(canonical_repository).expanduser().resolve()
-        self.board_db_path = None if board_db_path is None else Path(board_db_path).expanduser().resolve()
+        # Keep the configured spelling (including a symlink) so validation can
+        # detect retargeting instead of silently following the new target.
+        self.board_db_path = None if board_db_path is None else Path(board_db_path).expanduser()
 
     def _resolved_board_db_path(self) -> Path:
         if self.board_db_path is not None:
@@ -113,8 +115,12 @@ class HermesBoardAdapter:
         )
 
     @contextmanager
-    def revalidation(self, task_id: str):
+    def revalidation(self, local_first_ticket_id: str, external_task_id: str | None = None):
         """Hold the exact Hermes board write lock across the caller's ledger commit."""
+        if external_task_id is None:
+            # Legacy direct-adapter callers used one external identity for both
+            # domains. Controller paths always pass both explicitly.
+            external_task_id = local_first_ticket_id
         path = self._resolved_board_db_path()
         try:
             from hermes_cli.sqlite_util import open_db
@@ -123,8 +129,11 @@ class HermesBoardAdapter:
             raise RuntimeError("trusted board revalidation cannot open the configured local SQLite board") from exc
         try:
             connection.execute("BEGIN IMMEDIATE")
-            snapshot = self._snapshot_from_connection(connection, task_id)
-            capability = create_revalidation_capability(self, connection, path, task_id, snapshot, self.board)
+            snapshot = self._snapshot_from_connection(connection, external_task_id)
+            capability = create_revalidation_capability(
+                self, connection, path, local_first_ticket_id, external_task_id,
+                snapshot, self.board, configured_path=self.board_db_path or path,
+            )
             try:
                 yield capability
             finally:

@@ -194,7 +194,7 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
                 connection.commit()
                 finished.set()
         worker = threading.Thread(target=compete)
-        with self.adapter.revalidation(self.external_id) as proof:
+        with self.adapter.revalidation(self.ticket, self.external_id) as proof:
             worker.start()
             self.assertTrue(started.wait(1))
             self.assertFalse(finished.wait(0.1))
