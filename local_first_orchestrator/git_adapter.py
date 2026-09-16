@@ -5,6 +5,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .git_security import safe_git_argv, safe_git_env
+
 
 class GitAdapterError(RuntimeError):
     pass
@@ -41,7 +43,7 @@ class GitWorktreeAdapter:
 
     def _git(self, *args: str, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
         try:
-            return subprocess.run(("git", *args), cwd=cwd or self.primary_checkout, text=True, capture_output=True, timeout=30, check=check)
+            return subprocess.run(safe_git_argv(args), cwd=cwd or self.primary_checkout, env=safe_git_env(), text=True, capture_output=True, timeout=30, check=check)
         except subprocess.CalledProcessError as exc:
             raise GitAdapterError(exc.stderr.strip() or exc.stdout.strip() or "git command failed") from exc
 

@@ -102,6 +102,7 @@ class SchedulerOrderingTests(unittest.TestCase):
             "acceptance",
             "git_integration",
             "completion",
+            "worktree_cleanup",
             "native_dependency_graph",
             "native_dependency_release",
             "tranche_checkpoint",

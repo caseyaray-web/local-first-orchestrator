@@ -59,6 +59,7 @@ SCHEDULER_CRASH_POLICIES: dict[str, SchedulerCrashPolicy] = {
     "acceptance": _policy("acceptance", ReconciliationAction.REPLAY),
     "git_integration": _policy("git_integration", ReconciliationAction.REPLAY, "git_commit_intents"),
     "completion": _policy("completion", ReconciliationAction.REPLAY),
+    "worktree_cleanup": _policy("worktree_cleanup", ReconciliationAction.REPLAY, "runtime_stages"),
     "native_dependency_graph": _policy("native_dependency_graph", ReconciliationAction.REPLAY, "native_dependency_graphs"),
     "native_dependency_release": _policy("native_dependency_release", ReconciliationAction.REPLAY, "native_dependency_releases"),
     "tranche_checkpoint": _policy("tranche_checkpoint", ReconciliationAction.REPLAY, "tranche_checkpoint_evidence"),

@@ -35,6 +35,7 @@ SCHEDULER_STAGE_ORDER: tuple[str, ...] = (
     "acceptance",
     "git_integration",
     "completion",
+    "worktree_cleanup",
     "native_dependency_graph",
     "native_dependency_release",
     "tranche_checkpoint",
@@ -360,6 +361,21 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
             claim_id=reconciliation.claim_id,
             reconciliation_action=reconciliation.action.value,
         )
+
+    cleanup = ledger.connection.execute("""
+        SELECT t.id FROM tickets t
+        JOIN accepted_evidence ae ON ae.ticket_id=t.id
+        JOIN attempts a ON a.ticket_id=t.id AND a.accepted_commit_sha=ae.accepted_commit_sha
+        WHERE t.state='done' AND a.worktree_path IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM runtime_stages r WHERE r.ticket_id=t.id AND r.stage='worktree_cleanup')
+          AND EXISTS (
+              SELECT 1 FROM events e JOIN board_projection_outbox b ON b.ticket_id=e.entity_id AND b.event_id=e.id
+              WHERE e.entity_type='ticket' AND e.entity_id=t.id AND e.event_type='state_transition' AND e.to_state='done'
+                AND b.operation='set_state' AND b.acknowledged_at IS NOT NULL AND b.superseded_at IS NULL)
+        ORDER BY t.updated_at,t.id LIMIT 1
+    """).fetchone()
+    if cleanup is not None:
+        return ProcessNextPreview(next_stage="worktree_cleanup", ticket_id=str(cleanup["id"]), would_execute=True)
 
     implementation_replay = ledger.connection.execute(
         "SELECT ticket_id FROM scheduler_stage_claims WHERE (stage='implementation' OR stage LIKE 'implementation:%') AND status='claimed' "
@@ -810,6 +826,7 @@ class ProcessNextScheduler:
         triage_execution_policy_hash: str | None = None,
         acceptance_runner: Callable[[str], dict[str, Any]] | None = None,
         git_integration_runner: Callable[[str], dict[str, Any]] | None = None,
+        worktree_cleanup_runner: Callable[[str], dict[str, Any]] | None = None,
         tranche_checkpoint_runner: Callable[[str], dict[str, Any]] | None = None,
         paid_checkpoint_runner: Callable[[str], dict[str, Any]] | None = None,
         paid_checkpoint_route: tuple[str, str, str] | None = None,
@@ -845,6 +862,7 @@ class ProcessNextScheduler:
         self.triage_execution_policy_hash = triage_execution_policy_hash
         self.acceptance_runner = acceptance_runner
         self.git_integration_runner = git_integration_runner
+        self.worktree_cleanup_runner = worktree_cleanup_runner
         self.tranche_checkpoint_runner = tranche_checkpoint_runner
         self.paid_checkpoint_runner = paid_checkpoint_runner
         self.paid_checkpoint_route = paid_checkpoint_route
@@ -1018,6 +1036,13 @@ class ProcessNextScheduler:
                 "evidence_comment",
                 str(row["ticket_id"]) if row else None,
             )
+
+        if trusted_preview.next_stage == "worktree_cleanup":
+            if self.worktree_cleanup_runner is None:
+                raise RuntimeError("worktree_cleanup_reconciliation_required: cleanup runner unavailable")
+            ticket_id = str(trusted_preview.ticket_id)
+            self.worktree_cleanup_runner(ticket_id)
+            return ProcessNextResult("completed", "worktree_cleanup", ticket_id)
 
         if stage_allowed("implementation") and self.hermes_execution_runner is not None:
             external_result = self.hermes_execution_runner()

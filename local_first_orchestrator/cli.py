@@ -371,6 +371,9 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         git_integration_runner=lambda ticket_id: ctl.execute_git_integration_only(
             ticket_id, repository=registered.canonical_repository
         ),
+        worktree_cleanup_runner=lambda ticket_id: ctl.cleanup_completed_ticket_worktree(
+            ticket_id, repository=registered.canonical_repository
+        ),
         tranche_checkpoint_runner=lambda tranche_id: ctl.execute_tranche_checkpoint_only(
             tranche_id, repository=registered.canonical_repository
         ),

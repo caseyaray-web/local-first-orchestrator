@@ -36,6 +36,7 @@ from .usage_governor import PaidPurpose
 from .validation import DeterministicValidator
 from .native_release_approval import APPROVAL_DOMAIN, ACTIVATION_DOMAIN, APPROVAL_VERSION, canonical_approval_bytes, canonical_activation_bytes, canonical_snapshot_json, snapshot_authority, parse_approval_document, validate_activation_continuation_snapshot, validate_activation_post_snapshot, verify_detached_signature, fingerprint_public_key
 from .native_workspace import PinnedNativeWorkspace, canonical_native_workspace_path, require_native_path_identity, validate_native_workspace_path
+from .worktree_lifecycle import cleanup_completed_worktree
 
 
 @dataclass(frozen=True)
@@ -818,6 +819,61 @@ class LocalFirstController:
     def dry_run(self, task_id: str) -> dict[str, object]:
         row=self.ledger.get_ticket(task_id); binding=self.ledger.runtime_binding(task_id)
         return {"ticket_id":task_id,"state":row["state"],"repository":binding["repository_path"],"starting_sha":binding["starting_sha"],"would_invoke_model":False,"would_write_board":False,"would_modify_repository":False}
+
+    def cleanup_completed_ticket_worktree(self, ticket_id: str, *, repository: Path) -> dict[str, object]:
+        """Remove only an acknowledged, accepted, clean terminal ticket worktree."""
+        existing = self.ledger.runtime_stage(ticket_id, "worktree_cleanup")
+        if existing is not None:
+            return {"ticket_id": ticket_id, "status": "already_cleaned"}
+        ticket = self.ledger.get_ticket(ticket_id)
+        if ticket["state"] != CanonicalState.DONE.value:
+            raise PermissionError("worktree cleanup requires done ticket")
+        accepted_commit = self.ledger.accepted_commit(ticket_id)
+        if not accepted_commit:
+            raise PermissionError("worktree cleanup requires accepted evidence")
+        projection = self.ledger.connection.execute(
+            "SELECT 1 FROM events e JOIN board_projection_outbox b ON b.ticket_id=e.entity_id AND b.event_id=e.id "
+            "WHERE e.entity_type='ticket' AND e.entity_id=? AND e.event_type='state_transition' AND e.to_state='done' "
+            "AND b.operation='set_state' AND b.acknowledged_at IS NOT NULL AND b.superseded_at IS NULL LIMIT 1",
+            (ticket_id,),
+        ).fetchone()
+        if projection is None:
+            raise PermissionError("worktree cleanup requires acknowledged done projection")
+        attempt = self.ledger.connection.execute(
+            "SELECT * FROM attempts WHERE ticket_id=? AND accepted_commit_sha=? ORDER BY attempt_number DESC LIMIT 1",
+            (ticket_id, accepted_commit),
+        ).fetchone()
+        if attempt is None or not attempt["worktree_path"]:
+            raise RuntimeError("worktree cleanup requires accepted attempt workspace")
+        repo, worktree_root, _ = self.config.validate_execution_roots()
+        requested_repo = self.config.canonical_repository(Path(repository))
+        if requested_repo != repo:
+            raise ValueError("repository mismatch with runtime configuration")
+        path = Path(str(attempt["worktree_path"]))
+        lexical = Path(path.absolute())
+        external_id = str(ticket.get("external_id") or "")
+        native_path = canonical_native_workspace_path(repo, external_id) if external_id else None
+        try:
+            resolved = path.resolve(strict=True)
+        except FileNotFoundError:
+            resolved = None
+        allowed_local = self.config._inside(resolved, worktree_root) if resolved is not None else self.config._inside(lexical, worktree_root)
+        allowed_native = native_path is not None and lexical == native_path
+        if allowed_native and resolved is not None:
+            validate_native_workspace_path(path, repository=repo, external_task_id=external_id)
+            allowed_native = resolved == native_path.resolve(strict=True)
+        if not (allowed_local or allowed_native):
+            raise RuntimeError("recorded worktree is outside authorized ticket workspace roots")
+        status = cleanup_completed_worktree(repo, path, accepted_commit_sha=accepted_commit)
+        detail = json.dumps({"status": status, "worktree_path": str(path), "accepted_commit_sha": accepted_commit}, sort_keys=True)
+        self.ledger.record_runtime_stage(
+            ticket_id,
+            "worktree_cleanup",
+            detail,
+            attempt_number=int(attempt["attempt_number"]),
+            base_sha=str(attempt["base_sha"] or ""),
+        )
+        return {"ticket_id": ticket_id, "status": status, "worktree_path": str(path)}
 
     def admit_feature_contract(self, spec: FeatureAdmissionSpec, *, repository: Path) -> FeatureAdmissionResult:
         """Admit one human-approved feature contract without planning or projection."""
