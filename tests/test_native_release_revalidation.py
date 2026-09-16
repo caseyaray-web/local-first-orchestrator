@@ -350,6 +350,35 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "revalidation replay conflicts"):
             self.signed_revalidate(reason="changed")
 
+    def test_superseded_exact_signed_document_replay_is_rejected(self) -> None:
+        original = self.signed_revalidate(reason="superseded-replay")
+        replacement_id = "replacement-revalidation"
+        replacement_hash = "f" * 64
+        with self.ledger._transaction() as conn:
+            replacement_event_id = self.ledger._append_event(
+                conn,
+                entity_type="controller",
+                entity_id="controller",
+                event_type="native_dependency_release_revalidated",
+                actor_id="operator",
+                payload={"revalidation_id": replacement_id},
+            )
+            conn.execute(
+                """INSERT INTO native_dependency_release_revalidations
+                (revalidation_id,ticket_id,release_graph_hash,release_child_external_id,release_parent_completion_hash,release_routing_authority_json,release_hermes_status,release_observed_at,projection_event_id,projection_key,external_task_id,implementation_profile,repository_identity,canonical_worktree_path,branch,base_sha,snapshot_hash,operator_id,reason,created_at,revalidation_event_id,event_key,evidence_hash,approval_document_json,approval_document_hash,detached_signature,signer_fingerprint,snapshot_schema_version)
+                SELECT ?,ticket_id,release_graph_hash,release_child_external_id,release_parent_completion_hash,release_routing_authority_json,release_hermes_status,release_observed_at,projection_event_id,projection_key,external_task_id,implementation_profile,repository_identity,canonical_worktree_path,branch,base_sha,?,operator_id,reason,created_at,?,?,evidence_hash,'{}',?,detached_signature,signer_fingerprint,2
+                FROM native_dependency_release_revalidations WHERE revalidation_id=?""",
+                (replacement_id, "e" * 64, replacement_event_id, "native-release-revalidated:" + replacement_id, replacement_hash, original["revalidation_id"]),
+            )
+            conn.execute(
+                """INSERT INTO native_dependency_release_revalidation_supersessions
+                (old_revalidation_id,new_revalidation_id,ticket_id,reason,operator_id,old_snapshot_hash,new_snapshot_hash,old_snapshot_schema_version,new_snapshot_schema_version,old_approval_document_json,new_approval_document_json,old_approval_document_hash,new_approval_document_hash,detached_signature,event_id,evidence_hash,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (original["revalidation_id"], replacement_id, self.ticket, "schema transition", "operator", original["snapshot_hash"], "e" * 64, 1, 2, original["approval_document_json"], "{}", original["approval_document_hash"], replacement_hash, original["detached_signature"], original["revalidation_event_id"], "d" * 64, 2),
+            )
+        with self.assertRaisesRegex(ValueError, "revalidation replay conflicts"):
+            self.signed_revalidate(reason="superseded-replay")
+
     def test_rejects_execution_evidence_and_allows_spawn_failed_without_worker(self) -> None:
         self.seed_run(status="done", outcome="completed", summary="done", started_at=1, ended_at=2)
         with self.assertRaisesRegex(RuntimeError, "execution evidence"):

@@ -3197,6 +3197,8 @@ class Ledger:
             # Exact signed-document lookup is the compatibility path for old deterministic IDs.
             exact = conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE ticket_id=? AND approval_document_hash=?", (ticket_id, approval_hash)).fetchone()
             if exact is not None:
+                if conn.execute("SELECT 1 FROM native_dependency_release_revalidation_supersessions WHERE old_revalidation_id=?", (exact["revalidation_id"],)).fetchone() is not None:
+                    raise ValueError("revalidation replay conflicts")
                 linked = conn.execute("""
                     SELECT r.*, e.id AS linked_event_id, e.entity_type AS linked_event_entity_type,
                            e.entity_id AS linked_event_entity_id, e.event_type AS linked_event_type,
@@ -3236,6 +3238,8 @@ class Ledger:
             event_payload.update({"approval_document_hash": approval_document_hash, "signer_fingerprint": signer_fingerprint})
             prior = conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=?", (revalidation_id,)).fetchone()
             if prior is not None:
+                if conn.execute("SELECT 1 FROM native_dependency_release_revalidation_supersessions WHERE old_revalidation_id=?", (prior["revalidation_id"],)).fetchone() is not None:
+                    raise ValueError("revalidation replay conflicts")
                 expected = tuple(prior[key] for key in ("implementation_profile", "repository_identity", "canonical_worktree_path", "branch", "base_sha", "snapshot_hash", "operator_id", "reason"))
                 if expected != values:
                     raise ValueError("revalidation replay conflicts")
