@@ -67,6 +67,8 @@ class MicroTicket:
             "patch_budget": self.patch_budget.__dict__, "verification": {
                 "commands": [list(c) for c in self.verification.commands],
                 "working_directory": self.verification.working_directory,
+                "timeout_seconds": self.verification.timeout_seconds,
+                "output_limit": self.verification.output_limit,
             }, "risk": self.risk, "review_required": self.review_required,
             "max_attempts": self.max_attempts, "dependencies": list(self.dependencies),
         }

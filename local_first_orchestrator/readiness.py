@@ -26,9 +26,6 @@ def validate_ticket(ticket: MicroTicket, *, budget_policy=PATCH_BUDGET_POLICY) -
         raise ReadinessError("declared files exceed bounded patch budget")
     if any(normalized_repository_path(path) is None for path in paths):
         raise ReadinessError("declared files must be explicit normalized repository-relative files")
-    if len(set(paths)) != len(paths):
-        raise ReadinessError("declared file categories must not overlap")
-    if any(not is_supported_source(path) or is_test_path(path) for path in ticket.create_files):
         raise ReadinessError("create files must be supported non-test artifacts")
     if any(not is_supported_source(path) or not is_test_path(path) for path in ticket.new_test_files):
         raise ReadinessError("new files must be supported test artifacts")

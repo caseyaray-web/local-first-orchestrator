@@ -129,8 +129,16 @@ class SameTicketRepairCoordinator:
         if review.verdict == "escalate":
             self.ledger.transition(ticket_id, CanonicalState.NEEDS_TRIAGE, payload={"review_verdict": "escalate"})
             return "triage"
+        failed_criteria = {str(result["criterion_id"]) for result in review.criterion_results if result["status"] == "fail"}
+        covered_criteria = {finding.criterion_id for finding in review.findings}
+        uncovered_failures = sorted(failed_criteria - covered_criteria)
+        if uncovered_failures:
+            # Never convert an explicit failed criterion into acceptance merely because its
+            # blocking finding was malformed or outside the ticket boundary.
+            self.ledger.transition(ticket_id, CanonicalState.NEEDS_TRIAGE, payload={"review_verdict": "repair", "invalid_repair_missing_blocking_findings": uncovered_failures})
+            return "triage"
         if not review.findings:
-            # A repair verdict with no valid blocking finding is non-blocking.
+            # A repair verdict with no failed criterion and no valid blocker is non-blocking.
             self.ledger.transition(ticket_id, CanonicalState.ACCEPTED, payload={"review_verdict": "repair", "downgraded_to_suggestions": True})
             return "accepted"
         self.ledger.ensure_attempt(ticket_id, attempt_number)

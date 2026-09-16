@@ -751,7 +751,9 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             self.assertEqual(cli_main(["--database", str(unmigrated), "process-next"]), 0)
         self.assertEqual(unmigrated.read_bytes(), before)
-        self.assertEqual(json.loads(output.getvalue())["next_stage"], "no_work")
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["next_stage"], "database_unavailable")
+        self.assertEqual(payload["blocker_reason"], "scheduler database is unavailable or unmigrated")
 
 
 if __name__ == "__main__":

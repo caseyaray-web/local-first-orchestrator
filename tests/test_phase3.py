@@ -78,6 +78,19 @@ class Phase3Tests(unittest.TestCase):
         self.assertEqual(result.findings, ())
         self.assertEqual(len(result.suggestions), 1)
 
+    def test_failed_criterion_without_valid_matching_blocker_fails_closed_to_triage(self) -> None:
+        ticket_id = self.local_review_ticket()
+        result = normalize_review({
+            "verdict": "repair",
+            "criterion_results": [{"criterion_id": "AC-1", "status": "fail", "evidence": "wrong behavior"}],
+            "findings": [{"criterion_id": "OTHER", "severity": "blocking", "file": "outside.py", "symbol": "x", "evidence": "wrong", "minimal_repair": "fix", "verification": "test", "fingerprint_input": "wrong"}],
+            "suggestions": [],
+        }, self.ticket)
+        self.assertEqual(result.findings, ())
+        outcome = SameTicketRepairCoordinator(self.ledger).apply(ticket_id, 1, result)
+        self.assertEqual(outcome, "triage")
+        self.assertEqual(self.ledger.get_ticket(ticket_id)["state"], "needs_triage")
+
     def test_suggestions_do_not_consume_attempt(self) -> None:
         ticket_id = self.local_review_ticket()
         result = normalize_review({"verdict": "pass", "criterion_results": [{"criterion_id": "AC-1", "status": "pass", "evidence": "ok"}], "findings": [], "suggestions": ["rename helper"]}, self.ticket)

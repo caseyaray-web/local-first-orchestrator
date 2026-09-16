@@ -131,19 +131,13 @@ class DeterministicValidator:
         if actual_base != base_sha:
             raise ValidationError("worktree base SHA does not match recorded base")
         names = [p for p in self._git(worktree, "diff", "--name-only", base_sha, "--").splitlines() if p]
-        # Untracked generated/secrets must be rejected too; git diff alone hides them.
-        for line in self._git(worktree, "status", "--porcelain=v1").splitlines():
-            candidate = line[3:]
+        # Ask Git for every untracked path explicitly. Directory-summary porcelain output can
+        # hide nested symlinks, which must remain visible to the ticket allowlist and safety scan.
+        untracked = self._git(worktree, "ls-files", "--others", "--exclude-standard", "-z", "--")
+        for candidate in untracked.split("\0"):
             if not candidate or "__pycache__" in Path(candidate).parts:
                 continue
-            raw = worktree / candidate
-            if raw.is_dir() and not raw.is_symlink():
-                for child in sorted(raw.rglob("*")):
-                    if child.is_file() and not child.is_symlink():
-                        relative = child.relative_to(worktree).as_posix()
-                        if "__pycache__" not in child.parts and relative not in names:
-                            names.append(relative)
-            elif candidate not in names:
+            if candidate not in names:
                 names.append(candidate)
         errors = ["no_changes: model produced no effective diff"] if not names else []
         allowed = set(ticket.allowed_files)

@@ -777,7 +777,7 @@ def preview_database(database: Path, *, now: int | None = None, operator_config:
                 signer_public_key = signer_fingerprint = None
         return preview_next(readonly_ledger, now=now, signer_public_key=signer_public_key, signer_fingerprint=signer_fingerprint, signer_config_path=getattr(operator_config, "config_path", None), board=board)
     except sqlite3.DatabaseError:
-        return ProcessNextPreview(next_stage="no_work")
+        return ProcessNextPreview(next_stage="database_unavailable", blocker_reason="scheduler database is unavailable or unmigrated")
     finally:
         if connection is not None:
             connection.close()

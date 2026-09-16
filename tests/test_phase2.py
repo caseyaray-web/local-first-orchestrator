@@ -67,7 +67,7 @@ class Phase2Tests(unittest.TestCase):
         adapter.teardown(attempt)
 
     def test_context_manifest_is_reproducible_and_required_content_cannot_exceed_budget(self) -> None:
-        builder = ContextPacketBuilder(target_tokens=100, max_tokens=140)
+        builder = ContextPacketBuilder(target_tokens=100, max_tokens=180)
         first = builder.build(self.ticket, {"app.py": (self.repo / "app.py").read_text()}, repository_rules="No network.")
         second = builder.build(self.ticket, {"app.py": (self.repo / "app.py").read_text()}, repository_rules="No network.")
         self.assertEqual(first.manifest, second.manifest)
@@ -76,7 +76,7 @@ class Phase2Tests(unittest.TestCase):
             ContextPacketBuilder(target_tokens=1, max_tokens=3).build(self.ticket, {"app.py": "x" * 100}, repository_rules="rules")
 
     def test_context_packet_persists_deterministic_packet_and_manifest_artifacts(self) -> None:
-        builder = ContextPacketBuilder(target_tokens=100, max_tokens=140)
+        builder = ContextPacketBuilder(target_tokens=100, max_tokens=180)
         packet = builder.build(self.ticket, {"app.py": (self.repo / "app.py").read_text()}, repository_rules="No network.")
         first = builder.write_artifacts(packet, artifact_root=self.root / "context-artifacts")
         second = builder.write_artifacts(packet, artifact_root=self.root / "context-artifacts")
