@@ -34,8 +34,8 @@ class StateProjectionWorker:
         if self.fault_injector:
             self.fault_injector(stage)
 
-    def deliver_one(self, *, now: int | None = None) -> StateProjectionDeliveryResult:
-        row = self.ledger.claim_next_state_projection(self.worker_id, lease_seconds=self.lease_seconds, now=now)
+    def deliver_one(self, *, now: int | None = None, ticket_id: str | None = None) -> StateProjectionDeliveryResult:
+        row = self.ledger.claim_next_state_projection(self.worker_id, lease_seconds=self.lease_seconds, now=now, ticket_id=ticket_id)
         if row is None:
             return StateProjectionDeliveryResult("no_work")
         return self.deliver_claimed(str(row["ticket_id"]), int(row["event_id"]), now=now)

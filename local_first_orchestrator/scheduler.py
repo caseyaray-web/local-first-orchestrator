@@ -4,6 +4,7 @@ import json
 import hashlib
 import uuid
 import sqlite3
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -228,12 +229,12 @@ class ProcessNextPreview:
     session_id: str | None = None
 
 
-def _external_running_gate(ledger: Ledger, board: Any | None, *, now: int) -> ProcessNextPreview | None:
-    """Global stop gate for a valid Hermes-owned continuation."""
+def _external_running_gate(ledger: Ledger, board: Any | None, *, now: int, ticket_id: str | None = None) -> ProcessNextPreview | None:
+    """Stop gate for a valid Hermes-owned continuation, optionally scoped to one ticket."""
     if board is None or not hasattr(board, "execution_snapshot"):
         return None
     try:
-        activations = ledger.connection.execute("SELECT * FROM native_release_activation_intents WHERE status='acknowledged' ORDER BY request_key").fetchall()
+        activations = ledger.connection.execute("SELECT * FROM native_release_activation_intents WHERE status='acknowledged' AND (? IS NULL OR ticket_id=?) ORDER BY request_key", (ticket_id, ticket_id)).fetchall()
     except sqlite3.DatabaseError:
         return ProcessNextPreview(next_stage="reconciliation_required", reconciliation_action=ReconciliationAction.STOP.value, blocker_reason="running observation schema is unavailable")
     for activation in activations:
@@ -284,6 +285,8 @@ def _fresh_signer_authority(*, signer_public_key: bytes | None, signer_fingerpri
     try:
         from .operator_config import load_operator_config
         config = load_operator_config(Path(signer_config_path))
+        if config.operator_signing_public_key is None and config.operator_signing_key_fingerprint is None:
+            return None, None
         return config.signer_public_key_bytes, config.operator_signing_key_fingerprint
     except (OSError, ValueError) as exc:
         raise RuntimeError("scheduler signer configuration reload failed") from exc
@@ -396,8 +399,10 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
 
 
     validation_replay = ledger.connection.execute(
-        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage LIKE 'validation:%' AND status='claimed' "
-        "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+        "SELECT c.ticket_id FROM scheduler_stage_claims c WHERE c.stage LIKE 'validation:%' AND c.status='claimed' "
+        "AND c.lease_expires_at<=? "
+        "AND NOT EXISTS (SELECT 1 FROM failed_attempt_reconciliations r WHERE r.ticket_id=c.ticket_id AND c.stage=('validation:' || r.retired_attempt_number)) "
+        "ORDER BY c.created_at,c.claim_id LIMIT 1", (now,),
     ).fetchone()
     if validation_replay is not None:
         return ProcessNextPreview(next_stage="validation", ticket_id=str(validation_replay["ticket_id"]), would_execute=True)
@@ -412,8 +417,10 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
         return ProcessNextPreview(next_stage="validation", ticket_id=str(validation["id"]), would_execute=True)
 
     review_replay = ledger.connection.execute(
-        "SELECT ticket_id FROM scheduler_stage_claims WHERE stage LIKE 'review:%' AND status='claimed' "
-        "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+        "SELECT c.ticket_id FROM scheduler_stage_claims c WHERE c.stage LIKE 'review:%' AND c.status='claimed' "
+        "AND c.lease_expires_at<=? "
+        "AND NOT EXISTS (SELECT 1 FROM review_results rr JOIN tickets t ON t.id=rr.ticket_id WHERE rr.ticket_id=c.ticket_id AND c.stage=('review:' || rr.attempt_number) AND t.state IN ('accepted','done')) "
+        "ORDER BY c.created_at,c.claim_id LIMIT 1", (now,),
     ).fetchone()
     if review_replay is not None:
         return ProcessNextPreview(next_stage="review", ticket_id=str(review_replay["ticket_id"]), would_execute=True)
@@ -799,6 +806,118 @@ def preview_database(database: Path, *, now: int | None = None, operator_config:
             connection.close()
 
 
+def preview_ticket_database(database: Path, ticket_id: str, *, now: int | None = None, operator_config: Any | None = None, board: Any | None = None, review_execution_policy_hash: str | None = None, triage_execution_policy_hash: str | None = None) -> ProcessNextPreview:
+    """Preview one ticket by exercising target-aware claimers on a disposable ledger copy."""
+    try:
+        path = Path(database).expanduser().resolve(strict=True)
+    except FileNotFoundError:
+        return ProcessNextPreview(next_stage="database_unavailable", ticket_id=ticket_id, blocker_reason="scheduler database is unavailable")
+    now = Ledger._now() if now is None else now
+    with tempfile.TemporaryDirectory(prefix="local-first-preview-") as temp_dir:
+        temp_path = Path(temp_dir) / "preview.db"
+        source = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        target = sqlite3.connect(temp_path)
+        try:
+            source.backup(target)
+        finally:
+            target.close(); source.close()
+        ledger = Ledger(temp_path)
+        try:
+            state = ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if state is not None and state["paused"]:
+                return ProcessNextPreview(next_stage="paused", ticket_id=ticket_id)
+            ticket = ledger.get_ticket(ticket_id)
+            if ticket is None:
+                return ProcessNextPreview(next_stage="ticket_missing", ticket_id=ticket_id, blocker_reason="target ticket does not exist")
+            running = _external_running_gate(ledger, board, now=now, ticket_id=ticket_id)
+            if running is not None:
+                return running
+            if operator_config is None:
+                signer_public_key = signer_fingerprint = signer_config_path = None
+                implementation_profile = canonical_repository = None
+            else:
+                try:
+                    signer_public_key = operator_config.signer_public_key_bytes
+                    signer_fingerprint = operator_config.operator_signing_key_fingerprint
+                except (TypeError, ValueError):
+                    signer_public_key = signer_fingerprint = None
+                signer_config_path = getattr(operator_config, "config_path", None)
+                implementation_profile = operator_config.implementation.profile
+                canonical_repository = str(operator_config.canonical_repository)
+            signer_public_key, signer_fingerprint = _fresh_signer_authority(
+                signer_public_key=signer_public_key,
+                signer_fingerprint=signer_fingerprint,
+                signer_config_path=signer_config_path,
+            )
+            migration = ledger.native_dependency_release_migration_required(
+                signer_public_key=signer_public_key,
+                signer_fingerprint=signer_fingerprint,
+                config_path=signer_config_path,
+                board=board,
+                ticket_id=ticket_id,
+            )
+            if migration is not None:
+                return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=ticket_id, reconciliation_action=ReconciliationAction.STOP.value, blocker_reason=str(migration["reason"]))
+            reconciliation = ledger.next_scheduler_reconciliation(now=now, ticket_id=ticket_id)
+            if reconciliation is not None:
+                return ProcessNextPreview(
+                    next_stage="reconciliation_required" if reconciliation.action == ReconciliationAction.STOP else reconciliation.stage.split(":", 1)[0],
+                    ticket_id=ticket_id,
+                    would_execute=reconciliation.action != ReconciliationAction.STOP,
+                    claim_id=reconciliation.claim_id,
+                    reconciliation_action=reconciliation.action.value,
+                )
+            generated = ledger.claim_next_generated_create_projection("preview", lease_seconds=60, now=now, ticket_id=ticket_id)
+            if generated is not None:
+                return ProcessNextPreview(next_stage="generated_projection", ticket_id=ticket_id, would_execute=True, would_write_board=True)
+            projection = ledger.claim_next_state_projection("preview", lease_seconds=60, now=now, ticket_id=ticket_id)
+            if projection is not None:
+                return ProcessNextPreview(next_stage="state_projection", ticket_id=ticket_id, would_execute=True, would_write_board=True)
+            comment = ledger.claim_next_comment("preview", lease_seconds=60, now=now, ticket_id=ticket_id)
+            if comment is not None:
+                return ProcessNextPreview(next_stage="evidence_comment", ticket_id=ticket_id, would_execute=True, would_write_board=True)
+            cleanup = ledger.connection.execute("""
+                SELECT t.id FROM tickets t
+                JOIN accepted_evidence ae ON ae.ticket_id=t.id
+                JOIN attempts a ON a.ticket_id=t.id AND a.accepted_commit_sha=ae.accepted_commit_sha
+                WHERE t.id=? AND t.state='done' AND a.worktree_path IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM runtime_stages r WHERE r.ticket_id=t.id AND r.stage='worktree_cleanup')
+                  AND EXISTS (
+                      SELECT 1 FROM events e JOIN board_projection_outbox b ON b.ticket_id=e.entity_id AND b.event_id=e.id
+                      WHERE e.entity_type='ticket' AND e.entity_id=t.id AND e.event_type='state_transition' AND e.to_state='done'
+                        AND b.operation='set_state' AND b.acknowledged_at IS NOT NULL AND b.superseded_at IS NULL)
+            """, (ticket_id,)).fetchone()
+            if cleanup is not None:
+                return ProcessNextPreview(next_stage="worktree_cleanup", ticket_id=ticket_id, would_execute=True)
+            if any(str(row["ticket_id"]) == ticket_id for row in ledger.hermes_execution_candidates()):
+                return ProcessNextPreview(next_stage="hermes_execution_reconciliation", ticket_id=ticket_id, would_execute=True)
+            if any(str(row["ticket_id"]) == ticket_id for row in ledger.generated_activation_candidates()):
+                return ProcessNextPreview(next_stage="generated_activation", ticket_id=ticket_id, would_execute=True, would_write_board=True)
+
+            for stage, claimer in (
+                ("implementation", lambda: ledger.claim_next_scheduler_implementation("preview", lease_seconds=60, now=now, ticket_id=ticket_id)),
+                ("validation", lambda: ledger.claim_next_scheduler_validation("preview", lease_seconds=60, now=now, ticket_id=ticket_id)),
+                ("review", lambda: ledger.claim_next_scheduler_review("preview", lease_seconds=60, review_execution_policy_hash=str(review_execution_policy_hash or ""), now=now, ticket_id=ticket_id)),
+                ("repair_routing", lambda: ledger.claim_next_scheduler_repair_routing("preview", lease_seconds=60, now=now, ticket_id=ticket_id)),
+                ("triage", lambda: ledger.claim_next_scheduler_triage("preview", lease_seconds=60, triage_execution_policy_hash=str(triage_execution_policy_hash or ""), now=now, ticket_id=ticket_id)),
+                ("acceptance", lambda: ledger.claim_next_scheduler_acceptance("preview", lease_seconds=60, now=now, ticket_id=ticket_id)),
+                ("git_integration", lambda: ledger.claim_next_scheduler_git_integration("preview", lease_seconds=60, now=now, ticket_id=ticket_id)),
+                ("completion", lambda: ledger.claim_next_scheduler_completion("preview", lease_seconds=60, now=now, ticket_id=ticket_id)),
+                ("native_dependency_graph", lambda: ledger.claim_next_scheduler_native_dependency_graph("preview", lease_seconds=60, now=now, ticket_id=ticket_id)),
+                ("native_dependency_release", lambda: ledger.claim_next_scheduler_native_dependency_release("preview", lease_seconds=60, now=now, implementation_profile=implementation_profile, canonical_repository=canonical_repository, ticket_id=ticket_id)),
+                ("dependency_readiness", lambda: ledger.claim_next_scheduler_readiness("preview", lease_seconds=60, now=now, ticket_id=ticket_id)),
+            ):
+                try:
+                    claim = claimer()
+                except RuntimeError as exc:
+                    return ProcessNextPreview(next_stage="reconciliation_required", ticket_id=ticket_id, reconciliation_action=ReconciliationAction.STOP.value, blocker_reason=str(exc))
+                if claim is not None:
+                    return ProcessNextPreview(next_stage=stage, ticket_id=ticket_id, would_execute=True, claim_id=str(claim["claim_id"]), would_write_board=stage in {"native_dependency_graph", "native_dependency_release"})
+            return ProcessNextPreview(ticket_id=ticket_id)
+        finally:
+            ledger.close()
+
+
 class ProcessNextScheduler:
     """Run at most one Local First control stage; Hermes still schedules workers."""
 
@@ -808,6 +927,7 @@ class ProcessNextScheduler:
         board: Any,
         *,
         worker_id: str,
+        target_ticket_id: str | None = None,
         lease_seconds: int = 60,
         clock: Callable[[], int] | None = None,
         hermes_execution_runner: Callable[[], dict[str, Any] | None] | None = None,
@@ -844,6 +964,7 @@ class ProcessNextScheduler:
         self.ledger = ledger
         self.board = board
         self.worker_id = worker_id
+        self.target_ticket_id = target_ticket_id
         self.lease_seconds = lease_seconds
         self.clock = clock or Ledger._now
         self.hermes_execution_runner = hermes_execution_runner
@@ -927,7 +1048,10 @@ class ProcessNextScheduler:
                 if run.status not in {"blocked", "spawn_failed"}:
                     raise RuntimeError("native_dependency_release_reconciliation_required: current external run is ambiguous")
 
-        trusted_preview = preview_next(self.ledger, now=now, signer_public_key=self.native_dependency_release_signer_public_key, signer_fingerprint=self.native_dependency_release_signer_fingerprint, signer_config_path=self.native_dependency_release_signer_config_path, board=self.board)
+        if self.target_ticket_id is None:
+            trusted_preview = preview_next(self.ledger, now=now, signer_public_key=self.native_dependency_release_signer_public_key, signer_fingerprint=self.native_dependency_release_signer_fingerprint, signer_config_path=self.native_dependency_release_signer_config_path, board=self.board)
+        else:
+            trusted_preview = _external_running_gate(self.ledger, self.board, now=now, ticket_id=self.target_ticket_id) or ProcessNextPreview()
         if trusted_preview.next_stage == "reconciliation_required":
             reason = trusted_preview.blocker_reason or "trusted current board proof unavailable"
             if reason.startswith("signer enrollment reconciliation required:"):
@@ -961,7 +1085,7 @@ class ProcessNextScheduler:
             signer_fingerprint=self.native_dependency_release_signer_fingerprint,
             signer_config_path=self.native_dependency_release_signer_config_path,
         )
-        migration = self.ledger.native_dependency_release_migration_required(signer_public_key=fresh_signer_key, signer_fingerprint=fresh_signer_fingerprint, config_path=self.native_dependency_release_signer_config_path)
+        migration = self.ledger.native_dependency_release_migration_required(signer_public_key=fresh_signer_key, signer_fingerprint=fresh_signer_fingerprint, config_path=self.native_dependency_release_signer_config_path, ticket_id=self.target_ticket_id)
         if migration is not None:
             reason = str(migration["reason"])
             if reason.startswith("signer enrollment reconciliation required:"):
@@ -971,7 +1095,7 @@ class ProcessNextScheduler:
             )
         # An acknowledged activation is not a board authority. Re-read the
         # configured board and require the exact post-effect state and marker.
-        for activation in self.ledger.connection.execute("SELECT * FROM native_release_activation_intents WHERE status='acknowledged' ORDER BY request_key").fetchall():
+        for activation in self.ledger.connection.execute("SELECT * FROM native_release_activation_intents WHERE status='acknowledged' AND (? IS NULL OR ticket_id=?) ORDER BY request_key", (self.target_ticket_id, self.target_ticket_id)).fetchall():
             current = self.board.execution_snapshot(str(activation["external_task_id"]))
             board_path = self.board._resolved_board_db_path()
             board_identity = board_path.stat()
@@ -997,7 +1121,7 @@ class ProcessNextScheduler:
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 raise RuntimeError("native_dependency_release_reconciliation_required: acknowledged activation is not exact or authorized continuation") from exc
 
-        reconciliation = self.ledger.next_scheduler_reconciliation(now=now)
+        reconciliation = self.ledger.next_scheduler_reconciliation(now=now, ticket_id=self.target_ticket_id)
         if reconciliation is not None and reconciliation.action == ReconciliationAction.STOP:
             family = self.ledger._scheduler_stage_family(reconciliation.stage)
             if family in {"paid_checkpoint", "paid_escalation"}:
@@ -1016,19 +1140,19 @@ class ProcessNextScheduler:
 
         generated = GeneratedProjectionWorker(
             self.ledger, self.board, worker_id=execution_owner, clock=lambda: now
-        ).deliver_one()
+        ).deliver_one(ticket_id=self.target_ticket_id)
         if generated.status != "no_work":
             return ProcessNextResult(generated.status, "generated_projection", generated.ticket_id)
 
         state = StateProjectionWorker(
             self.ledger, self.board, worker_id=execution_owner, lease_seconds=self.lease_seconds
-        ).deliver_one(now=now)
+        ).deliver_one(now=now, ticket_id=self.target_ticket_id)
         if state.status != "no_work":
             return ProcessNextResult(state.status, "state_projection", state.ticket_id)
 
         comment = CommentDeliveryWorker(
             self.ledger, self.board, worker_id=execution_owner, clock=lambda: now
-        ).deliver_one()
+        ).deliver_one(ticket_id=self.target_ticket_id)
         if comment.status != "no_work":
             row = self.ledger.comment_outbox(str(comment.operation_id)) if comment.operation_id else None
             return ProcessNextResult(
@@ -1037,12 +1161,27 @@ class ProcessNextScheduler:
                 str(row["ticket_id"]) if row else None,
             )
 
-        if trusted_preview.next_stage == "worktree_cleanup":
+        cleanup_ticket_id = None
+        if self.target_ticket_id is not None:
+            cleanup = self.ledger.connection.execute("""
+                SELECT t.id FROM tickets t
+                JOIN accepted_evidence ae ON ae.ticket_id=t.id
+                JOIN attempts a ON a.ticket_id=t.id AND a.accepted_commit_sha=ae.accepted_commit_sha
+                WHERE t.id=? AND t.state='done' AND a.worktree_path IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM runtime_stages r WHERE r.ticket_id=t.id AND r.stage='worktree_cleanup')
+                  AND EXISTS (
+                      SELECT 1 FROM events e JOIN board_projection_outbox b ON b.ticket_id=e.entity_id AND b.event_id=e.id
+                      WHERE e.entity_type='ticket' AND e.entity_id=t.id AND e.event_type='state_transition' AND e.to_state='done'
+                        AND b.operation='set_state' AND b.acknowledged_at IS NOT NULL AND b.superseded_at IS NULL)
+            """, (self.target_ticket_id,)).fetchone()
+            cleanup_ticket_id = None if cleanup is None else str(cleanup["id"])
+        elif trusted_preview.next_stage == "worktree_cleanup":
+            cleanup_ticket_id = str(trusted_preview.ticket_id)
+        if cleanup_ticket_id is not None:
             if self.worktree_cleanup_runner is None:
                 raise RuntimeError("worktree_cleanup_reconciliation_required: cleanup runner unavailable")
-            ticket_id = str(trusted_preview.ticket_id)
-            self.worktree_cleanup_runner(ticket_id)
-            return ProcessNextResult("completed", "worktree_cleanup", ticket_id)
+            self.worktree_cleanup_runner(cleanup_ticket_id)
+            return ProcessNextResult("completed", "worktree_cleanup", cleanup_ticket_id)
 
         if stage_allowed("implementation") and self.hermes_execution_runner is not None:
             external_result = self.hermes_execution_runner()
@@ -1055,7 +1194,7 @@ class ProcessNextScheduler:
 
         if stage_allowed("implementation") and self.implementation_runner is not None:
             implementation_claim = self.ledger.claim_next_scheduler_implementation(
-                execution_owner, lease_seconds=self.lease_seconds, now=now
+                execution_owner, lease_seconds=self.lease_seconds, now=now, ticket_id=self.target_ticket_id
             )
             if implementation_claim is not None:
                 claim_id = str(implementation_claim["claim_id"])
@@ -1079,7 +1218,7 @@ class ProcessNextScheduler:
 
         if stage_allowed("validation") and self.validation_runner is not None:
             validation_claim = self.ledger.claim_next_scheduler_validation(
-                execution_owner, lease_seconds=self.lease_seconds, now=now
+                execution_owner, lease_seconds=self.lease_seconds, now=now, ticket_id=self.target_ticket_id
             )
             if validation_claim is not None:
                 claim_id = str(validation_claim["claim_id"])
@@ -1119,6 +1258,7 @@ class ProcessNextScheduler:
                 lease_seconds=self.lease_seconds,
                 review_execution_policy_hash=str(self.review_execution_policy_hash),
                 now=now,
+                ticket_id=self.target_ticket_id,
             )
             if review_claim is not None:
                 claim_id = str(review_claim["claim_id"])
@@ -1149,7 +1289,7 @@ class ProcessNextScheduler:
                 return ProcessNextResult("completed", "review", ticket_id, claim_id)
 
         repair_claim = self.ledger.claim_next_scheduler_repair_routing(
-            execution_owner, lease_seconds=self.lease_seconds, now=now
+            execution_owner, lease_seconds=self.lease_seconds, now=now, ticket_id=self.target_ticket_id
         ) if stage_allowed("repair_routing") else None
         if repair_claim is not None:
             claim_id = str(repair_claim["claim_id"])
@@ -1169,6 +1309,7 @@ class ProcessNextScheduler:
                 lease_seconds=self.lease_seconds,
                 triage_execution_policy_hash=str(self.triage_execution_policy_hash),
                 now=now,
+                ticket_id=self.target_ticket_id,
             )
             if triage_claim is not None:
                 claim_id = str(triage_claim["claim_id"])
@@ -1203,7 +1344,7 @@ class ProcessNextScheduler:
 
         if stage_allowed("acceptance") and self.acceptance_runner is not None:
             acceptance_claim = self.ledger.claim_next_scheduler_acceptance(
-                execution_owner, lease_seconds=self.lease_seconds, now=now
+                execution_owner, lease_seconds=self.lease_seconds, now=now, ticket_id=self.target_ticket_id
             )
             if acceptance_claim is not None:
                 claim_id = str(acceptance_claim["claim_id"])
@@ -1229,7 +1370,7 @@ class ProcessNextScheduler:
 
         if stage_allowed("git_integration") and self.git_integration_runner is not None:
             git_claim = self.ledger.claim_next_scheduler_git_integration(
-                execution_owner, lease_seconds=self.lease_seconds, now=now
+                execution_owner, lease_seconds=self.lease_seconds, now=now, ticket_id=self.target_ticket_id
             )
             if git_claim is not None:
                 claim_id = str(git_claim["claim_id"])
@@ -1251,7 +1392,7 @@ class ProcessNextScheduler:
                 return ProcessNextResult("completed", "git_integration", ticket_id, claim_id)
 
         completion_claim = self.ledger.claim_next_scheduler_completion(
-            execution_owner, lease_seconds=self.lease_seconds, now=now
+            execution_owner, lease_seconds=self.lease_seconds, now=now, ticket_id=self.target_ticket_id
         ) if stage_allowed("completion") else None
         if completion_claim is not None:
             claim_id = str(completion_claim["claim_id"])
@@ -1278,7 +1419,7 @@ class ProcessNextScheduler:
 
         if (stage_allowed("native_dependency_graph") or stage_allowed("native_dependency_release")) and hasattr(self.board, "get_task") and hasattr(self.board, "link_dependency"):
             graph_claim = self.ledger.claim_next_scheduler_native_dependency_graph(
-                execution_owner, lease_seconds=self.lease_seconds, now=now
+                execution_owner, lease_seconds=self.lease_seconds, now=now, ticket_id=self.target_ticket_id
             ) if stage_allowed("native_dependency_graph") else None
             if graph_claim is not None:
                 claim_id = str(graph_claim["claim_id"])
@@ -1343,6 +1484,7 @@ class ProcessNextScheduler:
                 execution_owner, lease_seconds=self.lease_seconds, now=now,
                 implementation_profile=self.native_dependency_release_profile,
                 canonical_repository=self.native_dependency_release_repository,
+                ticket_id=self.target_ticket_id,
             ) if stage_allowed("native_dependency_release") else None
             if release_claim is not None:
                 claim_id = str(release_claim["claim_id"])
@@ -1403,7 +1545,7 @@ class ProcessNextScheduler:
                 )
                 return ProcessNextResult("completed", "native_dependency_release", ticket_id, claim_id)
 
-        if stage_allowed("tranche_checkpoint") and self.tranche_checkpoint_runner is not None:
+        if self.target_ticket_id is None and stage_allowed("tranche_checkpoint") and self.tranche_checkpoint_runner is not None:
             checkpoint_claim = self.ledger.claim_next_scheduler_tranche_checkpoint(
                 execution_owner, lease_seconds=self.lease_seconds, now=now
             )
@@ -1431,6 +1573,8 @@ class ProcessNextScheduler:
             ("paid_checkpoint", "integration_checkpoint", self.paid_checkpoint_runner, self.paid_checkpoint_route),
             ("paid_escalation", "escalation", self.paid_escalation_runner, self.paid_escalation_route),
         ):
+            if self.target_ticket_id is not None:
+                continue
             if not stage_allowed(stage):
                 continue
             if runner is None or route is None:
@@ -1462,7 +1606,7 @@ class ProcessNextScheduler:
             self.ledger.complete_scheduler_claim(claim_id, execution_owner, paid_result, now=now)
             return ProcessNextResult("completed", stage, ticket_id, claim_id)
 
-        if stage_allowed("next_tranche_materialize") and self.next_tranche_materialize_runner is not None:
+        if self.target_ticket_id is None and stage_allowed("next_tranche_materialize") and self.next_tranche_materialize_runner is not None:
             materialize_claim = self.ledger.claim_next_scheduler_next_tranche_materialize(
                 execution_owner, lease_seconds=self.lease_seconds, now=now
             )
@@ -1486,7 +1630,7 @@ class ProcessNextScheduler:
 
         activation_claim = self.ledger.claim_next_scheduler_next_tranche_activation(
             execution_owner, lease_seconds=self.lease_seconds, now=now
-        ) if stage_allowed("next_tranche_activation") else None
+        ) if self.target_ticket_id is None and stage_allowed("next_tranche_activation") else None
         if activation_claim is not None:
             claim_id = str(activation_claim["claim_id"])
             ticket_id = str(activation_claim["ticket_id"])
@@ -1509,7 +1653,7 @@ class ProcessNextScheduler:
                 )
 
         claim = self.ledger.claim_next_scheduler_readiness(
-            execution_owner, lease_seconds=self.lease_seconds, now=now
+            execution_owner, lease_seconds=self.lease_seconds, now=now, ticket_id=self.target_ticket_id
         ) if stage_allowed("dependency_readiness") else None
         if claim is None:
             return ProcessNextResult("no_work")

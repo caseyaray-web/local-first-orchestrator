@@ -169,11 +169,11 @@ class GeneratedProjectionWorker:
         self.ledger.retry_generated_create_projection(str(row["ticket_id"]), int(row["event_id"]), self.worker_id, error=message, next_attempt_at=next_attempt_at, now=now)
         return GeneratedProjectionDeliveryResult("retry_scheduled", str(row["ticket_id"]), int(row["event_id"]), next_attempt_at=next_attempt_at, error=message)
 
-    def deliver_one(self) -> GeneratedProjectionDeliveryResult:
+    def deliver_one(self, *, ticket_id: str | None = None) -> GeneratedProjectionDeliveryResult:
         if not self.policy.writes_enabled or not bool(getattr(self.adapter, "allow_writes", True)):
             return GeneratedProjectionDeliveryResult("writes_disabled")
         now = int(self.clock())
-        row = self.ledger.claim_next_generated_create_projection(self.worker_id, lease_seconds=self.policy.lease_seconds, now=now)
+        row = self.ledger.claim_next_generated_create_projection(self.worker_id, lease_seconds=self.policy.lease_seconds, now=now, ticket_id=ticket_id)
         if row is None:
             return GeneratedProjectionDeliveryResult("no_work")
         try:

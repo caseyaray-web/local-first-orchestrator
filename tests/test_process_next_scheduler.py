@@ -9,6 +9,7 @@ import json
 import sqlite3
 import subprocess
 import unittest
+from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -159,6 +160,82 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         self.assertEqual(self.ledger.get_ticket(blocked)["state"], "draft")
         event = self.ledger.events_for(ready)[-1]
         self.assertEqual(event["event_type"], "scheduler_stage_claimed")
+
+    def test_preview_ignores_expired_validation_claim_for_retired_attempt(self) -> None:
+        ticket = self.ticket("retired-validation", state=CanonicalState.DONE)
+        self.ledger.connection.execute(
+            "INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("retired-validation-claim", ticket, "validation:1", "claimed", "old-worker", 50, 1, json.dumps({"attempt_number": 1}), 10, 10),
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO failed_attempt_reconciliations(ticket_id,retired_attempt_number,classification,previous_ticket_state,resulting_ticket_state,operator_id,runtime_identity_json,retry_base_sha,prospective_next_attempt_number,cleanup_required,forensic_artifact_paths_json,reconciled_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ticket, 1, "validation_failure", "verifying", "ready_local", "operator", "{}", "a" * 40, 2, 0, "[]", 60),
+        )
+
+        preview = preview_next(self.ledger, now=100)
+
+        self.assertNotEqual(preview.next_stage, "validation")
+        self.assertNotEqual(preview.claim_id, "retired-validation-claim")
+
+    def test_terminal_applied_review_claim_is_historical_not_replayable(self) -> None:
+        ticket = self.ticket("terminal-review", state=CanonicalState.DONE)
+        self.ledger.connection.execute(
+            "INSERT INTO review_results(ticket_id,attempt_number,verdict,payload_json,created_at) VALUES (?,?,?,?,?)",
+            (ticket, 2, "pass", json.dumps({"verdict": "pass", "criterion_results": [], "findings": [], "suggestions": []}), 60),
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("terminal-review-claim", ticket, "review:2", "claimed", "old-reviewer", 50, 1, json.dumps({"attempt_number": 2, "review_policy_hash": "old"}), 10, 10),
+        )
+
+        preview = preview_next(self.ledger, now=100)
+
+        self.assertNotEqual(preview.next_stage, "review")
+        self.assertNotEqual(preview.claim_id, "terminal-review-claim")
+        self.assertIsNone(self.ledger.claim_next_scheduler_review("new-reviewer", lease_seconds=30, review_execution_policy_hash="new", now=100))
+
+    def test_ticket_scoped_scheduler_claims_target_not_older_unrelated_candidate(self) -> None:
+        older = self.ticket("scope-older", state=CanonicalState.DRAFT)
+        target = self.ticket("scope-target", state=CanonicalState.DRAFT)
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            self.board,
+            worker_id="scoped-worker",
+            target_ticket_id=target,
+            lease_seconds=30,
+            clock=lambda: 100,
+        )
+
+        result = scheduler.process_next()
+
+        self.assertEqual((result.stage, result.ticket_id), ("dependency_readiness", target))
+        self.assertEqual(self.ledger.get_ticket(target)["state"], CanonicalState.READY_LOCAL.value)
+        self.assertEqual(self.ledger.get_ticket(older)["state"], CanonicalState.DRAFT.value)
+        self.assertIsNone(self.ledger.get_ticket(older)["lease_owner"])
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM scheduler_stage_claims WHERE ticket_id=?", (older,)).fetchone()[0], 0)
+
+    def test_ticket_scoped_scheduler_does_not_claim_unrelated_comment_backlog(self) -> None:
+        unrelated = self.ticket("scope-comment-old", state=CanonicalState.DRAFT)
+        target = self.ticket("scope-comment-target", state=CanonicalState.DRAFT)
+        operation_id = str(self.ledger.enqueue_evidence_comment(unrelated, 999, "unrelated backlog")["operation_id"])
+        self.assertTrue(self.ledger.claim_comment(operation_id, "old-worker", lease_seconds=1, now=10))
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            self.board,
+            worker_id="scoped-comment-worker",
+            target_ticket_id=target,
+            lease_seconds=30,
+            clock=lambda: 100,
+        )
+
+        result = scheduler.process_next()
+
+        self.assertEqual((result.stage, result.ticket_id), ("dependency_readiness", target))
+        row = self.ledger.comment_outbox(operation_id)
+        self.assertEqual(row["status"], "delivering")
+        self.assertEqual(row["lease_owner"], "old-worker")
+        self.assertEqual(int(row["attempt_count"]), 1)
+        self.assertEqual(self.board.comments, [])
 
     def test_native_root_is_prepared_before_hermes_release(self) -> None:
         board = NativeBoard()
@@ -734,8 +811,6 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         worktrees.mkdir()
         artifacts.mkdir()
         config_path = self.root / "cli-operator-config.json"
-        signer_public_key = b"\x01" * 32
-        signer_fingerprint = hashlib.sha256(signer_public_key).hexdigest()
         save_operator_config(
             OperatorConfig(
                 self.database,
@@ -747,8 +822,6 @@ class ProcessNextSchedulerTests(unittest.TestCase):
                 artifacts,
                 300,
                 300,
-                operator_signing_public_key=base64.b64encode(signer_public_key).decode(),
-                operator_signing_key_fingerprint=signer_fingerprint,
             ),
             config_path,
         )
@@ -768,6 +841,53 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         self.assertEqual((payload["status"], payload["next_stage"], payload["ticket_id"]), ("dry_run", "dependency_readiness", ticket))
         self.assertFalse(payload["would_execute"])
         self.assertFalse(payload["would_write_board"])
+
+    def test_cli_ticket_scoped_preview_ignores_unrelated_older_ticket_without_mutation(self) -> None:
+        repo = self.root / "cli-scope-repo"
+        repo.mkdir()
+        subprocess.run(("git", "init", "-q"), cwd=repo, check=True)
+        worktrees = self.root / "cli-scope-worktrees"
+        artifacts = self.root / "cli-scope-artifacts"
+        worktrees.mkdir(); artifacts.mkdir()
+        config_path = self.root / "cli-scope-operator-config.json"
+        save_operator_config(
+            OperatorConfig(
+                self.database, repo, (repo,),
+                ModelRegistration("impl-test", "test-provider", "test-model"),
+                ModelRegistration("review-test", "test-provider", "test-model"),
+                worktrees, artifacts, 300, 300,
+                (("local", ModelRegistration("triage-test", "triage-provider", "triage-model")),),
+            ),
+            config_path,
+        )
+        older = self.ticket("cli-scope-older", state=CanonicalState.DRAFT)
+        target = self.ticket("cli-scope-target", state=CanonicalState.DRAFT)
+        before_claims = self.ledger.connection.execute("SELECT COUNT(*) FROM scheduler_stage_claims").fetchone()[0]
+
+        output = io.StringIO()
+        profile_identity = {"profile": "impl-test", "provider": "test-provider", "model": "test-model", "routing_files": {"profile.yaml": None, "config.yaml": None}, "fingerprint": "f" * 64}
+        from local_first_orchestrator.scheduler import preview_ticket_database as real_preview_ticket_database
+        with mock.patch("local_first_orchestrator.controller.review_profile_identity", return_value=profile_identity), mock.patch("local_first_orchestrator.cli.preview_ticket_database", wraps=real_preview_ticket_database) as preview_call, contextlib.redirect_stdout(output):
+            self.assertEqual(
+                cli_main([
+                    "--database", str(self.database),
+                    "--operator-config-path", str(config_path),
+                    "process-next", "--ticket-id", target,
+                ]),
+                0,
+            )
+
+        preview_kwargs = preview_call.call_args.kwargs
+        self.assertEqual(len(str(preview_kwargs["review_execution_policy_hash"])), 64)
+        self.assertEqual(len(str(preview_kwargs["triage_execution_policy_hash"])), 64)
+        self.assertNotEqual(preview_kwargs["review_execution_policy_hash"], "preview-policy")
+        self.assertNotEqual(preview_kwargs["triage_execution_policy_hash"], "preview-policy")
+        payload = json.loads(output.getvalue())
+        self.assertEqual((payload["status"], payload["next_stage"], payload["ticket_id"]), ("dry_run", "dependency_readiness", target))
+        self.assertTrue(payload["would_execute"])
+        self.assertEqual(self.ledger.get_ticket(older)["state"], CanonicalState.DRAFT.value)
+        self.assertEqual(self.ledger.get_ticket(target)["state"], CanonicalState.DRAFT.value)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM scheduler_stage_claims").fetchone()[0], before_claims)
 
     def test_cli_preview_does_not_create_or_migrate_a_ledger(self) -> None:
         absent = self.root / "absent.db"

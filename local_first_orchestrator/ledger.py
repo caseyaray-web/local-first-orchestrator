@@ -2032,6 +2032,113 @@ class Ledger:
             self._enqueue_projection_bundle_in_transaction(conn, ticket_id=ticket_id, event_id=transition_event, evidence=evidence)
             return {"ticket_id":ticket_id,"retired_attempt_number":retired,"prospective_next_attempt_number":next_attempt,"retry_base_sha":retry_base_sha,"cleanup_required":bool(cleanup_required),"status":"reconciled","event_id":reconciliation_event}
 
+    def reconcile_completed_duplicate_execution(self, planning_ticket_id: str, execution_ticket_id: str, *, operator_id: str, reason: str) -> dict[str, Any]:
+        """Bind a completed imported execution back to its generated planning ticket.
+
+        This recovery is intentionally narrow: the generated ticket must have no
+        lifecycle evidence of its own, both ticket contracts must match, and the
+        active generated projection must be the completed execution ticket's
+        external identity.  It copies terminal acceptance authority only; it does
+        not fabricate attempts, model invocations, review results, or Git stages.
+        """
+        if not planning_ticket_id or not execution_ticket_id or planning_ticket_id == execution_ticket_id:
+            raise ValueError("duplicate execution reconciliation requires two distinct ticket ids")
+        if not operator_id.strip() or not reason.strip():
+            raise ValueError("duplicate execution reconciliation requires operator identity and reason")
+
+        json_fields = (
+            "criterion_ids_json", "allowed_files_json", "forbidden_changes_json",
+            "patch_budget_json", "dependencies_json", "new_test_files_json", "create_files_json",
+        )
+        scalar_fields = (
+            "feature_id", "tranche_id", "parent_ticket_id", "depth", "title", "objective",
+            "primary_symbol", "risk", "review_required", "max_attempts",
+        )
+
+        def verification_identity(raw: str) -> dict[str, Any]:
+            value = json.loads(str(raw or "{}"))
+            if not isinstance(value, dict):
+                raise ValueError("duplicate execution verification contract is malformed")
+            return {
+                "commands": value.get("commands", []),
+                "working_directory": value.get("working_directory", "."),
+                "timeout_seconds": value.get("timeout_seconds", 60),
+                "output_limit": value.get("output_limit", 20000),
+            }
+
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not paused["paused"]:
+                raise PermissionError("duplicate execution reconciliation requires Local First paused")
+            planning = conn.execute("SELECT * FROM tickets WHERE id=?", (planning_ticket_id,)).fetchone()
+            execution = conn.execute("SELECT * FROM tickets WHERE id=?", (execution_ticket_id,)).fetchone()
+            if planning is None or execution is None:
+                raise KeyError("duplicate execution ticket is missing")
+            source_evidence = conn.execute("SELECT * FROM accepted_evidence WHERE ticket_id=?", (execution_ticket_id,)).fetchone()
+            existing = conn.execute("SELECT * FROM accepted_evidence WHERE ticket_id=?", (planning_ticket_id,)).fetchone()
+            if planning["state"] == CanonicalState.DONE.value and existing is not None:
+                try:
+                    summary = json.loads(str(existing["diff_summary"]))
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("duplicate execution reconciliation evidence is malformed") from exc
+                if summary.get("reconciled_execution_ticket_id") != execution_ticket_id or source_evidence is None or str(existing["accepted_commit_sha"]) != str(source_evidence["accepted_commit_sha"]):
+                    raise RuntimeError("duplicate execution reconciliation conflicts with terminal evidence")
+                return {"ticket_id": planning_ticket_id, "execution_ticket_id": execution_ticket_id, "accepted_commit_sha": str(existing["accepted_commit_sha"]), "status": "already_reconciled"}
+            if planning["state"] not in {CanonicalState.DRAFT.value, CanonicalState.READY_LOCAL.value} or execution["state"] != CanonicalState.DONE.value or source_evidence is None:
+                raise ValueError("duplicate execution tickets are not in reconcilable states")
+            if conn.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND status='claimed' UNION SELECT 1 FROM tickets WHERE id=? AND lease_owner IS NOT NULL", (planning_ticket_id, planning_ticket_id)).fetchone() is not None:
+                raise ValueError("duplicate execution reconciliation refuses active lease or claim")
+            if conn.execute("SELECT 1 FROM attempts WHERE ticket_id=? UNION SELECT 1 FROM model_invocations WHERE ticket_id=? UNION SELECT 1 FROM model_stage_artifacts WHERE ticket_id=? UNION SELECT 1 FROM review_candidates WHERE ticket_id=? UNION SELECT 1 FROM review_results WHERE ticket_id=? UNION SELECT 1 FROM accepted_candidates WHERE ticket_id=? UNION SELECT 1 FROM accepted_evidence WHERE ticket_id=? UNION SELECT 1 FROM git_commit_intents WHERE ticket_id=? UNION SELECT 1 FROM git_commit_evidence WHERE ticket_id=? UNION SELECT 1 FROM hermes_execution_reconciliations WHERE ticket_id=?", (planning_ticket_id,)*10).fetchone() is not None:
+                raise ValueError("duplicate execution planning ticket already has lifecycle evidence")
+            for field in scalar_fields:
+                if planning[field] != execution[field]:
+                    raise ValueError(f"duplicate execution contract mismatch: {field}")
+            for field in json_fields:
+                if json.loads(str(planning[field])) != json.loads(str(execution[field])):
+                    raise ValueError(f"duplicate execution contract mismatch: {field}")
+            if verification_identity(str(planning["verification_json"])) != verification_identity(str(execution["verification_json"])):
+                raise ValueError("duplicate execution contract mismatch: verification_json")
+            projections = conn.execute("""
+                SELECT b.*,e.event_type,e.entity_type,e.entity_id FROM board_projection_outbox b
+                JOIN events e ON e.id=b.event_id
+                WHERE b.ticket_id=? AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL
+                  AND b.superseded_at IS NULL AND b.external_task_id IS NOT NULL
+            """, (planning_ticket_id,)).fetchall()
+            if len(projections) != 1 or projections[0]["event_type"] not in {"generated_microticket_created", "generated_microticket_projection_recovered"} or projections[0]["entity_type"] != "ticket" or projections[0]["entity_id"] != planning_ticket_id:
+                raise ValueError("duplicate execution planning projection is ambiguous")
+            external_task_id = str(projections[0]["external_task_id"])
+            if str(execution["external_id"] or "") != external_task_id:
+                raise ValueError("duplicate execution external identity mismatch")
+            release = conn.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (planning_ticket_id,)).fetchone()
+            if release is not None and str(release["child_external_id"]) != external_task_id:
+                raise ValueError("duplicate execution native release identity mismatch")
+            done_projection = conn.execute("""
+                SELECT b.event_id FROM board_projection_outbox b JOIN events e ON e.id=b.event_id
+                WHERE b.ticket_id=? AND b.operation='set_state' AND b.state='done'
+                  AND b.acknowledged_at IS NOT NULL AND b.superseded_at IS NULL
+                  AND b.external_task_id=? AND e.entity_type='ticket' AND e.entity_id=?
+                  AND e.event_type='state_transition' AND e.to_state='done'
+                ORDER BY b.event_id DESC LIMIT 1
+            """, (execution_ticket_id, external_task_id, execution_ticket_id)).fetchone()
+            if done_projection is None:
+                raise ValueError("duplicate execution completion is not remotely acknowledged")
+            now = self._now()
+            source_summary = json.loads(str(source_evidence["diff_summary"])) if str(source_evidence["diff_summary"]).strip().startswith("{") else str(source_evidence["diff_summary"])
+            reconciliation_summary = json.dumps({
+                "accepted_commit_sha": str(source_evidence["accepted_commit_sha"]),
+                "external_task_id": external_task_id,
+                "reconciled_execution_ticket_id": execution_ticket_id,
+                "source_diff_summary": source_summary,
+            }, sort_keys=True)
+            conn.execute("INSERT INTO accepted_evidence(ticket_id,accepted_commit_sha,diff_summary,validation_summary,created_at) VALUES (?,?,?,?,?)", (planning_ticket_id, source_evidence["accepted_commit_sha"], reconciliation_summary, f"reconciled completed duplicate execution {execution_ticket_id}: {source_evidence['validation_summary']}", now))
+            previous_state = str(planning["state"])
+            conn.execute("UPDATE tickets SET state=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=?", (CanonicalState.DONE.value, now, planning_ticket_id))
+            reconciliation_event = self._append_event(conn, entity_type="ticket", entity_id=planning_ticket_id, event_type="completed_duplicate_execution_reconciled", actor_id=operator_id, payload={"execution_ticket_id": execution_ticket_id, "external_task_id": external_task_id, "accepted_commit_sha": str(source_evidence["accepted_commit_sha"]), "reason": reason})
+            transition_event = self._append_event(conn, entity_type="ticket", entity_id=planning_ticket_id, event_type="state_transition", actor_id=operator_id, from_state=previous_state, to_state=CanonicalState.DONE.value, payload={"reason": "completed_duplicate_execution_reconciled", "execution_ticket_id": execution_ticket_id, "accepted_commit_sha": str(source_evidence["accepted_commit_sha"])})
+            self._enqueue_projection_bundle_in_transaction(conn, ticket_id=planning_ticket_id, event_id=transition_event, evidence=f"reconciled completed duplicate execution {execution_ticket_id}", state_payload={"reason": "completed_duplicate_execution_reconciled", "execution_ticket_id": execution_ticket_id})
+            conn.execute("INSERT INTO runtime_stages(ticket_id,stage,detail,created_at) VALUES (?,?,?,?)", (planning_ticket_id, "duplicate_execution_reconciliation", json.dumps({"execution_ticket_id": execution_ticket_id, "external_task_id": external_task_id, "accepted_commit_sha": str(source_evidence["accepted_commit_sha"]), "event_id": reconciliation_event}, sort_keys=True), now))
+            return {"ticket_id": planning_ticket_id, "execution_ticket_id": execution_ticket_id, "external_task_id": external_task_id, "accepted_commit_sha": str(source_evidence["accepted_commit_sha"]), "status": "reconciled", "event_id": reconciliation_event, "transition_event_id": transition_event}
+
     def confirm_retired_attempt_cleanup(self, ticket_id: str, *, retired_attempt_number: int, operator_id: str, checked_paths: tuple[str, ...]) -> dict[str, Any]:
         """Persist a separate operator attestation after controller-side absence checks."""
         if not operator_id.strip() or not all(isinstance(path, str) and path for path in checked_paths):
@@ -2406,13 +2513,27 @@ class Ledger:
             {},
         )
 
-    def next_scheduler_reconciliation(self, *, now: int | None = None):
+    def next_scheduler_reconciliation(self, *, now: int | None = None, ticket_id: str | None = None):
         now = self._now() if now is None else now
         rows = self.connection.execute(
-            "SELECT claim_id,stage,candidate_identity_json FROM scheduler_stage_claims WHERE status='claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at<=? ORDER BY created_at,claim_id",
-            (now,),
+            "SELECT claim_id,ticket_id,stage,candidate_identity_json FROM scheduler_stage_claims WHERE status='claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at<=? AND (? IS NULL OR ticket_id=?) ORDER BY created_at,claim_id",
+            (now, ticket_id, ticket_id),
         ).fetchall()
         for row in rows:
+            if str(row["stage"]).startswith("validation:"):
+                retired = self.connection.execute(
+                    "SELECT 1 FROM failed_attempt_reconciliations r WHERE r.ticket_id=(SELECT ticket_id FROM scheduler_stage_claims WHERE claim_id=?) AND ?=('validation:' || r.retired_attempt_number)",
+                    (row["claim_id"], row["stage"]),
+                ).fetchone()
+                if retired is not None:
+                    continue
+            if str(row["stage"]).startswith("review:"):
+                applied_terminal = self.connection.execute(
+                    "SELECT 1 FROM review_results rr JOIN tickets t ON t.id=rr.ticket_id WHERE rr.ticket_id=? AND ?=('review:' || rr.attempt_number) AND t.state IN ('accepted','done')",
+                    (row["ticket_id"], row["stage"]),
+                ).fetchone()
+                if applied_terminal is not None:
+                    continue
             if str(row["stage"]) == "tranche_checkpoint":
                 identity = json.loads(str(row["candidate_identity_json"] or "{}"))
                 try:
@@ -2447,7 +2568,7 @@ class Ledger:
             "triage_execution_policy_hash": triage_execution_policy_hash,
         }
 
-    def claim_next_scheduler_triage(self, owner: str, *, lease_seconds: int, triage_execution_policy_hash: str, now: int | None = None) -> dict[str, Any] | None:
+    def claim_next_scheduler_triage(self, owner: str, *, lease_seconds: int, triage_execution_policy_hash: str, now: int | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
         """Claim one policy-routed needs-triage ticket for planning-only triage."""
         if not owner or lease_seconds < 1 or not triage_execution_policy_hash:
             raise ValueError("triage scheduler claim requires owner, lease, and execution policy")
@@ -2456,8 +2577,8 @@ class Ledger:
             if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
                 return None
             replay = conn.execute(
-                "SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'triage:%' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
-                (now,),
+                "SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'triage:%' AND status='claimed' AND lease_expires_at<=? AND (? IS NULL OR ticket_id=?) ORDER BY created_at,claim_id LIMIT 1",
+                (now, ticket_id, ticket_id),
             ).fetchone()
             if replay is not None:
                 ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (replay["ticket_id"],)).fetchone()
@@ -2505,8 +2626,9 @@ class Ledger:
                   AND json_valid(r.detail)=1
                   AND json_extract(r.detail,'$.action')='triage'
                   AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('triage:' || r.attempt_number))
+                  AND (? IS NULL OR t.id=?)
                 ORDER BY t.created_at,t.id,r.attempt_number DESC LIMIT 1
-            """, (CanonicalState.NEEDS_TRIAGE.value,)).fetchone()
+            """, (CanonicalState.NEEDS_TRIAGE.value, ticket_id, ticket_id)).fetchone()
             if row is None:
                 return None
             attempt_number = int(row["routing_attempt"])
@@ -2581,7 +2703,7 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=str(claim["ticket_id"]), event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": "triage", "result": result})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
-    def claim_next_scheduler_acceptance(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+    def claim_next_scheduler_acceptance(self, owner: str, *, lease_seconds: int, now: int | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
         """Claim one reviewed pass candidate for pre-commit acceptance/freeze."""
         if not owner or lease_seconds < 1:
             raise ValueError("acceptance scheduler claim requires owner and positive lease")
@@ -2590,8 +2712,8 @@ class Ledger:
             if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
                 return None
             replay = conn.execute(
-                "SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'acceptance:%' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
-                (now,),
+                "SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'acceptance:%' AND status='claimed' AND lease_expires_at<=? AND (? IS NULL OR ticket_id=?) ORDER BY created_at,claim_id LIMIT 1",
+                (now, ticket_id, ticket_id),
             ).fetchone()
             if replay is not None:
                 changed = conn.execute(
@@ -2617,8 +2739,9 @@ class Ledger:
                   AND rr.verdict='pass'
                   AND NOT EXISTS (SELECT 1 FROM accepted_candidates ac WHERE ac.ticket_id=t.id)
                   AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('acceptance:' || rr.attempt_number))
+                  AND (? IS NULL OR t.id=?)
                 ORDER BY t.created_at,t.id LIMIT 1
-            """).fetchone()
+            """, (ticket_id, ticket_id)).fetchone()
             if row is None:
                 return None
             identity = {
@@ -2768,7 +2891,7 @@ class Ledger:
         row = self.connection.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (ticket_id,)).fetchone()
         return dict(row) if row else None
 
-    def _signer_enrollment_integrity_blocker(self, *, signer_public_key: bytes, signer_fingerprint: str, fresh_config_raw: bytes | None, fresh_config_identity: dict[str, Any] | None, fresh_config_obj: dict[str, Any] | None, config_path: Path | None) -> dict[str, Any] | None:
+    def _signer_enrollment_integrity_blocker(self, *, signer_public_key: bytes, signer_fingerprint: str, fresh_config_raw: bytes | None, fresh_config_identity: dict[str, Any] | None, fresh_config_obj: dict[str, Any] | None, config_path: Path | None, ticket_id: str | None = None) -> dict[str, Any] | None:
         """Validate the signed enrollment envelope before any release fallback runs.
 
         Every ledger copy is an assertion about one canonical signed document.  The
@@ -2789,7 +2912,13 @@ class Ledger:
                 return {"ticket_id": "", "reason": "signer enrollment reconciliation required: signer fingerprint does not match fresh signer key"}
             if fresh_config_obj is not None and (fresh_config_obj.get("operator_signing_key_fingerprint") != signer_fingerprint or fresh_config_obj.get("operator_signing_public_key") != base64.b64encode(signer_public_key).decode("ascii")):
                 return {"ticket_id": "", "reason": "signer enrollment reconciliation required: fresh signer config authority differs"}
-            intents = self.connection.execute("SELECT * FROM runtime_signer_enrollment_intents WHERE status IN ('pending_config','config_written','finalized') ORDER BY enrollment_key").fetchall()
+            intents = self.connection.execute(
+                "SELECT i.* FROM runtime_signer_enrollment_intents i WHERE i.status IN ('pending_config','config_written','finalized') "
+                "AND (? IS NULL OR EXISTS (SELECT 1 FROM runtime_signer_enrollments e WHERE e.enrollment_key=i.enrollment_key AND e.ticket_id=?) "
+                "OR EXISTS (SELECT 1 FROM json_each(i.ticket_ids_json) j WHERE j.value=?)) "
+                "ORDER BY i.enrollment_key",
+                (ticket_id, ticket_id, ticket_id),
+            ).fetchall()
             for intent in intents:
                 ticket_hint = str(intent["ticket_ids_json"] or "")
                 try:
@@ -2878,13 +3007,16 @@ class Ledger:
             return {"ticket_id": "", "reason": f"signer enrollment reconciliation required: {exc}"}
         return None
 
-    def native_dependency_release_migration_required(self, *, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None, config_path: Path | None = None, require_activation: bool = True, board: Any | None = None) -> dict[str, Any] | None:
+    def native_dependency_release_migration_required(self, *, signer_public_key: bytes | None = None, signer_fingerprint: str | None = None, config_path: Path | None = None, require_activation: bool = True, board: Any | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
         """Find legacy releases that cannot authorize downstream execution."""
-        rows = self.connection.execute("SELECT * FROM native_dependency_releases ORDER BY ticket_id").fetchall()
+        rows = self.connection.execute("SELECT r.* FROM native_dependency_releases r JOIN tickets t ON t.id=r.ticket_id WHERE t.state!='done' AND (? IS NULL OR r.ticket_id=?) ORDER BY r.ticket_id", (ticket_id, ticket_id)).fetchall()
         # A supersession marker is authority only when its complete signed envelope
         # and immutable event linkage survive independent verification.
         if signer_public_key is not None and signer_fingerprint:
-            for link in self.connection.execute("SELECT * FROM native_dependency_release_revalidation_supersessions ORDER BY old_revalidation_id").fetchall():
+            for link in self.connection.execute(
+                "SELECT * FROM native_dependency_release_revalidation_supersessions WHERE (? IS NULL OR ticket_id=?) ORDER BY old_revalidation_id",
+                (ticket_id, ticket_id),
+            ).fetchall():
                 try:
                     old = self.connection.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=?", (link["old_revalidation_id"],)).fetchone()
                     new = self.connection.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=?", (link["new_revalidation_id"],)).fetchone()
@@ -2909,10 +3041,13 @@ class Ledger:
         missing_signer = self.connection.execute("""
             SELECT r.ticket_id FROM native_dependency_releases r
             JOIN runtime_bindings b ON b.ticket_id=r.ticket_id
-            WHERE (b.operator_signer_fingerprint IS NULL OR b.operator_authority_hash IS NULL)
+            JOIN tickets t ON t.id=r.ticket_id
+            WHERE t.state!='done'
+              AND (? IS NULL OR r.ticket_id=?)
+              AND (b.operator_signer_fingerprint IS NULL OR b.operator_authority_hash IS NULL)
               AND json_valid(r.routing_authority_json)=1 AND json(r.routing_authority_json)='{}'
             ORDER BY r.ticket_id LIMIT 1
-        """).fetchone()
+        """, (ticket_id, ticket_id)).fetchone()
         if missing_signer is not None:
             return {"ticket_id": str(missing_signer["ticket_id"]), "reason": "legacy release requires completed signer enrollment"}
         if (signer_public_key is None) != (signer_fingerprint is None):
@@ -2955,13 +3090,17 @@ class Ledger:
                 fresh_config_identity=fresh_config_identity,
                 fresh_config_obj=fresh_config_obj,
                 config_path=config_path,
+                ticket_id=ticket_id,
             )
         if integrity_blocker is not None:
             return integrity_blocker
         # Activation status is never authority.  Acknowledgement is valid only
         # when the immutable intent, one evidence row, and one immutable event
         # form the exact same signed envelope.
-        for activation in self.connection.execute("SELECT * FROM native_release_activation_intents WHERE status='acknowledged' ORDER BY request_key").fetchall():
+        for activation in self.connection.execute(
+            "SELECT * FROM native_release_activation_intents WHERE status='acknowledged' AND (? IS NULL OR ticket_id=?) ORDER BY request_key",
+            (ticket_id, ticket_id),
+        ).fetchall():
             try:
                 evidence = self.connection.execute("SELECT * FROM native_release_activation_evidence WHERE request_key=?", (activation["request_key"],)).fetchall()
                 if len(evidence) != 1:
@@ -3020,7 +3159,10 @@ class Ledger:
         # A caller-supplied key/fingerprint is insufficient for an otherwise
         # valid activation. Migration and scheduling must freshly reload the
         # external signer configuration file.
-        if self.connection.execute("SELECT 1 FROM native_release_activation_intents WHERE status='acknowledged' LIMIT 1").fetchone() is not None and config_path is None:
+        if self.connection.execute(
+            "SELECT 1 FROM native_release_activation_intents WHERE status='acknowledged' AND (? IS NULL OR ticket_id=?) LIMIT 1",
+            (ticket_id, ticket_id),
+        ).fetchone() is not None and config_path is None:
             return {"ticket_id": str(rows[0]["ticket_id"]) if rows else "", "reason": "native release activation requires freshly loaded external signer configuration"}
         for row in rows:
             try:
@@ -3557,7 +3699,7 @@ class Ledger:
         encoded = json.dumps(core, sort_keys=True, separators=(",", ":"))
         return {**core, "graph_hash": hashlib.sha256(encoded.encode()).hexdigest()}
 
-    def claim_next_scheduler_native_dependency_graph(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+    def claim_next_scheduler_native_dependency_graph(self, owner: str, *, lease_seconds: int, now: int | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
         if not owner or lease_seconds < 1:
             raise ValueError("native dependency graph claim requires owner and positive lease")
         now = self._now() if now is None else now
@@ -3565,8 +3707,8 @@ class Ledger:
             if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
                 return None
             replay = conn.execute(
-                "SELECT * FROM scheduler_stage_claims WHERE stage='native_dependency_graph' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
-                (now,),
+                "SELECT * FROM scheduler_stage_claims WHERE stage='native_dependency_graph' AND status='claimed' AND lease_expires_at<=? AND (? IS NULL OR ticket_id=?) ORDER BY created_at,claim_id LIMIT 1",
+                (now, ticket_id, ticket_id),
             ).fetchone()
             if replay is not None:
                 identity = self._native_dependency_graph_identity(conn, str(replay["ticket_id"]))
@@ -3599,8 +3741,9 @@ class Ledger:
                         AND root_projection.superseded_at IS NULL))
                   AND NOT EXISTS (SELECT 1 FROM native_dependency_graphs g WHERE g.ticket_id=t.id)
                   AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage='native_dependency_graph')
+                  AND (? IS NULL OR t.id=?)
                 ORDER BY t.created_at,t.id LIMIT 100
-            """).fetchall()
+            """, (ticket_id, ticket_id)).fetchall()
             for candidate in candidates:
                 ticket_id = str(candidate["id"])
                 try:
@@ -3725,7 +3868,7 @@ class Ledger:
             identity["routing_authority"] = {"profile": implementation_profile, "canonical_repository": str(canonical_repository)}
         return identity
 
-    def claim_next_scheduler_native_dependency_release(self, owner: str, *, lease_seconds: int, now: int | None = None, implementation_profile: str | None = None, canonical_repository: str | None = None) -> dict[str, Any] | None:
+    def claim_next_scheduler_native_dependency_release(self, owner: str, *, lease_seconds: int, now: int | None = None, implementation_profile: str | None = None, canonical_repository: str | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
         if not owner or lease_seconds < 1:
             raise ValueError("native dependency release claim requires owner and positive lease")
         now = self._now() if now is None else now
@@ -3733,8 +3876,8 @@ class Ledger:
             if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
                 return None
             replay = conn.execute(
-                "SELECT * FROM scheduler_stage_claims WHERE stage='native_dependency_release' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
-                (now,),
+                "SELECT * FROM scheduler_stage_claims WHERE stage='native_dependency_release' AND status='claimed' AND lease_expires_at<=? AND (? IS NULL OR ticket_id=?) ORDER BY created_at,claim_id LIMIT 1",
+                (now, ticket_id, ticket_id),
             ).fetchone()
             if replay is not None:
                 identity = self._native_dependency_release_identity(conn, str(replay["ticket_id"]), implementation_profile=implementation_profile, canonical_repository=canonical_repository)
@@ -3770,8 +3913,9 @@ class Ledger:
                         AND root_projection.external_task_id IS NOT NULL
                         AND root_projection.superseded_at IS NULL))
                   AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage='native_dependency_release')
+                  AND (? IS NULL OR t.id=?)
                 ORDER BY t.created_at,t.id LIMIT 100
-            """).fetchall()
+            """, (ticket_id, ticket_id)).fetchall()
             for candidate in candidates:
                 ticket_id = str(candidate["id"])
                 try:
@@ -3879,7 +4023,7 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=str(claim["ticket_id"]), event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": "native_dependency_release", "result": result})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
-    def claim_next_scheduler_completion(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+    def claim_next_scheduler_completion(self, owner: str, *, lease_seconds: int, now: int | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
         """Claim one accepted, durably committed candidate for local completion."""
         if not owner or lease_seconds < 1:
             raise ValueError("completion scheduler claim requires owner and positive lease")
@@ -3888,8 +4032,8 @@ class Ledger:
             if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
                 return None
             replay = conn.execute(
-                "SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'completion:%' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
-                (now,),
+                "SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'completion:%' AND status='claimed' AND lease_expires_at<=? AND (? IS NULL OR ticket_id=?) ORDER BY created_at,claim_id LIMIT 1",
+                (now, ticket_id, ticket_id),
             ).fetchone()
             if replay is not None:
                 ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (replay["ticket_id"],)).fetchone()
@@ -3938,8 +4082,9 @@ class Ledger:
                   AND gi.commit_sha=ge.commit_sha
                   AND NOT EXISTS (SELECT 1 FROM accepted_evidence ae WHERE ae.ticket_id=t.id)
                   AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('completion:' || ac.attempt_number))
+                  AND (? IS NULL OR t.id=?)
                 ORDER BY t.created_at,t.id LIMIT 1
-            """).fetchone()
+            """, (ticket_id, ticket_id)).fetchone()
             if row is None:
                 return None
             accepted = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (row["id"],)).fetchone()
@@ -4144,7 +4289,7 @@ class Ledger:
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
 
-    def claim_next_scheduler_git_integration(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+    def claim_next_scheduler_git_integration(self, owner: str, *, lease_seconds: int, now: int | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
         """Claim one immutable accepted candidate for commit/integration only."""
         if not owner or lease_seconds < 1:
             raise ValueError("git integration scheduler claim requires owner and positive lease")
@@ -4153,8 +4298,8 @@ class Ledger:
             if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
                 return None
             replay = conn.execute(
-                "SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'git_integration:%' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1",
-                (now,),
+                "SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'git_integration:%' AND status='claimed' AND lease_expires_at<=? AND (? IS NULL OR ticket_id=?) ORDER BY created_at,claim_id LIMIT 1",
+                (now, ticket_id, ticket_id),
             ).fetchone()
             if replay is not None:
                 ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (replay["ticket_id"],)).fetchone()
@@ -4211,8 +4356,9 @@ class Ledger:
                 WHERE t.state='accepted'
                   AND NOT EXISTS (SELECT 1 FROM git_commit_evidence ge WHERE ge.ticket_id=t.id)
                   AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('git_integration:' || ac.attempt_number))
+                  AND (? IS NULL OR t.id=?)
                 ORDER BY t.created_at,t.id LIMIT 1
-            """).fetchone()
+            """, (ticket_id, ticket_id)).fetchone()
             if row is None:
                 return None
             identity = {
@@ -4424,7 +4570,7 @@ class Ledger:
             )
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
-    def claim_next_scheduler_repair_routing(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+    def claim_next_scheduler_repair_routing(self, owner: str, *, lease_seconds: int, now: int | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
         """Claim one failed validation or completed review for routing only."""
         if not owner or lease_seconds < 1:
             raise ValueError("scheduler claim requires an owner and positive lease")
@@ -4432,7 +4578,7 @@ class Ledger:
         with self._transaction() as conn:
             if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
                 return None
-            replay = conn.execute("SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'repair_routing:%' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,)).fetchone()
+            replay = conn.execute("SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'repair_routing:%' AND status='claimed' AND lease_expires_at<=? AND (? IS NULL OR ticket_id=?) ORDER BY created_at,claim_id LIMIT 1", (now, ticket_id, ticket_id)).fetchone()
             if replay is not None:
                 if conn.execute("UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?", (owner, now + lease_seconds, now, replay["claim_id"], now)).rowcount != 1:
                     return None
@@ -4444,7 +4590,7 @@ class Ledger:
                        COALESCE((SELECT MAX(r.attempt_number) FROM runtime_stages r WHERE r.ticket_id=t.id AND r.stage LIKE 'validation-%'),
                                 (SELECT MAX(m.attempt_number) FROM model_stage_artifacts m WHERE m.ticket_id=t.id AND m.stage='review')) AS attempt_number
                 FROM tickets t
-                WHERE (
+                WHERE ((
                     t.state='verifying' AND EXISTS (
                         SELECT 1 FROM runtime_stages r WHERE r.ticket_id=t.id AND r.stage=('validation-' || r.attempt_number)
                         AND json_valid(r.detail)=1 AND json_extract(r.detail,'$.passed')=0
@@ -4453,9 +4599,9 @@ class Ledger:
                     t.state='local_review' AND EXISTS (
                         SELECT 1 FROM model_stage_artifacts m WHERE m.ticket_id=t.id AND m.stage='review'
                     )
-                )
+                )) AND (? IS NULL OR t.id=?)
                 ORDER BY t.created_at,t.id LIMIT 1
-            """).fetchone()
+            """, (ticket_id, ticket_id)).fetchone()
             if row is None or row["attempt_number"] is None:
                 return None
             ticket_id = str(row["id"]); attempt_number = int(row["attempt_number"]); stage = f"repair_routing:{attempt_number}"
@@ -4590,7 +4736,7 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id":claim_id,"stage":"repair_routing","result":result})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
-    def claim_next_scheduler_implementation(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+    def claim_next_scheduler_implementation(self, owner: str, *, lease_seconds: int, now: int | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
         """Claim one ready-local implementation stage, including expired replay."""
         if not owner or lease_seconds < 1:
             raise ValueError("scheduler claim requires an owner and positive lease")
@@ -4601,7 +4747,7 @@ class Ledger:
                 return None
             replay = conn.execute(
                 "SELECT * FROM scheduler_stage_claims WHERE (stage='implementation' OR stage LIKE 'implementation:%') AND status='claimed' "
-                "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+                "AND lease_expires_at<=? AND (? IS NULL OR ticket_id=?) ORDER BY created_at,claim_id LIMIT 1", (now, ticket_id, ticket_id),
             ).fetchone()
             if replay is not None:
                 changed = conn.execute(
@@ -4623,8 +4769,8 @@ class Ledger:
                 "WHERE t.state IN (?,?) AND (t.lease_expires_at IS NULL OR t.lease_expires_at<=?) "
                 "AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND (c.stage='implementation' OR c.stage LIKE 'implementation:%') AND c.status='claimed') "
                 "AND NOT EXISTS (SELECT 1 FROM board_projection_outbox b WHERE b.ticket_id=t.id AND b.operation='create_microticket' AND b.superseded_at IS NULL) "
-                "ORDER BY t.created_at,t.id LIMIT 1",
-                (CanonicalState.READY_LOCAL.value, CanonicalState.REPAIRING.value, now),
+                "AND (? IS NULL OR t.id=?) ORDER BY t.created_at,t.id LIMIT 1",
+                (CanonicalState.READY_LOCAL.value, CanonicalState.REPAIRING.value, now, ticket_id, ticket_id),
             ).fetchone()
             if candidate is None:
                 return None
@@ -4740,7 +4886,7 @@ class Ledger:
         }
         return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
-    def claim_next_scheduler_validation(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+    def claim_next_scheduler_validation(self, owner: str, *, lease_seconds: int, now: int | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
         """Claim one exact implementation candidate for deterministic validation."""
         if not owner or lease_seconds < 1:
             raise ValueError("scheduler claim requires an owner and positive lease")
@@ -4753,7 +4899,7 @@ class Ledger:
                 "SELECT c.* FROM scheduler_stage_claims c WHERE c.stage LIKE 'validation:%' AND c.status='claimed' "
                 "AND c.lease_expires_at<=? "
                 "AND NOT EXISTS (SELECT 1 FROM failed_attempt_reconciliations r WHERE r.ticket_id=c.ticket_id AND c.stage=('validation:' || r.retired_attempt_number)) "
-                "ORDER BY c.created_at,c.claim_id LIMIT 1", (now,)
+                "AND (? IS NULL OR c.ticket_id=?) ORDER BY c.created_at,c.claim_id LIMIT 1", (now, ticket_id, ticket_id)
             ).fetchone()
             if replay is not None:
                 changed = conn.execute(
@@ -4775,8 +4921,8 @@ class Ledger:
                 "AND m.attempt_number=(SELECT MAX(latest.attempt_number) FROM model_stage_artifacts latest WHERE latest.ticket_id=t.id AND latest.stage='implementation') "
                 "WHERE t.state=? AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('validation:' || m.attempt_number)) "
                 "AND NOT EXISTS (SELECT 1 FROM runtime_stages r WHERE r.ticket_id=t.id AND r.stage=('validation-' || m.attempt_number)) "
-                "ORDER BY t.created_at,t.id LIMIT 1",
-                (CanonicalState.IMPLEMENTING.value,),
+                "AND (? IS NULL OR t.id=?) ORDER BY t.created_at,t.id LIMIT 1",
+                (CanonicalState.IMPLEMENTING.value, ticket_id, ticket_id),
             ).fetchone()
             if candidate is None:
                 return None
@@ -4856,7 +5002,7 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=str(claim["ticket_id"]), event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id": claim_id, "stage": "validation", "result": result})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
-    def claim_next_scheduler_review(self, owner: str, *, lease_seconds: int, review_execution_policy_hash: str, now: int | None = None) -> dict[str, Any] | None:
+    def claim_next_scheduler_review(self, owner: str, *, lease_seconds: int, review_execution_policy_hash: str, now: int | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
         """Claim one exact passing validation candidate for packet-only review."""
         if not owner or lease_seconds < 1:
             raise ValueError("scheduler claim requires an owner and positive lease")
@@ -4864,7 +5010,11 @@ class Ledger:
         with self._transaction() as conn:
             if conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"]:
                 return None
-            replay = conn.execute("SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'review:%' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,)).fetchone()
+            replay = conn.execute(
+                "SELECT c.* FROM scheduler_stage_claims c WHERE c.stage LIKE 'review:%' AND c.status='claimed' AND c.lease_expires_at<=? "
+                "AND NOT EXISTS (SELECT 1 FROM review_results rr JOIN tickets t ON t.id=rr.ticket_id WHERE rr.ticket_id=c.ticket_id AND c.stage=('review:' || rr.attempt_number) AND t.state IN ('accepted','done')) "
+                "AND (? IS NULL OR c.ticket_id=?) ORDER BY c.created_at,c.claim_id LIMIT 1", (now, ticket_id, ticket_id)
+            ).fetchone()
             if replay is not None:
                 try:
                     replay_identity = json.loads(str(replay["candidate_identity_json"] or ""))
@@ -4904,8 +5054,9 @@ class Ledger:
                     OR (m.adapter='manual-adoption' AND mi.invocation_id IS NULL AND he.hermes_run_id IS NULL AND ma.artifact_sha256 IS NOT NULL)
                 )
                 AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('review:' || r.attempt_number) AND c.status IN ('claimed','completed'))
+                AND (? IS NULL OR t.id=?)
                 ORDER BY t.created_at,t.id LIMIT 1
-            """, (CanonicalState.LOCAL_REVIEW.value,)).fetchone()
+            """, (CanonicalState.LOCAL_REVIEW.value, ticket_id, ticket_id)).fetchone()
             if row is None:
                 return None
             try:
@@ -5029,7 +5180,7 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=str(claim["ticket_id"]), event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id":claim_id,"stage":"review","result":result})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
-    def claim_next_scheduler_readiness(self, owner: str, *, lease_seconds: int, now: int | None = None) -> dict[str, Any] | None:
+    def claim_next_scheduler_readiness(self, owner: str, *, lease_seconds: int, now: int | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
         """Claim one dependency-ready admission stage, including expired replay."""
         if not owner or lease_seconds < 1:
             raise ValueError("scheduler claim requires an owner and positive lease")
@@ -5040,7 +5191,7 @@ class Ledger:
                 return None
             replay = conn.execute(
                 "SELECT * FROM scheduler_stage_claims WHERE stage='dependency_readiness' AND status='claimed' "
-                "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,),
+                "AND lease_expires_at<=? AND (? IS NULL OR ticket_id=?) ORDER BY created_at,claim_id LIMIT 1", (now, ticket_id, ticket_id),
             ).fetchone()
             if replay is not None:
                 changed = conn.execute(
@@ -5071,8 +5222,9 @@ class Ledger:
                     SELECT 1 FROM scheduler_stage_claims claim
                     WHERE claim.ticket_id=t.id AND claim.stage='dependency_readiness'
                   )
+                  AND (? IS NULL OR t.id=?)
                 ORDER BY t.created_at,t.id LIMIT 1
-            """, (CanonicalState.DRAFT.value, CanonicalState.ACCEPTED.value, CanonicalState.DONE.value, CanonicalState.DONE.value)).fetchone()
+            """, (CanonicalState.DRAFT.value, CanonicalState.ACCEPTED.value, CanonicalState.DONE.value, CanonicalState.DONE.value, ticket_id, ticket_id)).fetchone()
             if candidate is None:
                 return None
             ticket_id = str(candidate["id"])
@@ -5619,8 +5771,8 @@ class Ledger:
         safe = re.sub(r"(?i)bearer\s+[^\s,;]+", "Bearer [REDACTED]", safe)
         return safe[:limit]
 
-    def claim_next_comment(self, owner: str, *, lease_seconds: int = 60, now: int | None = None) -> dict[str, Any] | None:
-        """Atomically claim the oldest pending or due retryable comment."""
+    def claim_next_comment(self, owner: str, *, lease_seconds: int = 60, now: int | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
+        """Atomically claim the oldest pending or due retryable comment, optionally for one ticket."""
         now = self._now() if now is None else now
         with self._transaction() as conn:
             changed = conn.execute(
@@ -5631,10 +5783,11 @@ class Ledger:
                        SELECT operation_id FROM evidence_comment_outbox
                         WHERE status IN ('pending','retryable')
                           AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                          AND (? IS NULL OR ticket_id=?)
                         ORDER BY created_at, operation_id LIMIT 1)
                    AND status IN ('pending','retryable')
                    AND (next_attempt_at IS NULL OR next_attempt_at <= ?)""",
-                (owner, now + lease_seconds, now, now, now),
+                (owner, now + lease_seconds, now, now, ticket_id, ticket_id, now),
             )
             if changed.rowcount != 1:
                 return None
@@ -5667,14 +5820,23 @@ class Ledger:
             if row['status']=='permanently_failed': return row['terminal_owner']==owner
             return conn.execute("UPDATE evidence_comment_outbox SET status='permanently_failed',last_error=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,updated_at=?,terminal_owner=? WHERE operation_id=? AND status='delivering' AND lease_owner=? AND lease_expires_at>?",(self._safe_comment_error(error, limit=error_limit),now,owner,operation_id,owner,now)).rowcount==1
 
-    def recover_expired_comment_leases(self, *, now: int | None = None, reason: str | None = None) -> list[str]:
+    def recover_expired_comment_leases(self, *, now: int | None = None, reason: str | None = None, ticket_id: str | None = None) -> list[str]:
         now=self._now() if now is None else now
         with self._transaction() as conn:
-            rows=conn.execute("SELECT operation_id FROM evidence_comment_outbox WHERE status='delivering' AND lease_expires_at<=?",(now,)).fetchall()
+            rows=conn.execute(
+                "SELECT operation_id FROM evidence_comment_outbox WHERE status='delivering' AND lease_expires_at<=? AND (? IS NULL OR ticket_id=?)",
+                (now,ticket_id,ticket_id),
+            ).fetchall()
             if reason is None:
-                conn.execute("UPDATE evidence_comment_outbox SET status='retryable',lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=?,updated_at=? WHERE status='delivering' AND lease_expires_at<=?",(now,now,now))
+                conn.execute(
+                    "UPDATE evidence_comment_outbox SET status='retryable',lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=?,updated_at=? WHERE status='delivering' AND lease_expires_at<=? AND (? IS NULL OR ticket_id=?)",
+                    (now,now,now,ticket_id,ticket_id),
+                )
             else:
-                conn.execute("UPDATE evidence_comment_outbox SET status='retryable',lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=?,last_error=?,updated_at=? WHERE status='delivering' AND lease_expires_at<=?",(now,self._safe_comment_error(reason),now,now))
+                conn.execute(
+                    "UPDATE evidence_comment_outbox SET status='retryable',lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=?,last_error=?,updated_at=? WHERE status='delivering' AND lease_expires_at<=? AND (? IS NULL OR ticket_id=?)",
+                    (now,self._safe_comment_error(reason),now,now,ticket_id,ticket_id),
+                )
             return [str(row['operation_id']) for row in rows]
 
     def set_evidence_comment(self, ticket_id: str, comment: str, artifact_location: str | None = None) -> bool:
@@ -6130,10 +6292,10 @@ class Ledger:
         with self._transaction() as conn:
             return self._enqueue_generated_create_projection_in_transaction(conn, ticket_id=ticket_id, event_id=event_id, payload=payload, idempotency_key=idempotency_key)
 
-    def claim_next_generated_create_projection(self, owner: str, *, lease_seconds: int=60, now: int|None=None) -> dict[str, Any]|None:
+    def claim_next_generated_create_projection(self, owner: str, *, lease_seconds: int=60, now: int|None=None, ticket_id: str | None = None) -> dict[str, Any]|None:
         now=self._now() if now is None else now
         with self._transaction() as conn:
-            row=conn.execute("SELECT ticket_id,event_id FROM board_projection_outbox WHERE operation='create_microticket' AND terminal_error IS NULL AND acknowledged_at IS NULL AND superseded_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) AND (lease_expires_at IS NULL OR lease_expires_at<=?) ORDER BY queued_at LIMIT 1",(now,now)).fetchone()
+            row=conn.execute("SELECT ticket_id,event_id FROM board_projection_outbox WHERE operation='create_microticket' AND terminal_error IS NULL AND acknowledged_at IS NULL AND superseded_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) AND (lease_expires_at IS NULL OR lease_expires_at<=?) AND (? IS NULL OR ticket_id=?) ORDER BY queued_at LIMIT 1",(now,now,ticket_id,ticket_id)).fetchone()
             if not row:return None
             changed=conn.execute("UPDATE board_projection_outbox SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1 WHERE ticket_id=? AND event_id=? AND operation='create_microticket' AND terminal_error IS NULL AND acknowledged_at IS NULL AND superseded_at IS NULL AND (lease_expires_at IS NULL OR lease_expires_at<=?)",(owner,now+lease_seconds,row['ticket_id'],row['event_id'],now))
             if not changed.rowcount:return None
@@ -6320,14 +6482,14 @@ class Ledger:
             )
             return changed.rowcount == 1
 
-    def claim_next_state_projection(self, owner: str, *, lease_seconds: int = 60, now: int | None = None) -> dict[str, Any] | None:
+    def claim_next_state_projection(self, owner: str, *, lease_seconds: int = 60, now: int | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
         now = self._now() if now is None else now
         with self._transaction() as conn:
             row = conn.execute(
                 "SELECT ticket_id,event_id FROM board_projection_outbox WHERE operation='set_state' AND acknowledged_at IS NULL "
                 "AND superseded_at IS NULL AND terminal_error IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?) "
-                "AND (lease_expires_at IS NULL OR lease_expires_at<=?) ORDER BY queued_at,event_id LIMIT 1",
-                (now, now),
+                "AND (lease_expires_at IS NULL OR lease_expires_at<=?) AND (? IS NULL OR ticket_id=?) ORDER BY queued_at,event_id LIMIT 1",
+                (now, now, ticket_id, ticket_id),
             ).fetchone()
             if row is None:
                 return None

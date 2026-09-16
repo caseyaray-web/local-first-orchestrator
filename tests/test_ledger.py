@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -125,6 +126,85 @@ class LedgerTests(unittest.TestCase):
             "SELECT COUNT(*) FROM board_projections WHERE ticket_id = ?", (ticket,)
         ).fetchone()[0]
         self.assertEqual(acknowledgements, 1)
+
+    def test_reconcile_completed_duplicate_execution_terminalizes_generated_ticket(self) -> None:
+        contract = {
+            "objective": "same bounded work",
+            "criterion_ids": ["A"],
+            "primary_symbol": "app.py::run",
+            "allowed_files": ["app.py"],
+            "forbidden_changes": ["no secrets"],
+            "patch_budget": {"max_files": 1, "max_changed_lines": 20, "exception_reason": None},
+            "verification": {"commands": [["python", "-m", "compileall", "app.py"]], "working_directory": "."},
+            "risk": "medium",
+            "review_required": True,
+            "max_attempts": 2,
+            "dependencies": [],
+            "new_test_files": [],
+            "create_files": [],
+        }
+        planning = self.db.create_ticket(title="TK-1", state=CanonicalState.READY_LOCAL, contract=contract)
+        execution_contract = dict(contract)
+        execution_contract["verification"] = {**contract["verification"], "timeout_seconds": 60, "output_limit": 20000}
+        execution = self.db.create_ticket(title="TK-1", state=CanonicalState.DONE, external_id="external-1", contract=execution_contract)
+        with self.db._transaction() as conn:
+            create_event = self.db._append_event(conn, entity_type="ticket", entity_id=planning, event_type="generated_microticket_created", actor_id="test", to_state="draft", payload={"ticket_id": planning})
+        self.db.enqueue_generated_create_projection(planning, create_event, {"ticket_id": planning}, "create-1")
+        self.db.connection.execute("UPDATE board_projection_outbox SET acknowledged_at=100,external_task_id='external-1' WHERE ticket_id=? AND event_id=? AND operation='create_microticket'", (planning, create_event))
+        self.db.record_accepted_evidence(execution, "a" * 40, json.dumps({"candidate_fingerprint": "b" * 64}), "validated")
+        with self.db._transaction() as conn:
+            done_event = self.db._append_event(conn, entity_type="ticket", entity_id=execution, event_type="state_transition", actor_id="test", from_state="accepted", to_state="done", payload={"reason": "test"})
+            self.db._enqueue_projection_bundle_in_transaction(conn, ticket_id=execution, event_id=done_event, evidence="done")
+        self.db.connection.execute("UPDATE board_projection_outbox SET acknowledged_at=101 WHERE ticket_id=? AND event_id=? AND operation='set_state'", (execution, done_event))
+        self.db.bind_runtime(planning, "/repo", "1" * 40)
+        self.db.connection.execute("INSERT INTO native_dependency_releases(ticket_id,graph_hash,child_external_id,parent_completion_hash,routing_authority_json,hermes_status,observed_at) VALUES (?,?,?,?,?,?,?)", (planning, "g" * 64, "external-1", "p" * 64, "{}", "ready", 100))
+        self.db.pause("operator", reason="reconcile duplicate")
+
+        result = self.db.reconcile_completed_duplicate_execution(planning, execution, operator_id="operator", reason="completed through imported execution")
+        self.assertEqual(result["status"], "reconciled")
+        self.assertEqual(self.db.get_ticket(planning)["state"], "done")
+        copied = self.db.connection.execute("SELECT * FROM accepted_evidence WHERE ticket_id=?", (planning,)).fetchone()
+        self.assertEqual(copied["accepted_commit_sha"], "a" * 40)
+        self.assertEqual(json.loads(copied["diff_summary"])["reconciled_execution_ticket_id"], execution)
+        pending_done = self.db.connection.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND operation='set_state' AND state='done'", (planning,)).fetchone()
+        self.assertEqual(pending_done["external_task_id"], "external-1")
+        self.assertIsNone(self.db.native_dependency_release_migration_required())
+        replay = self.db.reconcile_completed_duplicate_execution(planning, execution, operator_id="operator", reason="completed through imported execution")
+        self.assertEqual(replay["status"], "already_reconciled")
+
+    def test_reconcile_completed_duplicate_execution_rejects_explicit_verification_limit_drift(self) -> None:
+        contract = {
+            "objective": "same bounded work",
+            "criterion_ids": ["A"],
+            "primary_symbol": "app.py::run",
+            "allowed_files": ["app.py"],
+            "forbidden_changes": ["no secrets"],
+            "patch_budget": {"max_files": 1, "max_changed_lines": 20, "exception_reason": None},
+            "verification": {"commands": [["python", "-m", "compileall", "app.py"]], "working_directory": ".", "timeout_seconds": 5, "output_limit": 1024},
+            "risk": "medium",
+            "review_required": True,
+            "max_attempts": 2,
+            "dependencies": [],
+            "new_test_files": [],
+            "create_files": [],
+        }
+        planning = self.db.create_ticket(title="TK-limit", state=CanonicalState.READY_LOCAL, contract=contract)
+        execution_contract = dict(contract)
+        execution_contract["verification"] = {**contract["verification"], "timeout_seconds": 300, "output_limit": 1_000_000}
+        execution = self.db.create_ticket(title="TK-limit", state=CanonicalState.DONE, external_id="external-limit", contract=execution_contract)
+        with self.db._transaction() as conn:
+            create_event = self.db._append_event(conn, entity_type="ticket", entity_id=planning, event_type="generated_microticket_created", actor_id="test", to_state="draft", payload={"ticket_id": planning})
+        self.db.enqueue_generated_create_projection(planning, create_event, {"ticket_id": planning}, "create-limit")
+        self.db.connection.execute("UPDATE board_projection_outbox SET acknowledged_at=100,external_task_id='external-limit' WHERE ticket_id=? AND event_id=? AND operation='create_microticket'", (planning, create_event))
+        self.db.record_accepted_evidence(execution, "a" * 40, json.dumps({"candidate_fingerprint": "b" * 64}), "validated")
+        with self.db._transaction() as conn:
+            done_event = self.db._append_event(conn, entity_type="ticket", entity_id=execution, event_type="state_transition", actor_id="test", from_state="accepted", to_state="done", payload={"reason": "test"})
+            self.db._enqueue_projection_bundle_in_transaction(conn, ticket_id=execution, event_id=done_event, evidence="done")
+        self.db.connection.execute("UPDATE board_projection_outbox SET acknowledged_at=101 WHERE ticket_id=? AND event_id=? AND operation='set_state'", (execution, done_event))
+        self.db.pause("operator", reason="reconcile duplicate")
+
+        with self.assertRaisesRegex(ValueError, "verification_json"):
+            self.db.reconcile_completed_duplicate_execution(planning, execution, operator_id="operator", reason="must reject verification limit drift")
 
     def test_config_requires_distinct_ledger_database(self) -> None:
         with self.assertRaisesRegex(ValueError, "required"):

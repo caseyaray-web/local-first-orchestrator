@@ -7,7 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from .controller import LocalFirstController, RuntimeConfig
+from .controller import LocalFirstController, RuntimeConfig, compute_review_execution_policy_hash
 from .admission import FeatureAdmissionSpec
 from .decomposition_planner import LocalDecompositionPlanner, resolve_hermes_identity
 from .daemon import SchedulerDaemon
@@ -23,7 +23,7 @@ from .signer_enrollment import enroll_operator_signer
 from .runtime_metrics import RuntimeMetricsStore
 from .native_release_approval import parse_approval_document
 from .paid_model import HermesPaidModelAdapter
-from .scheduler import ProcessNextScheduler, preview_database, scheduler_observability
+from .scheduler import ProcessNextScheduler, preview_database, preview_ticket_database, scheduler_observability
 from .states import CanonicalState
 from .ticket import MicroTicket, PatchBudget, VerificationProfile
 from .triage import LocalTriagePlanner
@@ -206,6 +206,32 @@ def _board_for_cli(args: argparse.Namespace, allow_board_writes: bool, *, implem
 
 
 
+def _registered_preview_policy_hashes(config: OperatorConfig, args: argparse.Namespace) -> tuple[str, str | None]:
+    runtime = config.runtime_config()
+    local_review = config.local_review_registration
+    model = LocalQwenAdapter(
+        provider=config.implementation.provider,
+        model=config.implementation.model,
+        hermes_home=Path.home()/".hermes"/"profiles"/config.implementation.profile,
+        review_hermes_home=Path.home()/".hermes"/"profiles"/local_review.profile,
+        implementation_timeout_seconds=runtime.implementation_timeout_seconds,
+        review_timeout_seconds=runtime.review_timeout_seconds,
+    )
+    model.review_provider, model.review_model = local_review.provider, local_review.model
+    review_hash = compute_review_execution_policy_hash(model, runtime.review_timeout_seconds)
+    triage_route = dict(config.decomposition).get("local")
+    if triage_route is None:
+        return review_hash, None
+    triage_hash = LocalTriagePlanner(
+        executable=args.hermes_executable,
+        provider=triage_route.provider,
+        model=triage_route.model,
+        profile=triage_route.profile,
+        timeout_seconds=runtime.review_timeout_seconds,
+    ).execution_policy_hash()
+    return review_hash, triage_hash
+
+
 def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace) -> ProcessNextScheduler:
     ctl, registered = _registered_controller(ledger,args,allow_board_writes=True)
     triage_route = dict(registered.decomposition).get("local")
@@ -236,9 +262,12 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         timeout_seconds=ctl.config.review_timeout_seconds,
     )
     successor_route = dict(registered.decomposition).get("standard")
+    target_ticket_id = getattr(args, "ticket_id", None)
 
     def reconcile_hermes_owned_execution() -> dict[str, Any] | None:
         for candidate in ledger.hermes_execution_candidates():
+            if target_ticket_id is not None and str(candidate["ticket_id"]) != target_ticket_id:
+                continue
             external_task_id = str(candidate["external_task_id"])
             try:
                 return ctl.reconcile_hermes_execution(external_task_id, require_handoff=True)
@@ -254,7 +283,7 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         return None
 
     def activate_generated_work() -> dict[str, Any] | None:
-        candidates = ledger.generated_activation_candidates()
+        candidates = [row for row in ledger.generated_activation_candidates() if target_ticket_id is None or str(row["ticket_id"]) == target_ticket_id]
         if not candidates:
             return None
         ticket_id = str(candidates[0]["ticket_id"])
@@ -345,6 +374,7 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         ledger,
         ctl.board,
         worker_id=args.worker_id,
+        target_ticket_id=target_ticket_id,
         lease_seconds=ctl.config.lease_seconds,
         hermes_execution_runner=reconcile_hermes_owned_execution,
         generated_activation_runner=activate_generated_work,
@@ -501,6 +531,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     process_next.add_argument("--allow-board-writes", action="store_true")
     process_next.add_argument("--worker-id", default="local-first-process-next")
     process_next.add_argument("--planner-executable", default="hermes")
+    process_next.add_argument("--ticket-id", help="scope this scheduler tick to exactly one ticket; tranche-wide stages are suppressed")
     daemon=commands.add_parser("daemon", help="repeatedly invoke the proven one-tick scheduler primitive")
     daemon.add_argument("--execute", action="store_true")
     daemon.add_argument("--allow-board-writes", action="store_true")
@@ -651,7 +682,19 @@ def run_command(args: argparse.Namespace) -> int:
         if args.ad_hoc_runtime: raise ValueError("process-next requires registered operator runtime")
         registered = load_operator_config(Path(args.operator_config_path) if args.operator_config_path else None)
         board = _board_for_cli(args, False, implementation_profile=registered.implementation.profile, canonical_repository=registered.canonical_repository)
-        print(json.dumps(asdict(preview_database(Path(args.database), operator_config=registered, board=board)),sort_keys=True))
+        if not getattr(args, "ticket_id", None):
+            preview = preview_database(Path(args.database), operator_config=registered, board=board)
+        else:
+            review_hash, triage_hash = _registered_preview_policy_hashes(registered, args)
+            preview = preview_ticket_database(
+                Path(args.database),
+                str(args.ticket_id),
+                operator_config=registered,
+                board=board,
+                review_execution_policy_hash=review_hash,
+                triage_execution_policy_hash=triage_hash,
+            )
+        print(json.dumps(asdict(preview),sort_keys=True))
         return 0
     ledger=_ledger(args.database)
     try:

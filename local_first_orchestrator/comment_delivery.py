@@ -76,13 +76,13 @@ class CommentDeliveryWorker:
     def _fault(self, stage: str) -> None:
         if self.fault_injector: self.fault_injector(stage)
 
-    def deliver_one(self) -> CommentDeliveryResult:
+    def deliver_one(self, *, ticket_id: str | None = None) -> CommentDeliveryResult:
         if not self.policy.writes_enabled or not bool(getattr(self.adapter, "writes_enabled", True)):
             return CommentDeliveryResult("writes_disabled")
 
         now = int(self.clock())
-        self.ledger.recover_expired_comment_leases(now=now)
-        row = self.ledger.claim_next_comment(self.worker_id, lease_seconds=self.policy.lease_seconds, now=now)
+        self.ledger.recover_expired_comment_leases(now=now, ticket_id=ticket_id)
+        row = self.ledger.claim_next_comment(self.worker_id, lease_seconds=self.policy.lease_seconds, now=now, ticket_id=ticket_id)
         if row is None:
             return CommentDeliveryResult("no_work")
 

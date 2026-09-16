@@ -152,6 +152,25 @@ class InjectedCrash(RuntimeError):
     """Test-only crash marker; completed stages remain resumable."""
 
 
+def compute_review_execution_policy_hash(local_model: Any, review_timeout_seconds: int) -> str:
+    """Pure review execution-policy hash shared by execution and dry-run preview."""
+    review_home = Path(getattr(local_model, "review_hermes_home", ""))
+    if not review_home.name:
+        provider = str(getattr(local_model, "review_provider", getattr(local_model, "provider", type(local_model).__name__)))
+        model = str(getattr(local_model, "review_model", getattr(local_model, "model", type(local_model).__name__)))
+        execution_identity = {"profile": None, "provider": provider, "model": model, "routing_files": {}, "fingerprint": hashlib.sha256(f"{provider}\0{model}".encode()).hexdigest()}
+    else:
+        executable = str(getattr(local_model, "executable", "hermes"))
+        execution_identity = review_profile_identity(review_home.name, executable=executable, profile_root=review_home)
+    policy = {
+        "execution_identity": execution_identity,
+        "timeout_seconds": int(review_timeout_seconds),
+        "schema": REVIEW_JSON_SCHEMA,
+        "review_mode": "packet-only",
+    }
+    return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 class LocalFirstController:
     def __init__(self, ledger: Ledger, board: Any, config: RuntimeConfig, *, local_model: LocalQwenAdapter | None = None, fault_injector: Callable[[str], None] | None = None) -> None:
         if getattr(board, "is_fake", False): raise ValueError("production controller refuses FakeBoardAdapter")
@@ -1982,13 +2001,7 @@ class LocalFirstController:
 
     def review_execution_policy_hash(self) -> str:
         """Hash the live review profile identity used for claim-time binding."""
-        policy = {
-            "execution_identity": self.review_execution_identity(),
-            "timeout_seconds": self.config.review_timeout_seconds,
-            "schema": REVIEW_JSON_SCHEMA,
-            "review_mode": "packet-only",
-        }
-        return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return compute_review_execution_policy_hash(self.local_model, self.config.review_timeout_seconds)
 
     def execute_fresh_review_only(self, ticket_id: str, *, repository: Path) -> dict[str, object]:
         """Persist one scheduler-claimed packet-only review, without disposition."""

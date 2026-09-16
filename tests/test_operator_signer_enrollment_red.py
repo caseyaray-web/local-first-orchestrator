@@ -250,6 +250,25 @@ class OperatorSignerEnrollmentRedTests(unittest.TestCase):
         self.assertNotIn("signer enrollment reconciliation required", preview.blocker_reason or "")
         ledger.close(); tmp.cleanup()
 
+    def test_ticket_scoped_migration_ignores_unrelated_corrupt_signer_enrollment(self) -> None:
+        tmp, root, ledger, config_path, prepared, signature, public_b64, fingerprint, ticket = self._enrollment_fixture()
+        enroll_operator_signer(ledger, config_path=config_path, document=prepared["document"], detached_signature=signature, public_key_b64=public_b64, fingerprint=fingerprint)
+        unrelated = ledger.create_ticket(title="unrelated", state=CanonicalState.DRAFT, external_id="external-unrelated", contract={"objective":"u","criterion_ids":["AC-1"],"primary_symbol":"u","allowed_files":["README"],"forbidden_changes":[],"patch_budget":{"max_files":1,"max_changed_lines":1},"verification":{"commands":[]},"risk":"low","review_required":True,"max_attempts":1,"dependencies":[]})
+        ledger.connection.execute("DROP TRIGGER runtime_signer_enrollment_intents_immutable_identity")
+        ledger.connection.execute("UPDATE runtime_signer_enrollment_intents SET reason='forged-unrelated-corruption'")
+        ledger.connection.commit()
+
+        unscoped = ledger.native_dependency_release_migration_required(signer_public_key=base64.b64decode(public_b64), signer_fingerprint=fingerprint, config_path=config_path)
+        scoped_unrelated = ledger.native_dependency_release_migration_required(signer_public_key=base64.b64decode(public_b64), signer_fingerprint=fingerprint, config_path=config_path, ticket_id=unrelated)
+        scoped_original = ledger.native_dependency_release_migration_required(signer_public_key=base64.b64decode(public_b64), signer_fingerprint=fingerprint, config_path=config_path, ticket_id=ticket)
+
+        self.assertIsNotNone(unscoped)
+        self.assertTrue(unscoped["reason"].startswith("signer enrollment reconciliation required:"))
+        self.assertIsNone(scoped_unrelated)
+        self.assertIsNotNone(scoped_original)
+        self.assertTrue(scoped_original["reason"].startswith("signer enrollment reconciliation required:"))
+        ledger.close(); tmp.cleanup()
+
     def test_completion_event_document_and_signature_mutations_stop_enrollment(self) -> None:
         for field, value in (("document_json", "{}"), ("detached_signature", base64.b64encode(b"x" * 64).decode())):
             tmp, root, ledger, config_path, prepared, signature, public_b64, fingerprint, ticket = self._enrollment_fixture()
