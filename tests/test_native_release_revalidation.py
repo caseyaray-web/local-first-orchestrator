@@ -176,6 +176,18 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
             self.approval_cache[reason] = (document, signature)
         return self.controller.revalidate_native_release(self.ticket, operator_id="operator", reason=reason, implementation_profile="impl", approval_document=document, detached_signature=signature, signer_public_key=self.signer_public_key, signer_fingerprint=self.signer_fingerprint)
 
+    def test_revalidation_ignores_ambient_git_repository_redirection(self) -> None:
+        other = self.root / "other-repo"
+        other.mkdir()
+        subprocess.run(("git", "init", "-q"), cwd=other, check=True)
+        (other / "README").write_text("other\n", encoding="utf-8")
+        subprocess.run(("git", "add", "README"), cwd=other, check=True)
+        subprocess.run(("git", "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "other"), cwd=other, check=True)
+        with patch.dict(os.environ, {"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other)}):
+            result = self.signed_revalidate(reason="ignore ambient git redirection")
+        self.assertEqual(result["ticket_id"], self.ticket)
+        self.assertEqual(result["external_task_id"], self.external_id)
+
     def seed_run(self, *, status: str, outcome: str, summary: str, started_at: int | None, ended_at: int | None, profile: str | None = None, worker_pid: int | None = None, metadata: object = None) -> None:
         self._assert_parent_identity_unchanged()
         with self._open_board() as connection:
@@ -245,7 +257,8 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
             nonlocal swapped
             result = original_run(*args, **kwargs)
             cwd = kwargs.get("cwd")
-            if not swapped and cwd == self.worktree and args and args[0][0:2] == ("git", "rev-parse"):
+            command = tuple(args[0]) if args else tuple(kwargs.get("args") or ())
+            if not swapped and cwd == self.worktree and "rev-parse" in command:
                 swapped = True
                 shutil.rmtree(self.worktree)
                 self.worktree.mkdir()

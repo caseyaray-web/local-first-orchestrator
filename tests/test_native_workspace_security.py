@@ -49,6 +49,15 @@ class NativeWorkspaceAdministrativePinTests(unittest.TestCase):
                     self._add_worktree(pin)
         self.assertTrue(swapped)
 
+    def test_worktree_add_does_not_execute_repository_hooks(self) -> None:
+        marker = self.root / "hook-fired"
+        hook = self.repo / ".git" / "hooks" / "post-checkout"
+        hook.write_text(f"#!/bin/sh\nprintf fired > {marker}\n", encoding="utf-8")
+        hook.chmod(0o755)
+        with PinnedNativeWorkspace.open(self.repo, self.target) as pin:
+            self._add_worktree(pin)
+        self.assertFalse(marker.exists(), "repository-local post-checkout hook executed during worktree creation")
+
     def test_child_byte_copy_swap_before_target_git_fd_stops(self) -> None:
         with PinnedNativeWorkspace.open(self.repo, self.target) as pin:
             self._add_worktree(pin)

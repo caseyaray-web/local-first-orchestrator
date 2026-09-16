@@ -6,6 +6,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .git_security import safe_git_argv, safe_git_env
+
 
 @dataclass(frozen=True)
 class NativePathIdentity:
@@ -177,9 +179,9 @@ class PinnedNativeWorkspace:
         worktree_fd = self.target_fd if target else self.repository_fd
         if cwd_fd is None or worktree_fd is None:
             raise RuntimeError("native workspace STOP: target is not pinned")
-        command = ("git", f"--git-dir=/proc/self/fd/{git_fd}", f"--work-tree=/proc/self/fd/{worktree_fd}", *args)
+        command = safe_git_argv((f"--git-dir=/proc/self/fd/{git_fd}", f"--work-tree=/proc/self/fd/{worktree_fd}", *args))
         try:
-            result = subprocess.run(command, cwd=f"/proc/self/fd/{cwd_fd}", pass_fds=tuple({git_fd, cwd_fd, worktree_fd}),
+            result = subprocess.run(command, cwd=f"/proc/self/fd/{cwd_fd}", env=safe_git_env(), pass_fds=tuple({git_fd, cwd_fd, worktree_fd}),
                                     text=True, capture_output=True, timeout=30, check=check)
         except subprocess.CalledProcessError as exc:
             raise RuntimeError(exc.stderr.strip() or exc.stdout.strip() or "Git command failed") from exc

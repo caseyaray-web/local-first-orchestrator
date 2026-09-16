@@ -19,6 +19,7 @@ from .admission import FeatureAdmissionResult, FeatureAdmissionSpec
 from .context_packet import ContextPacketBuilder
 from .evidence_hash import canonical_sha256
 from .git_adapter import AttemptWorktree, GitWorktreeAdapter
+from .git_security import safe_git_argv, safe_git_env
 from .historical_revalidation import attestation_hash_from_row, authorization_hash_from_row, classify_obsolete_validation_failure, derive_obsolete_validation_failure, historical_validation_result_hash
 from .execution_handoff import HANDOFF_SENTINEL
 from .ledger import Ledger, _completion_evidence_hash, _recheck_evidence_hash
@@ -217,7 +218,7 @@ class LocalFirstController:
         def git(*args: str) -> str:
             assert_stable()
             try:
-                result = subprocess.run(("git", *args), cwd=expected_path, text=True, capture_output=True, check=True, timeout=15)
+                result = subprocess.run(safe_git_argv(args), cwd=expected_path, env=safe_git_env(), text=True, capture_output=True, check=True, timeout=15)
             except (OSError, subprocess.SubprocessError) as exc:
                 raise RuntimeError("native release revalidation worktree verification failed") from exc
             assert_stable()

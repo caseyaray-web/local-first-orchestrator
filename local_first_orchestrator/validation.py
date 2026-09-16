@@ -10,6 +10,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .git_security import safe_git_argv, safe_git_env
+
 from .ticket import MicroTicket, declared_ticket_paths
 from .source_languages import is_supported_source, is_test_path, normalized_repository_path
 from .symbols import contract_target_scope, enforce_symbol_scope
@@ -79,11 +81,8 @@ class DeterministicValidator:
 
     def _git(self, path: Path, *args: str) -> str:
         """Run bounded, non-interactive internal Git inspection only."""
-        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat", "PAGER": "cat", "LESS": "FRX"}
-        safe_args = args
-        if args and args[0] == "diff":
-            safe_args = ("diff", "--no-ext-diff", "--no-textconv", *args[1:])
-        argv = ("git", "--no-pager", "-c", "core.pager=cat", "-c", "diff.external=false", *safe_args)
+        env = safe_git_env()
+        argv = safe_git_argv(args)
         try:
             completed = subprocess.run(argv, cwd=path, env=env, text=True, capture_output=True, timeout=15, check=False)
         except subprocess.TimeoutExpired as exc:
