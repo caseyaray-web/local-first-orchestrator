@@ -10,7 +10,7 @@ from unittest import mock
 
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
 from local_first_orchestrator.hermes_board import ExternalTicket
-from local_first_orchestrator.ledger import Ledger
+from local_first_orchestrator.ledger import Ledger, canonical_sha256
 from local_first_orchestrator.states import CanonicalState
 
 
@@ -86,6 +86,59 @@ class AcceptanceOnlyTests(unittest.TestCase):
         self.assertEqual(self.git_w(worktree, "diff", "--name-only", self.base, "HEAD"), "app.py")
         self.assertEqual(self.ledger.connection.execute("select count(*) from accepted_evidence where ticket_id=?", (self.ticket,)).fetchone()[0], 1)
         self.assertEqual(self.model.calls, ["implementation"])
+
+    def _convert_implementation_to_hermes_reconciliation(self) -> Path:
+        attempt = self.ledger.connection.execute("select * from attempts where ticket_id=? and attempt_number=1", (self.ticket,)).fetchone()
+        impl = self.ledger.model_stage(self.ticket, 1, "implementation")
+        candidate = self.ledger.review_candidate(self.ticket, 1)
+        self.assertIsNotNone(attempt); self.assertIsNotNone(impl); self.assertIsNotNone(candidate)
+        payload = {
+            "external_task_id": "accept-fixture",
+            "hermes_run_id": "hermes-run",
+            "attempt_number": 1,
+            "workspace_path": str(attempt["worktree_path"]),
+            "base_sha": self.base,
+            "diff_hash": str(impl["diff_hash"]),
+            "run_status": "completed",
+            "run_outcome": "success",
+        }
+        artifact = self.root / "hermes-reconciliation.json"
+        artifact.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        snapshot_hash = canonical_sha256(payload)
+        self.ledger.connection.execute("update tickets set state='implementing' where id=?", (self.ticket,))
+        self.ledger.connection.execute("delete from model_invocations where ticket_id=? and attempt_number=1 and stage='implementation'", (self.ticket,))
+        self.ledger.connection.execute("delete from model_stage_artifacts where ticket_id=? and attempt_number=1 and stage='implementation'", (self.ticket,))
+        self.ledger.connection.execute("update attempts set post_diff_hash=? where ticket_id=? and attempt_number=1", (str(impl["diff_hash"]), self.ticket))
+        self.ledger.record_hermes_execution_reconciliation(
+            external_task_id="accept-fixture", hermes_run_id=17, ticket_id=self.ticket, attempt_number=1,
+            run_status="completed", run_outcome="success", session_id=None, branch_name=str(attempt["branch"]),
+            workspace_path=str(attempt["worktree_path"]), base_sha=self.base, head_sha=self.base, diff_hash=str(impl["diff_hash"]),
+            artifact_path=str(artifact), snapshot_hash=snapshot_hash,
+        )
+        self.ledger.connection.execute("update tickets set state='local_review' where id=?", (self.ticket,))
+        self.ledger.connection.execute(
+            "update model_stage_artifacts set adapter='hermes-dispatch' where ticket_id=? and attempt_number=1 and stage='implementation'",
+            (self.ticket,),
+        )
+        self.ledger.connection.execute(
+            "update review_candidates set implementation_invocation_id=? where ticket_id=? and attempt_number=1",
+            ("hermes-run:accept-fixture:17", self.ticket),
+        )
+        return artifact
+
+    def test_accepts_valid_reconciled_hermes_implementation_without_model_invocation(self):
+        self._convert_implementation_to_hermes_reconciliation()
+        result = self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)
+        self.assertEqual(result["status"], "accepted")
+        evidence = self.ledger.connection.execute("select diff_summary from accepted_evidence where ticket_id=?", (self.ticket,)).fetchone()
+        self.assertIn("hermes-run:accept-fixture:17", str(evidence["diff_summary"]))
+        self.assertEqual(self.ledger.connection.execute("select count(*) from model_invocations where ticket_id=? and stage='implementation'", (self.ticket,)).fetchone()[0], 0)
+
+    def test_rejects_tampered_reconciled_hermes_artifact(self):
+        artifact = self._convert_implementation_to_hermes_reconciliation()
+        artifact.write_text(json.dumps({"tampered": True}), encoding="utf-8")
+        with self.assertRaisesRegex(PermissionError, "artifact integrity"):
+            self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)
 
     def test_replay_is_idempotent_and_does_not_integrate(self):
         first = self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)

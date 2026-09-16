@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import hashlib
+import json
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -84,6 +86,54 @@ class ManualAdoptionTests(unittest.TestCase):
         candidate = self.ledger.connection.execute("SELECT * FROM review_candidates WHERE ticket_id=? AND attempt_number=1", (self.ticket_id,)).fetchone()
         self.assertIsNotNone(candidate)
         self.assertTrue(str(candidate["implementation_invocation_id"]).startswith("manual-adoption:"))
+
+    def test_persisted_review_application_includes_approved_untracked_manual_adoption_files(self) -> None:
+        adopted = self.controller.adopt_existing_implementation(
+            self.ticket_id, repository=self.repo, operator_id="operator", reason="candidate with approved untracked test"
+        )
+        self.ledger.resume("operator", reason="validate candidate before persisted review")
+        validation_claim = self.ledger.claim_next_scheduler_validation("validator", lease_seconds=60)
+        self.assertIsNotNone(validation_claim)
+        self.ledger.begin_scheduler_claim_effect(str(validation_claim["claim_id"]), "validator")
+        validation = self.controller.execute_deterministic_validation_only(self.ticket_id, repository=self.repo)
+        self.ledger.complete_scheduler_validation_effect(str(validation_claim["claim_id"]), "validator", validation)
+        self.assertTrue(validation["passed"], validation)
+        review_claim = self.ledger.claim_next_scheduler_review("reviewer", lease_seconds=60, review_execution_policy_hash="review-policy")
+        self.assertIsNotNone(review_claim)
+        candidate = self.ledger.review_candidate(self.ticket_id, 1)
+        self.assertIsNotNone(candidate)
+
+        artifact = self.root / "persisted-review.json"
+        artifact.write_text(json.dumps({"payload": {"verdict": "pass", "criterion_results": [{"criterion_id": "AC-1", "status": "pass", "evidence": "verified"}], "findings": [], "suggestions": []}}, sort_keys=True), encoding="utf-8")
+        self.assertTrue(self.ledger.record_model_stage(
+            self.ticket_id, 1, "review", purpose="review", adapter="test-review",
+            request_hash=hashlib.sha256(b"packet").hexdigest(), response_artifact=str(artifact),
+            worktree_path="packet-only", base_sha=self.base, diff_hash=str(adopted["diff_hash"]),
+        ))
+        self.ledger.pause("operator", reason="apply persisted review only")
+        applied = self.controller.apply_persisted_review_only(self.ticket_id, 1, repository=self.repo)
+        self.assertEqual(applied["verdict"], "pass")
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM review_results WHERE ticket_id=? AND attempt_number=1", (self.ticket_id,)).fetchone()[0], 1)
+        self.assertTrue((self.worktree / "test_app.py").is_file())
+        self.assertIn("?? test_app.py", subprocess.run(("git", "status", "--porcelain=v1", "--untracked-files=all"), cwd=self.worktree, text=True, capture_output=True, check=True).stdout)
+        accepted = self.controller.accept_reviewed_candidate_only(self.ticket_id, 1, repository=self.repo)
+        self.assertEqual(subprocess.run(("git", "rev-parse", "HEAD^"), cwd=self.worktree, text=True, capture_output=True, check=True).stdout.strip(), self.base)
+        self.assertEqual(accepted["accepted_commit_sha"], subprocess.run(("git", "rev-parse", "HEAD"), cwd=self.worktree, text=True, capture_output=True, check=True).stdout.strip())
+        committed_files = set(subprocess.run(("git", "diff", "--name-only", self.base, "HEAD"), cwd=self.worktree, text=True, capture_output=True, check=True).stdout.splitlines())
+        self.assertEqual(committed_files, {"app.py", "test_app.py"})
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM model_invocations WHERE ticket_id=? AND stage='implementation'", (self.ticket_id,)).fetchone()[0], 0)
+        evidence = self.ledger.connection.execute("SELECT diff_summary FROM accepted_evidence WHERE ticket_id=?", (self.ticket_id,)).fetchone()
+        self.assertIsNotNone(evidence)
+        self.assertIn("manual-adoption:", str(evidence["diff_summary"]))
+        self.assertEqual(subprocess.run(("git", "status", "--porcelain=v1", "--untracked-files=all"), cwd=self.worktree, text=True, capture_output=True, check=True).stdout, "")
+        self.ledger.connection.execute("insert into features(id,title,status,created_at,updated_at) values ('manual-feature','manual','active',0,0)")
+        self.ledger.connection.execute("insert into tranches(id,feature_id,ordinal,status,base_sha) values ('manual-tranche','manual-feature',0,'active',?)", (self.base,))
+        self.ledger.connection.execute("update tickets set feature_id='manual-feature', tranche_id='manual-tranche' where id=?", (self.ticket_id,))
+        subprocess.run(("git", "update-ref", "refs/local-first/tranches/manual-tranche/integration-head", self.base), cwd=self.repo, check=True)
+        integrated = self.controller.integrate_accepted_candidate_only(self.ticket_id, 1, repository=self.repo)
+        self.assertEqual(integrated["status"], "integrated")
+        self.assertEqual(integrated["integration_head"], accepted["accepted_commit_sha"])
+        self.assertEqual(subprocess.run(("git", "rev-parse", "refs/local-first/tranches/manual-tranche/integration-head"), cwd=self.repo, text=True, capture_output=True, check=True).stdout.strip(), accepted["accepted_commit_sha"])
 
     def test_started_review_claim_can_fail_and_be_reissued_under_new_policy(self) -> None:
         self.controller.adopt_existing_implementation(
