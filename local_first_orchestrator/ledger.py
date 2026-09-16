@@ -1362,6 +1362,81 @@ class Ledger:
         return ticket_id
 
     def get_ticket(self, ticket_id: str) -> dict[str, Any]:
+        return ticket_id
+
+    def admit_imported_ticket(
+        self, *, title: str, external_id: str, contract: dict[str, Any],
+        repository_path: str, starting_sha: str, feature_id: str | None = None,
+        tranche_id: str | None = None, operator_signer_fingerprint: str | None = None,
+        operator_authority_hash: str | None = None,
+    ) -> str:
+        """Atomically admit one external ticket and bind its immutable runtime identity."""
+        if not external_id or not repository_path or not starting_sha:
+            raise ValueError("imported ticket identity is incomplete")
+        requested_binding = (
+            str(repository_path), str(starting_sha), str(starting_sha), 1,
+            operator_signer_fingerprint, operator_authority_hash,
+        )
+        now = self._now()
+        with self._transaction() as conn:
+            resolved_feature = feature_id
+            if tranche_id is not None:
+                tranche = conn.execute("SELECT id, feature_id FROM tranches WHERE id=?", (tranche_id,)).fetchone()
+                if tranche is None:
+                    raise ValueError("card tranche_id does not exist")
+                tranche_feature = str(tranche["feature_id"])
+                if resolved_feature is not None and resolved_feature != tranche_feature:
+                    raise ValueError("card tranche_id does not belong to feature_id")
+                resolved_feature = resolved_feature or tranche_feature
+            if resolved_feature is not None:
+                feature = conn.execute("SELECT id FROM features WHERE id=?", (resolved_feature,)).fetchone()
+                if feature is None:
+                    raise ValueError("card feature_id does not exist")
+
+            existing = conn.execute("SELECT * FROM tickets WHERE external_id=?", (external_id,)).fetchone()
+            if existing is None:
+                ticket_id = uuid.uuid4().hex
+                conn.execute(
+                    "INSERT INTO tickets(id, external_id, feature_id, tranche_id, title, objective, criterion_ids_json, primary_symbol, allowed_files_json, create_files_json, new_test_files_json, forbidden_changes_json, patch_budget_json, verification_json, risk, review_required, max_attempts, dependencies_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        ticket_id, external_id, resolved_feature, tranche_id, title,
+                        contract.get("objective"), json.dumps(contract.get("criterion_ids", [])), contract.get("primary_symbol"),
+                        json.dumps(contract.get("allowed_files", [])), json.dumps(contract.get("create_files", [])),
+                        json.dumps(contract.get("new_test_files", [])), json.dumps(contract.get("forbidden_changes", [])),
+                        json.dumps(contract.get("patch_budget", {})), json.dumps(contract.get("verification", {})),
+                        contract.get("risk"), int(contract.get("review_required", True)), contract.get("max_attempts", 2),
+                        json.dumps(contract.get("dependencies", [])), CanonicalState.READY_LOCAL.value, now, now,
+                    ),
+                )
+            else:
+                ticket_id = str(existing["id"])
+                existing_feature = None if existing["feature_id"] is None else str(existing["feature_id"])
+                existing_tranche = None if existing["tranche_id"] is None else str(existing["tranche_id"])
+                if existing_feature not in {None, resolved_feature} or existing_tranche not in {None, tranche_id}:
+                    raise ValueError("card feature/tranche identity conflicts with existing ticket")
+                if (existing_feature is not None and resolved_feature is None) or (existing_tranche is not None and tranche_id is None):
+                    raise ValueError("card feature/tranche identity conflicts with existing ticket")
+                conn.execute(
+                    "UPDATE tickets SET feature_id=COALESCE(feature_id,?), tranche_id=COALESCE(tranche_id,?) WHERE id=?",
+                    (resolved_feature, tranche_id, ticket_id),
+                )
+
+            binding = conn.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if binding is None:
+                conn.execute(
+                    "INSERT INTO runtime_bindings(ticket_id, repository_path, starting_sha, canonical_sha, ownership_verified, created_at, operator_signer_fingerprint, operator_authority_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ticket_id, requested_binding[0], requested_binding[1], requested_binding[2], requested_binding[3], now, requested_binding[4], requested_binding[5]),
+                )
+            else:
+                actual = (
+                    str(binding["repository_path"]), str(binding["starting_sha"]), str(binding["canonical_sha"]),
+                    int(binding["ownership_verified"]), binding["operator_signer_fingerprint"], binding["operator_authority_hash"],
+                )
+                if actual != requested_binding:
+                    raise ValueError("conflicting runtime binding")
+            return ticket_id
+
+    def get_ticket(self, ticket_id: str) -> dict[str, Any]:
         row = self.connection.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
         if row is None:
             raise KeyError(ticket_id)
@@ -1632,6 +1707,80 @@ class Ledger:
             )
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="hermes_execution_reconciled", actor_id="controller", payload={"external_task_id": external_task_id, "hermes_run_id": hermes_run_id, "attempt_number": attempt_number, "snapshot_hash": snapshot_hash, "diff_hash": diff_hash})
             return dict(conn.execute("SELECT * FROM hermes_execution_reconciliations WHERE external_task_id=? AND hermes_run_id=?", (external_task_id, hermes_run_id)).fetchone())
+
+    def record_manual_implementation_adoption(
+        self, *, ticket_id: str, attempt_number: int, operator_id: str, reason: str,
+        branch: str, workspace_path: str, base_sha: str, diff_hash: str,
+        artifact_path: str, artifact_sha256: str,
+    ) -> dict[str, Any]:
+        """Durably adopt an existing implementation without inventing model/worker provenance."""
+        if not operator_id.strip() or not reason.strip():
+            raise ValueError("manual adoption requires operator identity and reason")
+        if attempt_number < 1 or not all(isinstance(value, str) and value for value in (branch, workspace_path, base_sha, diff_hash, artifact_path, artifact_sha256)):
+            raise ValueError("manual adoption identity is incomplete")
+        detail = json.dumps({
+            "schema": "manual-implementation-adoption/v1",
+            "ticket_id": ticket_id,
+            "attempt_number": attempt_number,
+            "operator_id": operator_id,
+            "reason": reason,
+            "branch": branch,
+            "workspace_path": workspace_path,
+            "base_sha": base_sha,
+            "diff_hash": diff_hash,
+            "artifact_path": artifact_path,
+            "artifact_sha256": artifact_sha256,
+        }, sort_keys=True, separators=(",", ":"))
+        empty_hash = hashlib.sha256(b"").hexdigest()
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not paused["paused"]:
+                raise PermissionError("manual implementation adoption requires Local First paused")
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None:
+                raise KeyError(ticket_id)
+            existing_stage = conn.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='implementation'", (ticket_id, attempt_number)).fetchone()
+            existing_adoption = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"manual-adoption-{attempt_number}" )).fetchone()
+            if existing_stage is not None or existing_adoption is not None:
+                if existing_stage is None or existing_adoption is None:
+                    raise RuntimeError("manual_adoption_reconciliation_required: partial durable adoption")
+                expected_stage = ("manual-adoption", artifact_sha256, artifact_path, workspace_path, base_sha, diff_hash)
+                actual_stage = tuple(existing_stage[key] for key in ("adapter", "request_hash", "response_artifact", "worktree_path", "base_sha", "diff_hash"))
+                if actual_stage != expected_stage or str(existing_adoption["detail"]) != detail or str(existing_adoption["artifact_sha256"] or "") != artifact_sha256:
+                    raise RuntimeError("manual_adoption_reconciliation_required: identity conflict")
+                return {"ticket_id": ticket_id, "attempt_number": attempt_number, "status": "already_adopted", "detail": detail}
+            if ticket["state"] != CanonicalState.READY_LOCAL.value:
+                raise RuntimeError("manual adoption requires ready_local ticket")
+            if conn.execute("SELECT 1 FROM attempts WHERE ticket_id=?", (ticket_id,)).fetchone():
+                raise RuntimeError("manual adoption requires ticket with no prior attempts")
+            if conn.execute("SELECT 1 FROM model_invocations WHERE ticket_id=?", (ticket_id,)).fetchone():
+                raise RuntimeError("manual adoption refuses tickets with model invocation history")
+            if conn.execute("SELECT 1 FROM accepted_evidence WHERE ticket_id=?", (ticket_id,)).fetchone():
+                raise RuntimeError("manual adoption refuses accepted ticket")
+            now = self._now()
+            conn.execute(
+                "INSERT INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,post_diff_hash,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (ticket_id, attempt_number, base_sha, branch, workspace_path, empty_hash, diff_hash, now),
+            )
+            conn.execute(
+                "INSERT INTO model_stage_artifacts(ticket_id,attempt_number,stage,purpose,adapter,request_hash,response_artifact,worktree_path,base_sha,diff_hash,completed_at,status) VALUES (?,?,'implementation','implementation','manual-adoption',?,?,?,?,?,?,'completed')",
+                (ticket_id, attempt_number, artifact_sha256, artifact_path, workspace_path, base_sha, diff_hash, now),
+            )
+            conn.execute(
+                "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (ticket_id, f"manual-adoption-{attempt_number}", detail, attempt_number, artifact_path, artifact_sha256, base_sha, now),
+            )
+            conn.execute(
+                "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (ticket_id, f"implementation-{attempt_number}", detail, attempt_number, artifact_path, artifact_sha256, base_sha, now),
+            )
+            conn.execute(
+                "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (ticket_id, "implementation_completed", detail, attempt_number, artifact_path, artifact_sha256, base_sha, now),
+            )
+            conn.execute("UPDATE tickets SET state=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=?", (CanonicalState.IMPLEMENTING.value, now, ticket_id))
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="manual_implementation_adopted", actor_id=operator_id, from_state=CanonicalState.READY_LOCAL.value, to_state=CanonicalState.IMPLEMENTING.value, payload={"attempt_number": attempt_number, "reason": reason, "artifact_sha256": artifact_sha256, "diff_hash": diff_hash})
+            return {"ticket_id": ticket_id, "attempt_number": attempt_number, "status": "adopted", "detail": detail}
 
     def failed_attempt_reconciliation(self, ticket_id: str, retired_attempt_number: int | None = None) -> dict[str, Any] | None:
         query = "SELECT * FROM failed_attempt_reconciliations WHERE ticket_id=?"

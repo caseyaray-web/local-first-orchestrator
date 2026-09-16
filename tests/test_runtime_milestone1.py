@@ -39,9 +39,10 @@ class RuntimeMilestoneTests(unittest.TestCase):
         (root / "README.md").write_text("fixture\n")
         subprocess.run(("git","add","."),cwd=root,text=True,capture_output=True,check=True)
         subprocess.run(("git","commit","-m","fixture"),cwd=root,text=True,capture_output=True,check=True)
+        self.base_sha=subprocess.run(("git","rev-parse","HEAD"),cwd=root,text=True,capture_output=True,check=True).stdout.strip()
         self.ledger=Ledger(root/"ledger.db"); self.ledger.migrate()
         body="<!-- local-first-orchestrator -->\n```local-first-contract\n"+json.dumps(contract())+"\n```"
-        self.fake=FakeHermes([{"id":"t1","title":"eligible","body":body,"status":"scheduled","workspace_path":None}])
+        self.fake=FakeHermes([{"id":"t1","title":"eligible","body":body,"status":"scheduled","workspace_path":None,"base_sha":self.base_sha}])
         self.board=HermesBoardAdapter(runner=self.fake, executable="/bin/true", board="test-board")
         self.controller=LocalFirstController(self.ledger,self.board,RuntimeConfig(root,root/"wt",root/"art"))
     def tearDown(self): self.ledger.close(); self.tmp.cleanup()
@@ -50,6 +51,59 @@ class RuntimeMilestoneTests(unittest.TestCase):
         self.assertEqual(first,second); self.assertEqual(self.ledger.status()["tickets"]["ready_local"],1)
         before=list(self.fake.calls); plan=self.controller.dry_run(first)
         self.assertEqual(before,self.fake.calls); self.assertFalse(plan["would_invoke_model"]); self.assertFalse(plan["would_write_board"]); self.assertFalse(plan["would_modify_repository"])
+    def test_import_preserves_card_pinned_base_after_repository_head_moves(self):
+        root=Path(self.tmp.name)
+        (root / "README.md").write_text("new head\n")
+        subprocess.run(("git","add","README.md"),cwd=root,check=True)
+        subprocess.run(("git","commit","-m","later"),cwd=root,text=True,capture_output=True,check=True)
+        self.assertNotEqual(subprocess.run(("git","rev-parse","HEAD"),cwd=root,text=True,capture_output=True,check=True).stdout.strip(), self.base_sha)
+        card=self.board.import_candidates()[0]
+        self.assertEqual(card.base_sha,self.base_sha)
+        ticket=self.controller.import_card(card)
+        self.assertEqual(self.ledger.runtime_binding(ticket)["starting_sha"],self.base_sha)
+
+    def test_native_import_uses_worktree_head_when_card_base_sha_is_missing(self):
+        root=Path(self.tmp.name)
+        native=root/".worktrees"/"t1"
+        native.parent.mkdir()
+        subprocess.run(("git","worktree","add","-q","-b","wt/t1",str(native),self.base_sha),cwd=root,check=True)
+        self.fake.rows[0]["workspace_path"]=str(native)
+        self.fake.rows[0]["workspace_kind"]="worktree"
+        self.fake.rows[0]["base_sha"]=None
+        (root / "README.md").write_text("later head\n")
+        subprocess.run(("git","add","README.md"),cwd=root,check=True)
+        subprocess.run(("git","commit","-m","later"),cwd=root,text=True,capture_output=True,check=True)
+        ticket=self.controller.import_card(self.board.get_task("t1"))
+        self.assertEqual(self.ledger.runtime_binding(ticket)["starting_sha"],self.base_sha)
+
+    def test_import_accepts_recovery_escaped_contract_and_preserves_graph_identity(self):
+        raw=contract() | {"repo_base_sha": self.base_sha, "feature_id": "C11", "tranche_id": "C11-T0"}
+        now=self.ledger._now()
+        with self.ledger._transaction() as conn:
+            conn.execute("INSERT INTO features(id,title,status,created_at,updated_at) VALUES ('C11','Feature','planned',?,?)", (now,now))
+            conn.execute("INSERT INTO tranches(id,feature_id,ordinal,status,base_sha) VALUES ('C11-T0','C11',0,'active',?)", (self.base_sha,))
+        self.fake.rows[0]["body"]="<!-- local-first-orchestrator -->\\n```local-first-contract\\n"+json.dumps(raw)+"\\n```"
+        self.fake.rows[0]["base_sha"]=None
+        ticket=self.controller.import_card(self.board.get_task("t1"))
+        row=self.ledger.get_ticket(ticket)
+        self.assertEqual(row["feature_id"],"C11")
+        self.assertEqual(row["tranche_id"],"C11-T0")
+        self.assertEqual(self.ledger.runtime_binding(ticket)["starting_sha"],self.base_sha)
+
+    def test_import_rejects_cross_feature_tranche_without_partial_ticket(self):
+        raw=contract() | {"repo_base_sha": self.base_sha, "feature_id": "C11", "tranche_id": "C12-T0"}
+        now=self.ledger._now()
+        with self.ledger._transaction() as conn:
+            conn.execute("INSERT INTO features(id,title,status,created_at,updated_at) VALUES ('C11','Feature 11','planned',?,?)", (now,now))
+            conn.execute("INSERT INTO features(id,title,status,created_at,updated_at) VALUES ('C12','Feature 12','planned',?,?)", (now,now))
+            conn.execute("INSERT INTO tranches(id,feature_id,ordinal,status,base_sha) VALUES ('C12-T0','C12',0,'active',?)", (self.base_sha,))
+        self.fake.rows[0]["body"]="<!-- local-first-orchestrator -->\n```local-first-contract\n"+json.dumps(raw)+"\n```"
+        self.fake.rows[0]["base_sha"]=None
+        with self.assertRaisesRegex(ValueError, "does not belong"):
+            self.controller.import_card(self.board.get_task("t1"))
+        self.assertIsNone(self.ledger.connection.execute("SELECT id FROM tickets WHERE external_id='t1'").fetchone())
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM runtime_bindings").fetchone()[0], 0)
+
     def test_rejects_ineligible_contract_and_cli_failures_closed(self):
         bad=type("Card",(),{"id":"bad","title":"bad","body":"<!-- local-first-orchestrator -->","status":"scheduled"})()
         with self.assertRaisesRegex(ValueError,"contract block"): self.controller.import_card(bad)

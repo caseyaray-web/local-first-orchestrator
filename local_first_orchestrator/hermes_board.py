@@ -307,7 +307,14 @@ class HermesBoardAdapter:
             body = str(row.get("body") or "")
             if "<!-- local-first-orchestrator -->" not in body:
                 continue
-            candidates.append(ExternalTicket(str(row["id"]), str(row.get("title") or ""), body, str(row.get("status") or ""), row.get("workspace_path")))
+            candidates.append(ExternalTicket(
+                str(row["id"]), str(row.get("title") or ""), body, str(row.get("status") or ""), row.get("workspace_path"),
+                assignee=None if row.get("assignee") is None else str(row["assignee"]),
+                workspace_kind=None if row.get("workspace_kind") is None else str(row["workspace_kind"]),
+                repository_identity=None if row.get("repository_identity") is None else str(row["repository_identity"]),
+                base_sha=None if row.get("base_sha") is None else str(row["base_sha"]),
+                raw=dict(row),
+            ))
         return candidates
 
     def find_comment_marker(self, external_task_id: str, marker: str) -> MarkerLookup:

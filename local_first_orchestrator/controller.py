@@ -9,6 +9,7 @@ import subprocess
 import shutil
 import sqlite3
 import time
+import tempfile
 import uuid
 import secrets
 from dataclasses import asdict, dataclass
@@ -37,6 +38,58 @@ from .validation import DeterministicValidator
 from .native_release_approval import APPROVAL_DOMAIN, ACTIVATION_DOMAIN, APPROVAL_VERSION, canonical_approval_bytes, canonical_activation_bytes, canonical_snapshot_json, snapshot_authority, parse_approval_document, validate_activation_continuation_snapshot, validate_activation_post_snapshot, verify_detached_signature, fingerprint_public_key
 from .native_workspace import PinnedNativeWorkspace, canonical_native_workspace_path, require_native_path_identity, validate_native_workspace_path
 from .worktree_lifecycle import cleanup_completed_worktree
+
+
+def _isolated_candidate_diff(path: Path, base_sha: str, *, allowed_new_paths: tuple[str, ...] = ()) -> dict[str, object]:
+    """Build a candidate diff including approved new files without mutating the real Git index."""
+    path = Path(path).resolve(strict=True)
+    with tempfile.TemporaryDirectory(prefix="local-first-index-") as temp_dir:
+        env = safe_git_env()
+        env["GIT_INDEX_FILE"] = str(Path(temp_dir) / "index")
+
+        def git(*args: str) -> str:
+            completed = subprocess.run(
+                safe_git_argv(args), cwd=path, env=env, text=True, capture_output=True,
+                check=True, timeout=30,
+            )
+            return completed.stdout
+
+        git("read-tree", base_sha)
+        untracked = tuple(item for item in git("ls-files", "--others", "--exclude-standard", "-z").split("\0") if item)
+        approved_new = tuple(sorted(set(untracked) & set(allowed_new_paths)))
+        if approved_new:
+            git("add", "-N", "--", *approved_new)
+        diff = git("diff", "--binary", base_sha, "--")
+        changed = tuple(item for item in git("diff", "--name-only", base_sha, "--").splitlines() if item)
+        numstat = git("diff", "--numstat", base_sha, "--")
+    return {
+        "diff": diff,
+        "diff_hash": hashlib.sha256(diff.encode()).hexdigest(),
+        "changed_paths": changed,
+        "numstat": numstat,
+        "untracked_paths": untracked,
+    }
+
+
+def _write_replayable_artifact(path: Path, encoded: str) -> str:
+    """Atomically persist an immutable artifact; exact crash-orphans are safe to replay."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if path.read_text(encoding="utf-8") != encoded:
+            raise RuntimeError("manual adoption artifact conflict")
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temp.open("x", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        if temp.exists():
+            temp.unlink()
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -109,27 +162,61 @@ class LocalFirstController:
         if self.fault_injector is not None:
             self.fault_injector(point)
 
-    def _parse_card(self, card: Any) -> MicroTicket:
+    def _card_contract_payload(self, card: Any) -> dict[str, Any]:
         if card.status != "scheduled": raise ValueError("ineligible card: status must be scheduled")
         if "<!-- local-first-orchestrator -->" not in card.body: raise ValueError("ineligible card: missing local-first ownership marker")
+        body = str(card.body)
         marker = "```local-first-contract\n"
-        if marker not in card.body: raise ValueError("ineligible card: missing local-first contract block")
-        try: raw = json.loads(card.body.split(marker, 1)[1].split("```", 1)[0])
+        escaped_marker = "```local-first-contract\\n"
+        if marker in body:
+            encoded = body.split(marker, 1)[1].split("```", 1)[0]
+        elif escaped_marker in body:
+            encoded = body.split(escaped_marker, 1)[1].split("\\n```", 1)[0]
+        else:
+            raise ValueError("ineligible card: missing local-first contract block")
+        try: raw = json.loads(encoded)
         except json.JSONDecodeError as exc: raise ValueError("ineligible card: malformed Qwen-ready contract") from exc
+        if not isinstance(raw, dict): raise ValueError("ineligible card: malformed Qwen-ready contract")
+        return raw
+
+    def _parse_card(self, card: Any) -> MicroTicket:
+        raw = self._card_contract_payload(card)
         required=("objective","criterion_ids","primary_symbol","allowed_files","forbidden_changes","patch_budget","verification","risk","review_required","max_attempts")
         missing=[key for key in required if key not in raw]
         if missing: raise ValueError("missing Qwen-ready fields: " + ", ".join(missing))
         return validate_ticket(MicroTicket(card.id,raw["objective"],tuple(raw["criterion_ids"]),raw["primary_symbol"],tuple(raw["allowed_files"]),tuple(raw["forbidden_changes"]),PatchBudget(**raw["patch_budget"]),VerificationProfile(tuple(tuple(x) for x in raw["verification"]["commands"]),raw["verification"].get("working_directory","."),int(raw["verification"].get("timeout_seconds",60)),int(raw["verification"].get("output_limit",20000))),raw["risk"],bool(raw["review_required"]),int(raw["max_attempts"]),tuple(raw.get("dependencies",())),tuple(raw.get("new_test_files",()))))
 
     def import_card(self, card: Any) -> str:
+        raw_contract = self._card_contract_payload(card)
         ticket=self._parse_card(card)
-        try: repo=self.config.canonical_repository(Path(card.workspace_path or self.config.repository))
+        try: repo=self.config.canonical_repository(self.config.repository)
         except FileNotFoundError as exc: raise ValueError("repository path does not exist") from exc
-        base=subprocess.run(("git","rev-parse","HEAD"),cwd=repo,text=True,capture_output=True,check=True).stdout.strip()
-        existing=self.ledger.connection.execute("SELECT id FROM tickets WHERE external_id=?",(card.id,)).fetchone()
-        ticket_id=str(existing["id"]) if existing else self.ledger.create_ticket(title=card.title,external_id=card.id,state=CanonicalState.READY_LOCAL,contract=ticket.contract())
-        self.ledger.bind_runtime(ticket_id,str(repo),base, operator_signer_fingerprint=self.config.operator_signer_fingerprint, operator_authority_hash=self.config.operator_authority_hash)
-        return ticket_id
+        native_workspace = None
+        workspace_path = getattr(card, "workspace_path", None)
+        workspace_kind = getattr(card, "workspace_kind", None)
+        if workspace_path and workspace_kind == "worktree":
+            native_workspace, _ = validate_native_workspace_path(workspace_path, repository=repo, external_task_id=str(card.id))
+        elif workspace_path:
+            legacy_workspace = Path(workspace_path).expanduser().resolve(strict=True)
+            if legacy_workspace != repo:
+                raise ValueError("legacy card workspace_path must resolve to canonical repository")
+        base = str(getattr(card, "base_sha", None) or raw_contract.get("repo_base_sha") or "").strip()
+        if not base:
+            base_cwd = native_workspace if native_workspace is not None else repo
+            base=subprocess.run(("git","rev-parse","HEAD"),cwd=base_cwd,text=True,capture_output=True,check=True).stdout.strip()
+        verify = subprocess.run(("git","cat-file","-e",f"{base}^{{commit}}"),cwd=repo,text=True,capture_output=True)
+        if verify.returncode != 0: raise ValueError("card base_sha is not a commit in canonical repository")
+        return self.ledger.admit_imported_ticket(
+            title=card.title,
+            external_id=str(card.id),
+            contract=ticket.contract(),
+            repository_path=str(repo),
+            starting_sha=base,
+            feature_id=None if raw_contract.get("feature_id") is None else str(raw_contract["feature_id"]),
+            tranche_id=None if raw_contract.get("tranche_id") is None else str(raw_contract["tranche_id"]),
+            operator_signer_fingerprint=self.config.operator_signer_fingerprint,
+            operator_authority_hash=self.config.operator_authority_hash,
+        )
 
     def import_scheduled_cards(self) -> list[str]: return [self.import_card(c) for c in self.board.import_candidates()]
 
@@ -820,6 +907,113 @@ class LocalFirstController:
         row=self.ledger.get_ticket(task_id); binding=self.ledger.runtime_binding(task_id)
         return {"ticket_id":task_id,"state":row["state"],"repository":binding["repository_path"],"starting_sha":binding["starting_sha"],"would_invoke_model":False,"would_write_board":False,"would_modify_repository":False}
 
+    def adopt_existing_implementation(self, ticket_id: str, *, repository: Path, operator_id: str, reason: str) -> dict[str, object]:
+        """Adopt a pre-existing native-worktree diff without claiming model or worker provenance."""
+        if not operator_id.strip() or not reason.strip():
+            raise ValueError("manual adoption requires operator identity and reason")
+        paused = self.ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+        if paused is None or not paused["paused"]:
+            raise PermissionError("manual implementation adoption requires Local First paused")
+        ticket_row = self.ledger.get_ticket(ticket_id)
+        if ticket_row["state"] not in {CanonicalState.READY_LOCAL.value, CanonicalState.IMPLEMENTING.value}:
+            raise RuntimeError("manual adoption requires ready_local ticket or exact replay")
+        binding = self.ledger.runtime_binding(ticket_id)
+        repo, worktree_root, artifact_root = self.config.validate_execution_roots()
+        if repo != Path(repository).resolve(strict=True) or str(repo) != str(binding["repository_path"]):
+            raise ValueError("repository mismatch with imported binding")
+        ticket = ticket_from_ledger(ticket_row)
+        external_task_id = self.ledger.resolve_external_task_id(ticket_id)
+        path, _ = validate_native_workspace_path(
+            canonical_native_workspace_path(repo, external_task_id), repository=repo, external_task_id=external_task_id
+        )
+        branch = f"wt/{external_task_id}"
+
+        def git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+            try:
+                return subprocess.run(safe_git_argv(args), cwd=path, env=safe_git_env(), text=True, capture_output=True, check=check, timeout=30)
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(exc.stderr.strip() or exc.stdout.strip() or "manual adoption Git check failed") from exc
+
+        if git("rev-parse", "--show-toplevel").stdout.strip() != str(path):
+            raise RuntimeError("manual adoption workspace is not the Git toplevel")
+        repo_common_raw = subprocess.run(safe_git_argv(("rev-parse", "--git-common-dir")), cwd=repo, env=safe_git_env(), text=True, capture_output=True, check=True, timeout=30).stdout.strip()
+        path_common_raw = git("rev-parse", "--git-common-dir").stdout.strip()
+        repo_common = (repo / repo_common_raw).resolve(strict=True) if not Path(repo_common_raw).is_absolute() else Path(repo_common_raw).resolve(strict=True)
+        path_common = (path / path_common_raw).resolve(strict=True) if not Path(path_common_raw).is_absolute() else Path(path_common_raw).resolve(strict=True)
+        if path_common != repo_common:
+            raise RuntimeError("manual adoption worktree is not attached to canonical repository")
+        if git("branch", "--show-current").stdout.strip() != branch:
+            raise RuntimeError("manual adoption branch identity mismatch")
+        base = GitWorktreeAdapter(repo, worktree_root).resolve_execution_base(ticket_row.get("tranche_id") or None, str(binding["starting_sha"]))
+        if git("rev-parse", "HEAD").stdout.strip() != base:
+            raise RuntimeError("manual adoption worktree HEAD does not match authoritative execution base")
+
+        allowed_existing = set(ticket.allowed_files)
+        allowed_created = set(ticket.create_files) | set(ticket.new_test_files)
+        allowed = allowed_existing | allowed_created
+        candidate = _isolated_candidate_diff(path, base, allowed_new_paths=tuple(sorted(allowed_created)))
+        untracked = tuple(candidate["untracked_paths"])
+        unexpected_untracked = sorted(set(untracked) - allowed_created)
+        if unexpected_untracked:
+            raise RuntimeError("manual adoption contains unapproved untracked paths: " + ", ".join(unexpected_untracked))
+        changed = tuple(candidate["changed_paths"])
+        if not changed:
+            raise RuntimeError("manual adoption candidate has no diff")
+        unexpected = sorted(set(changed) - allowed)
+        if unexpected:
+            raise RuntimeError("manual adoption exceeds allowed file scope: " + ", ".join(unexpected))
+        if len(set(changed)) > ticket.patch_budget.max_files:
+            raise RuntimeError("manual adoption exceeds max_files patch budget")
+        changed_lines = 0
+        for line in str(candidate["numstat"]).splitlines():
+            added, deleted, _ = line.split("\t", 2)
+            if not added.isdigit() or not deleted.isdigit():
+                raise RuntimeError("manual adoption binary diff is not permitted")
+            changed_lines += int(added) + int(deleted)
+        if changed_lines > ticket.patch_budget.max_changed_lines:
+            raise RuntimeError("manual adoption exceeds max_changed_lines patch budget")
+        diff = str(candidate["diff"])
+        diff_hash = str(candidate["diff_hash"])
+        attempt_number = 1
+        selected_sha256 = {
+            relative: hashlib.sha256((path / relative).read_bytes()).hexdigest()
+            for relative in sorted(set(changed)) if (path / relative).is_file()
+        }
+        payload = {
+            "schema": "manual-implementation-adoption/v1",
+            "ticket_id": ticket_id,
+            "external_task_id": external_task_id,
+            "attempt_number": attempt_number,
+            "operator_id": operator_id,
+            "reason": reason,
+            "repository": str(repo),
+            "worktree_path": str(path),
+            "branch": branch,
+            "base_sha": base,
+            "diff_hash": diff_hash,
+            "changed_paths": sorted(set(changed)),
+            "changed_lines": changed_lines,
+            "selected_sha256": selected_sha256,
+        }
+        artifact_path = artifact_root / ticket_id / str(attempt_number) / "manual-adoption.json"
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+        artifact_sha256 = _write_replayable_artifact(artifact_path, encoded)
+        recorded = self.ledger.record_manual_implementation_adoption(
+            ticket_id=ticket_id, attempt_number=attempt_number, operator_id=operator_id, reason=reason,
+            branch=branch, workspace_path=str(path), base_sha=base, diff_hash=diff_hash,
+            artifact_path=str(artifact_path), artifact_sha256=artifact_sha256,
+        )
+        return {
+            "ticket_id": ticket_id,
+            "attempt_number": attempt_number,
+            "status": str(recorded["status"]),
+            "implementation_artifact": str(artifact_path),
+            "diff_hash": diff_hash,
+            "changed_paths": sorted(set(changed)),
+            "changed_lines": changed_lines,
+            "state": self.ledger.get_ticket(ticket_id)["state"],
+        }
+
     def cleanup_completed_ticket_worktree(self, ticket_id: str, *, repository: Path) -> dict[str, object]:
         """Remove only an acknowledged, accepted, clean terminal ticket worktree."""
         existing = self.ledger.runtime_stage(ticket_id, "worktree_cleanup")
@@ -1214,13 +1408,19 @@ class LocalFirstController:
         if implementation is None or attempt is None:
             raise RuntimeError("validation_reconciliation_required: implementation provenance is incomplete")
         hermes_execution = None
-        if str(implementation["adapter"]) == "hermes-dispatch":
+        manual_adoption = None
+        implementation_adapter = str(implementation["adapter"])
+        if implementation_adapter == "hermes-dispatch":
             hermes_execution = self.ledger.connection.execute(
                 "SELECT * FROM hermes_execution_reconciliations WHERE ticket_id=? AND attempt_number=?",
                 (ticket_id, attempt_number),
             ).fetchone()
             if hermes_execution is None or invocation is not None:
                 raise RuntimeError("validation_reconciliation_required: Hermes execution provenance is incomplete")
+        elif implementation_adapter == "manual-adoption":
+            manual_adoption = self.ledger.runtime_stage(ticket_id, f"manual-adoption-{attempt_number}")
+            if manual_adoption is None or invocation is not None:
+                raise RuntimeError("validation_reconciliation_required: manual adoption provenance is incomplete")
         elif invocation is None or invocation["status"] != "completed":
             raise RuntimeError("validation_reconciliation_required: implementation provenance is incomplete")
         expected = {
@@ -1235,7 +1435,25 @@ class LocalFirstController:
         }
         if identity != expected:
             raise RuntimeError("validation_reconciliation_required: durable candidate identity drift")
-        if hermes_execution is None:
+        if manual_adoption is not None:
+            artifact_sha = hashlib.sha256(Path(expected["implementation_artifact"]).read_bytes()).hexdigest()
+            try:
+                adoption_detail = json.loads(str(manual_adoption["detail"]))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("validation_reconciliation_required: manual adoption detail is malformed") from exc
+            if (
+                str(manual_adoption["artifact_path"] or "") != expected["implementation_artifact"]
+                or str(manual_adoption["artifact_sha256"] or "") != artifact_sha
+                or str(manual_adoption["base_sha"] or "") != expected["base_sha"]
+                or str(implementation["request_hash"]) != artifact_sha
+                or adoption_detail.get("ticket_id") != ticket_id
+                or int(adoption_detail.get("attempt_number", 0)) != attempt_number
+                or adoption_detail.get("workspace_path") != expected["worktree_path"]
+                or adoption_detail.get("base_sha") != expected["base_sha"]
+                or adoption_detail.get("diff_hash") != expected["implementation_diff_hash"]
+            ):
+                raise RuntimeError("validation_reconciliation_required: manual adoption identity drift")
+        elif hermes_execution is None:
             if str(invocation["model_artifact"] or "") != expected["implementation_artifact"]:
                 raise RuntimeError("validation_reconciliation_required: durable candidate identity drift")
         elif (
@@ -1250,10 +1468,14 @@ class LocalFirstController:
         if not path.is_dir() or not artifact.is_file() or str(attempt["worktree_path"] or "") != expected["worktree_path"]:
             raise RuntimeError("validation_reconciliation_required: implementation evidence is incomplete")
         worktrees = GitWorktreeAdapter(repo, worktree_root)
+        validation_ticket = ticket_from_ledger(ticket_row)
+        manual_new_paths = tuple(sorted(set(validation_ticket.create_files) | set(validation_ticket.new_test_files)))
         try:
             live_root = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
             live_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
-            if hermes_execution is None:
+            if manual_adoption is not None:
+                live_diff_hash = str(_isolated_candidate_diff(path, expected["base_sha"], allowed_new_paths=manual_new_paths)["diff_hash"])
+            elif hermes_execution is None:
                 live_diff_hash = worktrees.diff_hash(path)
             else:
                 live_diff = subprocess.run(("git", "diff", "--binary", "--no-ext-diff", expected["base_sha"], "--"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout
@@ -1291,7 +1513,9 @@ class LocalFirstController:
             try:
                 post_root = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
                 post_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
-                if hermes_execution is None:
+                if manual_adoption is not None:
+                    post_diff_hash = str(_isolated_candidate_diff(path, expected["base_sha"], allowed_new_paths=manual_new_paths)["diff_hash"])
+                elif hermes_execution is None:
                     post_diff_hash = worktrees.diff_hash(path)
                 else:
                     post_diff = subprocess.run(("git", "diff", "--binary", "--no-ext-diff", expected["base_sha"], "--"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout
@@ -1308,8 +1532,11 @@ class LocalFirstController:
             ):
                 raise RuntimeError("validation_reconciliation_required: live candidate changed during validation")
             validation_sha256 = hashlib.sha256(validation_path.read_bytes()).hexdigest()
-            review_diff = subprocess.run(("git", "diff", expected["base_sha"]), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout
-            selected_files = {relative: (path / relative).read_text(encoding="utf-8") for relative in (*ticket_from_ledger(ticket_row).allowed_files, *ticket_from_ledger(ticket_row).create_files, *ticket_from_ledger(ticket_row).new_test_files) if (path / relative).is_file()}
+            if manual_adoption is not None:
+                review_diff = str(_isolated_candidate_diff(path, expected["base_sha"], allowed_new_paths=manual_new_paths)["diff"])
+            else:
+                review_diff = subprocess.run(("git", "diff", expected["base_sha"]), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout
+            selected_files = {relative: (path / relative).read_text(encoding="utf-8") for relative in (*validation_ticket.allowed_files, *validation_ticket.create_files, *validation_ticket.new_test_files) if (path / relative).is_file()}
             if hashlib.sha256(review_diff.encode()).hexdigest() != expected["implementation_diff_hash"] or not selected_files:
                 raise RuntimeError("validation_reconciliation_required: review packet inputs drift")
             record = {

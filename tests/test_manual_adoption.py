@@ -1,0 +1,127 @@
+from __future__ import annotations
+
+import subprocess
+import unittest
+from unittest import mock
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
+from local_first_orchestrator.ledger import Ledger
+from local_first_orchestrator.states import CanonicalState
+from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
+
+
+class _Board:
+    is_fake = False
+
+
+class ManualAdoptionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        subprocess.run(("git", "init", "-q", "-b", "main"), cwd=self.repo, check=True)
+        subprocess.run(("git", "config", "user.email", "test@example.invalid"), cwd=self.repo, check=True)
+        subprocess.run(("git", "config", "user.name", "Test"), cwd=self.repo, check=True)
+        (self.repo / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+        subprocess.run(("git", "add", "app.py"), cwd=self.repo, check=True)
+        subprocess.run(("git", "commit", "-qm", "base"), cwd=self.repo, check=True)
+        self.base = subprocess.run(("git", "rev-parse", "HEAD"), cwd=self.repo, text=True, capture_output=True, check=True).stdout.strip()
+        self.external_id = "ext-task"
+        self.worktree = self.repo / ".worktrees" / self.external_id
+        self.worktree.parent.mkdir()
+        subprocess.run(("git", "worktree", "add", "-q", "-b", f"wt/{self.external_id}", str(self.worktree), self.base), cwd=self.repo, check=True)
+        (self.worktree / "app.py").write_text("def run():\n    return 2\n", encoding="utf-8")
+        (self.worktree / "test_app.py").write_text("from app import run\nassert run() == 2\n", encoding="utf-8")
+
+        self.ledger = Ledger(self.root / "ledger.db")
+        self.ledger.migrate()
+        ticket = MicroTicket(
+            "unused", "Change run and verify it.", ("AC-1",), "app.py::run", ("app.py",),
+            ("No unrelated files.",), PatchBudget(2, 20),
+            VerificationProfile((("python", "test_app.py"),)), "medium", True, 1, (), ("test_app.py",),
+        )
+        self.ticket_id = self.ledger.create_ticket(
+            title="manual adoption", external_id=self.external_id, state=CanonicalState.READY_LOCAL, contract=ticket.contract()
+        )
+        self.ledger.bind_runtime(self.ticket_id, str(self.repo), self.base)
+        self.config = RuntimeConfig(self.repo, self.root / "attempt-worktrees", self.root / "artifacts", repository_allowlist=(self.repo,))
+        self.controller = LocalFirstController(self.ledger, _Board(), self.config)
+        self.ledger.pause("operator", reason="manual adoption test")
+        self.initial_status = subprocess.run(("git", "status", "--porcelain=v1", "--untracked-files=all"), cwd=self.worktree, text=True, capture_output=True, check=True).stdout
+
+    def tearDown(self) -> None:
+        self.ledger.close()
+        self.temp.cleanup()
+
+    def test_adoption_records_truthful_provenance_and_enters_normal_validation(self) -> None:
+        adopted = self.controller.adopt_existing_implementation(
+            self.ticket_id, repository=self.repo, operator_id="operator", reason="reuse verified pre-existing implementation"
+        )
+        self.assertEqual(adopted["status"], "adopted")
+        self.assertEqual(adopted["state"], CanonicalState.IMPLEMENTING.value)
+        self.assertEqual(set(adopted["changed_paths"]), {"app.py", "test_app.py"})
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM model_invocations WHERE ticket_id=?", (self.ticket_id,)).fetchone()[0], 0)
+        stage = self.ledger.model_stage(self.ticket_id, 1, "implementation")
+        self.assertEqual(stage["adapter"], "manual-adoption")
+        self.assertEqual(stage["base_sha"], self.base)
+        self.assertIsNotNone(self.ledger.runtime_stage(self.ticket_id, "manual-adoption-1"))
+        after_adoption = subprocess.run(("git", "status", "--porcelain=v1", "--untracked-files=all"), cwd=self.worktree, text=True, capture_output=True, check=True).stdout
+        self.assertEqual(after_adoption, self.initial_status)
+
+        self.ledger.resume("operator", reason="continue deterministic validation")
+        claim = self.ledger.claim_next_scheduler_validation("validator", lease_seconds=60)
+        self.assertIsNotNone(claim)
+        result = self.controller.execute_deterministic_validation_only(self.ticket_id, repository=self.repo)
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.LOCAL_REVIEW.value)
+
+    def test_adoption_requires_pause(self) -> None:
+        self.ledger.resume("operator", reason="test refusal")
+        with self.assertRaisesRegex(PermissionError, "paused"):
+            self.controller.adopt_existing_implementation(
+                self.ticket_id, repository=self.repo, operator_id="operator", reason="should fail"
+            )
+
+    def test_adoption_rejects_out_of_scope_untracked_file(self) -> None:
+        (self.worktree / "extra.txt").write_text("nope\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "unapproved untracked"):
+            self.controller.adopt_existing_implementation(
+                self.ticket_id, repository=self.repo, operator_id="operator", reason="should fail"
+            )
+        after_rejection = subprocess.run(("git", "status", "--porcelain=v1", "--untracked-files=all"), cwd=self.worktree, text=True, capture_output=True, check=True).stdout
+        self.assertIn("?? extra.txt", after_rejection)
+        self.assertNotIn(" A test_app.py", after_rejection)
+
+    def test_exact_orphan_artifact_is_replayable_after_crash(self) -> None:
+        artifact = self.root / "artifacts" / self.ticket_id / "1" / "manual-adoption.json"
+        with mock.patch.object(self.ledger, "record_manual_implementation_adoption", side_effect=RuntimeError("simulated crash after artifact write")):
+            with self.assertRaisesRegex(RuntimeError, "simulated crash"):
+                self.controller.adopt_existing_implementation(
+                    self.ticket_id, repository=self.repo, operator_id="operator", reason="replayable orphan"
+                )
+        self.assertTrue(artifact.is_file())
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.READY_LOCAL.value)
+        adopted = self.controller.adopt_existing_implementation(
+            self.ticket_id, repository=self.repo, operator_id="operator", reason="replayable orphan"
+        )
+        self.assertEqual(adopted["status"], "adopted")
+
+    def test_conflicting_orphan_artifact_fails_closed(self) -> None:
+        artifact = self.root / "artifacts" / self.ticket_id / "1" / "manual-adoption.json"
+        with mock.patch.object(self.ledger, "record_manual_implementation_adoption", side_effect=RuntimeError("simulated crash after artifact write")):
+            with self.assertRaisesRegex(RuntimeError, "simulated crash"):
+                self.controller.adopt_existing_implementation(
+                    self.ticket_id, repository=self.repo, operator_id="operator", reason="conflicting orphan"
+                )
+        artifact.write_text("tampered\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "artifact conflict"):
+            self.controller.adopt_existing_implementation(
+                self.ticket_id, repository=self.repo, operator_id="operator", reason="conflicting orphan"
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
