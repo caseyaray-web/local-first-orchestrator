@@ -41,7 +41,7 @@ class ManualAdoptionTests(unittest.TestCase):
         ticket = MicroTicket(
             "unused", "Change run and verify it.", ("AC-1",), "app.py::run", ("app.py",),
             ("No unrelated files.",), PatchBudget(2, 20),
-            VerificationProfile((("python", "test_app.py"),)), "medium", True, 1, (), ("test_app.py",),
+            VerificationProfile((("python", "test_app.py"),)), "medium", True, 2, (), ("test_app.py",),
         )
         self.ticket_id = self.ledger.create_ticket(
             title="manual adoption", external_id=self.external_id, state=CanonicalState.READY_LOCAL, contract=ticket.contract()
@@ -74,9 +74,137 @@ class ManualAdoptionTests(unittest.TestCase):
         self.ledger.resume("operator", reason="continue deterministic validation")
         claim = self.ledger.claim_next_scheduler_validation("validator", lease_seconds=60)
         self.assertIsNotNone(claim)
+        self.ledger.begin_scheduler_claim_effect(str(claim["claim_id"]), "validator")
         result = self.controller.execute_deterministic_validation_only(self.ticket_id, repository=self.repo)
+        self.ledger.complete_scheduler_validation_effect(str(claim["claim_id"]), "validator", result)
         self.assertTrue(result["passed"], result)
         self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.LOCAL_REVIEW.value)
+        review_claim = self.ledger.claim_next_scheduler_review("reviewer", lease_seconds=60, review_execution_policy_hash="review-policy")
+        self.assertIsNotNone(review_claim)
+        candidate = self.ledger.connection.execute("SELECT * FROM review_candidates WHERE ticket_id=? AND attempt_number=1", (self.ticket_id,)).fetchone()
+        self.assertIsNotNone(candidate)
+        self.assertTrue(str(candidate["implementation_invocation_id"]).startswith("manual-adoption:"))
+
+    def test_failed_manual_validation_can_reconcile_and_adopt_corrected_attempt_two(self) -> None:
+        (self.worktree / "app.py").write_text("def run():\n    return 2\n\ndef extra():\n    return 3\n", encoding="utf-8")
+        first = self.controller.adopt_existing_implementation(
+            self.ticket_id, repository=self.repo, operator_id="operator", reason="first candidate"
+        )
+        self.assertEqual(first["attempt_number"], 1)
+        self.ledger.resume("operator", reason="validate first candidate")
+        first_claim = self.ledger.claim_next_scheduler_validation("validator-1", lease_seconds=60)
+        self.assertIsNotNone(first_claim)
+        self.ledger.begin_scheduler_claim_effect(str(first_claim["claim_id"]), "validator-1")
+        failed = self.controller.execute_deterministic_validation_only(self.ticket_id, repository=self.repo)
+        self.ledger.complete_scheduler_validation_effect(str(first_claim["claim_id"]), "validator-1", failed)
+        with self.ledger._transaction() as conn:
+            conn.execute("UPDATE scheduler_stage_claims SET lease_expires_at=0 WHERE claim_id=?", (str(first_claim["claim_id"]),))
+        self.assertFalse(failed["passed"], failed)
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.VERIFYING.value)
+        self.ledger.pause("operator", reason="reconcile failed manual validation")
+        reconciled = self.ledger.reconcile_failed_attempt(
+            self.ticket_id,
+            operator_id="operator",
+            classification="validation_failure",
+            retry_base_sha=self.base,
+            runtime_identity={"source": "manual-adoption-test"},
+            forensic_artifact_paths=(first["implementation_artifact"], failed["validation_artifact"]),
+        )
+        self.assertEqual(reconciled["prospective_next_attempt_number"], 2)
+        self.assertFalse(reconciled["cleanup_required"])
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.READY_LOCAL.value)
+        self.assertEqual(self.ledger.connection.execute("SELECT outcome FROM attempts WHERE ticket_id=? AND attempt_number=1", (self.ticket_id,)).fetchone()[0], "failed_retired")
+
+        (self.worktree / "app.py").write_text("def run():\n    return 2\n", encoding="utf-8")
+        second = self.controller.adopt_existing_implementation(
+            self.ticket_id, repository=self.repo, operator_id="operator", reason="corrected candidate"
+        )
+        self.assertEqual(second["attempt_number"], 2)
+        self.assertNotEqual(second["diff_hash"], first["diff_hash"])
+        first_attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (self.ticket_id,)).fetchone()
+        second_attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=2", (self.ticket_id,)).fetchone()
+        self.assertEqual(second_attempt["pre_diff_hash"], first_attempt["post_diff_hash"])
+        self.assertEqual(second_attempt["base_sha"], self.base)
+        self.assertEqual(self.ledger.runtime_stage(self.ticket_id, "implementation_completed")["attempt_number"], 2)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM model_invocations WHERE ticket_id=?", (self.ticket_id,)).fetchone()[0], 0)
+
+        self.ledger.resume("operator", reason="validate corrected candidate")
+        second_claim = self.ledger.claim_next_scheduler_validation("validator-2", lease_seconds=60)
+        self.assertIsNotNone(second_claim)
+        self.ledger.begin_scheduler_claim_effect(str(second_claim["claim_id"]), "validator-2")
+        passed = self.controller.execute_deterministic_validation_only(self.ticket_id, repository=self.repo)
+        self.ledger.complete_scheduler_validation_effect(str(second_claim["claim_id"]), "validator-2", passed)
+        self.assertTrue(passed["passed"], passed)
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.LOCAL_REVIEW.value)
+        self.assertEqual(self.ledger.runtime_stage(self.ticket_id, "validation_completed")["attempt_number"], 2)
+
+    def test_manual_validation_reconciliation_requires_completed_scheduler_effect(self) -> None:
+        (self.worktree / "app.py").write_text("def run():\n    return 2\n\ndef extra():\n    return 3\n", encoding="utf-8")
+        first = self.controller.adopt_existing_implementation(
+            self.ticket_id, repository=self.repo, operator_id="operator", reason="candidate with scope failure"
+        )
+        self.ledger.resume("operator", reason="run validation without completing claim effect")
+        claim = self.ledger.claim_next_scheduler_validation("validator", lease_seconds=60)
+        self.assertIsNotNone(claim)
+        failed = self.controller.execute_deterministic_validation_only(self.ticket_id, repository=self.repo)
+        self.assertFalse(failed["passed"], failed)
+        self.ledger.pause("operator", reason="attempt unsafe reconciliation")
+        with self.assertRaisesRegex(ValueError, "valid durable evidence"):
+            self.ledger.reconcile_failed_attempt(
+                self.ticket_id, operator_id="operator", classification="validation_failure", retry_base_sha=self.base,
+                runtime_identity={"source": "test"}, forensic_artifact_paths=(first["implementation_artifact"], failed["validation_artifact"]),
+            )
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.VERIFYING.value)
+
+    def test_manual_retry_respects_max_attempts(self) -> None:
+        (self.worktree / "app.py").write_text("def run():\n    return 2\n\ndef extra():\n    return 3\n", encoding="utf-8")
+        first = self.controller.adopt_existing_implementation(
+            self.ticket_id, repository=self.repo, operator_id="operator", reason="first candidate"
+        )
+        self.ledger.resume("operator", reason="validate first candidate")
+        claim = self.ledger.claim_next_scheduler_validation("validator", lease_seconds=60)
+        self.ledger.begin_scheduler_claim_effect(str(claim["claim_id"]), "validator")
+        failed = self.controller.execute_deterministic_validation_only(self.ticket_id, repository=self.repo)
+        self.ledger.complete_scheduler_validation_effect(str(claim["claim_id"]), "validator", failed)
+        self.ledger.pause("operator", reason="reconcile first candidate")
+        self.ledger.reconcile_failed_attempt(
+            self.ticket_id, operator_id="operator", classification="validation_failure", retry_base_sha=self.base,
+            runtime_identity={"source": "test"}, forensic_artifact_paths=(first["implementation_artifact"], failed["validation_artifact"]),
+        )
+        with self.ledger._transaction() as conn:
+            conn.execute("UPDATE tickets SET max_attempts=1 WHERE id=?", (self.ticket_id,))
+        (self.worktree / "app.py").write_text("def run():\n    return 2\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "max_attempts"):
+            self.controller.adopt_existing_implementation(
+                self.ticket_id, repository=self.repo, operator_id="operator", reason="should exceed budget"
+            )
+        self.assertIsNone(self.ledger.connection.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number=2", (self.ticket_id,)).fetchone())
+
+    def test_manual_retry_uses_reconciled_base_and_rejects_drift(self) -> None:
+        (self.worktree / "app.py").write_text("def run():\n    return 2\n\ndef extra():\n    return 3\n", encoding="utf-8")
+        first = self.controller.adopt_existing_implementation(
+            self.ticket_id, repository=self.repo, operator_id="operator", reason="first candidate"
+        )
+        self.ledger.resume("operator", reason="validate first candidate")
+        claim = self.ledger.claim_next_scheduler_validation("validator", lease_seconds=60)
+        self.ledger.begin_scheduler_claim_effect(str(claim["claim_id"]), "validator")
+        failed = self.controller.execute_deterministic_validation_only(self.ticket_id, repository=self.repo)
+        self.ledger.complete_scheduler_validation_effect(str(claim["claim_id"]), "validator", failed)
+        self.ledger.pause("operator", reason="reconcile against moved base")
+        (self.repo / "later.txt").write_text("later\n", encoding="utf-8")
+        subprocess.run(("git", "add", "later.txt"), cwd=self.repo, check=True)
+        subprocess.run(("git", "commit", "-qm", "later base"), cwd=self.repo, check=True)
+        later_base = subprocess.run(("git", "rev-parse", "HEAD"), cwd=self.repo, text=True, capture_output=True, check=True).stdout.strip()
+        self.ledger.reconcile_failed_attempt(
+            self.ticket_id, operator_id="operator", classification="validation_failure", retry_base_sha=later_base,
+            runtime_identity={"source": "test"}, forensic_artifact_paths=(first["implementation_artifact"], failed["validation_artifact"]),
+        )
+        (self.worktree / "app.py").write_text("def run():\n    return 2\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "authoritative execution base"):
+            self.controller.adopt_existing_implementation(
+                self.ticket_id, repository=self.repo, operator_id="operator", reason="must not silently rebase"
+            )
+        self.assertIsNone(self.ledger.connection.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number=2", (self.ticket_id,)).fetchone())
 
     def test_adoption_requires_pause(self) -> None:
         self.ledger.resume("operator", reason="test refusal")

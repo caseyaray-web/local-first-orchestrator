@@ -923,6 +923,12 @@ class LocalFirstController:
             raise ValueError("repository mismatch with imported binding")
         ticket = ticket_from_ledger(ticket_row)
         external_task_id = self.ledger.resolve_external_task_id(ticket_id)
+        reconciliation = self.ledger.failed_attempt_reconciliation(ticket_id)
+        attempt_number = int(reconciliation["prospective_next_attempt_number"]) if reconciliation is not None else 1
+        if attempt_number > ticket.max_attempts:
+            raise RuntimeError("manual adoption exceeds ticket max_attempts")
+        if reconciliation is not None and bool(reconciliation["cleanup_required"]) and not self.ledger.cleanup_confirmed(ticket_id, int(reconciliation["retired_attempt_number"])):
+            raise RuntimeError("manual adoption retry requires retired-attempt cleanup confirmation")
         path, _ = validate_native_workspace_path(
             canonical_native_workspace_path(repo, external_task_id), repository=repo, external_task_id=external_task_id
         )
@@ -944,7 +950,7 @@ class LocalFirstController:
             raise RuntimeError("manual adoption worktree is not attached to canonical repository")
         if git("branch", "--show-current").stdout.strip() != branch:
             raise RuntimeError("manual adoption branch identity mismatch")
-        base = GitWorktreeAdapter(repo, worktree_root).resolve_execution_base(ticket_row.get("tranche_id") or None, str(binding["starting_sha"]))
+        base = str(reconciliation["retry_base_sha"]) if reconciliation is not None else GitWorktreeAdapter(repo, worktree_root).resolve_execution_base(ticket_row.get("tranche_id") or None, str(binding["starting_sha"]))
         if git("rev-parse", "HEAD").stdout.strip() != base:
             raise RuntimeError("manual adoption worktree HEAD does not match authoritative execution base")
 
@@ -974,7 +980,6 @@ class LocalFirstController:
             raise RuntimeError("manual adoption exceeds max_changed_lines patch budget")
         diff = str(candidate["diff"])
         diff_hash = str(candidate["diff_hash"])
-        attempt_number = 1
         selected_sha256 = {
             relative: hashlib.sha256((path / relative).read_bytes()).hexdigest()
             for relative in sorted(set(changed)) if (path / relative).is_file()
@@ -1393,7 +1398,8 @@ class LocalFirstController:
         if ticket_row["state"] not in {CanonicalState.VERIFYING.value, CanonicalState.LOCAL_REVIEW.value, CanonicalState.NEEDS_TRIAGE.value}:
             raise RuntimeError("deterministic validation requires verifying state")
         claim_row = self.ledger.connection.execute(
-            "SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage LIKE 'validation:%' AND status='claimed' ORDER BY created_at DESC LIMIT 1",
+            "SELECT c.* FROM scheduler_stage_claims c WHERE c.ticket_id=? AND c.status='claimed' "
+            "AND c.stage=('validation:' || (SELECT MAX(m.attempt_number) FROM model_stage_artifacts m WHERE m.ticket_id=c.ticket_id AND m.stage='implementation')) LIMIT 1",
             (ticket_id,),
         ).fetchone()
         if claim_row is None or not claim_row["candidate_identity_json"]:
@@ -1550,7 +1556,10 @@ class LocalFirstController:
             }
             if not self.ledger.record_runtime_stage(ticket_id, f"validation-{attempt_number}", json.dumps(record, sort_keys=True), attempt_number=attempt_number, artifact_path=str(validation_path), artifact_sha256=validation_sha256, base_sha=expected["base_sha"]):
                 raise RuntimeError("validation_reconciliation_required: validation artifact persistence conflicted")
-            self.ledger.record_runtime_stage(ticket_id, "validation_completed", json.dumps(record, sort_keys=True), attempt_number=attempt_number, artifact_path=str(validation_path), artifact_sha256=validation_sha256, base_sha=expected["base_sha"])
+            if manual_adoption is not None:
+                self.ledger.advance_reconciled_runtime_marker(ticket_id, "validation_completed", attempt_number=attempt_number, detail=json.dumps(record, sort_keys=True), artifact_path=str(validation_path), artifact_sha256=validation_sha256, base_sha=expected["base_sha"])
+            else:
+                self.ledger.record_runtime_stage(ticket_id, "validation_completed", json.dumps(record, sort_keys=True), attempt_number=attempt_number, artifact_path=str(validation_path), artifact_sha256=validation_sha256, base_sha=expected["base_sha"])
         passed = bool(record.get("passed"))
         if passed and self.ledger.get_ticket(ticket_id)["state"] == CanonicalState.VERIFYING.value:
             self.ledger.transition(ticket_id, CanonicalState.LOCAL_REVIEW, payload={"validation": str(record["compact_evidence"]), "attempt_number": attempt_number})

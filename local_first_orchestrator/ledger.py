@@ -1751,16 +1751,52 @@ class Ledger:
                 return {"ticket_id": ticket_id, "attempt_number": attempt_number, "status": "already_adopted", "detail": detail}
             if ticket["state"] != CanonicalState.READY_LOCAL.value:
                 raise RuntimeError("manual adoption requires ready_local ticket")
-            if conn.execute("SELECT 1 FROM attempts WHERE ticket_id=?", (ticket_id,)).fetchone():
-                raise RuntimeError("manual adoption requires ticket with no prior attempts")
-            if conn.execute("SELECT 1 FROM model_invocations WHERE ticket_id=?", (ticket_id,)).fetchone():
-                raise RuntimeError("manual adoption refuses tickets with model invocation history")
+            if attempt_number > int(ticket["max_attempts"]):
+                raise RuntimeError("manual adoption exceeds ticket max_attempts")
+            pre_diff_hash = empty_hash
+            prior_attempts = conn.execute("SELECT * FROM attempts WHERE ticket_id=? ORDER BY attempt_number", (ticket_id,)).fetchall()
+            if attempt_number == 1:
+                if prior_attempts:
+                    raise RuntimeError("manual adoption attempt 1 requires ticket with no prior attempts")
+                if conn.execute("SELECT 1 FROM model_invocations WHERE ticket_id=?", (ticket_id,)).fetchone():
+                    raise RuntimeError("manual adoption attempt 1 refuses tickets with model invocation history")
+            else:
+                reconciliation = conn.execute(
+                    "SELECT * FROM failed_attempt_reconciliations WHERE ticket_id=? ORDER BY retired_attempt_number DESC LIMIT 1",
+                    (ticket_id,),
+                ).fetchone()
+                if reconciliation is None or int(reconciliation["prospective_next_attempt_number"]) != attempt_number:
+                    raise RuntimeError("manual adoption retry requires matching failed-attempt reconciliation")
+                if str(reconciliation["retry_base_sha"]) != base_sha:
+                    raise RuntimeError("manual adoption retry base does not match reconciliation")
+                if bool(reconciliation["cleanup_required"]):
+                    confirmed = conn.execute(
+                        "SELECT 1 FROM retired_attempt_cleanup_confirmations WHERE ticket_id=? AND retired_attempt_number=?",
+                        (ticket_id, int(reconciliation["retired_attempt_number"])),
+                    ).fetchone()
+                    if confirmed is None:
+                        raise RuntimeError("manual adoption retry requires retired-attempt cleanup confirmation")
+                retired = conn.execute(
+                    "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?",
+                    (ticket_id, int(reconciliation["retired_attempt_number"])),
+                ).fetchone()
+                if retired is None or retired["outcome"] != "failed_retired":
+                    raise RuntimeError("manual adoption retry requires retired predecessor attempt")
+                pre_diff_hash = str(retired["post_diff_hash"] or "")
+                if not pre_diff_hash:
+                    raise RuntimeError("manual adoption retry predecessor is missing post diff hash")
+                if str(retired["post_diff_hash"] or "") == diff_hash:
+                    raise RuntimeError("manual adoption retry must change the retired candidate diff")
+                if conn.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone():
+                    raise RuntimeError("manual adoption retry attempt already exists")
+                if conn.execute("SELECT 1 FROM model_invocations WHERE ticket_id=? AND status='started'", (ticket_id,)).fetchone():
+                    raise RuntimeError("manual adoption retry refuses incomplete model invocation history")
             if conn.execute("SELECT 1 FROM accepted_evidence WHERE ticket_id=?", (ticket_id,)).fetchone():
                 raise RuntimeError("manual adoption refuses accepted ticket")
             now = self._now()
             conn.execute(
                 "INSERT INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,post_diff_hash,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                (ticket_id, attempt_number, base_sha, branch, workspace_path, empty_hash, diff_hash, now),
+                (ticket_id, attempt_number, base_sha, branch, workspace_path, pre_diff_hash, diff_hash, now),
             )
             conn.execute(
                 "INSERT INTO model_stage_artifacts(ticket_id,attempt_number,stage,purpose,adapter,request_hash,response_artifact,worktree_path,base_sha,diff_hash,completed_at,status) VALUES (?,?,'implementation','implementation','manual-adoption',?,?,?,?,?,?,'completed')",
@@ -1774,9 +1810,9 @@ class Ledger:
                 "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
                 (ticket_id, f"implementation-{attempt_number}", detail, attempt_number, artifact_path, artifact_sha256, base_sha, now),
             )
-            conn.execute(
-                "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                (ticket_id, "implementation_completed", detail, attempt_number, artifact_path, artifact_sha256, base_sha, now),
+            self._advance_reconciled_runtime_marker_in_transaction(
+                conn, ticket_id, "implementation_completed", attempt_number=attempt_number, detail=detail,
+                artifact_path=artifact_path, artifact_sha256=artifact_sha256, base_sha=base_sha, now=now,
             )
             conn.execute("UPDATE tickets SET state=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=?", (CanonicalState.IMPLEMENTING.value, now, ticket_id))
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="manual_implementation_adopted", actor_id=operator_id, from_state=CanonicalState.READY_LOCAL.value, to_state=CanonicalState.IMPLEMENTING.value, payload={"attempt_number": attempt_number, "reason": reason, "artifact_sha256": artifact_sha256, "diff_hash": diff_hash})
@@ -1846,8 +1882,76 @@ class Ledger:
                     raise ValueError("reconciled ticket state drift requires investigation")
                 return {**dict(existing), "status": "already_reconciled"}
             previous_state = str(ticket["state"])
+            cleanup_required = True
             if previous_state == CanonicalState.BLOCKED.value:
                 pass
+            elif previous_state == CanonicalState.VERIFYING.value and classification == "validation_failure":
+                implementation_stage = conn.execute(
+                    "SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='implementation'",
+                    (ticket_id, retired),
+                ).fetchone()
+                manual_stage = conn.execute(
+                    "SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?",
+                    (ticket_id, f"manual-adoption-{retired}"),
+                ).fetchone()
+                validation_stage = conn.execute(
+                    "SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?",
+                    (ticket_id, f"validation-{retired}"),
+                ).fetchone()
+                invocation = conn.execute(
+                    "SELECT * FROM model_invocations WHERE ticket_id=? AND attempt_number=? AND stage='implementation'",
+                    (ticket_id, retired),
+                ).fetchone()
+                if implementation_stage is None or str(implementation_stage["adapter"]) != "manual-adoption" or implementation_stage["status"] != "completed" or invocation is not None:
+                    raise ValueError("manual validation-failure reconciliation requires completed manual adoption")
+                try:
+                    artifact_path = Path(str(implementation_stage["response_artifact"]))
+                    if not artifact_path.is_file() or hashlib.sha256(artifact_path.read_bytes()).hexdigest() != str(implementation_stage["request_hash"]):
+                        raise ValueError("manual adoption artifact integrity binding mismatch")
+                    if manual_stage is None or manual_stage["attempt_number"] != retired or manual_stage["artifact_path"] != str(artifact_path) or manual_stage["artifact_sha256"] != str(implementation_stage["request_hash"]):
+                        raise ValueError("manual adoption runtime provenance mismatch")
+                    if validation_stage is None or validation_stage["attempt_number"] != retired or validation_stage["base_sha"] != implementation_stage["base_sha"]:
+                        raise ValueError("manual validation artifact binding mismatch")
+                    validation_path = Path(str(validation_stage["artifact_path"] or ""))
+                    if not validation_path.is_file() or hashlib.sha256(validation_path.read_bytes()).hexdigest() != str(validation_stage["artifact_sha256"] or ""):
+                        raise ValueError("manual validation artifact integrity binding mismatch")
+                    record = json.loads(str(validation_stage["detail"]))
+                    identity = record.get("candidate_identity") if isinstance(record, dict) else None
+                    claim = conn.execute(
+                        "SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=? ORDER BY created_at DESC, claim_id DESC LIMIT 1",
+                        (ticket_id, f"validation:{retired}"),
+                    ).fetchone()
+                    if claim is None or claim["side_effect_started_at"] is None or claim["side_effect_completed_at"] is None or not claim["candidate_identity_json"]:
+                        raise ValueError("manual validation scheduler claim is incomplete")
+                    claim_identity = json.loads(str(claim["candidate_identity_json"]))
+                    if (
+                        not isinstance(record, dict)
+                        or record.get("passed") is not False
+                        or not isinstance(record.get("compact_evidence"), str)
+                        or not isinstance(identity, dict)
+                        or claim_identity != identity
+                        or identity.get("ticket_id") != ticket_id
+                        or identity.get("attempt_number") != retired
+                        or identity.get("implementation_artifact") != str(artifact_path)
+                        or identity.get("implementation_diff_hash") != str(implementation_stage["diff_hash"])
+                        or identity.get("worktree_path") != str(implementation_stage["worktree_path"])
+                        or identity.get("base_sha") != str(implementation_stage["base_sha"])
+                        or record.get("validation_artifact") != str(validation_path)
+                        or record.get("validation_artifact_sha256") != str(validation_stage["artifact_sha256"])
+                    ):
+                        raise ValueError("invalid manual validation failure evidence")
+                    validation_payload = json.loads(validation_path.read_text(encoding="utf-8"))
+                    if not isinstance(validation_payload, dict) or not isinstance(validation_payload.get("errors"), list) or not validation_payload["errors"]:
+                        raise ValueError("manual validation failure artifact lacks errors")
+                except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                    raise ValueError("manual validation-failure reconciliation requires valid durable evidence") from exc
+                if conn.execute("SELECT 1 FROM review_candidates WHERE ticket_id=?", (ticket_id,)).fetchone() or conn.execute("SELECT 1 FROM review_results WHERE ticket_id=?", (ticket_id,)).fetchone():
+                    raise ValueError("manual validation-failure reconciliation cannot retire after review activity")
+                if conn.execute("SELECT 1 FROM accepted_evidence WHERE ticket_id=?", (ticket_id,)).fetchone() or conn.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND accepted_commit_sha IS NOT NULL", (ticket_id,)).fetchone():
+                    raise ValueError("accepted ticket cannot retire an attempt")
+                if conn.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number>?", (ticket_id, retired)).fetchone():
+                    raise ValueError("manual validation-failure reconciliation cannot retire an attempt with repair history")
+                cleanup_required = False
             elif previous_state == CanonicalState.NEEDS_TRIAGE.value and classification == "validation_failure":
                 # Validation exhaustion is admitted only from a complete, same-attempt
                 # implementation/validation pair.  These checks deliberately use the
@@ -1920,12 +2024,13 @@ class Ledger:
             next_attempt = self.next_attempt_number(ticket_id)
             now = self._now()
             conn.execute("UPDATE attempts SET outcome='failed_retired' WHERE ticket_id=? AND attempt_number=?", (ticket_id, retired))
-            conn.execute("INSERT INTO failed_attempt_reconciliations(ticket_id,retired_attempt_number,classification,previous_ticket_state,resulting_ticket_state,operator_id,runtime_identity_json,retry_base_sha,prospective_next_attempt_number,cleanup_required,forensic_artifact_paths_json,reconciled_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (ticket_id,retired,classification,previous_state,CanonicalState.READY_LOCAL.value,operator_id,encoded_identity,retry_base_sha,next_attempt,1,encoded_artifacts,now))
+            conn.execute("INSERT INTO failed_attempt_reconciliations(ticket_id,retired_attempt_number,classification,previous_ticket_state,resulting_ticket_state,operator_id,runtime_identity_json,retry_base_sha,prospective_next_attempt_number,cleanup_required,forensic_artifact_paths_json,reconciled_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (ticket_id,retired,classification,previous_state,CanonicalState.READY_LOCAL.value,operator_id,encoded_identity,retry_base_sha,next_attempt,int(cleanup_required),encoded_artifacts,now))
             conn.execute("UPDATE tickets SET state=?, lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE id=? AND state=?", (CanonicalState.READY_LOCAL.value,now,ticket_id,previous_state))
-            reconciliation_event = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="failed_attempt_reconciled", actor_id=operator_id, payload={"retired_attempt":retired,"classification":classification,"next_attempt":next_attempt,"retry_base_sha":retry_base_sha,"cleanup_required":True,"forensic_artifact_paths":json.loads(encoded_artifacts),"runtime_identity":runtime_identity})
-            transition_event = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="state_transition", actor_id=operator_id, from_state=previous_state, to_state=CanonicalState.READY_LOCAL.value, payload={"reason":"failed_attempt_reconciled","retired_attempt":retired,"next_attempt":next_attempt,"cleanup_required":True})
-            self._enqueue_projection_bundle_in_transaction(conn, ticket_id=ticket_id, event_id=transition_event, evidence=f"failed attempt {retired} retired; cleanup required before attempt {next_attempt}")
-            return {"ticket_id":ticket_id,"retired_attempt_number":retired,"prospective_next_attempt_number":next_attempt,"retry_base_sha":retry_base_sha,"cleanup_required":True,"status":"reconciled","event_id":reconciliation_event}
+            reconciliation_event = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="failed_attempt_reconciled", actor_id=operator_id, payload={"retired_attempt":retired,"classification":classification,"next_attempt":next_attempt,"retry_base_sha":retry_base_sha,"cleanup_required":bool(cleanup_required),"forensic_artifact_paths":json.loads(encoded_artifacts),"runtime_identity":runtime_identity})
+            transition_event = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="state_transition", actor_id=operator_id, from_state=previous_state, to_state=CanonicalState.READY_LOCAL.value, payload={"reason":"failed_attempt_reconciled","retired_attempt":retired,"next_attempt":next_attempt,"cleanup_required":bool(cleanup_required)})
+            evidence = f"failed attempt {retired} retired; " + (f"cleanup required before attempt {next_attempt}" if cleanup_required else f"native workspace retained for attempt {next_attempt}")
+            self._enqueue_projection_bundle_in_transaction(conn, ticket_id=ticket_id, event_id=transition_event, evidence=evidence)
+            return {"ticket_id":ticket_id,"retired_attempt_number":retired,"prospective_next_attempt_number":next_attempt,"retry_base_sha":retry_base_sha,"cleanup_required":bool(cleanup_required),"status":"reconciled","event_id":reconciliation_event}
 
     def confirm_retired_attempt_cleanup(self, ticket_id: str, *, retired_attempt_number: int, operator_id: str, checked_paths: tuple[str, ...]) -> dict[str, Any]:
         """Persist a separate operator attestation after controller-side absence checks."""
@@ -4645,8 +4750,10 @@ class Ledger:
             if paused is None or paused["paused"]:
                 return None
             replay = conn.execute(
-                "SELECT * FROM scheduler_stage_claims WHERE stage LIKE 'validation:%' AND status='claimed' "
-                "AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,)
+                "SELECT c.* FROM scheduler_stage_claims c WHERE c.stage LIKE 'validation:%' AND c.status='claimed' "
+                "AND c.lease_expires_at<=? "
+                "AND NOT EXISTS (SELECT 1 FROM failed_attempt_reconciliations r WHERE r.ticket_id=c.ticket_id AND c.stage=('validation:' || r.retired_attempt_number)) "
+                "ORDER BY c.created_at,c.claim_id LIMIT 1", (now,)
             ).fetchone()
             if replay is not None:
                 changed = conn.execute(
@@ -4772,21 +4879,30 @@ class Ledger:
                 self._append_event(conn, entity_type="ticket", entity_id=str(replay["ticket_id"]), event_type="scheduler_stage_reclaimed", actor_id=owner, payload={"claim_id": replay["claim_id"], "stage": "review", "lease_expires_at": now + lease_seconds})
                 return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
             row = conn.execute("""
-                SELECT t.*, r.detail, r.artifact_path, r.artifact_sha256, m.response_artifact, m.diff_hash,
+                SELECT t.*, r.detail, r.artifact_path, r.artifact_sha256, m.response_artifact, m.diff_hash, m.adapter,
                        mi.invocation_id,
                        he.external_task_id AS hermes_external_task_id,
                        he.hermes_run_id,
+                       ma.artifact_path AS manual_artifact_path,
+                       ma.artifact_sha256 AS manual_artifact_sha256,
+                       ma.detail AS manual_adoption_detail,
                        CASE
                          WHEN mi.invocation_id IS NOT NULL THEN mi.invocation_id
                          WHEN he.hermes_run_id IS NOT NULL THEN ('hermes-run:' || he.external_task_id || ':' || he.hermes_run_id)
+                         WHEN m.adapter='manual-adoption' AND ma.artifact_sha256 IS NOT NULL THEN ('manual-adoption:' || ma.artifact_sha256)
                        END AS implementation_execution_id
                 FROM tickets t
                 JOIN runtime_stages r ON r.ticket_id=t.id AND r.stage='validation_completed'
                 JOIN model_stage_artifacts m ON m.ticket_id=t.id AND m.attempt_number=r.attempt_number AND m.stage='implementation'
                 LEFT JOIN model_invocations mi ON mi.ticket_id=t.id AND mi.attempt_number=r.attempt_number AND mi.stage='implementation' AND mi.status='completed'
                 LEFT JOIN hermes_execution_reconciliations he ON he.ticket_id=t.id AND he.attempt_number=r.attempt_number
+                LEFT JOIN runtime_stages ma ON ma.ticket_id=t.id AND ma.stage=('manual-adoption-' || r.attempt_number)
                 WHERE t.state=? AND EXISTS (SELECT 1 FROM scheduler_stage_claims v WHERE v.ticket_id=t.id AND v.stage=('validation:' || r.attempt_number) AND v.side_effect_completed_at IS NOT NULL)
-                AND ((mi.invocation_id IS NOT NULL AND he.hermes_run_id IS NULL) OR (mi.invocation_id IS NULL AND he.hermes_run_id IS NOT NULL))
+                AND (
+                    (mi.invocation_id IS NOT NULL AND he.hermes_run_id IS NULL AND m.adapter<>'manual-adoption')
+                    OR (mi.invocation_id IS NULL AND he.hermes_run_id IS NOT NULL AND m.adapter<>'manual-adoption')
+                    OR (m.adapter='manual-adoption' AND mi.invocation_id IS NULL AND he.hermes_run_id IS NULL AND ma.artifact_sha256 IS NOT NULL)
+                )
                 AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('review:' || r.attempt_number))
                 ORDER BY t.created_at,t.id LIMIT 1
             """, (CanonicalState.LOCAL_REVIEW.value,)).fetchone()
@@ -4802,6 +4918,22 @@ class Ledger:
                 raise RuntimeError("review_reconciliation_required: validation evidence is incomplete")
             if str(validation["candidate_identity"].get("implementation_diff_hash")) != str(row["diff_hash"]):
                 raise RuntimeError("review_reconciliation_required: validated candidate drift")
+            if str(row["adapter"]) == "manual-adoption":
+                manual_artifact = Path(str(row["manual_artifact_path"] or ""))
+                if not manual_artifact.is_file() or hashlib.sha256(manual_artifact.read_bytes()).hexdigest() != str(row["manual_artifact_sha256"] or ""):
+                    raise RuntimeError("review_reconciliation_required: manual adoption artifact integrity drift")
+                try:
+                    manual_detail = json.loads(str(row["manual_adoption_detail"] or ""))
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("review_reconciliation_required: manual adoption detail is malformed") from exc
+                if (
+                    manual_detail.get("ticket_id") != str(row["id"])
+                    or int(manual_detail.get("attempt_number", 0)) != attempt_number
+                    or manual_detail.get("diff_hash") != str(row["diff_hash"])
+                    or manual_detail.get("artifact_path") != str(manual_artifact)
+                    or manual_detail.get("artifact_sha256") != str(row["manual_artifact_sha256"])
+                ):
+                    raise RuntimeError("review_reconciliation_required: manual adoption provenance drift")
             ticket_id = str(row["id"])
             policy = self.review_policy_hash(row, review_execution_policy_hash)
             identity = {"ticket_id": ticket_id, "attempt_number": attempt_number, "implementation_diff_hash": str(row["diff_hash"]), "validation_artifact": str(row["artifact_path"]), "validation_artifact_sha256": str(row["artifact_sha256"]), "validation_evidence_hash": hashlib.sha256(str(validation.get("compact_evidence", "")).encode()).hexdigest(), "review_policy_hash": policy}
@@ -5071,9 +5203,49 @@ class Ledger:
 
     def record_runtime_stage(self, ticket_id: str, stage: str, detail: str, *, attempt_number: int | None = None, artifact_path: str | None = None, artifact_sha256: str | None = None, base_sha: str | None = None) -> bool:
         with self._transaction() as conn:
-            try: conn.execute("INSERT INTO runtime_stages(ticket_id, stage, detail, attempt_number, artifact_path, artifact_sha256, base_sha, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (ticket_id, stage, detail, attempt_number, artifact_path, artifact_sha256, base_sha, self._now()))
-            except sqlite3.IntegrityError: return False
+            try:
+                conn.execute("INSERT INTO runtime_stages(ticket_id, stage, detail, attempt_number, artifact_path, artifact_sha256, base_sha, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (ticket_id, stage, detail, attempt_number, artifact_path, artifact_sha256, base_sha, self._now()))
+            except sqlite3.IntegrityError:
+                return False
             return True
+
+    def _advance_reconciled_runtime_marker_in_transaction(self, conn: sqlite3.Connection, ticket_id: str, stage: str, *, attempt_number: int, detail: str, artifact_path: str | None, artifact_sha256: str | None, base_sha: str | None, now: int) -> bool:
+        if stage not in {"implementation_completed", "validation_completed"} or attempt_number < 1:
+            raise ValueError("invalid reconciled runtime marker")
+        existing = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, stage)).fetchone()
+        if existing is None:
+            conn.execute(
+                "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (ticket_id, stage, detail, attempt_number, artifact_path, artifact_sha256, base_sha, now),
+            )
+            return True
+        if existing["attempt_number"] is None or int(existing["attempt_number"]) == attempt_number:
+            return False
+        reconciliation = conn.execute(
+            "SELECT * FROM failed_attempt_reconciliations WHERE ticket_id=? AND retired_attempt_number=? AND prospective_next_attempt_number=?",
+            (ticket_id, int(existing["attempt_number"]), attempt_number),
+        ).fetchone()
+        if reconciliation is None:
+            raise RuntimeError("runtime marker cannot advance without failed-attempt reconciliation")
+        predecessor = conn.execute(
+            "SELECT outcome FROM attempts WHERE ticket_id=? AND attempt_number=?",
+            (ticket_id, int(existing["attempt_number"])),
+        ).fetchone()
+        if predecessor is None or predecessor["outcome"] != "failed_retired":
+            raise RuntimeError("runtime marker predecessor is not retired")
+        conn.execute(
+            "UPDATE runtime_stages SET detail=?,attempt_number=?,artifact_path=?,artifact_sha256=?,base_sha=?,created_at=? WHERE ticket_id=? AND stage=?",
+            (detail, attempt_number, artifact_path, artifact_sha256, base_sha, now, ticket_id, stage),
+        )
+        return True
+
+    def advance_reconciled_runtime_marker(self, ticket_id: str, stage: str, *, attempt_number: int, detail: str, artifact_path: str | None = None, artifact_sha256: str | None = None, base_sha: str | None = None) -> bool:
+        """Advance one active completion marker only across a durably reconciled retry boundary."""
+        with self._transaction() as conn:
+            return self._advance_reconciled_runtime_marker_in_transaction(
+                conn, ticket_id, stage, attempt_number=attempt_number, detail=detail,
+                artifact_path=artifact_path, artifact_sha256=artifact_sha256, base_sha=base_sha, now=self._now(),
+            )
 
     def runtime_stage(self, ticket_id: str, stage: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, stage)).fetchone()
