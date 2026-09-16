@@ -33,6 +33,8 @@ class OperatorAction(BaseModel):
 
 
 class ConfigurationUpdate(BaseModel):
+    canonical_repository: str | None = Field(default=None, min_length=1, max_length=4096)
+    repository_allowlist: list[str] | None = None
     implementation_profile: str = Field(min_length=1, max_length=240)
     review_profile: str = Field(min_length=1, max_length=240)
     decomposition_local_profile: str | None = Field(default=None, max_length=240)
@@ -151,10 +153,14 @@ def update_configuration(update: ConfigurationUpdate) -> dict[str, Any]:
             )
             if registration is not None
         }
+        requested_repository = Path(update.canonical_repository).expanduser() if update.canonical_repository is not None else config.canonical_repository
+        requested_allowlist = tuple(Path(item).expanduser() for item in update.repository_allowlist) if update.repository_allowlist is not None else config.repository_allowlist
+        if update.repository_allowlist is not None and (not update.repository_allowlist or any(not item.strip() for item in update.repository_allowlist)):
+            raise ValueError("repository_allowlist must be a non-empty list of paths")
         checked = OperatorConfig(
             ledger_path=config.ledger_path,
-            canonical_repository=config.canonical_repository,
-            repository_allowlist=config.repository_allowlist,
+            canonical_repository=requested_repository,
+            repository_allowlist=requested_allowlist,
             implementation=resolve_registration(update.implementation_profile),
             review=resolve_registration(update.review_profile),
             worktree_root=config.worktree_root,
@@ -171,6 +177,8 @@ def update_configuration(update: ConfigurationUpdate) -> dict[str, Any]:
             "VALUES ('controller','global','operator_configuration_updated',NULL,NULL,'controller','dashboard-operator',?,strftime('%s','now'))",
             (json.dumps({
                 "implementation_profile": checked.implementation.profile,
+                "canonical_repository": str(checked.canonical_repository),
+                "repository_allowlist": [str(path) for path in checked.repository_allowlist],
                 "review_profile": checked.review.profile,
                 "decomposition_profiles": {name: route.profile for name, route in checked.decomposition},
                 "paid_checkpoint_profile": checked.paid_checkpoint.profile if checked.paid_checkpoint else None,

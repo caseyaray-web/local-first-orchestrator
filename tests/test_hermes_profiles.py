@@ -19,6 +19,8 @@ class HermesProfileDiscoveryTests(unittest.TestCase):
  ◆default         gpt-5.6-luna                 running      —            —
   worker-architect-sol gpt-5.6-sol                  stopped      worker-architect-sol —
   worker-code-local qwen3.8-27b@iq3_s            stopped      worker-code-local —
+
+⚠ Profile 'worker-code-local' shares its telegram credential with default: the bot can only belong to one profile.
 """,
                 "",
             )

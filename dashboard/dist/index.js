@@ -11,6 +11,8 @@
     if (!config) return null;
     const decomposition = config.decomposition || {};
     return {
+      canonical_repository: config.canonical_repository,
+      repository_allowlist: config.repository_allowlist || [],
       implementation_profile: config.implementation.profile,
       review_profile: config.review.profile,
       decomposition_local_profile: decomposition.local ? decomposition.local.profile : "",
@@ -66,7 +68,11 @@
 
     const act = function (action) {
       setBusy(true); setError(""); setMessage("");
-      SDK.fetchJSON(apiBase + "/" + action, { method: "POST", body: { reason: "dashboard operator action" } })
+      SDK.fetchJSON(apiBase + "/" + action, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "dashboard operator action" })
+      })
         .then(function (next) { setStatus(next); setDraft(configDraft(next.configuration)); })
         .catch(function (err) { setError(String(err.message || err)); })
         .finally(function () { setBusy(false); });
@@ -75,7 +81,11 @@
     const saveConfiguration = function () {
       if (!draft) return;
       setBusy(true); setError(""); setMessage("");
-      SDK.fetchJSON(apiBase + "/configuration", { method: "PUT", body: draft })
+      SDK.fetchJSON(apiBase + "/configuration", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(draft)
+      })
         .then(function (configuration) {
           setStatus(function (current) { return current ? Object.assign({}, current, { configuration: configuration }) : current; });
           setDraft(configDraft(configuration));
@@ -105,10 +115,10 @@
           status ? React.createElement(React.Fragment, null,
             React.createElement("div", { className: "flex items-center gap-3" }, React.createElement("span", { className: "text-sm" }, "Admission:"), React.createElement(Badge, null, status.paused ? "Paused" : "Accepting new work")),
             React.createElement("div", { className: "grid grid-cols-2 gap-3 sm:grid-cols-5" }, metric("Ready local", status.ready_local), metric("Running", status.running), metric("Needs triage", status.needs_triage), metric("Done", status.done), metric("Pending outbox", status.outbox_pending)),
-            React.createElement("div", { className: "flex gap-2" },
-              React.createElement(Button, { onClick: refresh, disabled: busy }, "Refresh"),
-              React.createElement(Button, { onClick: function () { act("pause"); }, disabled: busy || status.paused }, "Pause new work"),
-              React.createElement(Button, { onClick: function () { act("resume"); }, disabled: busy || !status.paused }, "Resume new work")),
+            React.createElement("div", { className: "grid grid-cols-1 gap-2 sm:grid-cols-3" },
+              React.createElement(Button, { className: "w-full whitespace-nowrap justify-center", onClick: refresh, disabled: busy }, "Refresh"),
+              React.createElement(Button, { className: "w-full whitespace-nowrap justify-center", onClick: function () { act("pause"); }, disabled: busy || status.paused }, "Pause new work"),
+              React.createElement(Button, { className: "w-full whitespace-nowrap justify-center", onClick: function () { act("resume"); }, disabled: busy || !status.paused }, "Resume new work")),
             React.createElement("div", { className: "space-y-1" }, React.createElement("h3", { className: "text-sm font-medium" }, "Active tickets"), status.active.map(function (item) { return React.createElement("div", { key: item.ticket_id, className: "rounded border p-2 text-xs" }, item.ticket_id + " — " + item.state + " — feature " + (item.feature_id || "-") + " — tranche " + (item.tranche_id || "-")); }), status.active_truncated ? React.createElement("div", { className: "text-xs text-muted-foreground" }, "Showing the first 25 active tickets.") : null)
           ) : null)),
       React.createElement(Card, null,
@@ -130,6 +140,13 @@
         React.createElement(CardContent, { className: "space-y-4" },
           config && draft ? React.createElement(React.Fragment, null,
             React.createElement("p", { className: "text-sm text-muted-foreground" }, "Choose Hermes profiles for each model-using role. Provider and model are resolved from Hermes when you save, so this page does not duplicate Hermes model configuration."),
+            React.createElement("div", { className: "grid gap-3" },
+              React.createElement("label", { className: "space-y-1" },
+                React.createElement("div", { className: "text-xs font-medium" }, "Canonical repository"),
+                React.createElement("input", { className: "w-full rounded border bg-background px-2 py-2 font-mono text-xs", value: draft.canonical_repository || "", disabled: busy, onChange: function (event) { updateDraft("canonical_repository", event.target.value); } })),
+              React.createElement("label", { className: "space-y-1" },
+                React.createElement("div", { className: "text-xs font-medium" }, "Repository allowlist (one path per line)"),
+                React.createElement("textarea", { className: "min-h-24 w-full rounded border bg-background px-2 py-2 font-mono text-xs", value: (draft.repository_allowlist || []).join("\n"), disabled: busy, onChange: function (event) { updateDraft("repository_allowlist", event.target.value.split(/\r?\n/).map(function (value) { return value.trim(); }).filter(Boolean)); } }))),
             React.createElement("div", { className: "grid gap-3 md:grid-cols-2" },
               React.createElement(ProfileSelect, { label: "Local implementation", value: draft.implementation_profile, profiles: profiles, disabled: busy, onChange: function (value) { updateDraft("implementation_profile", value); } }),
               React.createElement(ProfileSelect, { label: "Review", value: draft.review_profile, profiles: profiles, disabled: busy, onChange: function (value) { updateDraft("review_profile", value); } }),
@@ -141,10 +158,8 @@
               React.createElement("label", { className: "space-y-1" }, React.createElement("div", { className: "text-xs font-medium" }, "Review timeout (seconds)"), React.createElement("input", { className: "w-full rounded border bg-background px-2 py-2 text-sm", type: "number", min: 1, max: 86400, value: draft.review_timeout_seconds, disabled: busy, onChange: function (event) { updateDraft("review_timeout_seconds", Number(event.target.value)); } }))
             ),
             !status.paused ? React.createElement("p", { className: "text-xs text-muted-foreground" }, "Pause Local First before saving role changes.") : null,
-            React.createElement("div", { className: "flex items-center gap-3" }, React.createElement(Button, { onClick: saveConfiguration, disabled: busy || !status.paused || !profiles.length }, busy ? "Saving…" : "Save configuration"), message ? React.createElement("span", { className: "text-xs text-muted-foreground" }, message) : null),
+            React.createElement("div", { className: "flex flex-col items-stretch gap-3 sm:flex-row sm:items-center" }, React.createElement(Button, { className: "w-full whitespace-nowrap justify-center sm:w-auto", onClick: saveConfiguration, disabled: busy || !status.paused || !profiles.length }, busy ? "Saving…" : "Save configuration"), message ? React.createElement("span", { className: "text-xs text-muted-foreground" }, message) : null),
             React.createElement("div", { className: "space-y-1 text-xs text-muted-foreground" },
-              React.createElement("div", null, "Canonical repo: " + config.canonical_repository),
-              React.createElement("div", null, "Allowlist: " + config.repository_allowlist.join(", ")),
               React.createElement("div", null, "Worktrees: " + (config.worktree_root || "—")),
               React.createElement("div", null, "Artifacts: " + (config.artifact_root || "—")))
           ) : React.createElement("p", { className: "text-sm text-muted-foreground" }, "Configuration unavailable.")))

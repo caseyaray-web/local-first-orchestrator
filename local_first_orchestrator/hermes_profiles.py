@@ -55,7 +55,12 @@ def list_profile_names(*, executable: str = "hermes", runner: Runner = subproces
     names: list[str] = []
     for raw in output.splitlines():
         line = raw.strip()
-        if not line or line.startswith("Profile") or set(line) <= {"─", "-", " ", "◆"}:
+        if (
+            not line
+            or line.startswith("Profile")
+            or line.startswith("⚠")
+            or set(line) <= {"─", "-", " ", "◆"}
+        ):
             continue
         line = line.lstrip("◆").strip()
         match = re.match(r"(?P<name>[^\s]+)\s+[^\s]+", line)

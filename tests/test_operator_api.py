@@ -148,6 +148,56 @@ class OperatorApiTests(unittest.TestCase):
         ledger.close()
         self.assertIsNotNone(event)
 
+    def test_configuration_update_can_change_canonical_repository_and_allowlist_while_paused(self) -> None:
+        from local_first_orchestrator.operator_config import ModelRegistration, load_operator_config
+        second = Path(self.tempdir.name) / "repo-two"
+        second.mkdir()
+        subprocess.run(("git", "init", "-q"), cwd=second, check=True)
+        registrations = {
+            "impl": ModelRegistration("impl", "custom:lm-studio", "qwen3.8-27b@iq3_s"),
+            "review": ModelRegistration("review", "openai-codex", "gpt-5.6-luna"),
+        }
+        payload = {
+            "canonical_repository": str(second),
+            "repository_allowlist": [str(self.repository), str(second)],
+            "implementation_profile": "impl",
+            "review_profile": "review",
+            "implementation_timeout_seconds": 1800,
+            "review_timeout_seconds": 900,
+        }
+        self.client.post("/api/plugins/local-first-orchestrator/pause", json={"reason": "change repo"})
+        with mock.patch.object(self.api_module, "resolve_registration", side_effect=lambda name: registrations[name]):
+            saved = self.client.put("/api/plugins/local-first-orchestrator/configuration", json=payload)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json()["canonical_repository"], str(second.resolve()))
+        self.assertEqual(saved.json()["repository_allowlist"], [str(self.repository.resolve()), str(second.resolve())])
+        loaded = load_operator_config(Path(os.environ["LOCAL_FIRST_OPERATOR_CONFIG"]))
+        self.assertEqual(loaded.canonical_repository, second.resolve())
+        self.assertEqual(loaded.repository_allowlist, (self.repository.resolve(), second.resolve()))
+
+    def test_configuration_update_rejects_canonical_repository_outside_allowlist(self) -> None:
+        from local_first_orchestrator.operator_config import ModelRegistration
+        second = Path(self.tempdir.name) / "repo-two"
+        second.mkdir()
+        subprocess.run(("git", "init", "-q"), cwd=second, check=True)
+        registrations = {
+            "impl": ModelRegistration("impl", "custom:lm-studio", "qwen3.8-27b@iq3_s"),
+            "review": ModelRegistration("review", "openai-codex", "gpt-5.6-luna"),
+        }
+        payload = {
+            "canonical_repository": str(second),
+            "repository_allowlist": [str(self.repository)],
+            "implementation_profile": "impl",
+            "review_profile": "review",
+            "implementation_timeout_seconds": 1800,
+            "review_timeout_seconds": 900,
+        }
+        self.client.post("/api/plugins/local-first-orchestrator/pause", json={"reason": "change repo"})
+        with mock.patch.object(self.api_module, "resolve_registration", side_effect=lambda name: registrations[name]):
+            rejected = self.client.put("/api/plugins/local-first-orchestrator/configuration", json=payload)
+        self.assertEqual(rejected.status_code, 409)
+        self.assertIn("exact allowlisted root", rejected.json()["detail"])
+
     def test_profiles_endpoint_returns_resolved_profile_metadata(self) -> None:
         class Profile:
             def as_json(self):
