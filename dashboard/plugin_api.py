@@ -37,6 +37,7 @@ class ConfigurationUpdate(BaseModel):
     repository_allowlist: list[str] | None = None
     implementation_profile: str = Field(min_length=1, max_length=240)
     review_profile: str = Field(min_length=1, max_length=240)
+    local_review_profile: str | None = Field(default=None, max_length=240)
     decomposition_local_profile: str | None = Field(default=None, max_length=240)
     decomposition_standard_profile: str | None = Field(default=None, max_length=240)
     paid_checkpoint_profile: str | None = Field(default=None, max_length=240)
@@ -95,6 +96,7 @@ def _configuration_json(config: OperatorConfig) -> dict[str, Any]:
         "repository_allowlist": [str(path) for path in config.repository_allowlist],
         "implementation": config.implementation.__dict__,
         "review": config.review.__dict__,
+        "local_review": config.local_review_registration.__dict__,
         "decomposition": {name: route.__dict__ for name, route in decomposition.items()},
         "paid_checkpoint": config.paid_checkpoint.__dict__ if config.paid_checkpoint is not None else None,
         "paid_escalation": config.paid_escalation.__dict__ if config.paid_escalation is not None else None,
@@ -157,12 +159,18 @@ def update_configuration(update: ConfigurationUpdate) -> dict[str, Any]:
         requested_allowlist = tuple(Path(item).expanduser() for item in update.repository_allowlist) if update.repository_allowlist is not None else config.repository_allowlist
         if update.repository_allowlist is not None and (not update.repository_allowlist or any(not item.strip() for item in update.repository_allowlist)):
             raise ValueError("repository_allowlist must be a non-empty list of paths")
+        local_review = (
+            _optional_registration(update.local_review_profile)
+            if "local_review_profile" in update.model_fields_set
+            else config.local_review
+        )
         checked = OperatorConfig(
             ledger_path=config.ledger_path,
             canonical_repository=requested_repository,
             repository_allowlist=requested_allowlist,
             implementation=resolve_registration(update.implementation_profile),
             review=resolve_registration(update.review_profile),
+            local_review=local_review,
             worktree_root=config.worktree_root,
             artifact_root=config.artifact_root,
             implementation_timeout_seconds=update.implementation_timeout_seconds,
@@ -180,6 +188,7 @@ def update_configuration(update: ConfigurationUpdate) -> dict[str, Any]:
                 "canonical_repository": str(checked.canonical_repository),
                 "repository_allowlist": [str(path) for path in checked.repository_allowlist],
                 "review_profile": checked.review.profile,
+                "local_review_profile": checked.local_review_registration.profile,
                 "decomposition_profiles": {name: route.profile for name, route in checked.decomposition},
                 "paid_checkpoint_profile": checked.paid_checkpoint.profile if checked.paid_checkpoint else None,
                 "paid_escalation_profile": checked.paid_escalation.profile if checked.paid_escalation else None,

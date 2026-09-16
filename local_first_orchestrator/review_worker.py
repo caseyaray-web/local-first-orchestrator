@@ -18,9 +18,9 @@ def _request() -> dict[str, Any]:
         raw: Any = json.loads(sys.stdin.read())
     except json.JSONDecodeError as exc:
         raise ValueError("review worker request must be JSON") from exc
-    if not isinstance(raw, dict) or set(raw) != {"packet", "provider", "model", "timeout_seconds"}:
+    if not isinstance(raw, dict) or set(raw) != {"packet", "timeout_seconds"}:
         raise ValueError("review worker request has an invalid shape")
-    if not all(isinstance(raw[key], str) and raw[key] for key in ("packet", "provider", "model")) or not isinstance(raw["timeout_seconds"], int) or not 1 <= raw["timeout_seconds"] <= 21_600:
+    if not isinstance(raw["packet"], str) or not raw["packet"] or not isinstance(raw["timeout_seconds"], int) or not 1 <= raw["timeout_seconds"] <= 21_600:
         raise ValueError("review worker request has an invalid shape")
     return raw
 
@@ -39,8 +39,6 @@ def main() -> int:
             json_schema=REVIEW_JSON_SCHEMA,
             json_mode=True,
             schema_name="local_first_review",
-            provider=request["provider"],
-            model=request["model"],
             temperature=0,
             purpose="local_first_review",
             timeout=request["timeout_seconds"],

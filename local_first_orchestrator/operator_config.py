@@ -22,7 +22,7 @@ from typing import Any
 _CONFIG_ENV = "LOCAL_FIRST_OPERATOR_CONFIG"
 _LEGACY_FIELDS = frozenset({"ledger_path", "canonical_repository", "repository_allowlist", "implementation", "review"})
 _RUNTIME_FIELDS = frozenset({"worktree_root", "artifact_root", "implementation_timeout_seconds", "review_timeout_seconds"})
-_ROUTING_FIELDS = frozenset({"decomposition"})
+_ROUTING_FIELDS = frozenset({"decomposition", "local_review"})
 _PAID_FIELDS = frozenset({"paid_checkpoint", "paid_escalation"})
 _SIGNER_FIELDS = frozenset({"operator_signing_public_key", "operator_signing_key_fingerprint"})
 
@@ -84,6 +84,11 @@ class OperatorConfig:
     operator_signing_public_key: str | None = None
     operator_signing_key_fingerprint: str | None = None
     config_path: Path | None = None
+    local_review: ModelRegistration | None = None
+
+    @property
+    def local_review_registration(self) -> ModelRegistration:
+        return self.local_review or self.implementation
 
     @property
     def signer_public_key_bytes(self) -> bytes:
@@ -128,7 +133,7 @@ class OperatorConfig:
             raise ValueError("operator signer registration requires public key and fingerprint together")
         if self.operator_signing_public_key is not None:
             self.signer_public_key_bytes
-        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review, self.worktree_root, self.artifact_root, self.implementation_timeout_seconds, self.review_timeout_seconds, self.decomposition, self.paid_checkpoint, self.paid_escalation, self.operator_signing_public_key, self.operator_signing_key_fingerprint, self.config_path)
+        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review, self.worktree_root, self.artifact_root, self.implementation_timeout_seconds, self.review_timeout_seconds, self.decomposition, self.paid_checkpoint, self.paid_escalation, self.operator_signing_public_key, self.operator_signing_key_fingerprint, self.config_path, self.local_review)
 
     @property
     def execution_configured(self) -> bool:
@@ -153,6 +158,7 @@ class OperatorConfig:
             "repository_allowlist": [str(path) for path in self.repository_allowlist],
             "implementation": asdict(self.implementation),
             "review": asdict(self.review),
+            "local_review": asdict(self.local_review_registration),
             "worktree_root": str(self.worktree_root),
             "artifact_root": str(self.artifact_root),
             "implementation_timeout_seconds": self.implementation_timeout_seconds,
@@ -211,10 +217,11 @@ def _parse_operator_config_bytes(raw_bytes: bytes, config_path: Path) -> Operato
         decomposition = tuple(sorted((str(cost), ModelRegistration.parse(value, f"decomposition.{cost}")) for cost, value in raw["decomposition"].items()))
     paid_checkpoint = ModelRegistration.parse(raw["paid_checkpoint"], "paid_checkpoint") if "paid_checkpoint" in raw else None
     paid_escalation = ModelRegistration.parse(raw["paid_escalation"], "paid_escalation") if "paid_escalation" in raw else None
+    local_review = ModelRegistration.parse(raw["local_review"], "local_review") if "local_review" in raw else None
     signer = (raw.get("operator_signing_public_key"), raw.get("operator_signing_key_fingerprint"))
     if ("operator_signing_public_key" in raw or "operator_signing_key_fingerprint" in raw) and not all(isinstance(value, str) and value.strip() for value in signer):
         raise ValueError("operator signer registration requires public key and fingerprint together")
-    return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review"), *runtime, decomposition, paid_checkpoint, paid_escalation, *signer, config_path).validated(require_ledger=True)
+    return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review"), *runtime, decomposition, paid_checkpoint, paid_escalation, *signer, config_path, local_review).validated(require_ledger=True)
 
 
 def _raw_config(path: Path) -> tuple[bytes, dict[str, Any], dict[str, Any] | None]:

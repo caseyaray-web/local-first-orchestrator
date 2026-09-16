@@ -4903,7 +4903,7 @@ class Ledger:
                     OR (mi.invocation_id IS NULL AND he.hermes_run_id IS NOT NULL AND m.adapter<>'manual-adoption')
                     OR (m.adapter='manual-adoption' AND mi.invocation_id IS NULL AND he.hermes_run_id IS NULL AND ma.artifact_sha256 IS NOT NULL)
                 )
-                AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('review:' || r.attempt_number))
+                AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('review:' || r.attempt_number) AND c.status IN ('claimed','completed'))
                 ORDER BY t.created_at,t.id LIMIT 1
             """, (CanonicalState.LOCAL_REVIEW.value,)).fetchone()
             if row is None:
@@ -4945,10 +4945,61 @@ class Ledger:
             elif candidate["candidate_fingerprint"] != str(row["diff_hash"]) or candidate["validation_evidence"] != str(validation["compact_evidence"]) or candidate["runtime_identity_json"] != encoded_identity:
                 raise RuntimeError("review_reconciliation_required: review candidate identity drift")
             claim_id = hashlib.sha256(("review:" + encoded_identity).encode()).hexdigest()[:32]
+            stage_name = f"review:{attempt_number}"
             if conn.execute("UPDATE tickets SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=? AND state=?", (owner,now+lease_seconds,now,ticket_id,CanonicalState.LOCAL_REVIEW.value)).rowcount != 1:
                 return None
-            conn.execute("INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,created_at,updated_at) VALUES (?,?,?,'claimed',?,?,1,?,?,?)", (claim_id,ticket_id,f"review:{attempt_number}",owner,now+lease_seconds,encoded_identity,now,now))
-            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_claimed", actor_id=owner, payload={"claim_id":claim_id,"stage":"review","candidate_identity":identity})
+            failed_claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=? AND status='failed'", (ticket_id, stage_name)).fetchone()
+            if failed_claim is None:
+                conn.execute("INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,created_at,updated_at) VALUES (?,?,?,'claimed',?,?,1,?,?,?)", (claim_id,ticket_id,stage_name,owner,now+lease_seconds,encoded_identity,now,now))
+                event_type = "scheduler_stage_claimed"
+                event_payload = {"claim_id":claim_id,"stage":"review","candidate_identity":identity}
+            else:
+                previous_claim_id = str(failed_claim["claim_id"])
+                previous_identity = str(failed_claim["candidate_identity_json"] or "")
+                conn.execute("UPDATE scheduler_stage_claims SET claim_id=?,status='claimed',lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,result_json=NULL,last_error=NULL,side_effect_started_at=NULL,side_effect_completed_at=NULL,finalized_at=NULL,candidate_identity_json=?,created_at=?,updated_at=? WHERE claim_id=? AND status='failed'", (claim_id,owner,now+lease_seconds,encoded_identity,now,now,previous_claim_id))
+                event_type = "scheduler_stage_reissued"
+                event_payload = {"claim_id":claim_id,"previous_claim_id":previous_claim_id,"stage":"review","candidate_identity":identity,"previous_candidate_identity_json":previous_identity}
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type=event_type, actor_id=owner, payload=event_payload)
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
+    def fail_started_review_claim(self, claim_id: str, owner: str, *, error: str, now: int | None = None) -> dict[str, Any]:
+        """Retire a started review claim that produced no durable review side effect."""
+        if not error.strip():
+            raise ValueError("review claim failure requires an error")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if claim is None or not str(claim["stage"]).startswith("review:"):
+                raise ValueError("scheduler claim is not review")
+            if claim["status"] == "failed":
+                return dict(claim)
+            if claim["status"] != "claimed" or claim["side_effect_started_at"] is None or claim["side_effect_completed_at"] is not None:
+                raise RuntimeError("review claim is not a started incomplete effect")
+            if claim["lease_owner"] != owner:
+                raise PermissionError("scheduler claim lease is not owned")
+            identity = json.loads(str(claim["candidate_identity_json"] or ""))
+            attempt_number = int(identity.get("attempt_number", 0))
+            if attempt_number < 1:
+                raise RuntimeError("review claim candidate identity is malformed")
+            if conn.execute("SELECT 1 FROM review_results WHERE ticket_id=? AND attempt_number=?", (claim["ticket_id"], attempt_number)).fetchone():
+                raise RuntimeError("review claim already has a durable review result")
+            if conn.execute("SELECT 1 FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='review' AND status='completed'", (claim["ticket_id"], attempt_number)).fetchone():
+                raise RuntimeError("review claim already has a durable review stage")
+            latest_invocation = conn.execute(
+                "SELECT * FROM model_invocations WHERE ticket_id=? AND attempt_number=? AND stage='review' ORDER BY started_at DESC, invocation_id DESC LIMIT 1",
+                (claim["ticket_id"], attempt_number),
+            ).fetchone()
+            if latest_invocation is not None and str(latest_invocation["status"]) not in {"process_error", "timeout", "malformed_output"}:
+                raise RuntimeError("review claim cannot fail while review invocation is active or recoverable")
+            changed = conn.execute(
+                "UPDATE scheduler_stage_claims SET status='failed',lease_owner=NULL,lease_expires_at=NULL,last_error=?,finalized_at=?,updated_at=? WHERE claim_id=? AND status='claimed' AND side_effect_completed_at IS NULL",
+                (error[:4000], now, now, claim_id),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("review claim changed concurrently")
+            conn.execute("DELETE FROM review_candidates WHERE ticket_id=? AND attempt_number=? AND status IN ('review_pending','review_infrastructure_failed')", (claim["ticket_id"], attempt_number))
+            conn.execute("UPDATE tickets SET lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND lease_owner=?", (now, claim["ticket_id"], owner))
+            self._append_event(conn, entity_type="ticket", entity_id=str(claim["ticket_id"]), event_type="scheduler_review_claim_failed", actor_id=owner, payload={"claim_id": claim_id, "attempt_number": attempt_number, "candidate_identity_json": str(claim["candidate_identity_json"] or ""), "error": error[:1000]})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
     def complete_scheduler_review_effect(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:

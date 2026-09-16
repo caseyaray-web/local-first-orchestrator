@@ -8,8 +8,11 @@ asking operators to maintain coupled provider/model strings manually.
 from __future__ import annotations
 
 import re
+import hashlib
+import json
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Sequence
 
 from .operator_config import ModelRegistration
@@ -91,6 +94,24 @@ def show_profile(profile: str, *, executable: str = "hermes", runner: Runner = s
         gateway=gateway_match.group("gateway").strip() if gateway_match else None,
         alias=alias_match.group("alias").strip() if alias_match else None,
     )
+
+
+def review_profile_identity(profile: str, *, executable: str = "hermes", runner: Runner = subprocess.run, timeout_seconds: int = 15, profile_root: Path | None = None) -> dict[str, object]:
+    """Resolve one Hermes review profile live and fingerprint only non-secret routing files."""
+    resolved = show_profile(profile, executable=executable, runner=runner, timeout_seconds=timeout_seconds)
+    root = Path(profile_root).resolve() if profile_root is not None else Path.home() / ".hermes" / "profiles" / profile
+    routing_files: dict[str, str | None] = {}
+    for name in ("profile.yaml", "config.yaml"):
+        path = root / name
+        routing_files[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    identity: dict[str, object] = {
+        "profile": resolved.profile,
+        "provider": resolved.provider,
+        "model": resolved.model,
+        "routing_files": routing_files,
+    }
+    identity["fingerprint"] = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return identity
 
 
 def discover_profiles(*, executable: str = "hermes", runner: Runner = subprocess.run, timeout_seconds: int = 15) -> tuple[HermesProfile, ...]:

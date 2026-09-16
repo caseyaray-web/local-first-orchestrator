@@ -172,15 +172,16 @@ def _registered_controller(ledger: Ledger, args: argparse.Namespace, *, allow_bo
     if requested != config.canonical_repository:
         raise ValueError("registered execution repository does not match operator registration")
     runtime = config.runtime_config()
+    local_review = config.local_review_registration
     model = LocalQwenAdapter(
         provider=config.implementation.provider,
         model=config.implementation.model,
         hermes_home=Path.home()/".hermes"/"profiles"/config.implementation.profile,
-        review_hermes_home=Path.home()/".hermes"/"profiles"/config.review.profile,
+        review_hermes_home=Path.home()/".hermes"/"profiles"/local_review.profile,
         implementation_timeout_seconds=runtime.implementation_timeout_seconds,
         review_timeout_seconds=runtime.review_timeout_seconds,
     )
-    model.review_provider, model.review_model = config.review.provider, config.review.model
+    model.review_provider, model.review_model = local_review.provider, local_review.model
     return LocalFirstController(ledger,_board_for_cli(args,allow_board_writes, implementation_profile=config.implementation.profile, canonical_repository=config.canonical_repository),runtime,local_model=model), config
 
 
@@ -606,6 +607,9 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     register.add_argument("--review-profile", default="worker-code-local")
     register.add_argument("--review-provider", default=LOCAL_QWEN_PROVIDER)
     register.add_argument("--review-model", default=LOCAL_QWEN_MODEL)
+    register.add_argument("--local-review-profile")
+    register.add_argument("--local-review-provider")
+    register.add_argument("--local-review-model")
     register.add_argument("--operator-signing-public-key", help="base64 Ed25519 public key; private keys are never accepted")
     register.add_argument("--operator-signing-key-fingerprint", help="sha256 fingerprint of the registered public key")
     register.add_argument("--decomposition-local-profile")
@@ -804,6 +808,13 @@ def run_command(args: argparse.Namespace) -> int:
                     if not all(isinstance(value, str) and value.strip() for value in supplied):
                         raise ValueError(f"paid {purpose} route requires profile, provider, and model together")
                     paid_routes[purpose] = ModelRegistration(*supplied)
+            local_review_values = (args.local_review_profile, args.local_review_provider, args.local_review_model)
+            if any(value is not None for value in local_review_values):
+                if not all(isinstance(value, str) and value.strip() for value in local_review_values):
+                    raise ValueError("local review route requires profile, provider, and model together")
+                local_review = ModelRegistration(*local_review_values)
+            else:
+                local_review = None
             config=OperatorConfig(
                 ledger_path=Path(args.database),
                 canonical_repository=root,
@@ -819,6 +830,7 @@ def run_command(args: argparse.Namespace) -> int:
                 paid_escalation=paid_routes.get("escalation"),
                 operator_signing_public_key=args.operator_signing_public_key,
                 operator_signing_key_fingerprint=args.operator_signing_key_fingerprint,
+                local_review=local_review,
             )
             path=save_operator_config(config, Path(args.config_path) if args.config_path else None)
             print(json.dumps({"registered": str(path)}, sort_keys=True))

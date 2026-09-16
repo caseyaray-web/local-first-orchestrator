@@ -130,7 +130,7 @@ class LocalQwenAdapter:
             argv = (sys.executable, "-m", "local_first_orchestrator.review_worker")
             completed = self.runner(
                 argv,
-                input=json.dumps({"packet": packet, "provider": self.review_provider, "model": self.review_model, "timeout_seconds": self.review_timeout_seconds}),
+                input=json.dumps({"packet": packet, "timeout_seconds": self.review_timeout_seconds}),
                 text=True,
                 capture_output=True,
                 timeout=self.review_timeout_seconds,

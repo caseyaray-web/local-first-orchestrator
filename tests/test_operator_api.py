@@ -86,6 +86,7 @@ class OperatorApiTests(unittest.TestCase):
             "repository_allowlist": [str(self.repository.resolve())],
             "implementation": {"profile": "impl-profile", "provider": "impl-provider", "model": "impl-model"},
             "review": {"profile": "review-profile", "provider": "review-provider", "model": "review-model"},
+            "local_review": {"profile": "impl-profile", "provider": "impl-provider", "model": "impl-model"},
             "decomposition": {},
             "paid_checkpoint": None,
             "paid_escalation": None,
@@ -123,11 +124,13 @@ class OperatorApiTests(unittest.TestCase):
         registrations = {
             "impl": ModelRegistration("impl", "custom:lm-studio", "qwen3.8-27b@iq3_s"),
             "review": ModelRegistration("review", "openai-codex", "gpt-5.6-luna"),
+            "local-review": ModelRegistration("local-review", "custom:lm-studio", "qwen3.8-27b@iq3_s"),
             "decomp": ModelRegistration("decomp", "openai-codex", "gpt-5.6-sol"),
         }
         payload = {
             "implementation_profile": "impl",
             "review_profile": "review",
+            "local_review_profile": "local-review",
             "decomposition_standard_profile": "decomp",
             "implementation_timeout_seconds": 1200,
             "review_timeout_seconds": 600,
@@ -140,9 +143,18 @@ class OperatorApiTests(unittest.TestCase):
         self.assertEqual(saved.status_code, 200)
         body = saved.json()
         self.assertEqual(body["implementation"], {"profile": "impl", "provider": "custom:lm-studio", "model": "qwen3.8-27b@iq3_s"})
+        self.assertEqual(body["local_review"], {"profile": "local-review", "provider": "custom:lm-studio", "model": "qwen3.8-27b@iq3_s"})
         self.assertEqual(body["decomposition"]["standard"]["profile"], "decomp")
         config = load_operator_config(Path(os.environ["LOCAL_FIRST_OPERATOR_CONFIG"]))
         self.assertEqual(config.implementation_timeout_seconds, 1200)
+        self.assertEqual(config.local_review_registration.profile, "local-review")
+        legacy_payload = dict(payload)
+        legacy_payload.pop("local_review_profile")
+        with mock.patch.object(self.api_module, "resolve_registration", side_effect=lambda name: registrations[name]):
+            preserved = self.client.put("/api/plugins/local-first-orchestrator/configuration", json=legacy_payload)
+        self.assertEqual(preserved.status_code, 200, preserved.text)
+        preserved_config = load_operator_config(Path(os.environ["LOCAL_FIRST_OPERATOR_CONFIG"]))
+        self.assertEqual(preserved_config.local_review_registration.profile, "local-review")
         ledger = Ledger(self.database)
         event = ledger.connection.execute("SELECT event_type FROM events WHERE event_type='operator_configuration_updated' ORDER BY id DESC LIMIT 1").fetchone()
         ledger.close()

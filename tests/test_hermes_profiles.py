@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
+from pathlib import Path
+from unittest import mock
 import unittest
 
-from local_first_orchestrator.hermes_profiles import discover_profiles, list_profile_names, resolve_registration, show_profile
+from local_first_orchestrator.hermes_profiles import discover_profiles, list_profile_names, resolve_registration, review_profile_identity, show_profile
 
 
 class HermesProfileDiscoveryTests(unittest.TestCase):
@@ -40,6 +43,22 @@ class HermesProfileDiscoveryTests(unittest.TestCase):
         local = resolve_registration("worker-code-local", runner=self.runner)
         self.assertEqual((local.profile, local.provider, local.model), ("worker-code-local", "custom:lm-studio", "qwen3.8-27b@iq3_s"))
         self.assertEqual(len(discover_profiles(runner=self.runner)), 3)
+
+    def test_review_profile_identity_binds_live_routing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            profile = home / ".hermes" / "profiles" / "worker-code-local"
+            profile.mkdir(parents=True)
+            (profile / "profile.yaml").write_text("name: worker-code-local\n", encoding="utf-8")
+            config = profile / "config.yaml"
+            config.write_text("model: first\n", encoding="utf-8")
+            with mock.patch("local_first_orchestrator.hermes_profiles.Path.home", return_value=home):
+                first = review_profile_identity("worker-code-local", runner=self.runner)
+                config.write_text("model: second\n", encoding="utf-8")
+                second = review_profile_identity("worker-code-local", runner=self.runner)
+            self.assertEqual(first["profile"], "worker-code-local")
+            self.assertEqual(first["provider"], "custom:lm-studio")
+            self.assertNotEqual(first["fingerprint"], second["fingerprint"])
 
     def test_rejects_unparseable_profile_metadata(self) -> None:
         def runner(argv, **kwargs):

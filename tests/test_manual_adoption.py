@@ -85,6 +85,43 @@ class ManualAdoptionTests(unittest.TestCase):
         self.assertIsNotNone(candidate)
         self.assertTrue(str(candidate["implementation_invocation_id"]).startswith("manual-adoption:"))
 
+    def test_started_review_claim_can_fail_and_be_reissued_under_new_policy(self) -> None:
+        self.controller.adopt_existing_implementation(
+            self.ticket_id, repository=self.repo, operator_id="operator", reason="candidate for review retry"
+        )
+        self.ledger.resume("operator", reason="validate review retry candidate")
+        validation_claim = self.ledger.claim_next_scheduler_validation("validator", lease_seconds=60)
+        self.assertIsNotNone(validation_claim)
+        self.ledger.begin_scheduler_claim_effect(str(validation_claim["claim_id"]), "validator")
+        validation = self.controller.execute_deterministic_validation_only(self.ticket_id, repository=self.repo)
+        self.ledger.complete_scheduler_validation_effect(str(validation_claim["claim_id"]), "validator", validation)
+        self.assertTrue(validation["passed"], validation)
+
+        first = self.ledger.claim_next_scheduler_review("reviewer-old", lease_seconds=60, review_execution_policy_hash="old-policy")
+        self.assertIsNotNone(first)
+        self.ledger.begin_scheduler_claim_effect(str(first["claim_id"]), "reviewer-old")
+        self.ledger.start_model_invocation(invocation_id="inflight-review", ticket_id=self.ticket_id, attempt_number=1, stage="review", provider="provider", model="model", packet_hash="packet", worktree_path="packet-only", timeout_seconds=60)
+        with self.assertRaisesRegex(RuntimeError, "active or recoverable"):
+            self.ledger.fail_started_review_claim(str(first["claim_id"]), "reviewer-old", error="must not retire active invocation")
+        self.ledger.finish_model_invocation("inflight-review", status="process_error", duration_seconds=0.1, error={"type": "test"})
+        failed = self.ledger.fail_started_review_claim(str(first["claim_id"]), "reviewer-old", error="provider override rejected before review output")
+        self.assertEqual(failed["status"], "failed")
+        self.assertIsNone(self.ledger.connection.execute("SELECT 1 FROM review_candidates WHERE ticket_id=? AND attempt_number=1", (self.ticket_id,)).fetchone())
+
+        second = self.ledger.claim_next_scheduler_review("reviewer-new", lease_seconds=60, review_execution_policy_hash="new-policy")
+        self.assertIsNotNone(second)
+        self.assertNotEqual(second["claim_id"], first["claim_id"])
+        identity = __import__("json").loads(str(second["candidate_identity_json"]))
+        self.assertNotEqual(identity["review_policy_hash"], __import__("json").loads(str(first["candidate_identity_json"]))["review_policy_hash"])
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM scheduler_stage_claims WHERE ticket_id=? AND stage='review:1'", (self.ticket_id,)).fetchone()[0], 1)
+        event = self.ledger.connection.execute("SELECT payload_json FROM events WHERE entity_id=? AND event_type='scheduler_review_claim_failed' ORDER BY id DESC LIMIT 1", (self.ticket_id,)).fetchone()
+        self.assertIsNotNone(event)
+        self.assertIn(str(first["claim_id"]), str(event["payload_json"]))
+        reissued = self.ledger.connection.execute("SELECT payload_json FROM events WHERE entity_id=? AND event_type='scheduler_stage_reissued' ORDER BY id DESC LIMIT 1", (self.ticket_id,)).fetchone()
+        self.assertIsNotNone(reissued)
+        self.assertIn(str(first["claim_id"]), str(reissued["payload_json"]))
+        self.assertIn("previous_candidate_identity_json", str(reissued["payload_json"]))
+
     def test_failed_manual_validation_can_reconcile_and_adopt_corrected_attempt_two(self) -> None:
         (self.worktree / "app.py").write_text("def run():\n    return 2\n\ndef extra():\n    return 3\n", encoding="utf-8")
         first = self.controller.adopt_existing_implementation(

@@ -204,7 +204,7 @@ class Phase2Tests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         argv, kwargs = calls[0]
         self.assertEqual(argv, (sys.executable, "-m", "local_first_orchestrator.review_worker"))
-        self.assertEqual(json.loads(kwargs["input"]), {"packet": "packet", "provider": "custom:lm-studio", "model": "qwen3.8-27b@iq3_s", "timeout_seconds": 300})
+        self.assertEqual(json.loads(kwargs["input"]), {"packet": "packet", "timeout_seconds": 300})
         self.assertEqual(kwargs["env"]["HERMES_HOME"], str(review_home.resolve()))
         self.assertNotEqual(kwargs["env"]["HERMES_HOME"], str(implementation_home.resolve()))
         self.assertNotIn("TERMINAL_CWD", kwargs["env"])

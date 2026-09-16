@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import hashlib
 import io
@@ -15,6 +16,7 @@ from local_first_orchestrator.cli import main as cli_main, register_cli
 from local_first_orchestrator.execution_handoff import HANDOFF_MARKER
 from local_first_orchestrator.hermes_board import ExternalTicket, HermesBoardAdapter
 from local_first_orchestrator.ledger import Ledger
+from local_first_orchestrator.operator_config import ModelRegistration, OperatorConfig, save_operator_config
 from local_first_orchestrator.scheduler import ProcessNextScheduler, preview_next
 from local_first_orchestrator.states import CanonicalState
 
@@ -724,10 +726,44 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         self.assertFalse(args.execute)
         self.assertFalse(args.allow_board_writes)
 
+        repo = self.root / "cli-repo"
+        repo.mkdir()
+        subprocess.run(("git", "init", "-q"), cwd=repo, check=True)
+        worktrees = self.root / "cli-worktrees"
+        artifacts = self.root / "cli-artifacts"
+        worktrees.mkdir()
+        artifacts.mkdir()
+        config_path = self.root / "cli-operator-config.json"
+        signer_public_key = b"\x01" * 32
+        signer_fingerprint = hashlib.sha256(signer_public_key).hexdigest()
+        save_operator_config(
+            OperatorConfig(
+                self.database,
+                repo,
+                (repo,),
+                ModelRegistration("impl-test", "test-provider", "test-model"),
+                ModelRegistration("review-test", "test-provider", "test-model"),
+                worktrees,
+                artifacts,
+                300,
+                300,
+                operator_signing_public_key=base64.b64encode(signer_public_key).decode(),
+                operator_signing_key_fingerprint=signer_fingerprint,
+            ),
+            config_path,
+        )
+
         ticket = self.ticket("cli-preview")
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            self.assertEqual(cli_main(["--database", str(self.database), "process-next"]), 0)
+            self.assertEqual(
+                cli_main([
+                    "--database", str(self.database),
+                    "--operator-config-path", str(config_path),
+                    "process-next",
+                ]),
+                0,
+            )
         payload = json.loads(output.getvalue())
         self.assertEqual((payload["status"], payload["next_stage"], payload["ticket_id"]), ("dry_run", "dependency_readiness", ticket))
         self.assertFalse(payload["would_execute"])

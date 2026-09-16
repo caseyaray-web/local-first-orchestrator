@@ -22,6 +22,7 @@ from .evidence_hash import canonical_sha256
 from .git_adapter import AttemptWorktree, GitWorktreeAdapter
 from .git_security import safe_git_argv, safe_git_env
 from .historical_revalidation import attestation_hash_from_row, authorization_hash_from_row, classify_obsolete_validation_failure, derive_obsolete_validation_failure, historical_validation_result_hash
+from .hermes_profiles import review_profile_identity
 from .execution_handoff import HANDOFF_SENTINEL
 from .ledger import Ledger, _completion_evidence_hash, _recheck_evidence_hash
 from .local_qwen import LocalQwenAdapter, REVIEW_JSON_SCHEMA
@@ -1969,13 +1970,20 @@ class LocalFirstController:
         """Freeze an exact, already-completed passing historical validation result."""
         return self.revalidate_historical_implementation(ticket_id, attempt_number, repository=repository, operator_id=operator_id, freeze_candidate=True, allow_existing_review=allow_existing_review)
 
+    def review_execution_identity(self) -> dict[str, object]:
+        """Resolve the live Hermes review profile and bind its non-secret routing state."""
+        review_home = Path(getattr(self.local_model, "review_hermes_home", ""))
+        if not review_home.name:
+            provider = str(getattr(self.local_model, "review_provider", getattr(self.local_model, "provider", type(self.local_model).__name__)))
+            model = str(getattr(self.local_model, "review_model", getattr(self.local_model, "model", type(self.local_model).__name__)))
+            return {"profile": None, "provider": provider, "model": model, "routing_files": {}, "fingerprint": hashlib.sha256(f"{provider}\0{model}".encode()).hexdigest()}
+        executable = str(getattr(self.local_model, "executable", "hermes"))
+        return review_profile_identity(review_home.name, executable=executable, profile_root=review_home)
+
     def review_execution_policy_hash(self) -> str:
-        """Hash the configured review execution identity used for claim-time binding."""
-        provider = str(getattr(self.local_model, "review_provider", getattr(self.local_model, "provider", type(self.local_model).__name__)))
-        model = str(getattr(self.local_model, "review_model", getattr(self.local_model, "model", type(self.local_model).__name__)))
+        """Hash the live review profile identity used for claim-time binding."""
         policy = {
-            "provider": provider,
-            "model": model,
+            "execution_identity": self.review_execution_identity(),
             "timeout_seconds": self.config.review_timeout_seconds,
             "schema": REVIEW_JSON_SCHEMA,
             "review_mode": "packet-only",
@@ -2036,6 +2044,7 @@ class LocalFirstController:
                     raise RuntimeError("review_reconciliation_required: persisted review artifact is invalid") from exc
                 return result_payload(existing_review, response, replayed=True)
             raise RuntimeError("review_reconciliation_required: persisted review stage conflicts")
+        retry_authorization = None
         prior_invocations = self.ledger.review_invocations(ticket_id, attempt_number)
         if prior_invocations:
             prior = prior_invocations[-1]
@@ -2051,8 +2060,9 @@ class LocalFirstController:
                     envelope = json.loads(response.read_text(encoding="utf-8"))
                     if not isinstance(envelope, dict) or set(envelope) != {"provider", "model", "payload"}:
                         raise ValueError("unexpected review artifact envelope")
-                    provider = str(getattr(self.local_model, "review_provider", getattr(self.local_model, "provider", type(self.local_model).__name__)))
-                    model = str(getattr(self.local_model, "review_model", getattr(self.local_model, "model", type(self.local_model).__name__)))
+                    live_review_identity = self.review_execution_identity()
+                    provider = str(live_review_identity["provider"])
+                    model = str(live_review_identity["model"])
                     if envelope["provider"] != provider or envelope["model"] != model or prior["provider"] != provider or prior["model"] != model:
                         raise ValueError("review execution identity drift")
                     recovered_review = normalize_review(envelope["payload"], ticket)
@@ -2073,13 +2083,26 @@ class LocalFirstController:
                 if not recorded and self.ledger.model_stage(ticket_id, attempt_number, "review") is None:
                     raise RuntimeError("review_reconciliation_required: completed review invocation could not be recovered")
                 return result_payload(recovered_review, response, replayed=True)
-            raise RuntimeError("review_reconciliation_required: prior review invocation requires reconciliation")
+            retry_authorization = self.ledger.connection.execute(
+                "SELECT * FROM review_retry_authorizations WHERE ticket_id=? AND attempt_number=? AND failed_invocation_id=? AND candidate_fingerprint=? AND consumed_invocation_id IS NULL ORDER BY authorized_at DESC LIMIT 1",
+                (ticket_id, attempt_number, str(prior["invocation_id"]), str(identity["implementation_diff_hash"])),
+            ).fetchone()
+            if retry_authorization is None:
+                raise RuntimeError("review_reconciliation_required: prior review invocation requires reconciliation")
         artifacts_root = self.config.validate_execution_roots()[2] / ticket_id / str(attempt_number); artifacts_root.mkdir(parents=True, exist_ok=True)
         invocation_id = uuid.uuid4().hex
-        provider = str(getattr(self.local_model, "review_provider", getattr(self.local_model, "provider", type(self.local_model).__name__)))
-        model = str(getattr(self.local_model, "review_model", getattr(self.local_model, "model", type(self.local_model).__name__)))
+        live_review_identity = self.review_execution_identity()
+        provider = str(live_review_identity["provider"])
+        model = str(live_review_identity["model"])
+        if hasattr(self.local_model, "review_provider"):
+            self.local_model.review_provider = provider
+        if hasattr(self.local_model, "review_model"):
+            self.local_model.review_model = model
         packet_hash = hashlib.sha256(packet.encode()).hexdigest()
-        self.ledger.start_model_invocation(invocation_id=invocation_id, ticket_id=ticket_id, attempt_number=attempt_number, stage="review", provider=provider, model=model, packet_hash=packet_hash, worktree_path="packet-only", timeout_seconds=self.config.review_timeout_seconds)
+        if retry_authorization is None:
+            self.ledger.start_model_invocation(invocation_id=invocation_id, ticket_id=ticket_id, attempt_number=attempt_number, stage="review", provider=provider, model=model, packet_hash=packet_hash, worktree_path="packet-only", timeout_seconds=self.config.review_timeout_seconds)
+        else:
+            self.ledger.launch_authorized_review(str(retry_authorization["authorization_id"]), invocation_id=invocation_id, provider=provider, model=model, packet_hash=packet_hash, worktree_path="packet-only", timeout_seconds=self.config.review_timeout_seconds)
         self._crash("review_invocation_started")
         started = time.monotonic()
         try:
@@ -2706,8 +2729,13 @@ class LocalFirstController:
         packet = ReviewPacketBuilder().build(ticket, diff=diff, selected_files=selected_files, validation_evidence=str(candidate["validation_evidence"]))
         artifacts_root = artifact_root / ticket_id / str(attempt_number); artifacts_root.mkdir(parents=True, exist_ok=True)
         invocation_id = uuid.uuid4().hex
-        provider = str(getattr(self.local_model, "review_provider", getattr(self.local_model, "provider", type(self.local_model).__name__)))
-        model = str(getattr(self.local_model, "review_model", getattr(self.local_model, "model", type(self.local_model).__name__)))
+        live_review_identity = self.review_execution_identity()
+        provider = str(live_review_identity["provider"])
+        model = str(live_review_identity["model"])
+        if hasattr(self.local_model, "review_provider"):
+            self.local_model.review_provider = provider
+        if hasattr(self.local_model, "review_model"):
+            self.local_model.review_model = model
         packet_hash = hashlib.sha256(packet.encode()).hexdigest()
         try:
             self.ledger.start_model_invocation(invocation_id=invocation_id, ticket_id=ticket_id, attempt_number=attempt_number, stage="review", provider=provider, model=model, packet_hash=packet_hash, worktree_path=str(path), timeout_seconds=self.config.review_timeout_seconds)
