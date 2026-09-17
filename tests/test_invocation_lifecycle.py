@@ -925,6 +925,76 @@ class InvocationLifecycleTests(unittest.TestCase):
         self.assertEqual(len(triage_events), 1)
         self.assertIsNone(self.ledger.claim_next_scheduler_repair_routing("other", lease_seconds=30, now=100))
 
+    def test_repeated_failure_uses_remaining_local_attempt_budget_before_triage(self) -> None:
+        model = SequencedLifecycleModel(["still-bad", "still-bad"]); ctl, ticket = self.controller(model)
+        self.ledger.connection.execute("UPDATE tickets SET max_attempts=3 WHERE id=?", (ticket,))
+        scheduler = ProcessNextScheduler(
+            self.ledger, Board(), worker_id="scheduler", lease_seconds=30, clock=lambda: 100,
+            implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo),
+            validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo),
+        )
+        for expected in ("implementation", "validation", "repair_routing", "implementation", "validation", "repair_routing"):
+            self.assertEqual(scheduler.process_next().stage, expected)
+        decision = json.loads(str(self.ledger.runtime_stage(ticket, "repair-routing-2")["detail"]))
+        self.assertTrue(decision["repeated_fingerprint"])
+        self.assertEqual((decision["action"], decision["next_attempt_number"]), ("repair", 3))
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "repairing")
+
+    def test_triage_feedback_is_durable_before_needs_triage_comment_can_be_delivered(self) -> None:
+        model = SequencedLifecycleModel(["still-bad"]); ctl, ticket = self.controller(model)
+        self.ledger.connection.execute("UPDATE tickets SET max_attempts=1 WHERE id=?", (ticket,))
+        feedback_calls: list[str] = []
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="scheduler",
+            lease_seconds=30,
+            clock=lambda: 100,
+            implementation_runner=lambda value: ctl.execute_implementation_model_only(value, repository=self.repo),
+            validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo),
+            triage_feedback_runner=lambda value, triage: feedback_calls.append(value) or {"feedback": "SYNTHESIZED TRIAGE FEEDBACK"},
+        )
+        self.assertEqual(scheduler.process_next().stage, "implementation")
+        self.assertEqual(scheduler.process_next().stage, "validation")
+
+        original_apply = self.ledger.apply_scheduler_repair_routing_effect
+        self.ledger.apply_scheduler_repair_routing_effect = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("crash-before-triage-commit"))
+        try:
+            with self.assertRaisesRegex(RuntimeError, "crash-before-triage-commit"):
+                scheduler.process_next()
+        finally:
+            self.ledger.apply_scheduler_repair_routing_effect = original_apply
+
+        self.assertEqual(feedback_calls, [ticket])
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], "verifying")
+        self.assertFalse(any(event["event_type"] == "state_transition" and event["to_state"] == "needs_triage" for event in self.ledger.events_for(ticket)))
+        feedback_stage = self.ledger.runtime_stage(ticket, "triage-feedback-1")
+        self.assertIsNotNone(feedback_stage)
+        recorded = json.loads(str(feedback_stage["detail"]))
+        self.assertEqual(recorded["feedback"], "SYNTHESIZED TRIAGE FEEDBACK")
+
+        resumed = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="recovery",
+            lease_seconds=30,
+            clock=lambda: 132,
+            triage_feedback_runner=lambda *_args: (_ for _ in ()).throw(AssertionError("feedback must not be regenerated on replay")),
+        )
+        result = resumed.process_next()
+        self.assertEqual((result.stage, result.ticket_id), ("repair_routing", ticket))
+        transition = self.ledger.connection.execute(
+            "SELECT id FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='state_transition' AND to_state='needs_triage' ORDER BY id DESC LIMIT 1",
+            (ticket,),
+        ).fetchone()
+        self.assertIsNotNone(transition)
+        comment = self.ledger.connection.execute(
+            "SELECT payload,status FROM evidence_comment_outbox WHERE ticket_id=? AND event_id=?",
+            (ticket, int(transition["id"])),
+        ).fetchone()
+        self.assertEqual(comment["status"], "pending")
+        self.assertIn("SYNTHESIZED TRIAGE FEEDBACK", comment["payload"])
+
     def test_failure_driven_repair_then_restart_triages_exactly_once_with_provenance(self) -> None:
         model = SequencedLifecycleModel(["still-bad", "still-bad"])
         ctl, ticket = self.controller(model)

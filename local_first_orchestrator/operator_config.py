@@ -24,6 +24,7 @@ _LEGACY_FIELDS = frozenset({"ledger_path", "canonical_repository", "repository_a
 _RUNTIME_FIELDS = frozenset({"worktree_root", "artifact_root", "implementation_timeout_seconds", "review_timeout_seconds"})
 _ROUTING_FIELDS = frozenset({"decomposition", "local_review"})
 _PAID_FIELDS = frozenset({"paid_checkpoint", "paid_escalation"})
+_NOTIFICATION_FIELDS = frozenset({"unresolvable_notification_target"})
 _SIGNER_FIELDS = frozenset({"operator_signing_public_key", "operator_signing_key_fingerprint"})
 
 
@@ -85,6 +86,7 @@ class OperatorConfig:
     operator_signing_key_fingerprint: str | None = None
     config_path: Path | None = None
     local_review: ModelRegistration | None = None
+    unresolvable_notification_target: str | None = None
 
     @property
     def local_review_registration(self) -> ModelRegistration:
@@ -133,7 +135,10 @@ class OperatorConfig:
             raise ValueError("operator signer registration requires public key and fingerprint together")
         if self.operator_signing_public_key is not None:
             self.signer_public_key_bytes
-        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review, self.worktree_root, self.artifact_root, self.implementation_timeout_seconds, self.review_timeout_seconds, self.decomposition, self.paid_checkpoint, self.paid_escalation, self.operator_signing_public_key, self.operator_signing_key_fingerprint, self.config_path, self.local_review)
+        notification_target = self.unresolvable_notification_target
+        if notification_target is not None and (not isinstance(notification_target, str) or not notification_target.strip() or len(notification_target) > 512):
+            raise ValueError("unresolvable_notification_target must be a non-empty bounded Hermes target")
+        return OperatorConfig(ledger, repository, allowlist, self.implementation, self.review, self.worktree_root, self.artifact_root, self.implementation_timeout_seconds, self.review_timeout_seconds, self.decomposition, self.paid_checkpoint, self.paid_escalation, self.operator_signing_public_key, self.operator_signing_key_fingerprint, self.config_path, self.local_review, notification_target.strip() if notification_target else None)
 
     @property
     def execution_configured(self) -> bool:
@@ -170,6 +175,8 @@ class OperatorConfig:
             result["paid_checkpoint"] = asdict(self.paid_checkpoint)
         if self.paid_escalation is not None:
             result["paid_escalation"] = asdict(self.paid_escalation)
+        if self.unresolvable_notification_target is not None:
+            result["unresolvable_notification_target"] = self.unresolvable_notification_target
         if self.operator_signing_public_key is not None:
             result["operator_signing_public_key"] = self.operator_signing_public_key
             result["operator_signing_key_fingerprint"] = self.operator_signing_key_fingerprint
@@ -195,7 +202,7 @@ def _parse_operator_config_bytes(raw_bytes: bytes, config_path: Path) -> Operato
                          parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite JSON number")))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError("operator registration is not valid JSON") from exc
-    if not isinstance(raw, dict) or not _LEGACY_FIELDS <= set(raw) or set(raw) - (_LEGACY_FIELDS | _RUNTIME_FIELDS | _ROUTING_FIELDS | _PAID_FIELDS | _SIGNER_FIELDS):
+    if not isinstance(raw, dict) or not _LEGACY_FIELDS <= set(raw) or set(raw) - (_LEGACY_FIELDS | _RUNTIME_FIELDS | _ROUTING_FIELDS | _PAID_FIELDS | _SIGNER_FIELDS | _NOTIFICATION_FIELDS):
         raise ValueError("operator registration has unexpected fields")
     if bool(set(raw) & _RUNTIME_FIELDS) and not _RUNTIME_FIELDS <= set(raw):
         raise ValueError("execution_runtime_not_configured")
@@ -217,11 +224,14 @@ def _parse_operator_config_bytes(raw_bytes: bytes, config_path: Path) -> Operato
         decomposition = tuple(sorted((str(cost), ModelRegistration.parse(value, f"decomposition.{cost}")) for cost, value in raw["decomposition"].items()))
     paid_checkpoint = ModelRegistration.parse(raw["paid_checkpoint"], "paid_checkpoint") if "paid_checkpoint" in raw else None
     paid_escalation = ModelRegistration.parse(raw["paid_escalation"], "paid_escalation") if "paid_escalation" in raw else None
+    notification_target = raw.get("unresolvable_notification_target")
+    if notification_target is not None and (not isinstance(notification_target, str) or not notification_target.strip() or len(notification_target) > 512):
+        raise ValueError("unresolvable_notification_target must be a non-empty bounded Hermes target")
     local_review = ModelRegistration.parse(raw["local_review"], "local_review") if "local_review" in raw else None
     signer = (raw.get("operator_signing_public_key"), raw.get("operator_signing_key_fingerprint"))
     if ("operator_signing_public_key" in raw or "operator_signing_key_fingerprint" in raw) and not all(isinstance(value, str) and value.strip() for value in signer):
         raise ValueError("operator signer registration requires public key and fingerprint together")
-    return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review"), *runtime, decomposition, paid_checkpoint, paid_escalation, *signer, config_path, local_review).validated(require_ledger=True)
+    return OperatorConfig(Path(raw["ledger_path"]), Path(raw["canonical_repository"]), tuple(Path(item) for item in paths), ModelRegistration.parse(raw["implementation"], "implementation"), ModelRegistration.parse(raw["review"], "review"), *runtime, decomposition, paid_checkpoint, paid_escalation, *signer, config_path, local_review, notification_target.strip() if isinstance(notification_target, str) else None).validated(require_ledger=True)
 
 
 def _raw_config(path: Path) -> tuple[bytes, dict[str, Any], dict[str, Any] | None]:

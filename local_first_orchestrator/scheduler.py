@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .comment_delivery import CommentDeliveryWorker
+from .gateway_notification import HermesGatewayNotificationWorker
 from .execution_handoff import HANDOFF_MARKER
 from .generated_projection import GeneratedProjectionWorker
 from .ledger import Ledger
@@ -32,6 +33,7 @@ SCHEDULER_STAGE_ORDER: tuple[str, ...] = (
     "validation",
     "review",
     "repair_routing",
+    "ticket_paid_escalation",
     "triage",
     "acceptance",
     "git_integration",
@@ -896,6 +898,14 @@ def preview_ticket_database(database: Path, ticket_id: str, *, now: int | None =
             if any(str(row["ticket_id"]) == ticket_id for row in ledger.generated_activation_candidates()):
                 return ProcessNextPreview(next_stage="generated_activation", ticket_id=ticket_id, would_execute=True, would_write_board=True)
 
+            paid_ticket_escalation_enabled = bool(
+                operator_config is not None
+                and getattr(operator_config, "paid_escalation", None) is not None
+                and getattr(operator_config, "unresolvable_notification_target", None)
+            )
+            if paid_ticket_escalation_enabled and ledger.ticket_paid_escalation_candidate(ticket_id=ticket_id) is not None:
+                return ProcessNextPreview(next_stage="ticket_paid_escalation", ticket_id=ticket_id, would_execute=True)
+
             for stage, claimer in (
                 ("implementation", lambda: ledger.claim_next_scheduler_implementation("preview", lease_seconds=60, now=now, ticket_id=ticket_id)),
                 ("validation", lambda: ledger.claim_next_scheduler_validation("preview", lease_seconds=60, now=now, ticket_id=ticket_id)),
@@ -946,6 +956,7 @@ class ProcessNextScheduler:
         review_execution_policy_hash: str | None = None,
         triage_runner: Callable[[str], dict[str, Any]] | None = None,
         triage_execution_policy_hash: str | None = None,
+        triage_feedback_runner: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
         acceptance_runner: Callable[[str], dict[str, Any]] | None = None,
         git_integration_runner: Callable[[str], dict[str, Any]] | None = None,
         worktree_cleanup_runner: Callable[[str], dict[str, Any]] | None = None,
@@ -954,6 +965,8 @@ class ProcessNextScheduler:
         paid_checkpoint_route: tuple[str, str, str] | None = None,
         paid_escalation_runner: Callable[[str], dict[str, Any]] | None = None,
         paid_escalation_route: tuple[str, str, str] | None = None,
+        ticket_escalation_runner: Callable[[str], dict[str, Any]] | None = None,
+        gateway_notification_executable: str | None = None,
         next_tranche_materialize_runner: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         if not worker_id or lease_seconds < 1:
@@ -983,6 +996,7 @@ class ProcessNextScheduler:
         self.review_execution_policy_hash = review_execution_policy_hash
         self.triage_runner = triage_runner
         self.triage_execution_policy_hash = triage_execution_policy_hash
+        self.triage_feedback_runner = triage_feedback_runner
         self.acceptance_runner = acceptance_runner
         self.git_integration_runner = git_integration_runner
         self.worktree_cleanup_runner = worktree_cleanup_runner
@@ -991,6 +1005,8 @@ class ProcessNextScheduler:
         self.paid_checkpoint_route = paid_checkpoint_route
         self.paid_escalation_runner = paid_escalation_runner
         self.paid_escalation_route = paid_escalation_route
+        self.ticket_escalation_runner = ticket_escalation_runner
+        self.gateway_notification_executable = gateway_notification_executable
         self.next_tranche_materialize_runner = next_tranche_materialize_runner
         if self.review_runner is not None and not self.review_execution_policy_hash:
             raise ValueError("process-next review runner requires a review execution policy hash")
@@ -1163,6 +1179,17 @@ class ProcessNextScheduler:
                 str(row["ticket_id"]) if row else None,
             )
 
+        if self.target_ticket_id is None and self.gateway_notification_executable:
+            notification = HermesGatewayNotificationWorker(
+                self.ledger,
+                executable=self.gateway_notification_executable,
+                worker_id=execution_owner,
+                lease_seconds=self.lease_seconds,
+                clock=lambda: now,
+            ).deliver_one()
+            if notification.status != "no_work":
+                return ProcessNextResult(notification.status, "gateway_notification", notification.ticket_id)
+
         cleanup_ticket_id = None
         if self.target_ticket_id is not None:
             cleanup = self.ledger.connection.execute("""
@@ -1310,11 +1337,51 @@ class ProcessNextScheduler:
             current = self.ledger.scheduler_claim(claim_id)
             if current.get("side_effect_completed_at") is None:
                 if current.get("side_effect_started_at") is None:
+                    proposed = self.ledger.plan_scheduler_repair_routing_effect(claim_id, execution_owner, now=now)
+                    if proposed.get("action") == "triage" and self.triage_feedback_runner is not None:
+                        attempt_number = int(proposed["attempt_number"])
+                        stage_name = f"triage-feedback-{attempt_number}"
+                        existing_feedback = self.ledger.runtime_stage(ticket_id, stage_name)
+                        if existing_feedback is None:
+                            feedback_result = self.triage_feedback_runner(ticket_id, proposed)
+                            feedback = feedback_result.get("feedback") if isinstance(feedback_result, dict) else None
+                            if not isinstance(feedback, str) or not feedback.strip():
+                                raise RuntimeError("triage feedback runner returned invalid feedback")
+                            feedback_detail = {
+                                "ticket_id": ticket_id,
+                                "attempt_number": attempt_number,
+                                "failure_fingerprint": proposed.get("failure_fingerprint"),
+                                "failure_evidence": proposed.get("failure_evidence"),
+                                "feedback": feedback.strip(),
+                            }
+                            if not self.ledger.record_runtime_stage(
+                                ticket_id,
+                                stage_name,
+                                json.dumps(feedback_detail, sort_keys=True, separators=(",", ":")),
+                                attempt_number=attempt_number,
+                            ):
+                                existing_feedback = self.ledger.runtime_stage(ticket_id, stage_name)
+                                if existing_feedback is None:
+                                    raise RuntimeError("triage feedback reconciliation required")
+                        else:
+                            try:
+                                feedback_detail = json.loads(str(existing_feedback["detail"]))
+                            except json.JSONDecodeError as exc:
+                                raise RuntimeError("triage feedback reconciliation required") from exc
+                            if feedback_detail.get("failure_fingerprint") != proposed.get("failure_fingerprint") or not str(feedback_detail.get("feedback") or "").strip():
+                                raise RuntimeError("triage feedback reconciliation required")
                     self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
                 current = self.ledger.apply_scheduler_repair_routing_effect(claim_id, execution_owner, now=now)
             result = json.loads(str(current["result_json"]))
             self.ledger.complete_scheduler_claim(claim_id, execution_owner, result, now=now)
             return ProcessNextResult("completed", "repair_routing", ticket_id, claim_id)
+
+        if stage_allowed("ticket_paid_escalation") and self.ticket_escalation_runner is not None:
+            paid_ticket = self.ledger.ticket_paid_escalation_candidate(ticket_id=self.target_ticket_id)
+            if paid_ticket is not None:
+                ticket_id = str(paid_ticket["ticket_id"])
+                result = self.ticket_escalation_runner(ticket_id)
+                return ProcessNextResult(str(result.get("status") or "completed"), "ticket_paid_escalation", ticket_id)
 
         if stage_allowed("triage") and self.triage_runner is not None:
             triage_claim = self.ledger.claim_next_scheduler_triage(

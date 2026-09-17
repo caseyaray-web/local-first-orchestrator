@@ -91,14 +91,14 @@ class SchedulerCrashMatrixTests(unittest.TestCase):
         )
 
     def test_unknown_model_and_paid_effects_are_fail_closed(self) -> None:
-        for stage in ("implementation", "review", "triage", "paid_checkpoint", "paid_escalation"):
+        for stage in ("implementation", "review", "ticket_paid_escalation", "triage", "paid_checkpoint", "paid_escalation"):
             with self.subTest(stage=stage):
                 self.assertEqual(SCHEDULER_CRASH_POLICIES[stage].started_action, ReconciliationAction.STOP)
         self.assertEqual(SCHEDULER_CRASH_POLICIES["implementation"].authority, "model_invocations")
         self.assertEqual(SCHEDULER_CRASH_POLICIES["paid_checkpoint"].authority, "paid_reservations")
 
     def test_replayable_stages_are_explicit_and_never_silently_stop(self) -> None:
-        replayable = set(SCHEDULER_CRASH_POLICIES) - {"implementation", "review", "triage", "paid_checkpoint", "paid_escalation"}
+        replayable = set(SCHEDULER_CRASH_POLICIES) - {"implementation", "review", "ticket_paid_escalation", "triage", "paid_checkpoint", "paid_escalation"}
         for stage in sorted(replayable):
             with self.subTest(stage=stage):
                 self.assertEqual(SCHEDULER_CRASH_POLICIES[stage].started_action, ReconciliationAction.REPLAY)

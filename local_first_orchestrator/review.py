@@ -196,7 +196,7 @@ class SameTicketRepairCoordinator:
             occurrence = self.ledger.record_review_finding(ticket_id, attempt_number, finding)
             repeated = repeated or occurrence >= 2
         max_attempts = int(self.ledger.get_ticket(ticket_id)["max_attempts"])
-        if repeated or attempt_number >= max_attempts:
+        if attempt_number >= max_attempts:
             self.ledger.transition(ticket_id, CanonicalState.NEEDS_TRIAGE, payload={"review_verdict": "repair", "repeated_fingerprint": repeated, "attempt_number": attempt_number})
             return "triage"
         self.ledger.transition(ticket_id, CanonicalState.REPAIRING, payload={"review_verdict": "repair", "attempt_number": attempt_number})

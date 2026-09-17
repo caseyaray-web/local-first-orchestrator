@@ -495,6 +495,78 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         self.assertEqual((result.stage, result.status, result.ticket_id), ("dependency_readiness", "activated_waiting", "generated-1"))
         self.assertEqual(calls, ["run"])
 
+    def test_repair_dependency_revision_preserves_base_graph_and_tracks_fresh_parent(self) -> None:
+        cause = self.ticket("repair-parent", state=CanonicalState.REPAIRING)
+        self.ledger.connection.execute("UPDATE tickets SET external_id=NULL WHERE id=?", (cause,))
+        with self.ledger._transaction() as conn:
+            event_id = self.ledger._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=cause,
+                event_type="generated_microticket_created",
+                actor_id="test",
+                to_state=CanonicalState.DRAFT.value,
+                payload={"ticket_id": cause},
+            )
+            conn.execute(
+                "INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,operation,external_task_id,acknowledged_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (cause, event_id, "draft", "{}", "generated-repair-parent", 1, "create_microticket", "external-repair-parent", 1),
+            )
+        child = self.ticket("repair-child", dependencies=(cause,))
+        with self.ledger._transaction() as conn:
+            identity = self.ledger._native_dependency_graph_identity(conn, child)
+            conn.execute(
+                "INSERT INTO native_dependency_graphs(ticket_id,child_external_id,local_dependency_ids_json,parent_external_ids_json,graph_hash,verified_at) VALUES (?,?,?,?,?,?)",
+                (
+                    child,
+                    identity["child_external_id"],
+                    json.dumps([row["ticket_id"] for row in identity["parents"]], sort_keys=True, separators=(",", ":")),
+                    json.dumps([row["external_task_id"] for row in identity["parents"]], sort_keys=True, separators=(",", ":")),
+                    identity["graph_hash"],
+                    10,
+                ),
+            )
+        base = dict(self.ledger.connection.execute("SELECT * FROM native_dependency_graphs WHERE ticket_id=?", (child,)).fetchone())
+
+        revisions = self.ledger.record_repair_dependency_insertions(
+            cause_ticket_id=cause,
+            cause_attempt_number=2,
+            predecessor_external_task_id="external-repair-parent",
+            replacement_external_task_id="external-repair-parent-attempt-2",
+            downstream_child_ids=("external-repair-child",),
+            reason="repair parity",
+            now=20,
+        )
+
+        self.assertEqual(len(revisions), 1)
+        effective = self.ledger.native_dependency_graph(child)
+        self.assertEqual(effective["generation"], 1)
+        self.assertEqual(json.loads(effective["parent_external_ids_json"]), ["external-repair-parent-attempt-2"])
+        unchanged = dict(self.ledger.connection.execute("SELECT * FROM native_dependency_graphs WHERE ticket_id=?", (child,)).fetchone())
+        self.assertEqual(unchanged, base)
+        replay = self.ledger.record_repair_dependency_insertions(
+            cause_ticket_id=cause,
+            cause_attempt_number=2,
+            predecessor_external_task_id="external-repair-parent",
+            replacement_external_task_id="external-repair-parent-attempt-2",
+            downstream_child_ids=("external-repair-child",),
+            reason="repair parity",
+            now=30,
+        )
+        self.assertEqual(replay[0]["revision_id"], revisions[0]["revision_id"])
+
+        self.ledger.record_runtime_stage(
+            cause,
+            "generated-repair-activation-2",
+            json.dumps({"external_task_id": "external-repair-parent-attempt-2", "attempt_number": 2}, sort_keys=True, separators=(",", ":")),
+            attempt_number=2,
+            base_sha="a" * 40,
+        )
+        with self.ledger._transaction() as conn:
+            current = self.ledger._native_dependency_graph_identity(conn, child)
+        self.assertEqual(current["graph_hash"], effective["graph_hash"])
+        self.assertEqual(current["parents"][0]["external_task_id"], "external-repair-parent-attempt-2")
+
     def test_native_dependency_graph_replays_after_link_transport_loss_without_duplicate_edge(self) -> None:
         board = NativeBoard()
         parent = self.ticket("parent", state=CanonicalState.ACCEPTED)

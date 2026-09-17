@@ -98,6 +98,7 @@ class SchedulerOrderingTests(unittest.TestCase):
             "validation",
             "review",
             "repair_routing",
+            "ticket_paid_escalation",
             "triage",
             "acceptance",
             "git_integration",

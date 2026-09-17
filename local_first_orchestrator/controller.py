@@ -26,7 +26,7 @@ from .hermes_profiles import review_profile_identity
 from .execution_handoff import HANDOFF_MARKER, HANDOFF_SENTINEL
 from .ledger import Ledger, _completion_evidence_hash, _recheck_evidence_hash
 from .local_qwen import LocalQwenAdapter, REVIEW_JSON_SCHEMA
-from .paid_model import PaidModelAdapter
+from .paid_model import PaidInvocationError, PaidModelAdapter
 from .readiness import validate_ticket
 from .review import LocalReviewAdapter, ReviewPacketBuilder, SameTicketRepairCoordinator, normalize_review
 from .repository_snapshot import snapshot as repository_snapshot
@@ -687,8 +687,11 @@ class LocalFirstController:
             raise RuntimeError("Hermes execution task identity conflict")
         rows = self.ledger.connection.execute(
             "SELECT DISTINCT t.* FROM tickets t LEFT JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL AND b.superseded_at IS NULL "
-            "WHERE t.external_id=? OR b.external_task_id=? ORDER BY t.created_at,t.id LIMIT 2",
-            (external_task_id, external_task_id),
+            "WHERE t.external_id=? OR b.external_task_id=? OR EXISTS ("
+            "  SELECT 1 FROM runtime_stages ra WHERE ra.ticket_id=t.id AND ra.stage LIKE 'generated-repair-activation-%' "
+            "  AND json_valid(ra.detail)=1 AND json_extract(ra.detail,'$.external_task_id')=?"
+            ") ORDER BY t.created_at,t.id LIMIT 2",
+            (external_task_id, external_task_id, external_task_id),
         ).fetchall()
         if len(rows) > 1:
             raise RuntimeError("Hermes execution task identity is ambiguous")
@@ -705,7 +708,12 @@ class LocalFirstController:
                  AND e.event_type IN ('generated_microticket_created','generated_microticket_projection_recovered')""",
             (ticket_id, external_task_id, ticket_id),
         ).fetchall()
-        generated_owned = ticket_row["external_id"] is None and len(generated_projection) == 1
+        repair_projection = self.ledger.connection.execute(
+            "SELECT 1 FROM runtime_stages WHERE ticket_id=? AND stage LIKE 'generated-repair-activation-%' "
+            "AND json_valid(detail)=1 AND json_extract(detail,'$.external_task_id')=? LIMIT 1",
+            (ticket_id, external_task_id),
+        ).fetchone()
+        generated_owned = ticket_row["external_id"] is None and (len(generated_projection) == 1 or repair_projection is not None)
         completed_generated_handoff = (
             require_handoff
             and snapshot.task.status == "done"
@@ -2734,6 +2742,166 @@ class LocalFirstController:
         finally:
             if ephemeral_worktree:
                 cleanup_checkpoint_worktree()
+
+    def generate_ticket_failure_feedback(self, ticket_id: str, triage: dict[str, Any]) -> dict[str, Any]:
+        attempt_number = int(triage["attempt_number"])
+        stage = f"triage-feedback-{attempt_number}"
+        existing = self.ledger.connection.execute(
+            "SELECT detail,artifact_path,artifact_sha256 FROM runtime_stages WHERE ticket_id=? AND stage=?",
+            (ticket_id, stage),
+        ).fetchone()
+        if existing is not None:
+            detail = json.loads(str(existing["detail"]))
+            if detail.get("failure_fingerprint") != triage.get("failure_fingerprint") or not isinstance(detail.get("feedback"), str):
+                raise RuntimeError("triage feedback reconciliation required")
+            return detail
+        ticket = self.ledger.get_ticket(ticket_id)
+        failure_evidence = str(triage.get("failure_evidence") or "").strip()
+        if not failure_evidence:
+            raise RuntimeError("triage feedback requires deterministic failure evidence")
+        packet = json.dumps(
+            {
+                "task": "Synthesize repair feedback from deterministic findings only. Do not introduce new facts or expand scope. The deterministic evidence remains authoritative.",
+                "ticket_id": ticket_id,
+                "title": ticket["title"],
+                "criterion_ids": json.loads(ticket["criterion_ids_json"]),
+                "allowed_files": json.loads(ticket["allowed_files_json"]),
+                "patch_budget": json.loads(ticket["patch_budget_json"]),
+                "attempt_number": attempt_number,
+                "deterministic_failure": triage,
+                "required_behavior": "Return a repair/escalation review proposal using only supplied evidence. Suggestions must be actionable within the existing ticket contract.",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        artifact_dir = self.config.artifact_root / ticket_id / str(attempt_number) / "triage-feedback"
+        result = self.local_model.invoke("review", packet, artifact_dir=artifact_dir)
+        payload = result.payload
+        findings = payload.get("findings") if isinstance(payload, dict) else None
+        suggestions = payload.get("suggestions") if isinstance(payload, dict) else None
+        lines = [
+            f"Local First repair feedback for {ticket_id} attempt {attempt_number}",
+            "",
+            "Deterministic findings (authoritative):",
+            failure_evidence,
+        ]
+        if isinstance(findings, list) and findings:
+            lines.extend(("", "Local synthesis:"))
+            for finding in findings[:12]:
+                if not isinstance(finding, dict):
+                    continue
+                evidence = str(finding.get("evidence") or "").strip()
+                repair = str(finding.get("minimal_repair") or "").strip()
+                if evidence or repair:
+                    lines.append(f"- {evidence}" + (f" Repair: {repair}" if repair else ""))
+        if isinstance(suggestions, list) and suggestions:
+            lines.extend(("", "Suggested next actions:"))
+            lines.extend(f"- {str(item).strip()}" for item in suggestions[:12] if str(item).strip())
+        feedback = "\n".join(lines)[:8000]
+        artifact_path = str(result.artifact_path)
+        artifact_sha = hashlib.sha256(Path(artifact_path).read_bytes()).hexdigest()
+        detail = {
+            "ticket_id": ticket_id,
+            "attempt_number": attempt_number,
+            "failure_fingerprint": str(triage.get("failure_fingerprint") or ""),
+            "failure_evidence": failure_evidence,
+            "feedback": feedback,
+            "model_payload": payload,
+            "artifact_path": artifact_path,
+            "artifact_sha256": artifact_sha,
+        }
+        encoded = json.dumps(detail, sort_keys=True, separators=(",", ":"))
+        if not self.ledger.record_runtime_stage(
+            ticket_id,
+            stage,
+            encoded,
+            attempt_number=attempt_number,
+            artifact_path=artifact_path,
+            artifact_sha256=artifact_sha,
+        ):
+            current = self.ledger.connection.execute("SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, stage)).fetchone()
+            if current is None or str(current["detail"]) != encoded:
+                raise RuntimeError("triage feedback reconciliation required")
+        return detail
+
+    def execute_ticket_paid_escalation(
+        self,
+        ticket_id: str,
+        *,
+        adapter: PaidModelAdapter,
+        notification_target: str,
+    ) -> dict[str, object]:
+        ticket = self.ledger.get_ticket(ticket_id)
+        if ticket["state"] != CanonicalState.NEEDS_TRIAGE.value:
+            raise ValueError("ticket paid escalation requires needs_triage state")
+        triage = self.ledger.latest_triage_failure(ticket_id)
+        if triage is None:
+            raise RuntimeError("ticket paid escalation requires deterministic triage evidence")
+        local_feedback = self.generate_ticket_failure_feedback(ticket_id, triage)
+        attempt_number = int(triage["attempt_number"])
+        fingerprint = str(triage.get("failure_fingerprint") or "")
+        if not fingerprint:
+            raise RuntimeError("ticket paid escalation requires failure fingerprint")
+        feature_id = str(ticket.get("feature_id") or "")
+        if not feature_id:
+            raise RuntimeError("ticket paid escalation requires feature identity")
+        request_key = f"ticket-escalation:{ticket_id}:{attempt_number}:{fingerprint}"
+        packet = {
+            "version": 1,
+            "role": "ticket_repair_escalation",
+            "required_response": {"decision": "repair|unresolvable", "feedback": "concise actionable text"},
+            "feature_id": feature_id,
+            "ticket_id": ticket_id,
+            "title": ticket["title"],
+            "attempt_number": attempt_number,
+            "max_local_attempts": int(ticket["max_attempts"]),
+            "failure_fingerprint": fingerprint,
+            "failure_evidence": str(triage.get("failure_evidence") or ""),
+            "deterministic_triage": triage,
+            "local_feedback": local_feedback["feedback"],
+            "instruction": "Decide whether one more repair attempt is actionable. Do not expand ticket scope. Return only the required JSON object.",
+        }
+        try:
+            proposal = adapter.invoke(feature_id, PaidPurpose.ESCALATION, request_key, packet)
+        except PaidInvocationError as exc:
+            message = str(exc)
+            if "paid budget exhausted" not in message and "no paid budget configured" not in message:
+                raise
+            summary = {"policy": "local_and_paid_budgets_exhausted", "deterministic_failure": triage, "local_feedback": local_feedback["feedback"], "paid_error": message}
+            return self.ledger.record_terminal_unresolvable(
+                ticket_id,
+                attempt_number=attempt_number,
+                failure_fingerprint=fingerprint,
+                reason="paid escalation budget exhausted",
+                summary=summary,
+                notification_target=notification_target,
+            )
+        if not isinstance(proposal, dict) or set(proposal) != {"decision", "feedback"}:
+            raise PaidInvocationError("ticket paid escalation returned invalid response schema")
+        decision = proposal.get("decision")
+        feedback = proposal.get("feedback")
+        if decision not in {"repair", "unresolvable"} or not isinstance(feedback, str) or not feedback.strip() or len(feedback) > 8000:
+            raise PaidInvocationError("ticket paid escalation returned invalid decision or feedback")
+        feedback = feedback.strip()
+        if decision == "repair":
+            combined_feedback = local_feedback["feedback"] + "\n\nPaid escalation guidance:\n" + feedback
+            result = self.ledger.apply_paid_repair_authorization(
+                ticket_id,
+                attempt_number=attempt_number,
+                failure_fingerprint=fingerprint,
+                feedback=combined_feedback,
+                response=proposal,
+            )
+            return {"ticket_id": ticket_id, "status": "repair_authorized", **result}
+        summary = {"policy": "paid_escalation_declared_unresolvable", "deterministic_failure": triage, "local_feedback": local_feedback["feedback"], "paid_feedback": feedback}
+        return self.ledger.record_terminal_unresolvable(
+            ticket_id,
+            attempt_number=attempt_number,
+            failure_fingerprint=fingerprint,
+            reason=feedback,
+            summary=summary,
+            notification_target=notification_target,
+        )
 
     def execute_paid_stage_only(self, tranche_id: str, *, adapter: PaidModelAdapter, purpose: PaidPurpose) -> dict[str, object]:
         stage = "paid_checkpoint" if purpose == PaidPurpose.INTEGRATION_CHECKPOINT else "paid_escalation"

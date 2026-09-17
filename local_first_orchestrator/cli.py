@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -287,26 +287,81 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         if repair_candidates:
             candidate = repair_candidates[0]
             ticket_id = str(candidate["ticket_id"])
-            external_task_id = str(candidate["external_task_id"])
+            predecessor_external_task_id = str(candidate["external_task_id"])
             attempt_number = int(candidate["attempt_number"])
-            prepared = ctl.prepare_hermes_repair_worktree(ticket_id, external_task_id, attempt_number)
+            prepared = ctl.prepare_hermes_repair_worktree(ticket_id, predecessor_external_task_id, attempt_number)
             failure_evidence = str(candidate.get("failure_evidence") or "repair requested by Local First review")
             reason = f"Local First repair attempt {attempt_number}: {failure_evidence}"[:1500]
-            task = ctl.board.reclaim_for_repair(external_task_id, reason=reason)
-            binder = getattr(ctl.board, "bind_native_release_task", None)
-            if binder is not None:
-                binder(external_task_id, expected_workspace_path=prepared["workspace_path"])
-                task = ctl.board.get_task(external_task_id)
-            if task.status not in {"todo", "ready"}:
-                raise RuntimeError("generated repair activation did not produce a dispatchable Hermes task")
+            intent_stage = f"generated-repair-activation-intent-{attempt_number}"
+            intent_row = ledger.connection.execute("SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, intent_stage)).fetchone()
+            if intent_row is None:
+                predecessor = ctl.board.repair_predecessor_task(predecessor_external_task_id)
+                intent_payload = {
+                    "ticket_id": ticket_id,
+                    "attempt_number": attempt_number,
+                    "previous_attempt_number": int(candidate["previous_attempt_number"]),
+                    "predecessor_external_task_id": predecessor_external_task_id,
+                    "downstream_child_ids": sorted(set(predecessor.children)),
+                    "reason": reason,
+                    "prepared_execution": prepared,
+                    "idempotency_key": f"generated-repair:{ticket_id}:{attempt_number}",
+                }
+                intent_detail = json.dumps(intent_payload, sort_keys=True, separators=(",", ":"))
+                if not ledger.record_runtime_stage(ticket_id, intent_stage, intent_detail, attempt_number=attempt_number, base_sha=prepared["base_sha"]):
+                    raise RuntimeError("generated repair activation intent reconciliation required")
+            else:
+                intent_payload = json.loads(str(intent_row["detail"]))
+                expected_intent = {
+                    "ticket_id": ticket_id,
+                    "attempt_number": attempt_number,
+                    "previous_attempt_number": int(candidate["previous_attempt_number"]),
+                    "predecessor_external_task_id": predecessor_external_task_id,
+                    "reason": reason,
+                    "prepared_execution": prepared,
+                    "idempotency_key": f"generated-repair:{ticket_id}:{attempt_number}",
+                }
+                if any(intent_payload.get(key) != value for key, value in expected_intent.items()) or not isinstance(intent_payload.get("downstream_child_ids"), list):
+                    raise RuntimeError("generated repair activation intent reconciliation required")
+            predecessor = ctl.board.repair_predecessor_task(predecessor_external_task_id)
+            repair_title = f"{predecessor.title} repair attempt {attempt_number}"
+            repair_body = f"{predecessor.body}\n\n## Local First repair attempt {attempt_number}\n{failure_evidence}"
+            creator = getattr(ctl.board, "create_repair_task", None)
+            if creator is None:
+                raise RuntimeError("generated repair activation requires fresh repair task support")
+            task = creator(
+                predecessor_external_task_id,
+                title=repair_title,
+                body=repair_body,
+                workspace_path=prepared["workspace_path"],
+                downstream_child_ids=tuple(str(value) for value in intent_payload["downstream_child_ids"]),
+                idempotency_key=str(intent_payload["idempotency_key"]),
+                reason=reason,
+            )
+            if task.status not in {"todo", "ready", "scheduled", "running", "blocked", "done"}:
+                raise RuntimeError("generated repair activation produced an unsupported Hermes task status")
+            graph_revisions = ledger.record_repair_dependency_insertions(
+                cause_ticket_id=ticket_id,
+                cause_attempt_number=attempt_number,
+                predecessor_external_task_id=predecessor_external_task_id,
+                replacement_external_task_id=task.id,
+                downstream_child_ids=tuple(str(value) for value in intent_payload["downstream_child_ids"]),
+                reason=reason,
+            )
             detail = json.dumps({
                 "ticket_id": ticket_id,
-                "external_task_id": external_task_id,
+                "external_task_id": task.id,
+                "predecessor_external_task_id": predecessor_external_task_id,
+                "downstream_child_ids": list(intent_payload["downstream_child_ids"]),
                 "attempt_number": attempt_number,
                 "previous_attempt_number": int(candidate["previous_attempt_number"]),
                 "reason": reason,
                 "prepared_execution": prepared,
                 "hermes_status": task.status,
+                "idempotency_key": intent_payload["idempotency_key"],
+                "dependency_graph_revisions": [
+                    {"ticket_id": str(row["ticket_id"]), "revision_id": str(row["revision_id"]), "graph_hash": str(row["graph_hash"])}
+                    for row in graph_revisions
+                ],
             }, sort_keys=True, separators=(",", ":"))
             stage = f"generated-repair-activation-{attempt_number}"
             if not ledger.record_runtime_stage(ticket_id, stage, detail, attempt_number=attempt_number, base_sha=prepared["base_sha"]):
@@ -317,7 +372,8 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
                 "ticket_id": ticket_id,
                 "status": "repair_activated",
                 "prepared_execution": prepared,
-                "external_task_id": external_task_id,
+                "external_task_id": task.id,
+                "predecessor_external_task_id": predecessor_external_task_id,
                 "attempt_number": attempt_number,
             }
 
@@ -434,6 +490,7 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         review_execution_policy_hash=ctl.review_execution_policy_hash(),
         triage_runner=None if triage_planner is None else lambda ticket_id: ctl.execute_triage_only(ticket_id, planner=triage_planner),
         triage_execution_policy_hash=None if triage_planner is None else triage_planner.execution_policy_hash(),
+        triage_feedback_runner=lambda ticket_id, triage: ctl.generate_ticket_failure_feedback(ticket_id, triage),
         acceptance_runner=lambda ticket_id: ctl.inspect_acceptance_candidate_only(
             ticket_id, repository=registered.canonical_repository
         ),
@@ -458,6 +515,10 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         paid_escalation_route=None if registered.paid_escalation is None else (
             registered.paid_escalation.provider, registered.paid_escalation.model, registered.paid_escalation.profile
         ),
+        ticket_escalation_runner=None if paid_escalation is None or not registered.unresolvable_notification_target else lambda ticket_id: ctl.execute_ticket_paid_escalation(
+            ticket_id, adapter=paid_escalation, notification_target=registered.unresolvable_notification_target
+        ),
+        gateway_notification_executable=args.hermes_executable if registered.unresolvable_notification_target else None,
         next_tranche_materialize_runner=None if successor_route is None else materialize_successor,
     )
 
@@ -568,6 +629,13 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     retire_target.add_argument("--claim-id")
     retire_claims.add_argument("--reason", required=True)
     retire_claims.add_argument("--operator-id", default="local-first-cli")
+    notification_target=commands.add_parser("set-notification-target", help="update only the registered Hermes target used for terminal unresolvable alerts")
+    notification_target.add_argument("--target", required=True)
+    resolve_notification=commands.add_parser("resolve-notification", help="reconcile an ambiguous or permanently failed terminal gateway notification after pausing the controller")
+    resolve_notification.add_argument("--operation-id", required=True)
+    resolve_notification.add_argument("--action", required=True, choices=("confirm_delivered","retry"))
+    resolve_notification.add_argument("--reason", required=True)
+    resolve_notification.add_argument("--operator-id", default="local-first-cli")
     status=commands.add_parser("status"); status.add_argument("--active",action="store_true"); status.add_argument("--scheduler-detail",action="store_true",help="include one read-only scheduler lifecycle boundary snapshot")
     imported=commands.add_parser("import"); imported.add_argument("--task-id",required=True)
     run=commands.add_parser("run-once"); run.add_argument("--task-id",required=True); run.add_argument("--dry-run",action="store_true",default=True); run.add_argument("--execute",action="store_true"); run.add_argument("--allow-board-writes",action="store_true")
@@ -577,7 +645,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     process_next.add_argument("--worker-id", default="local-first-process-next")
     process_next.add_argument("--planner-executable", default="hermes")
     process_next.add_argument("--ticket-id", help="scope this scheduler tick to exactly one ticket; tranche-wide stages are suppressed")
-    daemon=commands.add_parser("daemon", help="repeatedly invoke the proven one-tick scheduler primitive")
+    daemon=commands.add_parser("daemon", aliases=("run",), help="continuously drive Local First stages and authorized Hermes dispatch")
     daemon.add_argument("--execute", action="store_true")
     daemon.add_argument("--allow-board-writes", action="store_true")
     daemon.add_argument("--worker-id", default="local-first-daemon")
@@ -700,6 +768,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     register.add_argument("--paid-escalation-profile")
     register.add_argument("--paid-escalation-provider")
     register.add_argument("--paid-escalation-model")
+    register.add_argument("--unresolvable-notification-target", help="Hermes send target used when local and paid escalation budgets are exhausted")
     paid_approve=commands.add_parser("approve-paid", help="grant exactly one additional paid call for one feature/purpose")
     paid_approve.add_argument("--feature-id", required=True)
     paid_approve.add_argument("--purpose", required=True, choices=(PaidPurpose.ARCHITECTURE.value, PaidPurpose.INTEGRATION_CHECKPOINT.value, PaidPurpose.ESCALATION.value))
@@ -760,6 +829,15 @@ def run_command(args: argparse.Namespace) -> int:
         elif args.command=="resume":
             ledger.resume(args.operator_id,reason=args.reason)
             print(json.dumps({"paused":False,"operator_id":args.operator_id,"reason":args.reason},sort_keys=True))
+        elif args.command=="set-notification-target":
+            config_path=Path(args.operator_config_path) if args.operator_config_path else None
+            registered=load_operator_config(config_path)
+            updated=replace(registered,unresolvable_notification_target=args.target.strip()).validated(require_ledger=True)
+            saved=save_operator_config(updated,config_path)
+            print(json.dumps({"config_path":str(saved),"unresolvable_notification_target":updated.unresolvable_notification_target},sort_keys=True))
+        elif args.command=="resolve-notification":
+            row=ledger.resolve_gateway_notification(args.operation_id,operator_id=args.operator_id,reason=args.reason,action=args.action)
+            print(json.dumps({"operation_id":row["operation_id"],"ticket_id":row["ticket_id"],"status":row["status"],"action":args.action},sort_keys=True))
         elif args.command=="retire-historical-claims":
             if args.claim_id:
                 row=ledger.retire_historical_scheduler_claim(args.claim_id,operator_id=args.operator_id,reason=args.reason)
@@ -792,14 +870,20 @@ def run_command(args: argparse.Namespace) -> int:
             if not args.hermes_executable or not args.board: raise ValueError("process-next execution requires --hermes-executable and --board")
             result=_registered_process_next_scheduler(ledger,args).process_next()
             print(json.dumps(asdict(result),sort_keys=True))
-        elif args.command=="daemon":
+        elif args.command in {"daemon", "run"}:
             if args.ad_hoc_runtime: raise ValueError("daemon requires registered operator runtime")
             if not args.execute: raise PermissionError("daemon requires --execute")
             if not args.allow_board_writes: raise PermissionError("daemon --execute requires --allow-board-writes")
             if not args.hermes_executable or not args.board: raise ValueError("daemon execution requires --hermes-executable and --board")
+            registered=load_operator_config(Path(args.operator_config_path) if args.operator_config_path else None)
+            dispatch_board=_board_for_cli(args,True,implementation_profile=registered.implementation.profile,canonical_repository=registered.canonical_repository)
+            def dispatch_authorized_work() -> str | None:
+                allowed=set(ledger.dispatchable_external_task_ids())
+                return dispatch_board.dispatch_one_if_allowed(allowed)
             daemon=SchedulerDaemon(
                 ledger,
                 lambda: _registered_process_next_scheduler(ledger,args),
+                external_progress_runner=dispatch_authorized_work,
                 worker_id=args.worker_id,
                 idle_sleep_seconds=args.idle_sleep_seconds,
                 busy_sleep_seconds=args.busy_sleep_seconds,
@@ -926,6 +1010,7 @@ def run_command(args: argparse.Namespace) -> int:
                 decomposition=tuple(sorted(decomposition_routes.items())),
                 paid_checkpoint=paid_routes.get("checkpoint"),
                 paid_escalation=paid_routes.get("escalation"),
+                unresolvable_notification_target=args.unresolvable_notification_target,
                 operator_signing_public_key=args.operator_signing_public_key,
                 operator_signing_key_fingerprint=args.operator_signing_key_fingerprint,
                 local_review=local_review,

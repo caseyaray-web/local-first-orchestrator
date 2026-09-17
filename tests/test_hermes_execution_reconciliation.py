@@ -213,29 +213,35 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
         self.ledger.record_runtime_stage(
             self.ticket_id,
             "generated-repair-activation-2",
-            json.dumps({"ticket_id": self.ticket_id, "attempt_number": 2}, sort_keys=True, separators=(",", ":")),
+            json.dumps({"ticket_id": self.ticket_id, "attempt_number": 2, "external_task_id": "H-2", "predecessor_external_task_id": "H-1"}, sort_keys=True, separators=(",", ":")),
             attempt_number=2,
             base_sha=self.base,
         )
         visible = self.ledger.hermes_execution_candidates()
         self.assertEqual([row["ticket_id"] for row in visible], [self.ticket_id])
+        self.assertEqual([row["external_task_id"] for row in visible], ["H-2"])
+        self.assertEqual(self.ledger.resolve_external_task_id(self.ticket_id), "H-2")
 
     def test_fresh_hermes_repair_run_completes_preallocated_attempt_two(self) -> None:
         self._seed_generated_repair_attempt_two()
+        self.ledger.record_runtime_stage(
+            self.ticket_id,
+            "generated-repair-activation-2",
+            json.dumps({"ticket_id": self.ticket_id, "attempt_number": 2, "external_task_id": "H-2", "predecessor_external_task_id": "H-1"}, sort_keys=True, separators=(",", ":")),
+            attempt_number=2,
+            base_sha=self.base,
+        )
         (self.repo / "app.py").write_text('def value():\n    return "repaired"\n')
         self.board.snapshot = ExternalExecutionSnapshot(
-            task=ExternalTicket("H-1", "external", "", "scheduled", str(self.repo)),
+            task=ExternalTicket("H-2", "external repair", HANDOFF_MARKER, "blocked", str(self.repo), parents=("H-1",)),
             session_id="session-2",
             branch_name="worker-branch",
             started_at=30,
             completed_at=40,
-            runs=(
-                self.snapshot.runs[0],
-                ExternalExecutionRun(8, "completed", "completed", 30, 40, "worker repaired", "worker-code", 456, {"source": "dispatcher"}),
-            ),
+            runs=(ExternalExecutionRun(8, "blocked", "blocked", 30, 40, HANDOFF_SENTINEL, "worker-code", 456, {"source": "dispatcher"}),),
         )
 
-        result = self.controller.reconcile_hermes_execution("H-1", hermes_run_id=8)
+        result = self.controller.reconcile_hermes_execution("H-2", hermes_run_id=8, require_handoff=True)
 
         self.assertEqual(result["attempt_number"], 2)
         self.assertEqual(self.ledger.attempt_count(self.ticket_id), 2)

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .comment_delivery import MarkerLookup
-from .execution_handoff import HANDOFF_MARKER
+from .execution_handoff import HANDOFF_MARKER, HANDOFF_SENTINEL, attach_execution_handoff
 from .states import CanonicalState
 
 
@@ -178,6 +178,38 @@ class HermesBoardAdapter:
         if "--json" not in args: return completed.stdout[:self.output_limit]
         try: return json.loads(completed.stdout[:self.output_limit])
         except json.JSONDecodeError as exc: raise RuntimeError("Hermes Kanban malformed JSON") from exc
+
+    def dispatch_one_if_allowed(self, allowed_task_ids: set[str]) -> str | None:
+        """Dispatch at most one task, refusing a board plan containing unrelated work."""
+        if not self.allow_writes:
+            raise PermissionError("real board writes require --allow-board-writes")
+        if not allowed_task_ids:
+            return None
+        preview = self._run("dispatch", "--dry-run", "--max", "100", "--json")
+        if not isinstance(preview, dict) or not isinstance(preview.get("spawned"), list):
+            raise RuntimeError("Hermes dispatch dry-run returned malformed JSON")
+        planned_ids: list[str] = []
+        for item in preview["spawned"]:
+            if not isinstance(item, dict) or not isinstance(item.get("task_id"), str):
+                raise RuntimeError("Hermes dispatch dry-run returned malformed spawn identity")
+            planned_ids.append(str(item["task_id"]))
+        if not planned_ids:
+            return None
+        unexpected = sorted(set(planned_ids) - set(allowed_task_ids))
+        if unexpected:
+            raise RuntimeError("Hermes dispatch plan contains non-Local-First task(s): " + ",".join(unexpected))
+        result = self._run("dispatch", "--max", "1", "--json")
+        if not isinstance(result, dict) or not isinstance(result.get("spawned"), list):
+            raise RuntimeError("Hermes dispatch returned malformed JSON")
+        spawned = result["spawned"]
+        if not spawned:
+            return None
+        if len(spawned) != 1 or not isinstance(spawned[0], dict) or not isinstance(spawned[0].get("task_id"), str):
+            raise RuntimeError("Hermes dispatch violated single-task bound")
+        task_id = str(spawned[0]["task_id"])
+        if task_id not in allowed_task_ids:
+            raise RuntimeError("Hermes dispatch spawned a task outside Local First authority")
+        return task_id
 
     def get_task(self, task_id: str) -> ExternalTicket:
         payload = self._run("show", task_id, "--json")
@@ -412,6 +444,101 @@ class HermesBoardAdapter:
         if task.status not in {"todo", "ready"}:
             raise RuntimeError(f"Hermes repair reclaim did not make task dispatchable: {task.status}")
         return task
+
+    def repair_predecessor_task(self, task_id: str) -> ExternalTicket:
+        task = self.get_task(task_id)
+        if task.status == "done":
+            return task
+        if task.status == "blocked":
+            snapshot = self.execution_snapshot(task_id)
+            if snapshot.runs:
+                latest = max(snapshot.runs, key=lambda run: run.id)
+                if latest.status == "blocked" and latest.outcome == "blocked" and latest.summary == HANDOFF_SENTINEL and latest.ended_at is not None:
+                    return task
+        raise RuntimeError(f"Hermes repair predecessor is not terminal Local First work: {task.status}")
+
+    def create_repair_task(
+        self,
+        predecessor_task_id: str,
+        *,
+        title: str,
+        body: str,
+        workspace_path: str,
+        downstream_child_ids: tuple[str, ...],
+        idempotency_key: str,
+        reason: str,
+    ) -> ExternalTicket:
+        """Insert a fresh repair task between a completed task and its children.
+
+        Downstream children are parked before any dependency edge is removed, so
+        an interrupted rewrite fails closed instead of releasing successor work.
+        Replaying with the same idempotency key converges the same task/graph.
+        """
+        if not self.allow_writes:
+            raise PermissionError("real board writes require --allow-board-writes")
+        if not predecessor_task_id or not workspace_path or not idempotency_key or not reason:
+            raise ValueError("repair task creation requires predecessor, workspace, key, and reason")
+        predecessor = self.repair_predecessor_task(predecessor_task_id)
+        expected_children = tuple(sorted(set(downstream_child_ids)))
+        if predecessor_task_id in expected_children:
+            raise ValueError("repair task cannot depend on itself")
+        args = [
+            "create", title,
+            "--body", attach_execution_handoff(body),
+            "--parent", predecessor_task_id,
+            "--workspace", f"dir:{workspace_path}",
+            "--idempotency-key", idempotency_key,
+            "--initial-status", "blocked",
+        ]
+        assignee = self.implementation_profile or predecessor.assignee
+        if assignee:
+            args += ["--assignee", assignee]
+        args += ["--json"]
+        payload = self._run(*args)
+        if not isinstance(payload, dict) or not isinstance(payload.get("id"), str) or not payload["id"]:
+            raise RuntimeError("Hermes repair create JSON missing task id")
+        repair_task_id = str(payload["id"])
+        if repair_task_id == predecessor_task_id:
+            raise RuntimeError("Hermes repair task identity conflicts with predecessor")
+        repair = self.get_task(repair_task_id)
+        if predecessor_task_id not in set(repair.parents):
+            raise RuntimeError("Hermes repair task is missing predecessor dependency")
+        extra_children = set(repair.children) - set(expected_children)
+        if extra_children:
+            raise RuntimeError("Hermes repair task has unexpected downstream dependencies")
+
+        for child_id in expected_children:
+            child = self.get_task(child_id)
+            if child.status in {"running", "done"}:
+                raise RuntimeError(f"Hermes downstream child cannot be safely re-parented: {child_id}:{child.status}")
+            if child.status != "blocked":
+                self._run("block", child_id, f"Local First repair dependency insertion ({idempotency_key})", "--kind", "needs_input")
+                child = self.get_task(child_id)
+            if child.status != "blocked":
+                raise RuntimeError(f"Hermes downstream child was not durably parked: {child_id}:{child.status}")
+            parents = set(child.parents)
+            if repair_task_id not in parents:
+                self._run("link", repair_task_id, child_id)
+                child = self.get_task(child_id)
+                parents = set(child.parents)
+            if repair_task_id not in parents:
+                raise RuntimeError(f"Hermes repair dependency link did not converge: {child_id}")
+            if predecessor_task_id in parents:
+                self._run("unlink", predecessor_task_id, child_id)
+                child = self.get_task(child_id)
+                parents = set(child.parents)
+            if repair_task_id not in parents or predecessor_task_id in parents:
+                raise RuntimeError(f"Hermes repair dependency rewrite did not converge: {child_id}")
+
+        repair = self.get_task(repair_task_id)
+        if tuple(sorted(set(repair.children))) != expected_children:
+            raise RuntimeError("Hermes repair task downstream graph did not converge")
+        if repair.status == "blocked":
+            self._run("unblock", repair_task_id, "--reason", reason)
+            repair = self.get_task(repair_task_id)
+        if repair.status not in {"todo", "ready", "scheduled", "running", "blocked", "done"}:
+            raise RuntimeError(f"Hermes repair task entered an unsupported status: {repair.status}")
+        return repair
 
     def create_microticket(self, title: str, body: str, *, idempotency_key: str) -> str:
         if not self.allow_writes:

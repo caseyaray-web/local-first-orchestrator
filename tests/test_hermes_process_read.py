@@ -70,6 +70,64 @@ class ProcessReadTests(unittest.TestCase):
   self.assertEqual(first_reclaims,1)
   self.assertEqual(a.reclaim_for_repair('1',reason='fix parity').status,'ready')
   self.assertEqual(sum(1 for call in calls if call[4]=='reclaim'),1)
+ def test_create_repair_task_inserts_dependency_and_parks_downstream_first(self):
+  calls=[]
+  tasks={
+   'old':{'id':'old','title':'TK-2','body':'body','status':'done','workspace_path':'/repo/.worktrees/old','assignee':'worker-code-local','parents':['p'],'children':['child']},
+   'child':{'id':'child','title':'TK-3','body':'body','status':'ready','workspace_path':'/repo/.worktrees/child','parents':['old'],'children':[]},
+  }
+  def payload(task_id):
+   row=tasks[task_id]
+   return {'task':{k:v for k,v in row.items() if k not in {'parents','children'}},'parents':list(row['parents']),'children':list(row['children']),'comments':[]}
+  def runner(argv,**kwargs):
+   calls.append(list(argv)); action=argv[4]
+   if action=='show': return subprocess.CompletedProcess(argv,0,json.dumps(payload(argv[5])), '')
+   if action=='create':
+    if 'repair' not in tasks:
+     tasks['repair']={'id':'repair','title':argv[5],'body':argv[argv.index('--body')+1],'status':'blocked','workspace_path':'/repo/.worktrees/old','assignee':'worker-code-local','parents':['old'],'children':[]}; tasks['old']['children'].append('repair')
+    return subprocess.CompletedProcess(argv,0,json.dumps({'id':'repair'}),'')
+   if action=='block': tasks[argv[5]]['status']='blocked'; return subprocess.CompletedProcess(argv,0,'','')
+   if action=='link':
+    parent,child=argv[5],argv[6]
+    if parent not in tasks[child]['parents']: tasks[child]['parents'].append(parent)
+    if child not in tasks[parent]['children']: tasks[parent]['children'].append(child)
+    return subprocess.CompletedProcess(argv,0,'','')
+   if action=='unlink':
+    parent,child=argv[5],argv[6]
+    if parent in tasks[child]['parents']: tasks[child]['parents'].remove(parent)
+    if child in tasks[parent]['children']: tasks[parent]['children'].remove(child)
+    return subprocess.CompletedProcess(argv,0,'','')
+   if action=='unblock': tasks[argv[5]]['status']='ready'; return subprocess.CompletedProcess(argv,0,'','')
+   raise AssertionError(argv)
+  a=HermesBoardAdapter(executable=str(self.exe),board='board',allow_writes=True,runner=runner,implementation_profile='worker-code-local')
+  task=a.create_repair_task('old',title='TK-2 repair attempt 2',body='repair body',workspace_path='/repo/.worktrees/old',downstream_child_ids=('child',),idempotency_key='repair-key',reason='fix parity')
+  self.assertEqual(task.status,'ready'); self.assertEqual(tasks['child']['status'],'blocked')
+  self.assertEqual(tasks['child']['parents'],['repair']); self.assertEqual(tasks['old']['children'],['repair']); self.assertEqual(tasks['repair']['children'],['child'])
+  actions=[call[4] for call in calls if call[4] in {'block','link','unlink','unblock'}]
+  self.assertLess(actions.index('block'),actions.index('unlink')); self.assertEqual(actions[-1],'unblock')
+ def test_guarded_dispatch_spawns_only_authorized_task(self):
+  calls=[]
+  def runner(argv,**kwargs):
+   calls.append(list(argv))
+   if '--dry-run' in argv:
+    return subprocess.CompletedProcess(argv,0,json.dumps({'spawned':[{'task_id':'repair','assignee':'worker-code-local','workspace':'/repo'}]}),'')
+   return subprocess.CompletedProcess(argv,0,json.dumps({'spawned':[{'task_id':'repair','assignee':'worker-code-local','workspace':'/repo'}]}),'')
+  a=HermesBoardAdapter(executable=str(self.exe),board='board',allow_writes=True,runner=runner)
+  self.assertEqual(a.dispatch_one_if_allowed({'repair'}),'repair')
+  self.assertEqual(len(calls),2)
+  self.assertIn('--dry-run',calls[0]); self.assertNotIn('--dry-run',calls[1])
+
+ def test_guarded_dispatch_refuses_plan_with_unrelated_task(self):
+  calls=[]
+  def runner(argv,**kwargs):
+   calls.append(list(argv))
+   return subprocess.CompletedProcess(argv,0,json.dumps({'spawned':[{'task_id':'repair','assignee':'worker','workspace':'/repo'},{'task_id':'unrelated','assignee':'worker','workspace':'/other'}]}),'')
+  a=HermesBoardAdapter(executable=str(self.exe),board='board',allow_writes=True,runner=runner)
+  with self.assertRaisesRegex(RuntimeError,'non-Local-First'):
+   a.dispatch_one_if_allowed({'repair'})
+  self.assertEqual(len(calls),1)
+  self.assertIn('--dry-run',calls[0])
+
  def test_comment_marker_lookup_uses_show_json_comments(self):
   def runner(argv,**kwargs):
    payload={'task':{'id':'1','title':'x','body':'','status':'scheduled','workspace_path':None},'comments':[{'author':'local-first-orchestrator','body':'hello <!-- local-first-comment:abc -->','created_at':1}], 'parents':[], 'children':[]}

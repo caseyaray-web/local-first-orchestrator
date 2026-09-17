@@ -37,6 +37,7 @@ class SchedulerDaemon:
         self,
         ledger: Ledger,
         scheduler_factory: Callable[[], ProcessNextScheduler],
+        external_progress_runner: Callable[[], str | None] | None = None,
         *,
         worker_id: str,
         idle_sleep_seconds: float = 1.0,
@@ -52,6 +53,7 @@ class SchedulerDaemon:
             raise ValueError("initial error backoff cannot exceed maximum error backoff")
         self.ledger = ledger
         self.scheduler_factory = scheduler_factory
+        self.external_progress_runner = external_progress_runner
         self.worker_id = worker_id
         self.idle_sleep_seconds = idle_sleep_seconds
         self.busy_sleep_seconds = busy_sleep_seconds
@@ -127,6 +129,10 @@ class SchedulerDaemon:
         self._last_tick_started_at = self.clock()
         try:
             result = self.scheduler_factory().process_next()
+            if result.status in {"idle", "no_work"} and self.external_progress_runner is not None:
+                external_ticket_id = self.external_progress_runner()
+                if external_ticket_id is not None:
+                    result = ProcessNextResult("external_progress", "hermes_dispatch", external_ticket_id)
         except Exception as exc:
             self._transient_errors += 1
             self._consecutive_errors += 1

@@ -443,6 +443,34 @@ CREATE TABLE IF NOT EXISTS evidence_comment_outbox (
  terminal_owner TEXT,
     UNIQUE(ticket_id, event_id, operation_kind)
 );
+CREATE TABLE IF NOT EXISTS terminal_ticket_failures (
+    ticket_id TEXT PRIMARY KEY REFERENCES tickets(id),
+    attempt_number INTEGER NOT NULL,
+    failure_fingerprint TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(ticket_id, failure_fingerprint)
+);
+CREATE TABLE IF NOT EXISTS gateway_notification_outbox (
+    operation_id TEXT PRIMARY KEY,
+    ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    failure_fingerprint TEXT NOT NULL,
+    target TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    lease_owner TEXT,
+    lease_expires_at INTEGER,
+    next_attempt_at INTEGER,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    delivered_at INTEGER,
+    terminal_owner TEXT,
+    UNIQUE(ticket_id, failure_fingerprint)
+);
 CREATE TABLE IF NOT EXISTS evidence_comments (
     ticket_id TEXT PRIMARY KEY REFERENCES tickets(id), comment TEXT NOT NULL,
     artifact_location TEXT, created_at INTEGER NOT NULL
@@ -518,6 +546,29 @@ CREATE TRIGGER IF NOT EXISTS native_dependency_graphs_immutable_update
 BEFORE UPDATE ON native_dependency_graphs BEGIN SELECT RAISE(ABORT, 'native dependency graph evidence is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS native_dependency_graphs_immutable_delete
 BEFORE DELETE ON native_dependency_graphs BEGIN SELECT RAISE(ABORT, 'native dependency graph evidence is append-only'); END;
+CREATE TABLE IF NOT EXISTS native_dependency_graph_revisions (
+    revision_id TEXT PRIMARY KEY,
+    ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    supersedes_graph_hash TEXT NOT NULL,
+    child_external_id TEXT NOT NULL,
+    local_dependency_ids_json TEXT NOT NULL,
+    parent_external_ids_json TEXT NOT NULL,
+    graph_hash TEXT NOT NULL,
+    cause_ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    cause_attempt_number INTEGER NOT NULL CHECK(cause_attempt_number > 0),
+    predecessor_external_task_id TEXT NOT NULL,
+    replacement_external_task_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(ticket_id, generation),
+    UNIQUE(ticket_id, cause_ticket_id, cause_attempt_number),
+    UNIQUE(ticket_id, graph_hash)
+);
+CREATE TRIGGER IF NOT EXISTS native_dependency_graph_revisions_immutable_update
+BEFORE UPDATE ON native_dependency_graph_revisions BEGIN SELECT RAISE(ABORT, 'native dependency graph revisions are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS native_dependency_graph_revisions_immutable_delete
+BEFORE DELETE ON native_dependency_graph_revisions BEGIN SELECT RAISE(ABORT, 'native dependency graph revisions are append-only'); END;
 CREATE TABLE IF NOT EXISTS native_dependency_releases (
     ticket_id TEXT PRIMARY KEY REFERENCES tickets(id),
     graph_hash TEXT NOT NULL,
@@ -1471,6 +1522,16 @@ class Ledger:
             # tickets.external_id. The final fallback keeps legacy fake/internal
             # board fixtures working; it is never available to generated tickets.
             return str(ticket["external_id"] or ticket_id)
+        repair = conn.execute(
+            "SELECT json_extract(detail,'$.external_task_id') AS external_task_id FROM runtime_stages "
+            "WHERE ticket_id=? AND stage LIKE 'generated-repair-activation-%' AND json_valid(detail)=1 "
+            "AND json_type(detail,'$.external_task_id')='text' ORDER BY attempt_number DESC,created_at DESC LIMIT 1",
+            (ticket_id,),
+        ).fetchone()
+        if repair is not None and isinstance(repair["external_task_id"], str) and repair["external_task_id"]:
+            if ticket["external_id"] is not None:
+                raise ValueError("external_projection_identity_conflict")
+            return str(repair["external_task_id"])
         rows = conn.execute(
             "SELECT b.external_task_id FROM events e JOIN board_projection_outbox b "
             "ON b.ticket_id=e.entity_id AND b.event_id=e.id "
@@ -1552,6 +1613,46 @@ class Ledger:
         with self._transaction() as conn:
             result = self._enqueue_projection_bundle_in_transaction(conn, ticket_id=ticket_id, event_id=event_id, evidence=evidence, state_payload=state_payload, external_task_id=external_task_id)
         return result
+
+    def replace_pending_triage_comment(self, ticket_id: str, *, attempt_number: int, evidence: str) -> dict[str, Any]:
+        """Replace the still-pending needs-triage comment with synthesized feedback."""
+        if attempt_number < 1 or not evidence.strip():
+            raise ValueError("triage feedback comment requires attempt and evidence")
+        with self._transaction() as conn:
+            event = conn.execute(
+                "SELECT id FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='state_transition' AND to_state=? "
+                "AND json_extract(payload_json,'$.attempt_number')=? ORDER BY id DESC LIMIT 1",
+                (ticket_id, CanonicalState.NEEDS_TRIAGE.value, attempt_number),
+            ).fetchone()
+            if event is None:
+                raise RuntimeError("triage feedback comment requires durable needs_triage transition")
+            event_id = int(event["id"])
+            row = conn.execute(
+                "SELECT * FROM evidence_comment_outbox WHERE ticket_id=? AND event_id=?",
+                (ticket_id, event_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("triage feedback comment intent is missing")
+            payload = self._comment_payload(ticket_id, CanonicalState.NEEDS_TRIAGE.value, str(row["operation_id"]), evidence)
+            if str(row["payload"]) == payload:
+                return dict(row)
+            if row["status"] not in {"pending", "retryable"} or row["delivered_at"] is not None or row["lease_owner"] is not None:
+                raise RuntimeError("triage feedback comment already entered delivery; reconciliation required")
+            changed = conn.execute(
+                "UPDATE evidence_comment_outbox SET payload=?,updated_at=? WHERE operation_id=? AND status IN ('pending','retryable') AND delivered_at IS NULL AND lease_owner IS NULL",
+                (payload, self._now(), row["operation_id"]),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("triage feedback comment changed concurrently")
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=ticket_id,
+                event_type="triage_feedback_comment_prepared",
+                actor_id="local_feedback",
+                payload={"attempt_number": attempt_number, "event_id": event_id, "operation_id": row["operation_id"]},
+            )
+            return dict(conn.execute("SELECT * FROM evidence_comment_outbox WHERE operation_id=?", (row["operation_id"],)).fetchone())
 
     def projection_reconciliation_report(self) -> list[dict[str, Any]]:
         """Read-only report for legacy events or intents missing their pair."""
@@ -3087,8 +3188,7 @@ class Ledger:
         return dict(row) if row else None
 
     def native_dependency_graph(self, ticket_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("SELECT * FROM native_dependency_graphs WHERE ticket_id=?", (ticket_id,)).fetchone()
-        return dict(row) if row else None
+        return self._effective_native_dependency_graph_in_transaction(self.connection, ticket_id)
 
     def native_dependency_release(self, ticket_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (ticket_id,)).fetchone()
@@ -3859,6 +3959,187 @@ class Ledger:
             self._inject_failure("after_native_release_revalidation")
             return dict(conn.execute("SELECT * FROM native_dependency_release_revalidations WHERE revalidation_id=?", (revalidation_id,)).fetchone())
 
+    @staticmethod
+    def _native_dependency_graph_hash(ticket_id: str, child_external_id: str, dependency_ids: tuple[str, ...], parent_external_ids: tuple[str, ...]) -> str:
+        if len(dependency_ids) != len(parent_external_ids):
+            raise ValueError("native dependency graph identity is malformed")
+        core = {
+            "ticket_id": ticket_id,
+            "child_external_id": child_external_id,
+            "parents": [
+                {"ticket_id": dependency_id, "external_task_id": external_task_id}
+                for dependency_id, external_task_id in zip(dependency_ids, parent_external_ids)
+            ],
+        }
+        return hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def _effective_native_dependency_graph_in_transaction(self, conn: sqlite3.Connection, ticket_id: str) -> dict[str, Any] | None:
+        base = conn.execute("SELECT * FROM native_dependency_graphs WHERE ticket_id=?", (ticket_id,)).fetchone()
+        if base is None:
+            return None
+        try:
+            dependency_ids = tuple(json.loads(str(base["local_dependency_ids_json"])))
+            parent_external_ids = tuple(json.loads(str(base["parent_external_ids_json"])))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("native_dependency_graph_reconciliation_required: graph evidence malformed") from exc
+        if not all(isinstance(value, str) and value for value in (*dependency_ids, *parent_external_ids)):
+            raise RuntimeError("native_dependency_graph_reconciliation_required: graph evidence malformed")
+        current = {
+            "ticket_id": str(base["ticket_id"]),
+            "child_external_id": str(base["child_external_id"]),
+            "local_dependency_ids_json": str(base["local_dependency_ids_json"]),
+            "parent_external_ids_json": str(base["parent_external_ids_json"]),
+            "graph_hash": str(base["graph_hash"]),
+            "verified_at": int(base["verified_at"]),
+            "generation": 0,
+            "revision_id": None,
+        }
+        revisions = conn.execute("SELECT * FROM native_dependency_graph_revisions WHERE ticket_id=? ORDER BY generation", (ticket_id,)).fetchall()
+        for revision in revisions:
+            generation = int(revision["generation"])
+            if generation != int(current["generation"]) + 1 or str(revision["supersedes_graph_hash"]) != str(current["graph_hash"]):
+                raise RuntimeError("native_dependency_graph_reconciliation_required: graph revision chain drift")
+            if str(revision["child_external_id"]) != str(current["child_external_id"]) or str(revision["local_dependency_ids_json"]) != str(current["local_dependency_ids_json"]):
+                raise RuntimeError("native_dependency_graph_reconciliation_required: graph revision contract drift")
+            try:
+                revised_dependencies = tuple(json.loads(str(revision["local_dependency_ids_json"])))
+                revised_parents = tuple(json.loads(str(revision["parent_external_ids_json"])))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("native_dependency_graph_reconciliation_required: graph revision malformed") from exc
+            expected_revision_hash = self._native_dependency_graph_hash(ticket_id, str(revision["child_external_id"]), revised_dependencies, revised_parents)
+            if str(revision["graph_hash"]) != expected_revision_hash:
+                raise RuntimeError("native_dependency_graph_reconciliation_required: graph revision hash drift")
+            current = {
+                "ticket_id": ticket_id,
+                "child_external_id": str(revision["child_external_id"]),
+                "local_dependency_ids_json": str(revision["local_dependency_ids_json"]),
+                "parent_external_ids_json": str(revision["parent_external_ids_json"]),
+                "graph_hash": str(revision["graph_hash"]),
+                "verified_at": int(revision["created_at"]),
+                "generation": generation,
+                "revision_id": str(revision["revision_id"]),
+            }
+        return current
+
+    def record_repair_dependency_insertions(
+        self,
+        *,
+        cause_ticket_id: str,
+        cause_attempt_number: int,
+        predecessor_external_task_id: str,
+        replacement_external_task_id: str,
+        downstream_child_ids: tuple[str, ...],
+        reason: str,
+        now: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Append effective native-graph revisions after a verified repair graph rewrite."""
+        if cause_attempt_number < 1 or not all(isinstance(value, str) and value for value in (cause_ticket_id, predecessor_external_task_id, replacement_external_task_id, reason)):
+            raise ValueError("repair dependency insertion identity is incomplete")
+        if predecessor_external_task_id == replacement_external_task_id:
+            raise ValueError("repair dependency insertion requires a fresh external task")
+        child_ids = tuple(sorted(set(downstream_child_ids)))
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            cause = conn.execute("SELECT state FROM tickets WHERE id=?", (cause_ticket_id,)).fetchone()
+            if cause is None:
+                raise KeyError(cause_ticket_id)
+            if str(cause["state"]) != CanonicalState.REPAIRING.value:
+                raise RuntimeError("repair dependency insertion requires repairing ticket")
+            results: list[dict[str, Any]] = []
+            for child_external_id in child_ids:
+                matches = conn.execute("SELECT ticket_id FROM native_dependency_graphs WHERE child_external_id=? ORDER BY ticket_id", (child_external_id,)).fetchall()
+                if len(matches) > 1:
+                    raise RuntimeError("repair dependency insertion child identity is ambiguous")
+                if not matches:
+                    continue
+                downstream_ticket_id = str(matches[0]["ticket_id"])
+                if conn.execute("SELECT 1 FROM native_dependency_releases WHERE ticket_id=?", (downstream_ticket_id,)).fetchone() is not None:
+                    raise RuntimeError("repair dependency insertion cannot revise an already released downstream ticket")
+                effective = self._effective_native_dependency_graph_in_transaction(conn, downstream_ticket_id)
+                if effective is None:
+                    raise RuntimeError("repair dependency insertion native graph is missing")
+                dependency_ids = tuple(json.loads(str(effective["local_dependency_ids_json"])))
+                parent_external_ids = list(json.loads(str(effective["parent_external_ids_json"])))
+                indices = [index for index, dependency_id in enumerate(dependency_ids) if dependency_id == cause_ticket_id]
+                if len(indices) != 1:
+                    raise RuntimeError("repair dependency insertion local dependency identity is missing or ambiguous")
+                index = indices[0]
+                existing_for_attempt = conn.execute(
+                    "SELECT * FROM native_dependency_graph_revisions WHERE ticket_id=? AND cause_ticket_id=? AND cause_attempt_number=?",
+                    (downstream_ticket_id, cause_ticket_id, cause_attempt_number),
+                ).fetchone()
+                if parent_external_ids[index] == replacement_external_task_id:
+                    if existing_for_attempt is None:
+                        raise RuntimeError("repair dependency insertion replacement lacks revision evidence")
+                    if (
+                        str(existing_for_attempt["predecessor_external_task_id"]) != predecessor_external_task_id
+                        or str(existing_for_attempt["replacement_external_task_id"]) != replacement_external_task_id
+                        or str(existing_for_attempt["reason"]) != reason
+                        or str(existing_for_attempt["graph_hash"]) != str(effective["graph_hash"])
+                    ):
+                        raise RuntimeError("repair dependency insertion revision conflicts")
+                    results.append(dict(existing_for_attempt))
+                    continue
+                if parent_external_ids[index] != predecessor_external_task_id:
+                    raise RuntimeError("repair dependency insertion predecessor identity drift")
+                parent_external_ids[index] = replacement_external_task_id
+                parent_tuple = tuple(str(value) for value in parent_external_ids)
+                new_hash = self._native_dependency_graph_hash(downstream_ticket_id, str(effective["child_external_id"]), dependency_ids, parent_tuple)
+                generation = int(effective["generation"]) + 1
+                revision_id = hashlib.sha256(
+                    f"native-repair-graph:{downstream_ticket_id}:{cause_ticket_id}:{cause_attempt_number}:{new_hash}".encode()
+                ).hexdigest()[:32]
+                values = (
+                    revision_id,
+                    downstream_ticket_id,
+                    generation,
+                    str(effective["graph_hash"]),
+                    str(effective["child_external_id"]),
+                    str(effective["local_dependency_ids_json"]),
+                    json.dumps(list(parent_tuple), sort_keys=True, separators=(",", ":")),
+                    new_hash,
+                    cause_ticket_id,
+                    cause_attempt_number,
+                    predecessor_external_task_id,
+                    replacement_external_task_id,
+                    reason,
+                    now,
+                )
+                if existing_for_attempt is not None:
+                    actual = tuple(existing_for_attempt[key] for key in (
+                        "revision_id", "ticket_id", "generation", "supersedes_graph_hash", "child_external_id",
+                        "local_dependency_ids_json", "parent_external_ids_json", "graph_hash", "cause_ticket_id",
+                        "cause_attempt_number", "predecessor_external_task_id", "replacement_external_task_id", "reason", "created_at",
+                    ))
+                    if actual != values:
+                        raise RuntimeError("repair dependency insertion revision conflicts")
+                    results.append(dict(existing_for_attempt))
+                    continue
+                conn.execute(
+                    "INSERT INTO native_dependency_graph_revisions(revision_id,ticket_id,generation,supersedes_graph_hash,child_external_id,local_dependency_ids_json,parent_external_ids_json,graph_hash,cause_ticket_id,cause_attempt_number,predecessor_external_task_id,replacement_external_task_id,reason,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    values,
+                )
+                self._append_event(
+                    conn,
+                    entity_type="ticket",
+                    entity_id=downstream_ticket_id,
+                    event_type="native_dependency_graph_revised_for_repair",
+                    actor_id="repair_activation",
+                    payload={
+                        "revision_id": revision_id,
+                        "generation": generation,
+                        "supersedes_graph_hash": str(effective["graph_hash"]),
+                        "graph_hash": new_hash,
+                        "cause_ticket_id": cause_ticket_id,
+                        "cause_attempt_number": cause_attempt_number,
+                        "predecessor_external_task_id": predecessor_external_task_id,
+                        "replacement_external_task_id": replacement_external_task_id,
+                        "reason": reason,
+                    },
+                )
+                results.append(dict(conn.execute("SELECT * FROM native_dependency_graph_revisions WHERE revision_id=?", (revision_id,)).fetchone()))
+            return results
+
     def _native_dependency_graph_identity(self, conn: sqlite3.Connection, ticket_id: str) -> dict[str, Any]:
         ticket = conn.execute("SELECT id,dependencies_json FROM tickets WHERE id=?", (ticket_id,)).fetchone()
         if ticket is None:
@@ -3899,8 +4180,8 @@ class Ledger:
             "child_external_id": child_external_id,
             "parents": parents,
         }
-        encoded = json.dumps(core, sort_keys=True, separators=(",", ":"))
-        return {**core, "graph_hash": hashlib.sha256(encoded.encode()).hexdigest()}
+        graph_hash = self._native_dependency_graph_hash(ticket_id, child_external_id, dependencies, tuple(parent_external_ids))
+        return {**core, "graph_hash": graph_hash}
 
     def claim_next_scheduler_native_dependency_graph(self, owner: str, *, lease_seconds: int, now: int | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
         if not owner or lease_seconds < 1:
@@ -4010,7 +4291,7 @@ class Ledger:
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
     def _native_dependency_release_identity(self, conn: sqlite3.Connection, ticket_id: str, *, implementation_profile: str | None = None, canonical_repository: str | None = None) -> dict[str, Any]:
-        graph = conn.execute("SELECT * FROM native_dependency_graphs WHERE ticket_id=?", (ticket_id,)).fetchone()
+        graph = self._effective_native_dependency_graph_in_transaction(conn, ticket_id)
         if graph is None:
             raise RuntimeError("native_dependency_release_reconciliation_required: verified graph missing")
         try:
@@ -4153,7 +4434,9 @@ class Ledger:
             identity = self._native_dependency_release_identity(conn, str(claim["ticket_id"]), implementation_profile=implementation_profile, canonical_repository=canonical_repository)
             if json.loads(str(claim["candidate_identity_json"] or "{}")) != identity or result.get("candidate_identity") != identity:
                 raise RuntimeError("native_dependency_release_reconciliation_required: result identity drift")
-            graph = conn.execute("SELECT * FROM native_dependency_graphs WHERE ticket_id=?", (claim["ticket_id"],)).fetchone()
+            graph = self._effective_native_dependency_graph_in_transaction(conn, str(claim["ticket_id"]))
+            if graph is None:
+                raise RuntimeError("native_dependency_release_reconciliation_required: verified graph missing")
             expected_parents = sorted(json.loads(str(graph["parent_external_ids_json"])))
             if sorted(result.get("actual_parent_external_ids") or []) != expected_parents:
                 raise RuntimeError("native_dependency_release_reconciliation_required: Hermes graph diverged")
@@ -4831,6 +5114,74 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_claimed", actor_id=owner, payload={"claim_id":claim_id,"stage":"repair_routing","attempt_number":attempt_number})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
+    def plan_scheduler_repair_routing_effect(self, claim_id: str, owner: str, *, now: int | None = None) -> dict[str, Any]:
+        """Derive one repair/pass/triage decision without mutating ticket or review state."""
+        now = self._now() if now is None else now
+        claim = self.connection.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+        if claim is None or not str(claim["stage"]).startswith("repair_routing:"):
+            raise ValueError("scheduler claim is not repair routing")
+        if claim["lease_owner"] != owner or claim["lease_expires_at"] is None or int(claim["lease_expires_at"]) <= now:
+            raise PermissionError("scheduler claim lease is not owned")
+        ticket_id = str(claim["ticket_id"])
+        attempt_number = int(str(claim["stage"]).split(":", 1)[1])
+        ticket = self.connection.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+        if ticket is None:
+            raise KeyError(ticket_id)
+        state = str(ticket["state"])
+        max_attempts = int(ticket["max_attempts"])
+        if state == CanonicalState.VERIFYING.value:
+            validation = self.connection.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"validation-{attempt_number}")).fetchone()
+            if validation is None:
+                raise RuntimeError("repair_routing_reconciliation_required: failed validation evidence is missing")
+            try:
+                detail = json.loads(str(validation["detail"]))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("repair_routing_reconciliation_required: validation evidence is malformed") from exc
+            if bool(detail.get("passed")):
+                raise RuntimeError("repair_routing_reconciliation_required: passing validation is not repair-routable")
+            compact = str(detail.get("compact_evidence") or "")
+            if not compact:
+                raise RuntimeError("repair_routing_reconciliation_required: validation failure evidence is empty")
+            fingerprint = _stable_scheduler_failure_fingerprint(ticket_id, "validation", compact)
+            repeated = False
+            for prior in self.connection.execute("SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage LIKE 'validation-%' AND attempt_number<?", (ticket_id, attempt_number)):
+                try:
+                    prior_detail = json.loads(str(prior["detail"]))
+                except json.JSONDecodeError:
+                    continue
+                if bool(prior_detail.get("passed")):
+                    continue
+                prior_compact = str(prior_detail.get("compact_evidence") or "")
+                repeated = repeated or _stable_scheduler_failure_fingerprint(ticket_id, "validation", prior_compact) == fingerprint
+            action = "triage" if attempt_number >= max_attempts else "repair"
+            return {"ticket_id":ticket_id,"attempt_number":attempt_number,"source":"validation","action":action,"failure_fingerprint":fingerprint,"repeated_fingerprint":repeated,"failure_evidence":compact}
+        if state == CanonicalState.LOCAL_REVIEW.value:
+            review_claim = self.connection.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=? AND side_effect_completed_at IS NOT NULL AND result_json IS NOT NULL", (ticket_id, f"review:{attempt_number}")).fetchone()
+            if review_claim is None:
+                raise RuntimeError("repair_routing_reconciliation_required: completed review result is missing")
+            try:
+                review_result = json.loads(str(review_claim["result_json"]))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("repair_routing_reconciliation_required: review result is malformed") from exc
+            verdict = str(review_result.get("review_verdict") or "")
+            findings = review_result.get("findings") or []
+            criterion_results = review_result.get("criterion_results") or []
+            suggestions = review_result.get("suggestions") or []
+            if verdict not in {"pass","repair","escalate"} or not isinstance(findings, list) or not isinstance(criterion_results, list):
+                raise RuntimeError("repair_routing_reconciliation_required: normalized review result is incomplete")
+            repeated = any(
+                isinstance(finding, dict) and finding.get("fingerprint") and self.connection.execute("SELECT 1 FROM review_findings WHERE ticket_id=? AND fingerprint=? LIMIT 1", (ticket_id, finding["fingerprint"])).fetchone() is not None
+                for finding in findings
+            )
+            if verdict == "pass" or (verdict == "repair" and not findings):
+                action = "pass"
+            elif verdict == "escalate" or attempt_number >= max_attempts:
+                action = "triage"
+            else:
+                action = "repair"
+            return {"ticket_id":ticket_id,"attempt_number":attempt_number,"source":"review","action":action,"review_verdict":verdict,"repeated_fingerprint":repeated,"failure_fingerprint":next((str(item.get("fingerprint")) for item in findings if isinstance(item, dict) and item.get("fingerprint")), None),"failure_evidence":"; ".join(str(item.get("evidence") or "") for item in findings if isinstance(item, dict) and item.get("evidence")),"suggestions":suggestions}
+        raise RuntimeError("repair_routing_reconciliation_required: ticket state is not routable")
+
     def apply_scheduler_repair_routing_effect(self, claim_id: str, owner: str, *, now: int | None = None) -> dict[str, Any]:
         """Derive and persist one repair/pass/triage decision atomically."""
         now = self._now() if now is None else now
@@ -4879,7 +5230,7 @@ class Ledger:
                     prior_compact = str(prior_detail.get("compact_evidence") or "")
                     prior_fingerprint = _stable_scheduler_failure_fingerprint(ticket_id, "validation", prior_compact)
                     repeated = repeated or prior_fingerprint == fingerprint
-                action = "triage" if repeated or attempt_number >= max_attempts else "repair"
+                action = "triage" if attempt_number >= max_attempts else "repair"
                 result = {"ticket_id":ticket_id,"attempt_number":attempt_number,"source":"validation","action":action,"failure_fingerprint":fingerprint,"repeated_fingerprint":repeated,"failure_evidence":compact}
             elif state == CanonicalState.LOCAL_REVIEW.value:
                 review_claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=? AND side_effect_completed_at IS NOT NULL AND result_json IS NOT NULL", (ticket_id, f"review:{attempt_number}")).fetchone()
@@ -4902,7 +5253,7 @@ class Ledger:
                 )
                 if verdict == "pass" or (verdict == "repair" and not findings):
                     action = "pass"
-                elif verdict == "escalate" or repeated or attempt_number >= max_attempts:
+                elif verdict == "escalate" or attempt_number >= max_attempts:
                     action = "triage"
                 else:
                     action = "repair"
@@ -4917,6 +5268,18 @@ class Ledger:
                         conn.execute("INSERT INTO criterion_statuses(ticket_id,criterion_id,status,evidence,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(ticket_id,criterion_id) DO UPDATE SET status=excluded.status,evidence=excluded.evidence,updated_at=excluded.updated_at", (ticket_id,str(criterion["criterion_id"]),"open",str(criterion.get("evidence") or "review failure"),now))
             else:
                 raise RuntimeError("repair_routing_reconciliation_required: ticket state is not routable")
+
+            if result["action"] == "triage":
+                feedback_stage = conn.execute("SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"triage-feedback-{attempt_number}")).fetchone()
+                if feedback_stage is not None:
+                    try:
+                        feedback_detail = json.loads(str(feedback_stage["detail"]))
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError("repair_routing_reconciliation_required: triage feedback evidence is malformed") from exc
+                    feedback = str(feedback_detail.get("feedback") or "").strip()
+                    if feedback_detail.get("failure_fingerprint") != result.get("failure_fingerprint") or not feedback:
+                        raise RuntimeError("repair_routing_reconciliation_required: triage feedback does not match routing evidence")
+                    result["triage_feedback"] = feedback
 
             encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
             stage_name = f"repair-routing-{attempt_number}"
@@ -4934,7 +5297,8 @@ class Ledger:
                     raise RuntimeError("ticket changed concurrently")
                 event_id = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="state_transition", actor_id="repair_router", from_state=current.value, to_state=target.value, payload=result)
                 if target.value in self._PROJECTABLE_STATES:
-                    self._enqueue_projection_bundle_in_transaction(conn, ticket_id=ticket_id, event_id=event_id, evidence=f"repair routing={result['action']}", state_payload=result)
+                    projection_evidence = str(result.get("triage_feedback") or f"repair routing={result['action']}")
+                    self._enqueue_projection_bundle_in_transaction(conn, ticket_id=ticket_id, event_id=event_id, evidence=projection_evidence, state_payload=result)
                 if target == CanonicalState.REPAIRING:
                     implementation = conn.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='implementation'", (ticket_id,attempt_number)).fetchone()
                     attempt = conn.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id,attempt_number)).fetchone()
@@ -5019,7 +5383,11 @@ class Ledger:
 
     def hermes_execution_candidates(self) -> list[dict[str, Any]]:
         rows = self.connection.execute(
-            "SELECT DISTINCT t.id AS ticket_id,t.state,b.external_task_id,t.created_at "
+            "SELECT DISTINCT t.id AS ticket_id,t.state,COALESCE(("
+            "  SELECT json_extract(ra.detail,'$.external_task_id') FROM runtime_stages ra WHERE ra.ticket_id=t.id "
+            "  AND ra.stage LIKE 'generated-repair-activation-%' AND json_valid(ra.detail)=1 "
+            "  AND json_type(ra.detail,'$.external_task_id')='text' ORDER BY ra.attempt_number DESC,ra.created_at DESC LIMIT 1"
+            "),b.external_task_id) AS external_task_id,t.created_at "
             "FROM tickets t JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket' "
             "WHERE b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL AND b.superseded_at IS NULL "
             "AND t.state IN (?,?,?) "
@@ -5028,22 +5396,63 @@ class Ledger:
             "  AND ra.stage=('generated-repair-activation-' || ra.attempt_number) "
             "  AND ra.attempt_number > COALESCE((SELECT MAX(he.attempt_number) FROM hermes_execution_reconciliations he WHERE he.ticket_id=t.id),0)"
             ")) "
-            "ORDER BY t.created_at,t.id,b.external_task_id",
+            "ORDER BY t.created_at,t.id,external_task_id",
             (CanonicalState.READY_LOCAL.value, CanonicalState.IMPLEMENTING.value, CanonicalState.REPAIRING.value, CanonicalState.REPAIRING.value),
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def dispatchable_external_task_ids(self) -> tuple[str, ...]:
+        """External task ids with durable Local First authority for Hermes dispatch."""
+        authorized: list[str] = []
+        released = self.connection.execute(
+            """SELECT DISTINCT i.external_task_id
+                 FROM native_release_activation_intents i
+                 JOIN native_release_activation_evidence e
+                   ON e.request_key=i.request_key AND e.ticket_id=i.ticket_id
+                  AND e.revalidation_id=i.revalidation_id AND e.activation_marker=i.activation_marker
+                 JOIN events ev ON ev.id=e.event_id
+                 JOIN tickets t ON t.id=i.ticket_id
+                WHERE i.status='acknowledged' AND t.state IN (?,?)
+                  AND ev.entity_type='controller' AND ev.entity_id='controller'
+                  AND ev.event_type='native_dependency_release_activation_acknowledged'
+                  AND NOT EXISTS (SELECT 1 FROM terminal_ticket_failures f WHERE f.ticket_id=t.id)
+                ORDER BY i.external_task_id""",
+            (CanonicalState.DRAFT.value, CanonicalState.READY_LOCAL.value),
+        ).fetchall()
+        authorized.extend(str(row["external_task_id"]) for row in released)
+        repairs = self.connection.execute(
+            """SELECT json_extract(r.detail,'$.external_task_id') AS external_task_id
+                 FROM runtime_stages r
+                 JOIN tickets t ON t.id=r.ticket_id
+                WHERE t.state=? AND r.stage=('generated-repair-activation-' || r.attempt_number)
+                  AND r.attempt_number=(SELECT MAX(a.attempt_number) FROM attempts a WHERE a.ticket_id=t.id)
+                  AND json_valid(r.detail)=1 AND json_type(r.detail,'$.external_task_id')='text'
+                  AND NOT EXISTS (SELECT 1 FROM terminal_ticket_failures f WHERE f.ticket_id=t.id)
+                  AND NOT EXISTS (SELECT 1 FROM hermes_execution_reconciliations h WHERE h.ticket_id=t.id AND h.attempt_number=r.attempt_number)
+                ORDER BY t.created_at,t.id""",
+            (CanonicalState.REPAIRING.value,),
+        ).fetchall()
+        for row in repairs:
+            external_id = str(row["external_task_id"])
+            if external_id and external_id not in authorized:
+                authorized.append(external_id)
+        return tuple(authorized)
+
     def generated_repair_activation_candidates(self) -> list[dict[str, Any]]:
         rows = self.connection.execute(
-            """SELECT t.id AS ticket_id,b.external_task_id,r.attempt_number AS previous_attempt_number,
+            """SELECT t.id AS ticket_id,COALESCE((
+                          SELECT json_extract(prev.detail,'$.external_task_id') FROM runtime_stages prev
+                           WHERE prev.ticket_id=t.id AND prev.stage=('generated-repair-activation-' || r.attempt_number)
+                             AND json_valid(prev.detail)=1 AND json_type(prev.detail,'$.external_task_id')='text'
+                           ORDER BY prev.created_at DESC LIMIT 1
+                      ),b.external_task_id) AS external_task_id,r.attempt_number AS previous_attempt_number,
                       CAST(json_extract(r.detail,'$.next_attempt_number') AS INTEGER) AS attempt_number,
                       COALESCE(json_extract(r.detail,'$.failure_evidence'),'repair requested by Local First review') AS failure_evidence,
                       t.created_at
                FROM tickets t
                JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket'
                JOIN runtime_stages r ON r.ticket_id=t.id
-                 AND r.stage=('repair-routing-' || r.attempt_number)
-                 AND r.attempt_number=(SELECT MAX(rr.attempt_number) FROM runtime_stages rr WHERE rr.ticket_id=t.id AND rr.stage LIKE 'repair-routing-%')
+                 AND (r.stage=('repair-routing-' || r.attempt_number) OR r.stage=('paid-repair-routing-' || r.attempt_number))
                WHERE t.state='repairing'
                  AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL AND b.superseded_at IS NULL
                  AND json_valid(r.detail)=1 AND json_extract(r.detail,'$.action')='repair'
@@ -6087,6 +6496,348 @@ class Ledger:
                 )
             return [str(row['operation_id']) for row in rows]
 
+    def latest_triage_failure(self, ticket_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT attempt_number,detail FROM runtime_stages WHERE ticket_id=? AND stage LIKE 'repair-routing-%' "
+            "AND json_valid(detail)=1 AND json_extract(detail,'$.action')='triage' ORDER BY attempt_number DESC,created_at DESC LIMIT 1",
+            (ticket_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        detail = json.loads(str(row["detail"]))
+        return {"attempt_number": int(row["attempt_number"]), **detail}
+
+    def ticket_paid_escalation_candidate(self, *, ticket_id: str | None = None) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """SELECT t.id AS ticket_id,t.feature_id,t.max_attempts,r.attempt_number,r.detail,t.created_at
+               FROM tickets t
+               JOIN runtime_stages r ON r.ticket_id=t.id
+                AND r.stage=('repair-routing-' || r.attempt_number)
+               WHERE t.state='needs_triage'
+                 AND t.feature_id IS NOT NULL
+                 AND json_valid(r.detail)=1 AND json_extract(r.detail,'$.action')='triage'
+                 AND r.attempt_number=(SELECT MAX(rr.attempt_number) FROM runtime_stages rr WHERE rr.ticket_id=t.id AND rr.stage LIKE 'repair-routing-%' AND json_valid(rr.detail)=1 AND json_extract(rr.detail,'$.action')='triage')
+                 AND NOT EXISTS (SELECT 1 FROM terminal_ticket_failures f WHERE f.ticket_id=t.id)
+                 AND (? IS NULL OR t.id=?)
+               ORDER BY t.created_at,t.id LIMIT 1""",
+            (ticket_id, ticket_id),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["triage"] = json.loads(str(row["detail"]))
+        return result
+
+    def apply_paid_repair_authorization(
+        self,
+        ticket_id: str,
+        *,
+        attempt_number: int,
+        failure_fingerprint: str,
+        feedback: str,
+        response: dict[str, Any],
+        actor_id: str = "paid_escalation",
+    ) -> dict[str, Any]:
+        if attempt_number < 1 or not failure_fingerprint.strip() or not feedback.strip():
+            raise ValueError("paid repair authorization requires attempt, fingerprint, and feedback")
+        now = self._now()
+        with self._transaction() as conn:
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None:
+                raise KeyError(ticket_id)
+            stage_name = f"paid-repair-routing-{attempt_number}"
+            existing = conn.execute("SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, stage_name)).fetchone()
+            if existing is not None:
+                detail = json.loads(str(existing["detail"]))
+                if detail.get("failure_fingerprint") != failure_fingerprint or detail.get("feedback") != feedback:
+                    raise ValueError("paid repair authorization conflicts with durable evidence")
+                return detail
+            if str(ticket["state"]) != CanonicalState.NEEDS_TRIAGE.value:
+                raise ValueError("paid repair authorization requires needs_triage ticket")
+            triage = conn.execute(
+                "SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage=?",
+                (ticket_id, f"repair-routing-{attempt_number}"),
+            ).fetchone()
+            if triage is None:
+                raise RuntimeError("paid repair authorization requires deterministic triage evidence")
+            triage_detail = json.loads(str(triage["detail"]))
+            if triage_detail.get("action") != "triage" or triage_detail.get("failure_fingerprint") != failure_fingerprint:
+                raise RuntimeError("paid repair authorization does not match deterministic triage evidence")
+            attempt = conn.execute(
+                "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?",
+                (ticket_id, attempt_number),
+            ).fetchone()
+            if attempt is None or not attempt["worktree_path"] or not attempt["post_diff_hash"]:
+                raise RuntimeError("paid repair authorization requires complete failed candidate provenance")
+            next_attempt = attempt_number + 1
+            conn.execute(
+                "INSERT INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,created_at) VALUES (?,?,?,?,?,?,?)",
+                (ticket_id, next_attempt, attempt["base_sha"], attempt["branch"], attempt["worktree_path"], attempt["post_diff_hash"], now),
+            )
+            conn.execute(
+                "UPDATE attempts SET outcome='repair_requested',failure_fingerprint=? WHERE ticket_id=? AND attempt_number=?",
+                (failure_fingerprint, ticket_id, attempt_number),
+            )
+            detail = {
+                "action": "repair",
+                "source": "paid_escalation",
+                "ticket_id": ticket_id,
+                "attempt_number": attempt_number,
+                "next_attempt_number": next_attempt,
+                "failure_fingerprint": failure_fingerprint,
+                "failure_evidence": str(triage_detail.get("failure_evidence") or "paid escalation requested repair"),
+                "feedback": feedback,
+                "paid_response": response,
+            }
+            encoded = json.dumps(detail, sort_keys=True, separators=(",", ":"))
+            conn.execute(
+                "INSERT INTO runtime_stages(ticket_id,stage,attempt_number,detail,base_sha,created_at) VALUES (?,?,?,?,?,?)",
+                (ticket_id, stage_name, attempt_number, encoded, attempt["base_sha"], now),
+            )
+            validate_transition(CanonicalState.NEEDS_TRIAGE, CanonicalState.REPAIRING)
+            conn.execute(
+                "UPDATE tickets SET state=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND state=?",
+                (CanonicalState.REPAIRING.value, now, ticket_id, CanonicalState.NEEDS_TRIAGE.value),
+            )
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=ticket_id,
+                event_type="paid_repair_authorized",
+                actor_id=actor_id,
+                payload=detail,
+            )
+            event_id = self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=ticket_id,
+                event_type="state_transition",
+                actor_id=actor_id,
+                from_state=CanonicalState.NEEDS_TRIAGE.value,
+                to_state=CanonicalState.REPAIRING.value,
+                payload={"reason": "paid_repair_authorized", **detail},
+            )
+            return detail
+
+    def record_terminal_unresolvable(
+        self,
+        ticket_id: str,
+        *,
+        attempt_number: int,
+        failure_fingerprint: str,
+        reason: str,
+        summary: dict[str, Any],
+        notification_target: str,
+        actor_id: str = "ticket_escalation",
+    ) -> dict[str, Any]:
+        if attempt_number < 1 or not failure_fingerprint.strip() or not reason.strip() or not notification_target.strip():
+            raise ValueError("terminal unresolvable record requires attempt, fingerprint, reason, and notification target")
+        encoded_summary = json.dumps(summary, sort_keys=True, separators=(",", ":"))
+        now = self._now()
+        operation_key = f"unresolvable:{ticket_id}:{failure_fingerprint}"
+        operation_id = hashlib.sha256(operation_key.encode()).hexdigest()[:32]
+        with self._transaction() as conn:
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None:
+                raise KeyError(ticket_id)
+            existing = conn.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if existing is not None:
+                if (int(existing["attempt_number"]), str(existing["failure_fingerprint"]), str(existing["reason"]), str(existing["summary_json"])) != (attempt_number, failure_fingerprint, reason, encoded_summary):
+                    raise ValueError("terminal unresolvable evidence conflicts with durable record")
+            else:
+                current = CanonicalState(str(ticket["state"]))
+                if current != CanonicalState.BLOCKED:
+                    validate_transition(current, CanonicalState.BLOCKED)
+                    changed = conn.execute(
+                        "UPDATE tickets SET state=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND state=?",
+                        (CanonicalState.BLOCKED.value, now, ticket_id, current.value),
+                    )
+                    if changed.rowcount != 1:
+                        raise RuntimeError("ticket changed while recording terminal unresolvable outcome")
+                    self._append_event(
+                        conn,
+                        entity_type="ticket",
+                        entity_id=ticket_id,
+                        event_type="terminal_unresolvable",
+                        actor_id=actor_id,
+                        payload={"attempt_number": attempt_number, "failure_fingerprint": failure_fingerprint, "reason": reason, "summary": summary},
+                    )
+                    event_id = self._append_event(
+                        conn,
+                        entity_type="ticket",
+                        entity_id=ticket_id,
+                        event_type="state_transition",
+                        actor_id=actor_id,
+                        from_state=current.value,
+                        to_state=CanonicalState.BLOCKED.value,
+                        payload={"reason": "terminal_unresolvable", "attempt_number": attempt_number, "failure_fingerprint": failure_fingerprint},
+                    )
+                    self._enqueue_projection_bundle_in_transaction(
+                        conn,
+                        ticket_id=ticket_id,
+                        event_id=event_id,
+                        evidence=(str(summary.get("local_feedback") or "").strip() or f"terminal unresolvable: {reason}"),
+                        state_payload={"terminal_unresolvable": True, "failure_fingerprint": failure_fingerprint, "reason": reason},
+                    )
+                conn.execute(
+                    "INSERT INTO terminal_ticket_failures(ticket_id,attempt_number,failure_fingerprint,reason,summary_json,created_at) VALUES (?,?,?,?,?,?)",
+                    (ticket_id, attempt_number, failure_fingerprint, reason, encoded_summary, now),
+                )
+            title = str(ticket["title"])
+            local_attempts = int(conn.execute("SELECT COUNT(*) FROM attempts WHERE ticket_id=?", (ticket_id,)).fetchone()[0])
+            payload = (
+                f"Local First: ticket {ticket_id} is unresolvable\n\n"
+                f"Title: {title}\n"
+                f"Attempts used: {local_attempts}\n"
+                f"Final attempt: {attempt_number}\n"
+                f"Failure fingerprint: {failure_fingerprint}\n"
+                f"Reason: {reason}\n\n"
+                f"Summary:\n{json.dumps(summary, sort_keys=True, indent=2)}"
+            )[:12000]
+            existing_notice = conn.execute("SELECT * FROM gateway_notification_outbox WHERE operation_id=?", (operation_id,)).fetchone()
+            if existing_notice is None:
+                conn.execute(
+                    "INSERT INTO gateway_notification_outbox(operation_id,ticket_id,failure_fingerprint,target,idempotency_key,payload,status,created_at,updated_at) VALUES (?,?,?,?,?,?,'pending',?,?)",
+                    (operation_id, ticket_id, failure_fingerprint, notification_target, operation_key, payload, now, now),
+                )
+            elif (str(existing_notice["target"]), str(existing_notice["payload"]), str(existing_notice["failure_fingerprint"])) != (notification_target, payload, failure_fingerprint):
+                raise ValueError("terminal notification intent conflicts with durable record")
+            return {"ticket_id": ticket_id, "operation_id": operation_id, "status": "unresolvable", "failure_fingerprint": failure_fingerprint}
+
+    def claim_next_gateway_notification(self, owner: str, *, lease_seconds: int = 60, now: int | None = None) -> dict[str, Any] | None:
+        if not owner or lease_seconds < 1:
+            raise ValueError("gateway notification claim requires owner and positive lease")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            changed = conn.execute(
+                """UPDATE gateway_notification_outbox
+                   SET status='delivering',lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=?
+                 WHERE operation_id=(
+                    SELECT operation_id FROM gateway_notification_outbox
+                     WHERE status IN ('pending','retryable') AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+                     ORDER BY created_at,operation_id LIMIT 1)
+                   AND status IN ('pending','retryable')""",
+                (owner, now + lease_seconds, now, now),
+            )
+            if changed.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM gateway_notification_outbox WHERE lease_owner=? AND status='delivering' AND updated_at=? ORDER BY operation_id LIMIT 1",
+                (owner, now),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def mark_gateway_notification_delivered(self, operation_id: str, owner: str, *, now: int | None = None) -> bool:
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            row = conn.execute("SELECT status,lease_owner,lease_expires_at,terminal_owner FROM gateway_notification_outbox WHERE operation_id=?", (operation_id,)).fetchone()
+            if row is None:
+                return False
+            if row["status"] == "delivered":
+                return row["terminal_owner"] == owner
+            return conn.execute(
+                "UPDATE gateway_notification_outbox SET status='delivered',delivered_at=?,updated_at=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,last_error=NULL,terminal_owner=? WHERE operation_id=? AND status='delivering' AND lease_owner=? AND lease_expires_at>?",
+                (now, now, owner, operation_id, owner, now),
+            ).rowcount == 1
+
+    def mark_gateway_notification_retryable(self, operation_id: str, owner: str, error: str, *, next_attempt_at: int | None = None, now: int | None = None) -> bool:
+        now = self._now() if now is None else now
+        next_attempt_at = now if next_attempt_at is None else next_attempt_at
+        with self._transaction() as conn:
+            return conn.execute(
+                "UPDATE gateway_notification_outbox SET status='retryable',last_error=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=?,updated_at=? WHERE operation_id=? AND status='delivering' AND lease_owner=? AND lease_expires_at>?",
+                (self._safe_comment_error(error), next_attempt_at, now, operation_id, owner, now),
+            ).rowcount == 1
+
+    def mark_gateway_notification_delivery_unknown(self, operation_id: str, owner: str, error: str, *, now: int | None = None) -> bool:
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            return conn.execute(
+                "UPDATE gateway_notification_outbox SET status='delivery_unknown',last_error=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,updated_at=?,terminal_owner=? WHERE operation_id=? AND status='delivering' AND lease_owner=?",
+                (self._safe_comment_error(error), now, owner, operation_id, owner),
+            ).rowcount == 1
+
+    def mark_gateway_notification_permanently_failed(self, operation_id: str, owner: str, error: str, *, now: int | None = None) -> bool:
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            return conn.execute(
+                "UPDATE gateway_notification_outbox SET status='permanently_failed',last_error=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,updated_at=?,terminal_owner=? WHERE operation_id=? AND status='delivering' AND lease_owner=? AND lease_expires_at>?",
+                (self._safe_comment_error(error), now, owner, operation_id, owner, now),
+            ).rowcount == 1
+
+    def recover_expired_gateway_notification_leases(self, *, now: int | None = None) -> list[str]:
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            rows = conn.execute("SELECT operation_id FROM gateway_notification_outbox WHERE status='delivering' AND lease_expires_at<=?", (now,)).fetchall()
+            conn.execute(
+                "UPDATE gateway_notification_outbox SET status='delivery_unknown',last_error='delivery lease expired after send may have started',lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,updated_at=? WHERE status='delivering' AND lease_expires_at<=?",
+                (now, now),
+            )
+            return [str(row["operation_id"]) for row in rows]
+
+    def resolve_gateway_notification(
+        self,
+        operation_id: str,
+        *,
+        operator_id: str,
+        reason: str,
+        action: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        if not operator_id.strip() or not reason.strip() or action not in {"confirm_delivered", "retry"}:
+            raise ValueError("gateway notification reconciliation requires operator, reason, and supported action")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM gateway_notification_outbox WHERE operation_id=?", (operation_id,)).fetchone()
+            controller = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if controller is None or not bool(controller["paused"]):
+                raise PermissionError("gateway notification reconciliation requires paused controller")
+            if row is None:
+                raise KeyError(operation_id)
+            prior_status = str(row["status"])
+            if prior_status not in {"delivery_unknown", "permanently_failed"}:
+                raise ValueError("gateway notification is not awaiting operator reconciliation")
+            if prior_status == "permanently_failed" and action != "retry":
+                raise ValueError("permanently failed gateway notifications may only be retried")
+            if action == "confirm_delivered":
+                conn.execute(
+                    "UPDATE gateway_notification_outbox SET status='delivered',delivered_at=?,updated_at=?,last_error=NULL,terminal_owner=? WHERE operation_id=?",
+                    (now, now, operator_id, operation_id),
+                )
+            else:
+                context = "ambiguous delivery" if prior_status == "delivery_unknown" else "permanent delivery failure"
+                conn.execute(
+                    "UPDATE gateway_notification_outbox SET status='retryable',updated_at=?,next_attempt_at=?,last_error=?,terminal_owner=NULL WHERE operation_id=?",
+                    (now, now, f"operator-authorized retry after {context}: {reason[:1000]}", operation_id),
+                )
+            self._append_event(
+                conn,
+                entity_type="gateway_notification",
+                entity_id=operation_id,
+                event_type="gateway_notification_unknown_resolved" if prior_status == "delivery_unknown" else "gateway_notification_failure_retried",
+                actor_id=operator_id,
+                payload={"action": action, "reason": reason, "ticket_id": row["ticket_id"], "prior_status": prior_status},
+            )
+            resolved = conn.execute("SELECT * FROM gateway_notification_outbox WHERE operation_id=?", (operation_id,)).fetchone()
+            return dict(resolved)
+
+    def resolve_gateway_notification_unknown(
+        self,
+        operation_id: str,
+        *,
+        operator_id: str,
+        reason: str,
+        action: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        return self.resolve_gateway_notification(
+            operation_id,
+            operator_id=operator_id,
+            reason=reason,
+            action=action,
+            now=now,
+        )
+
     def set_evidence_comment(self, ticket_id: str, comment: str, artifact_location: str | None = None) -> bool:
         with self._transaction() as conn:
             cur = conn.execute("INSERT OR IGNORE INTO evidence_comments(ticket_id,comment,artifact_location,created_at) VALUES (?,?,?,?)", (ticket_id, comment[:4000], artifact_location, self._now()))
@@ -6646,8 +7397,19 @@ class Ledger:
         outbox_pending = self.connection.execute(
             "SELECT "
             "(SELECT COUNT(*) FROM board_projection_outbox WHERE acknowledged_at IS NULL AND superseded_at IS NULL) + "
-            "(SELECT COUNT(*) FROM evidence_comment_outbox WHERE status IN ('pending', 'retryable', 'delivering'))"
+            "(SELECT COUNT(*) FROM evidence_comment_outbox WHERE status IN ('pending', 'retryable', 'delivering')) + "
+            "(SELECT COUNT(*) FROM gateway_notification_outbox WHERE status IN ('pending', 'retryable', 'delivering'))"
         ).fetchone()[0]
+        ambiguous_gateway_notifications = [dict(row) for row in self.connection.execute(
+            "SELECT operation_id,ticket_id,target,attempt_count,updated_at FROM gateway_notification_outbox "
+            "WHERE status='delivery_unknown' ORDER BY updated_at,operation_id LIMIT ?",
+            (active_limit,),
+        )]
+        failed_gateway_notifications = [dict(row) for row in self.connection.execute(
+            "SELECT operation_id,ticket_id,target,attempt_count,updated_at,last_error FROM gateway_notification_outbox "
+            "WHERE status='permanently_failed' ORDER BY updated_at,operation_id LIMIT ?",
+            (active_limit,),
+        )]
         pending_state_projections = self.connection.execute("SELECT COUNT(*) FROM board_projection_outbox WHERE operation='set_state' AND acknowledged_at IS NULL AND superseded_at IS NULL").fetchone()[0]
         superseded_state_projections = self.connection.execute("SELECT COUNT(*) FROM board_projection_outbox WHERE operation='set_state' AND superseded_at IS NOT NULL").fetchone()[0]
         reconciliations = [{**dict(row), "cleanup_confirmed": row["cleanup_confirmed_at"] is not None} for row in self.connection.execute(
@@ -6666,6 +7428,10 @@ class Ledger:
             "active": active,
             "active_truncated": len(active) == active_limit and sum(state_counts.get(state, 0) for state in active_states) > active_limit,
             "outbox_pending": int(outbox_pending),
+            "ambiguous_gateway_notifications": ambiguous_gateway_notifications,
+            "ambiguous_gateway_notifications_truncated": len(ambiguous_gateway_notifications) == active_limit and self.connection.execute("SELECT COUNT(*) FROM gateway_notification_outbox WHERE status='delivery_unknown'").fetchone()[0] > active_limit,
+            "failed_gateway_notifications": failed_gateway_notifications,
+            "failed_gateway_notifications_truncated": len(failed_gateway_notifications) == active_limit and self.connection.execute("SELECT COUNT(*) FROM gateway_notification_outbox WHERE status='permanently_failed'").fetchone()[0] > active_limit,
             "pending_state_projections": int(pending_state_projections),
             "superseded_state_projections": int(superseded_state_projections),
             "failed_attempt_reconciliations": reconciliations,
@@ -7041,7 +7807,7 @@ class Ledger:
             external_task_ids.append(external_id)
             dependencies = sorted(set(json.loads(str(ticket["dependencies_json"]))))
             if dependencies:
-                graph = conn.execute("SELECT * FROM native_dependency_graphs WHERE ticket_id=?", (ticket_id,)).fetchone()
+                graph = self._effective_native_dependency_graph_in_transaction(conn, ticket_id)
                 if graph is None:
                     raise RuntimeError("next_tranche_activation_reconciliation_required: native dependency graph not verified")
                 if json.loads(str(graph["local_dependency_ids_json"])) != dependencies:

@@ -503,6 +503,7 @@ class NativeReleaseRevalidationTests(unittest.TestCase):
         self.assertEqual(result["status"], "acknowledged")
         self.assertEqual(mutate.call_count, 1)
         self.assertEqual(self.ledger.connection.execute("SELECT status FROM native_release_activation_intents WHERE request_key='controller-request'").fetchone()[0], "acknowledged")
+        self.assertIn(self.external_id, self.ledger.dispatchable_external_task_ids())
 
     def test_after_unblock_crash_replays_ready_post_state_without_reunblocking(self) -> None:
         with self._open_board() as connection:

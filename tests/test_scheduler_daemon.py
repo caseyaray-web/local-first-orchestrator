@@ -78,6 +78,51 @@ class SchedulerDaemonTests(unittest.TestCase):
         self.assertEqual(health.last_stage, "validation")
         self.assertFalse(health.running)
 
+    def test_idle_tick_can_advance_one_authorized_external_task(self) -> None:
+        calls: list[str] = []
+        sleeps: list[float] = []
+        daemon = SchedulerDaemon(
+            self.ledger,
+            lambda: FakeScheduler(ProcessNextResult("no_work")),
+            external_progress_runner=lambda: calls.append("dispatch") or "H-1",
+            worker_id="daemon",
+            idle_sleep_seconds=2.0,
+            sleep=sleeps.append,
+            clock=lambda: 100.0,
+        )
+        health = daemon.run(max_iterations=1)
+        self.assertEqual(calls, ["dispatch"])
+        self.assertEqual(sleeps, [])
+        self.assertEqual(health.last_status, "external_progress")
+        self.assertEqual(health.last_stage, "hermes_dispatch")
+
+    def test_dispatch_authority_requires_durable_release_or_repair_activation(self) -> None:
+        imported = self.ledger.create_ticket(
+            title="imported",
+            state=CanonicalState.READY_LOCAL,
+            external_id="H-imported",
+        )
+        self.assertEqual(self.ledger.dispatchable_external_task_ids(), ())
+
+        repair = self.ledger.create_ticket(
+            title="repair",
+            state=CanonicalState.REPAIRING,
+            external_id="H-original",
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,created_at) VALUES (?,?,?,?,?,?,?)",
+            (repair, 1, "a" * 40, "repair/branch", str(self.root / "worktree"), "b" * 64, 1),
+        )
+        self.ledger.record_runtime_stage(
+            repair,
+            "generated-repair-activation-1",
+            '{"external_task_id":"H-repair","attempt_number":1}',
+            attempt_number=1,
+            base_sha="a" * 40,
+        )
+        self.assertEqual(self.ledger.dispatchable_external_task_ids(), ("H-repair",))
+        self.assertNotIn("H-imported", self.ledger.dispatchable_external_task_ids())
+
     def test_transient_errors_backoff_exponentially_and_success_resets_counter(self) -> None:
         outcomes = [RuntimeError("one"), RuntimeError("two"), ProcessNextResult("no_work"), RuntimeError("three")]
         sleeps: list[float] = []

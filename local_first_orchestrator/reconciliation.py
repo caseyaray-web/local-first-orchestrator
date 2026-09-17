@@ -55,6 +55,7 @@ SCHEDULER_CRASH_POLICIES: dict[str, SchedulerCrashPolicy] = {
     "validation": _policy("validation", ReconciliationAction.REPLAY),
     "review": _policy("review", ReconciliationAction.STOP, "model_invocations"),
     "repair_routing": _policy("repair_routing", ReconciliationAction.REPLAY),
+    "ticket_paid_escalation": _policy("ticket_paid_escalation", ReconciliationAction.STOP, "paid_reservations"),
     "triage": _policy("triage", ReconciliationAction.STOP, "model_invocations"),
     "acceptance": _policy("acceptance", ReconciliationAction.REPLAY),
     "git_integration": _policy("git_integration", ReconciliationAction.REPLAY, "git_commit_intents"),
