@@ -450,12 +450,17 @@ CREATE TABLE IF NOT EXISTS terminal_ticket_failures (
     reason TEXT NOT NULL,
     summary_json TEXT NOT NULL,
     created_at INTEGER NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 1,
+    resolved_at INTEGER,
+    resolved_by TEXT,
+    resolution_reason TEXT,
     UNIQUE(ticket_id, failure_fingerprint)
 );
 CREATE TABLE IF NOT EXISTS gateway_notification_outbox (
     operation_id TEXT PRIMARY KEY,
     ticket_id TEXT NOT NULL REFERENCES tickets(id),
     failure_fingerprint TEXT NOT NULL,
+    terminal_generation INTEGER NOT NULL DEFAULT 1,
     target TEXT NOT NULL,
     idempotency_key TEXT NOT NULL UNIQUE,
     payload TEXT NOT NULL,
@@ -469,7 +474,8 @@ CREATE TABLE IF NOT EXISTS gateway_notification_outbox (
     updated_at INTEGER NOT NULL,
     delivered_at INTEGER,
     terminal_owner TEXT,
-    UNIQUE(ticket_id, failure_fingerprint)
+    superseded_at INTEGER,
+    UNIQUE(ticket_id, failure_fingerprint, terminal_generation)
 );
 CREATE TABLE IF NOT EXISTS evidence_comments (
     ticket_id TEXT PRIMARY KEY REFERENCES tickets(id), comment TEXT NOT NULL,
@@ -1254,6 +1260,59 @@ class Ledger:
         comment_columns={row["name"] for row in self.connection.execute("PRAGMA table_info(evidence_comment_outbox)")}
         for name,definition in {"lease_expires_at":"INTEGER","next_attempt_at":"INTEGER","terminal_owner":"TEXT"}.items():
             if name not in comment_columns: self.connection.execute(f"ALTER TABLE evidence_comment_outbox ADD COLUMN {name} {definition}")
+        terminal_columns={row["name"] for row in self.connection.execute("PRAGMA table_info(terminal_ticket_failures)")}
+        for name,definition in {"generation":"INTEGER NOT NULL DEFAULT 1","resolved_at":"INTEGER","resolved_by":"TEXT","resolution_reason":"TEXT"}.items():
+            if name not in terminal_columns: self.connection.execute(f"ALTER TABLE terminal_ticket_failures ADD COLUMN {name} {definition}")
+        gateway_sql_row = self.connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='gateway_notification_outbox'").fetchone()
+        gateway_sql = str(gateway_sql_row["sql"] or "") if gateway_sql_row is not None else ""
+        gateway_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(gateway_notification_outbox)")}
+        legacy_gateway_unique = "UNIQUE(ticket_id, failure_fingerprint)" in gateway_sql and "UNIQUE(ticket_id, failure_fingerprint, terminal_generation)" not in gateway_sql
+        if "terminal_generation" not in gateway_columns or "superseded_at" not in gateway_columns or legacy_gateway_unique:
+            self.connection.executescript("""
+            ALTER TABLE gateway_notification_outbox RENAME TO gateway_notification_outbox_legacy;
+            CREATE TABLE gateway_notification_outbox (
+                operation_id TEXT PRIMARY KEY,
+                ticket_id TEXT NOT NULL REFERENCES tickets(id),
+                failure_fingerprint TEXT NOT NULL,
+                terminal_generation INTEGER NOT NULL DEFAULT 1,
+                target TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                lease_owner TEXT,
+                lease_expires_at INTEGER,
+                next_attempt_at INTEGER,
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                delivered_at INTEGER,
+                terminal_owner TEXT,
+                superseded_at INTEGER,
+                UNIQUE(ticket_id, failure_fingerprint, terminal_generation)
+            );
+            INSERT INTO gateway_notification_outbox(
+                operation_id,ticket_id,failure_fingerprint,terminal_generation,target,idempotency_key,payload,status,
+                attempt_count,lease_owner,lease_expires_at,next_attempt_at,last_error,created_at,updated_at,
+                delivered_at,terminal_owner,superseded_at
+            )
+            SELECT operation_id,ticket_id,failure_fingerprint,1,target,idempotency_key,payload,status,
+                   attempt_count,lease_owner,lease_expires_at,next_attempt_at,last_error,created_at,updated_at,
+                   delivered_at,terminal_owner,NULL
+              FROM gateway_notification_outbox_legacy;
+            DROP TABLE gateway_notification_outbox_legacy;
+            """)
+            legacy_generation_rows = self.connection.execute(
+                "SELECT operation_id,failure_fingerprint FROM gateway_notification_outbox WHERE failure_fingerprint GLOB '*:g[0-9]*'"
+            ).fetchall()
+            for legacy_row in legacy_generation_rows:
+                fingerprint = str(legacy_row["failure_fingerprint"])
+                base, marker = fingerprint.rsplit(":g", 1)
+                if len(base) == 64 and marker.isdigit() and int(marker) >= 2:
+                    self.connection.execute(
+                        "UPDATE gateway_notification_outbox SET failure_fingerprint=?,terminal_generation=? WHERE operation_id=?",
+                        (base, int(marker), legacy_row["operation_id"]),
+                    )
         release_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(native_dependency_releases)")}
         if "routing_authority_json" not in release_columns:
             self.connection.execute("ALTER TABLE native_dependency_releases ADD COLUMN routing_authority_json TEXT NOT NULL DEFAULT '{}'")
@@ -5415,7 +5474,7 @@ class Ledger:
                 WHERE i.status='acknowledged' AND t.state IN (?,?)
                   AND ev.entity_type='controller' AND ev.entity_id='controller'
                   AND ev.event_type='native_dependency_release_activation_acknowledged'
-                  AND NOT EXISTS (SELECT 1 FROM terminal_ticket_failures f WHERE f.ticket_id=t.id)
+                  AND NOT EXISTS (SELECT 1 FROM terminal_ticket_failures f WHERE f.ticket_id=t.id AND f.resolved_at IS NULL)
                 ORDER BY i.external_task_id""",
             (CanonicalState.DRAFT.value, CanonicalState.READY_LOCAL.value),
         ).fetchall()
@@ -5427,7 +5486,7 @@ class Ledger:
                 WHERE t.state=? AND r.stage=('generated-repair-activation-' || r.attempt_number)
                   AND r.attempt_number=(SELECT MAX(a.attempt_number) FROM attempts a WHERE a.ticket_id=t.id)
                   AND json_valid(r.detail)=1 AND json_type(r.detail,'$.external_task_id')='text'
-                  AND NOT EXISTS (SELECT 1 FROM terminal_ticket_failures f WHERE f.ticket_id=t.id)
+                  AND NOT EXISTS (SELECT 1 FROM terminal_ticket_failures f WHERE f.ticket_id=t.id AND f.resolved_at IS NULL)
                   AND NOT EXISTS (SELECT 1 FROM hermes_execution_reconciliations h WHERE h.ticket_id=t.id AND h.attempt_number=r.attempt_number)
                 ORDER BY t.created_at,t.id""",
             (CanonicalState.REPAIRING.value,),
@@ -6517,7 +6576,7 @@ class Ledger:
                  AND t.feature_id IS NOT NULL
                  AND json_valid(r.detail)=1 AND json_extract(r.detail,'$.action')='triage'
                  AND r.attempt_number=(SELECT MAX(rr.attempt_number) FROM runtime_stages rr WHERE rr.ticket_id=t.id AND rr.stage LIKE 'repair-routing-%' AND json_valid(rr.detail)=1 AND json_extract(rr.detail,'$.action')='triage')
-                 AND NOT EXISTS (SELECT 1 FROM terminal_ticket_failures f WHERE f.ticket_id=t.id)
+                 AND NOT EXISTS (SELECT 1 FROM terminal_ticket_failures f WHERE f.ticket_id=t.id AND f.resolved_at IS NULL)
                  AND (? IS NULL OR t.id=?)
                ORDER BY t.created_at,t.id LIMIT 1""",
             (ticket_id, ticket_id),
@@ -6619,6 +6678,89 @@ class Ledger:
             )
             return detail
 
+    def reopen_terminal_ticket_after_paid_budget(
+        self,
+        ticket_id: str,
+        *,
+        operator_id: str,
+        reason: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        if not operator_id.strip() or not reason.strip():
+            raise ValueError("terminal ticket reopen requires operator and reason")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            controller = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if controller is None or not bool(controller["paused"]):
+                raise PermissionError("terminal ticket reopen requires paused controller")
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None:
+                raise KeyError(ticket_id)
+            terminal = conn.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if terminal is None or terminal["resolved_at"] is not None:
+                raise ValueError("ticket has no unresolved terminal failure")
+            if str(ticket["state"]) != CanonicalState.BLOCKED.value:
+                raise ValueError("terminal ticket must be blocked before reopen")
+            if str(terminal["reason"]) != "paid escalation budget exhausted":
+                raise ValueError("only paid-budget-exhaustion terminals may be reopened by this operation")
+            feature_id = ticket["feature_id"]
+            if feature_id is None:
+                raise ValueError("terminal ticket has no feature identity")
+            budget = conn.execute("SELECT escalation_limit FROM paid_budgets WHERE feature_id=?", (feature_id,)).fetchone()
+            if budget is None:
+                raise ValueError("paid escalation budget is still unconfigured")
+            approvals = int(conn.execute("SELECT COALESCE(SUM(calls),0) FROM paid_approvals WHERE feature_id=? AND purpose='escalation'", (feature_id,)).fetchone()[0])
+            used = int(conn.execute("SELECT COUNT(*) FROM paid_reservations WHERE feature_id=? AND purpose='escalation' AND status IN ('in_flight','completed','unknown_outcome')", (feature_id,)).fetchone()[0])
+            remaining = int(budget["escalation_limit"]) + approvals - used
+            if remaining <= 0:
+                raise ValueError("paid escalation budget is still exhausted")
+            terminal_generation = int(terminal["generation"] or 1)
+            terminal_fingerprint = str(terminal["failure_fingerprint"])
+            notices = conn.execute(
+                "SELECT operation_id,status FROM gateway_notification_outbox WHERE ticket_id=? AND failure_fingerprint=? AND terminal_generation=?",
+                (ticket_id, terminal_fingerprint, terminal_generation),
+            ).fetchall()
+            unsafe_notice = next((row for row in notices if str(row["status"]) in {"delivering", "delivery_unknown"}), None)
+            if unsafe_notice is not None:
+                raise ValueError("terminal notification delivery is in-flight or ambiguous; reconcile it before reopening ticket")
+            superseded_operation_ids = [str(row["operation_id"]) for row in notices if str(row["status"]) in {"pending", "retryable"}]
+            if superseded_operation_ids:
+                placeholders = ",".join("?" for _ in superseded_operation_ids)
+                conn.execute(
+                    f"UPDATE gateway_notification_outbox SET status='superseded',superseded_at=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,updated_at=? WHERE operation_id IN ({placeholders}) AND status IN ('pending','retryable')",
+                    (now, now, *superseded_operation_ids),
+                )
+            validate_transition(CanonicalState.BLOCKED, CanonicalState.NEEDS_TRIAGE)
+            changed = conn.execute(
+                "UPDATE tickets SET state=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND state=?",
+                (CanonicalState.NEEDS_TRIAGE.value, now, ticket_id, CanonicalState.BLOCKED.value),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("ticket changed while reopening terminal failure")
+            conn.execute(
+                "UPDATE terminal_ticket_failures SET resolved_at=?,resolved_by=?,resolution_reason=? WHERE ticket_id=? AND resolved_at IS NULL",
+                (now, operator_id, reason[:2000], ticket_id),
+            )
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=ticket_id,
+                event_type="terminal_unresolvable_resolved",
+                actor_id=operator_id,
+                payload={"reason": reason, "remaining_escalation_calls": remaining, "terminal_generation": terminal_generation, "superseded_notification_operation_ids": superseded_operation_ids},
+            )
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=ticket_id,
+                event_type="state_transition",
+                actor_id=operator_id,
+                from_state=CanonicalState.BLOCKED.value,
+                to_state=CanonicalState.NEEDS_TRIAGE.value,
+                payload={"reason": "paid_budget_added_after_terminal", "remaining_escalation_calls": remaining},
+            )
+            return {"ticket_id": ticket_id, "state": CanonicalState.NEEDS_TRIAGE.value, "remaining_escalation_calls": remaining, "terminal_generation": terminal_generation, "superseded_notification_operation_ids": superseded_operation_ids}
+
     def record_terminal_unresolvable(
         self,
         ticket_id: str,
@@ -6634,17 +6776,19 @@ class Ledger:
             raise ValueError("terminal unresolvable record requires attempt, fingerprint, reason, and notification target")
         encoded_summary = json.dumps(summary, sort_keys=True, separators=(",", ":"))
         now = self._now()
-        operation_key = f"unresolvable:{ticket_id}:{failure_fingerprint}"
-        operation_id = hashlib.sha256(operation_key.encode()).hexdigest()[:32]
         with self._transaction() as conn:
             ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
             if ticket is None:
                 raise KeyError(ticket_id)
             existing = conn.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=?", (ticket_id,)).fetchone()
-            if existing is not None:
+            generation = 1
+            if existing is not None and existing["resolved_at"] is None:
                 if (int(existing["attempt_number"]), str(existing["failure_fingerprint"]), str(existing["reason"]), str(existing["summary_json"])) != (attempt_number, failure_fingerprint, reason, encoded_summary):
                     raise ValueError("terminal unresolvable evidence conflicts with durable record")
+                generation = int(existing["generation"] or 1)
             else:
+                if existing is not None:
+                    generation = int(existing["generation"] or 1) + 1
                 current = CanonicalState(str(ticket["state"]))
                 if current != CanonicalState.BLOCKED:
                     validate_transition(current, CanonicalState.BLOCKED)
@@ -6660,7 +6804,7 @@ class Ledger:
                         entity_id=ticket_id,
                         event_type="terminal_unresolvable",
                         actor_id=actor_id,
-                        payload={"attempt_number": attempt_number, "failure_fingerprint": failure_fingerprint, "reason": reason, "summary": summary},
+                        payload={"attempt_number": attempt_number, "failure_fingerprint": failure_fingerprint, "reason": reason, "summary": summary, "generation": generation},
                     )
                     event_id = self._append_event(
                         conn,
@@ -6670,19 +6814,27 @@ class Ledger:
                         actor_id=actor_id,
                         from_state=current.value,
                         to_state=CanonicalState.BLOCKED.value,
-                        payload={"reason": "terminal_unresolvable", "attempt_number": attempt_number, "failure_fingerprint": failure_fingerprint},
+                        payload={"reason": "terminal_unresolvable", "attempt_number": attempt_number, "failure_fingerprint": failure_fingerprint, "generation": generation},
                     )
                     self._enqueue_projection_bundle_in_transaction(
                         conn,
                         ticket_id=ticket_id,
                         event_id=event_id,
                         evidence=(str(summary.get("local_feedback") or "").strip() or f"terminal unresolvable: {reason}"),
-                        state_payload={"terminal_unresolvable": True, "failure_fingerprint": failure_fingerprint, "reason": reason},
+                        state_payload={"terminal_unresolvable": True, "failure_fingerprint": failure_fingerprint, "reason": reason, "generation": generation},
                     )
-                conn.execute(
-                    "INSERT INTO terminal_ticket_failures(ticket_id,attempt_number,failure_fingerprint,reason,summary_json,created_at) VALUES (?,?,?,?,?,?)",
-                    (ticket_id, attempt_number, failure_fingerprint, reason, encoded_summary, now),
-                )
+                if existing is None:
+                    conn.execute(
+                        "INSERT INTO terminal_ticket_failures(ticket_id,attempt_number,failure_fingerprint,reason,summary_json,created_at,generation) VALUES (?,?,?,?,?,?,?)",
+                        (ticket_id, attempt_number, failure_fingerprint, reason, encoded_summary, now, generation),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE terminal_ticket_failures SET attempt_number=?,failure_fingerprint=?,reason=?,summary_json=?,created_at=?,generation=?,resolved_at=NULL,resolved_by=NULL,resolution_reason=NULL WHERE ticket_id=?",
+                        (attempt_number, failure_fingerprint, reason, encoded_summary, now, generation, ticket_id),
+                    )
+            operation_key = f"unresolvable:{ticket_id}:{failure_fingerprint}" if generation == 1 else f"unresolvable:{ticket_id}:{failure_fingerprint}:g{generation}"
+            operation_id = hashlib.sha256(operation_key.encode()).hexdigest()[:32]
             title = str(ticket["title"])
             local_attempts = int(conn.execute("SELECT COUNT(*) FROM attempts WHERE ticket_id=?", (ticket_id,)).fetchone()[0])
             payload = (
@@ -6697,10 +6849,10 @@ class Ledger:
             existing_notice = conn.execute("SELECT * FROM gateway_notification_outbox WHERE operation_id=?", (operation_id,)).fetchone()
             if existing_notice is None:
                 conn.execute(
-                    "INSERT INTO gateway_notification_outbox(operation_id,ticket_id,failure_fingerprint,target,idempotency_key,payload,status,created_at,updated_at) VALUES (?,?,?,?,?,?,'pending',?,?)",
-                    (operation_id, ticket_id, failure_fingerprint, notification_target, operation_key, payload, now, now),
+                    "INSERT INTO gateway_notification_outbox(operation_id,ticket_id,failure_fingerprint,terminal_generation,target,idempotency_key,payload,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,'pending',?,?)",
+                    (operation_id, ticket_id, failure_fingerprint, generation, notification_target, operation_key, payload, now, now),
                 )
-            elif (str(existing_notice["target"]), str(existing_notice["payload"]), str(existing_notice["failure_fingerprint"])) != (notification_target, payload, failure_fingerprint):
+            elif (str(existing_notice["target"]), str(existing_notice["payload"]), str(existing_notice["failure_fingerprint"]), int(existing_notice["terminal_generation"])) != (notification_target, payload, failure_fingerprint, generation):
                 raise ValueError("terminal notification intent conflicts with durable record")
             return {"ticket_id": ticket_id, "operation_id": operation_id, "status": "unresolvable", "failure_fingerprint": failure_fingerprint}
 

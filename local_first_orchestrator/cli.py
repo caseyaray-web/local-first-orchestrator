@@ -636,6 +636,10 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     resolve_notification.add_argument("--action", required=True, choices=("confirm_delivered","retry"))
     resolve_notification.add_argument("--reason", required=True)
     resolve_notification.add_argument("--operator-id", default="local-first-cli")
+    reopen_terminal=commands.add_parser("reopen-terminal", help="paused operator-only: reopen one paid-budget-exhaustion terminal after escalation capacity is added")
+    reopen_terminal.add_argument("--ticket-id", required=True)
+    reopen_terminal.add_argument("--reason", required=True)
+    reopen_terminal.add_argument("--operator-id", default="local-first-cli")
     status=commands.add_parser("status"); status.add_argument("--active",action="store_true"); status.add_argument("--scheduler-detail",action="store_true",help="include one read-only scheduler lifecycle boundary snapshot")
     imported=commands.add_parser("import"); imported.add_argument("--task-id",required=True)
     run=commands.add_parser("run-once"); run.add_argument("--task-id",required=True); run.add_argument("--dry-run",action="store_true",default=True); run.add_argument("--execute",action="store_true"); run.add_argument("--allow-board-writes",action="store_true")
@@ -838,6 +842,9 @@ def run_command(args: argparse.Namespace) -> int:
         elif args.command=="resolve-notification":
             row=ledger.resolve_gateway_notification(args.operation_id,operator_id=args.operator_id,reason=args.reason,action=args.action)
             print(json.dumps({"operation_id":row["operation_id"],"ticket_id":row["ticket_id"],"status":row["status"],"action":args.action},sort_keys=True))
+        elif args.command=="reopen-terminal":
+            row=ledger.reopen_terminal_ticket_after_paid_budget(args.ticket_id,operator_id=args.operator_id,reason=args.reason)
+            print(json.dumps(row,sort_keys=True))
         elif args.command=="retire-historical-claims":
             if args.claim_id:
                 row=ledger.retire_historical_scheduler_claim(args.claim_id,operator_id=args.operator_id,reason=args.reason)

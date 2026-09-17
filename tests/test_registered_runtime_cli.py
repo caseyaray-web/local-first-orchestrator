@@ -14,6 +14,7 @@ from local_first_orchestrator.cli import _ad_hoc_controller, _registered_control
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.generated_projection import GeneratedProjectionDeliveryResult
 from local_first_orchestrator.operator_config import ModelRegistration, OperatorConfig, save_operator_config
+from local_first_orchestrator.states import CanonicalState
 
 
 class RegisteredRuntimeCliTests(unittest.TestCase):
@@ -157,6 +158,46 @@ class RegisteredRuntimeCliTests(unittest.TestCase):
             "SELECT event_type FROM events WHERE entity_type='controller' ORDER BY id"
         )]
         self.assertEqual(events[-2:], ["paused", "resumed"])
+
+    def test_reopen_terminal_cli_requires_pause_and_reopens_budget_exhaustion_terminal(self) -> None:
+        now = self.ledger._now()
+        self.ledger.connection.execute(
+            "INSERT INTO features(id,title,status,created_at,updated_at) VALUES ('F-reopen-cli','feature','active',?,?)",
+            (now, now),
+        )
+        ticket = self.ledger.create_ticket(title="terminal-cli", state=CanonicalState.NEEDS_TRIAGE)
+        self.ledger.connection.execute("UPDATE tickets SET feature_id='F-reopen-cli' WHERE id=?", (ticket,))
+        notice = self.ledger.record_terminal_unresolvable(
+            ticket,
+            attempt_number=1,
+            failure_fingerprint="f" * 64,
+            reason="paid escalation budget exhausted",
+            summary={"local_feedback": "terminal evidence"},
+            notification_target="mattermost:ops",
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO paid_budgets(feature_id,architecture_limit,checkpoint_limit,escalation_limit,created_at,updated_at) VALUES ('F-reopen-cli',0,0,1,?,?)",
+            (now, now),
+        )
+        with self.assertRaisesRegex(PermissionError, "paused controller"):
+            cli_main([
+                "--database", str(self.database),
+                "reopen-terminal", "--ticket-id", ticket, "--reason", "budget added", "--operator-id", "operator",
+            ])
+        cli_main(["--database", str(self.database), "pause", "--reason", "terminal recovery", "--operator-id", "operator"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(cli_main([
+                "--database", str(self.database),
+                "reopen-terminal", "--ticket-id", ticket, "--reason", "paid capacity added", "--operator-id", "operator",
+            ]), 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual((payload["ticket_id"], payload["state"], payload["remaining_escalation_calls"]), (ticket, "needs_triage", 1))
+        notice_row = self.ledger.connection.execute(
+            "SELECT status,superseded_at FROM gateway_notification_outbox WHERE operation_id=?", (notice["operation_id"],)
+        ).fetchone()
+        self.assertEqual(notice_row["status"], "superseded")
+        self.assertIsNotNone(notice_row["superseded_at"])
 
     def test_historical_claim_retirement_cli_supports_exact_operator_targets(self) -> None:
         parser = argparse.ArgumentParser(); register_cli(parser)

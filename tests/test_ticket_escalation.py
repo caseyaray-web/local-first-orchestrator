@@ -116,6 +116,154 @@ class TicketEscalationTests(unittest.TestCase):
         self.assertIn("Fixes exceeded the authorized envelope", row["payload"])
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM terminal_ticket_failures WHERE ticket_id=?", (self.ticket,)).fetchone()[0], 1)
 
+    def test_budget_exhaustion_terminal_can_be_reopened_after_budget_added_and_reterminal_alerts_again(self) -> None:
+        now = self.ledger._now()
+        self.ledger.connection.execute(
+            "INSERT INTO features(id,title,status,created_at,updated_at) VALUES ('F-reopen','feature','active',?,?)",
+            (now, now),
+        )
+        self.ledger.connection.execute("UPDATE tickets SET feature_id='F-reopen' WHERE id=?", (self.ticket,))
+        summary = {"local_feedback": "authoritative findings", "policy": "local_and_paid_budgets_exhausted"}
+        first = self.ledger.record_terminal_unresolvable(
+            self.ticket,
+            attempt_number=2,
+            failure_fingerprint="d" * 64,
+            reason="paid escalation budget exhausted",
+            summary=summary,
+            notification_target="mattermost:ops",
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO paid_budgets(feature_id,architecture_limit,checkpoint_limit,escalation_limit,created_at,updated_at) VALUES ('F-reopen',0,0,1,?,?)",
+            (now, now),
+        )
+        with self.assertRaisesRegex(PermissionError, "paused controller"):
+            self.ledger.reopen_terminal_ticket_after_paid_budget(
+                self.ticket, operator_id="operator", reason="budget added", now=now + 1
+            )
+        self.ledger.pause("operator", reason="reopen budget-exhaustion terminal")
+        reopened = self.ledger.reopen_terminal_ticket_after_paid_budget(
+            self.ticket, operator_id="operator", reason="paid escalation capacity added", now=now + 2
+        )
+        self.assertEqual(reopened["state"], "needs_triage")
+        self.assertEqual(reopened["remaining_escalation_calls"], 1)
+        terminal = self.ledger.connection.execute(
+            "SELECT resolved_at,resolved_by,generation FROM terminal_ticket_failures WHERE ticket_id=?", (self.ticket,)
+        ).fetchone()
+        self.assertIsNotNone(terminal["resolved_at"])
+        self.assertEqual((terminal["resolved_by"], terminal["generation"]), ("operator", 1))
+        self.assertIsNotNone(self.ledger.ticket_paid_escalation_candidate(ticket_id=self.ticket))
+        first_notice = self.ledger.connection.execute(
+            "SELECT status,superseded_at,failure_fingerprint,terminal_generation FROM gateway_notification_outbox WHERE operation_id=?",
+            (first["operation_id"],),
+        ).fetchone()
+        self.assertEqual(first_notice["status"], "superseded")
+        self.assertIsNotNone(first_notice["superseded_at"])
+        self.assertEqual((first_notice["failure_fingerprint"], first_notice["terminal_generation"]), ("d" * 64, 1))
+
+        second = self.ledger.record_terminal_unresolvable(
+            self.ticket,
+            attempt_number=2,
+            failure_fingerprint="d" * 64,
+            reason="paid escalation budget exhausted",
+            summary=summary,
+            notification_target="mattermost:ops",
+        )
+        self.assertNotEqual(first["operation_id"], second["operation_id"])
+        self.assertEqual(
+            self.ledger.connection.execute("SELECT COUNT(*) FROM gateway_notification_outbox WHERE ticket_id=?", (self.ticket,)).fetchone()[0],
+            2,
+        )
+        second_notice = self.ledger.connection.execute(
+            "SELECT failure_fingerprint,terminal_generation,status FROM gateway_notification_outbox WHERE operation_id=?",
+            (second["operation_id"],),
+        ).fetchone()
+        self.assertEqual((second_notice["failure_fingerprint"], second_notice["terminal_generation"], second_notice["status"]), ("d" * 64, 2, "pending"))
+        terminal = self.ledger.connection.execute(
+            "SELECT resolved_at,generation FROM terminal_ticket_failures WHERE ticket_id=?", (self.ticket,)
+        ).fetchone()
+        self.assertIsNone(terminal["resolved_at"])
+        self.assertEqual(terminal["generation"], 2)
+
+    def test_reopen_blocks_when_terminal_notification_delivery_is_ambiguous(self) -> None:
+        now = self.ledger._now()
+        self.ledger.connection.execute(
+            "INSERT INTO features(id,title,status,created_at,updated_at) VALUES ('F-ambiguous','feature','active',?,?)",
+            (now, now),
+        )
+        self.ledger.connection.execute("UPDATE tickets SET feature_id='F-ambiguous' WHERE id=?", (self.ticket,))
+        notice = self.ledger.record_terminal_unresolvable(
+            self.ticket,
+            attempt_number=2,
+            failure_fingerprint="e" * 64,
+            reason="paid escalation budget exhausted",
+            summary={"local_feedback": "authoritative findings"},
+            notification_target="mattermost:ops",
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO paid_budgets(feature_id,architecture_limit,checkpoint_limit,escalation_limit,created_at,updated_at) VALUES ('F-ambiguous',0,0,1,?,?)",
+            (now, now),
+        )
+        claimed = self.ledger.claim_next_gateway_notification("notify", lease_seconds=60, now=now + 1)
+        self.assertEqual(claimed["operation_id"], notice["operation_id"])
+        self.ledger.pause("operator", reason="attempt guarded reopen")
+        with self.assertRaisesRegex(ValueError, "in-flight or ambiguous"):
+            self.ledger.reopen_terminal_ticket_after_paid_budget(
+                self.ticket,
+                operator_id="operator",
+                reason="paid escalation capacity added",
+                now=now + 2,
+            )
+        self.assertEqual(self.ledger.get_ticket(self.ticket)["state"], "blocked")
+        terminal = self.ledger.connection.execute(
+            "SELECT resolved_at FROM terminal_ticket_failures WHERE ticket_id=?", (self.ticket,)
+        ).fetchone()
+        self.assertIsNone(terminal["resolved_at"])
+
+    def test_migrate_legacy_gateway_generation_suffix_to_explicit_generation(self) -> None:
+        with TemporaryDirectory() as td:
+            database = Path(td) / "legacy.db"
+            legacy = Ledger(database)
+            legacy.migrate()
+            ticket = legacy.create_ticket(title="legacy-gateway")
+            legacy.connection.execute("DROP TABLE gateway_notification_outbox")
+            legacy.connection.execute(
+                """CREATE TABLE gateway_notification_outbox (
+                    operation_id TEXT PRIMARY KEY,
+                    ticket_id TEXT NOT NULL REFERENCES tickets(id),
+                    failure_fingerprint TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    lease_owner TEXT,
+                    lease_expires_at INTEGER,
+                    next_attempt_at INTEGER,
+                    last_error TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    delivered_at INTEGER,
+                    terminal_owner TEXT,
+                    UNIQUE(ticket_id, failure_fingerprint)
+                )"""
+            )
+            fingerprint = "a" * 64
+            legacy.connection.execute(
+                "INSERT INTO gateway_notification_outbox(operation_id,ticket_id,failure_fingerprint,target,idempotency_key,payload,status,created_at,updated_at) VALUES ('op-legacy',?,?,?,?,?,'pending',1,1)",
+                (ticket, fingerprint + ":g2", "mattermost:ops", "legacy-key", "payload"),
+            )
+            legacy.migrate()
+            row = legacy.connection.execute(
+                "SELECT failure_fingerprint,terminal_generation,status,superseded_at FROM gateway_notification_outbox WHERE operation_id='op-legacy'"
+            ).fetchone()
+            self.assertEqual((row["failure_fingerprint"], row["terminal_generation"], row["status"]), (fingerprint, 2, "pending"))
+            self.assertIsNone(row["superseded_at"])
+            table_sql = legacy.connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='gateway_notification_outbox'"
+            ).fetchone()[0]
+            self.assertIn("UNIQUE(ticket_id, failure_fingerprint, terminal_generation)", table_sql)
+            legacy.close()
+
     def test_gateway_notification_worker_delivers_once(self) -> None:
         self.ledger.record_terminal_unresolvable(
             self.ticket,
