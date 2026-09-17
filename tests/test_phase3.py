@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 import json
 import subprocess
 import unittest
@@ -139,6 +141,24 @@ class Phase3Tests(unittest.TestCase):
         self.assertEqual(kwargs_seen[0]["input"], [{"type": "text", "text": packet}])
         self.assertNotIn("board", str(kwargs_seen[0]).lower())
         self.assertNotIn("workdir", kwargs_seen[0])
+
+    def test_review_packet_bounds_large_selected_file_without_truncating_diff(self) -> None:
+        builder = ReviewPacketBuilder()
+        huge = "BEGIN\n" + ("x" * 200_000) + "\nEND"
+        diff = "diff --git a/app.py b/app.py\n" + ("+changed\n" * 500)
+        selected = {"app.py": huge, "test_app.py": "small context"}
+
+        first = builder.build(self.ticket, diff=diff, selected_files=selected, validation_evidence="tests pass")
+        second = builder.build(self.ticket, diff=diff, selected_files=selected, validation_evidence="tests pass")
+
+        self.assertEqual(first, second)
+        self.assertLessEqual(len(first), builder.max_packet_chars)
+        self.assertIn(diff, first)
+        self.assertIn("small context", first)
+        self.assertIn("BEGIN", first)
+        self.assertIn("END", first)
+        self.assertIn(hashlib.sha256(huge.encode("utf-8")).hexdigest(), first)
+        self.assertIn("middle omitted", first)
 
 
 if __name__ == "__main__":

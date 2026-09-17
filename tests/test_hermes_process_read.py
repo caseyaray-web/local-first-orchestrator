@@ -54,6 +54,22 @@ class ProcessReadTests(unittest.TestCase):
   self.assertEqual(task.parents,('parent-a','parent-b'));self.assertEqual(task.children,('leaf',))
   a.link_dependency('parent-a','child')
   self.assertIn([str(self.exe),'kanban','--board','board','link','parent-a','child'],calls)
+ def test_reclaim_for_repair_is_idempotent_once_dispatchable(self):
+  calls=[]; remote={'status':'done'}
+  def runner(argv,**kwargs):
+   calls.append(list(argv))
+   action=argv[4]
+   if action=='show':
+    return subprocess.CompletedProcess(argv,0,json.dumps({'task':{'id':'1','title':'x','body':'','status':remote['status'],'workspace_path':'/repo','workspace_kind':'worktree','assignee':'worker-code-local'},'parents':[],'children':[],'comments':[]}), '')
+   if action=='reclaim':
+    remote['status']='ready'; return subprocess.CompletedProcess(argv,0,'','')
+   raise AssertionError(argv)
+  a=HermesBoardAdapter(executable=str(self.exe),board='board',allow_writes=True,runner=runner)
+  self.assertEqual(a.reclaim_for_repair('1',reason='fix parity').status,'ready')
+  first_reclaims=sum(1 for call in calls if call[4]=='reclaim')
+  self.assertEqual(first_reclaims,1)
+  self.assertEqual(a.reclaim_for_repair('1',reason='fix parity').status,'ready')
+  self.assertEqual(sum(1 for call in calls if call[4]=='reclaim'),1)
  def test_comment_marker_lookup_uses_show_json_comments(self):
   def runner(argv,**kwargs):
    payload={'task':{'id':'1','title':'x','body':'','status':'scheduled','workspace_path':None},'comments':[{'author':'local-first-orchestrator','body':'hello <!-- local-first-comment:abc -->','created_at':1}], 'parents':[], 'children':[]}

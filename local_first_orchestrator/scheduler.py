@@ -889,6 +889,8 @@ def preview_ticket_database(database: Path, ticket_id: str, *, now: int | None =
             """, (ticket_id,)).fetchone()
             if cleanup is not None:
                 return ProcessNextPreview(next_stage="worktree_cleanup", ticket_id=ticket_id, would_execute=True)
+            if any(str(row["ticket_id"]) == ticket_id for row in ledger.generated_repair_activation_candidates()):
+                return ProcessNextPreview(next_stage="generated_activation", ticket_id=ticket_id, would_execute=True, would_write_board=True)
             if any(str(row["ticket_id"]) == ticket_id for row in ledger.hermes_execution_candidates()):
                 return ProcessNextPreview(next_stage="hermes_execution_reconciliation", ticket_id=ticket_id, would_execute=True)
             if any(str(row["ticket_id"]) == ticket_id for row in ledger.generated_activation_candidates()):
@@ -1240,7 +1242,9 @@ class ProcessNextScheduler:
                         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                             detail = {}
                         if detail.get("candidate_identity") != identity:
-                            raise RuntimeError("validation_reconciliation_required: started validation outcome is unknown")
+                            decision = self.ledger.scheduler_reconciliation(claim_id)
+                            if decision.action != ReconciliationAction.REPLAY:
+                                raise RuntimeError("validation_reconciliation_required: started validation outcome is unknown")
                     else:
                         self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
                     validation_result = self.validation_runner(ticket_id)
@@ -1276,7 +1280,16 @@ class ProcessNextScheduler:
                         review_stage = self.ledger.model_stage(ticket_id, attempt_number, "review")
                         invocations = self.ledger.review_invocations(ticket_id, attempt_number)
                         if review_stage is None and invocations and str(invocations[-1]["status"]) != "completed":
-                            raise RuntimeError("review_reconciliation_required: started review outcome is unknown")
+                            latest = invocations[-1]
+                            authorization = self.ledger.connection.execute(
+                                """SELECT 1 FROM review_retry_authorizations
+                                   WHERE ticket_id=? AND attempt_number=? AND candidate_fingerprint=?
+                                     AND failed_invocation_id=? AND consumed_invocation_id IS NULL
+                                   LIMIT 1""",
+                                (ticket_id, attempt_number, str(identity.get("implementation_diff_hash") or ""), latest["invocation_id"]),
+                            ).fetchone()
+                            if authorization is None:
+                                raise RuntimeError("review_reconciliation_required: started review outcome is unknown")
                     else:
                         self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
                     review_result = self.review_runner(ticket_id)
@@ -1507,10 +1520,15 @@ class ProcessNextScheduler:
                         prepared_workspace = str(prepared.get("workspace_path") or "")
                         if not prepared_workspace:
                             raise RuntimeError("native_dependency_release_reconciliation_required: prepared workspace is missing")
+                        binder = getattr(self.board, "bind_native_release_task", None)
                         verifier = getattr(self.board, "verify_native_release_task", None)
-                        if verifier is None:
+                        if binder is not None:
+                            routing = binder(child_external_id, expected_workspace_path=prepared_workspace)
+                            task = self.board.get_task(child_external_id)
+                        elif verifier is not None:
+                            routing = verifier(task, expected_workspace_path=prepared_workspace)
+                        else:
                             raise RuntimeError("native_dependency_release_reconciliation_required: board authority verifier is missing")
-                        routing = verifier(task, expected_workspace_path=prepared_workspace)
                         routing["canonical_repository"] = str(self.native_dependency_release_repository)
                     else:
                         routing = {}

@@ -283,6 +283,44 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         return None
 
     def activate_generated_work() -> dict[str, Any] | None:
+        repair_candidates = [row for row in ledger.generated_repair_activation_candidates() if target_ticket_id is None or str(row["ticket_id"]) == target_ticket_id]
+        if repair_candidates:
+            candidate = repair_candidates[0]
+            ticket_id = str(candidate["ticket_id"])
+            external_task_id = str(candidate["external_task_id"])
+            attempt_number = int(candidate["attempt_number"])
+            prepared = ctl.prepare_hermes_repair_worktree(ticket_id, external_task_id, attempt_number)
+            failure_evidence = str(candidate.get("failure_evidence") or "repair requested by Local First review")
+            reason = f"Local First repair attempt {attempt_number}: {failure_evidence}"[:1500]
+            task = ctl.board.reclaim_for_repair(external_task_id, reason=reason)
+            binder = getattr(ctl.board, "bind_native_release_task", None)
+            if binder is not None:
+                binder(external_task_id, expected_workspace_path=prepared["workspace_path"])
+                task = ctl.board.get_task(external_task_id)
+            if task.status not in {"todo", "ready"}:
+                raise RuntimeError("generated repair activation did not produce a dispatchable Hermes task")
+            detail = json.dumps({
+                "ticket_id": ticket_id,
+                "external_task_id": external_task_id,
+                "attempt_number": attempt_number,
+                "previous_attempt_number": int(candidate["previous_attempt_number"]),
+                "reason": reason,
+                "prepared_execution": prepared,
+                "hermes_status": task.status,
+            }, sort_keys=True, separators=(",", ":"))
+            stage = f"generated-repair-activation-{attempt_number}"
+            if not ledger.record_runtime_stage(ticket_id, stage, detail, attempt_number=attempt_number, base_sha=prepared["base_sha"]):
+                existing = ledger.connection.execute("SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, stage)).fetchone()
+                if existing is None or str(existing["detail"]) != detail:
+                    raise RuntimeError("generated repair activation reconciliation required")
+            return {
+                "ticket_id": ticket_id,
+                "status": "repair_activated",
+                "prepared_execution": prepared,
+                "external_task_id": external_task_id,
+                "attempt_number": attempt_number,
+            }
+
         candidates = [row for row in ledger.generated_activation_candidates() if target_ticket_id is None or str(row["ticket_id"]) == target_ticket_id]
         if not candidates:
             return None

@@ -5,9 +5,27 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.adapters import FakeBoardAdapter
+from local_first_orchestrator.execution_handoff import HANDOFF_MARKER
+from local_first_orchestrator.hermes_board import ExternalTicket
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.state_projection import StateProjectionWorker
 from local_first_orchestrator.states import CanonicalState
+
+
+class PrematureDoneBoard(FakeBoardAdapter):
+    def __init__(self, external_id: str) -> None:
+        super().__init__()
+        self.external_id = external_id
+        self.set_state_calls = 0
+
+    def get_task(self, ticket_id: str) -> ExternalTicket:
+        if ticket_id != self.external_id:
+            raise KeyError(ticket_id)
+        return ExternalTicket(ticket_id, "generated", HANDOFF_MARKER, "done", None)
+
+    def set_state(self, ticket_id, state, *, idempotency_key):
+        self.set_state_calls += 1
+        raise AssertionError("intermediate generated-done projection must be acknowledged without board mutation")
 
 
 class StateProjectionSupersessionTests(unittest.TestCase):
@@ -38,6 +56,38 @@ class StateProjectionSupersessionTests(unittest.TestCase):
             "WHERE ticket_id=? AND operation='set_state' ORDER BY event_id",
             (ticket,),
         ).fetchall()
+
+    def test_reconciled_generated_done_handoff_acknowledges_intermediate_projection_without_board_mutation(self) -> None:
+        ticket = self.ledger.create_ticket(title="generated done handoff")
+        with self.ledger._transaction() as conn:
+            create_event = self.ledger._append_event(conn, entity_type="ticket", entity_id=ticket, event_type="generated_microticket_created", actor_id="controller", to_state="draft", payload={"ticket_id": ticket})
+        self.ledger.enqueue_generated_create_projection(ticket, create_event, {"ticket_id": ticket}, "create-generated")
+        self.ledger.connection.execute(
+            "UPDATE board_projection_outbox SET acknowledged_at=10,external_task_id='external-generated' WHERE ticket_id=? AND event_id=? AND operation='create_microticket'",
+            (ticket, create_event),
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO hermes_execution_reconciliations(external_task_id,hermes_run_id,ticket_id,attempt_number,run_status,run_outcome,session_id,branch_name,workspace_path,base_sha,head_sha,diff_hash,artifact_path,snapshot_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("external-generated", 7, ticket, 1, "done", "completed", None, "wt/external-generated", "/tmp/worktree", "a" * 40, "b" * 40, "c" * 64, "/tmp/artifact", "d" * 64, 20),
+        )
+        self.ledger.transition(ticket, CanonicalState.READY_LOCAL)
+        self.ledger.transition(ticket, CanonicalState.IMPLEMENTING)
+        self.ledger.transition(ticket, CanonicalState.VERIFYING)
+        self.ledger.transition(ticket, CanonicalState.LOCAL_REVIEW)
+        board = PrematureDoneBoard("external-generated")
+        worker = StateProjectionWorker(self.ledger, board, worker_id="generated-done")
+
+        result = worker.deliver_one(now=30)
+
+        self.assertEqual((result.status, result.ticket_id), ("delivered", ticket))
+        self.assertEqual(board.set_state_calls, 0)
+        row = self.ledger.connection.execute(
+            "SELECT acknowledged_at FROM board_projection_outbox WHERE ticket_id=? AND event_id=?",
+            (ticket, result.event_id),
+        ).fetchone()
+        self.assertIsNotNone(row["acknowledged_at"])
+        audit = self.ledger.runtime_stage(ticket, f"state_projection_generated_done_noop-{result.event_id}")
+        self.assertIsNotNone(audit)
 
     def test_pending_history_is_superseded_and_only_current_state_is_delivered(self) -> None:
         ticket = self._history_to_local_review()

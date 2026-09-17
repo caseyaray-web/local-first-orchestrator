@@ -111,7 +111,7 @@ class AcceptanceOnlyTests(unittest.TestCase):
         self.ledger.connection.execute("update attempts set post_diff_hash=? where ticket_id=? and attempt_number=1", (str(impl["diff_hash"]), self.ticket))
         self.ledger.record_hermes_execution_reconciliation(
             external_task_id="accept-fixture", hermes_run_id=17, ticket_id=self.ticket, attempt_number=1,
-            run_status="completed", run_outcome="success", session_id=None, branch_name=str(attempt["branch"]),
+            run_status="done", run_outcome="success", session_id=None, branch_name=str(attempt["branch"]),
             workspace_path=str(attempt["worktree_path"]), base_sha=self.base, head_sha=self.base, diff_hash=str(impl["diff_hash"]),
             artifact_path=str(artifact), snapshot_hash=snapshot_hash,
         )

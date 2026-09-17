@@ -177,6 +177,58 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         self.assertNotEqual(preview.next_stage, "validation")
         self.assertNotEqual(preview.claim_id, "retired-validation-claim")
 
+    def test_started_validation_claim_replays_from_frozen_identity(self) -> None:
+        ticket = self.ticket("validation-replay", state=CanonicalState.VERIFYING)
+        identity = {"ticket_id": ticket, "attempt_number": 1, "frozen": "candidate"}
+        claim_id = "validation-replay-claim"
+        self.ledger.connection.execute(
+            "UPDATE tickets SET lease_owner='old-worker',lease_expires_at=50 WHERE id=?",
+            (ticket,),
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,side_effect_started_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (claim_id, ticket, "validation:1", "claimed", "old-worker", 50, 1, json.dumps(identity, sort_keys=True, separators=(",", ":")), 20, 10, 20),
+        )
+        artifact = self.root / "validation-replay.json"
+        artifact.write_text("{}", encoding="utf-8")
+        artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        calls: list[str] = []
+
+        def validation_runner(ticket_id: str) -> dict[str, object]:
+            calls.append(ticket_id)
+            self.assertTrue(self.ledger.record_runtime_stage(
+                ticket_id,
+                "validation-1",
+                json.dumps({"candidate_identity": identity}, sort_keys=True),
+                attempt_number=1,
+                artifact_path=str(artifact),
+                artifact_sha256=artifact_sha,
+                base_sha="a" * 40,
+            ))
+            return {
+                "candidate_identity": identity,
+                "validation_artifact": str(artifact),
+                "validation_artifact_sha256": artifact_sha,
+            }
+
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            self.board,
+            worker_id="validation-replay-worker",
+            target_ticket_id=ticket,
+            lease_seconds=30,
+            clock=lambda: 100,
+            validation_runner=validation_runner,
+        )
+
+        result = scheduler.process_next()
+
+        self.assertEqual((result.status, result.stage, result.ticket_id, result.claim_id), ("completed", "validation", ticket, claim_id))
+        self.assertEqual(calls, [ticket])
+        claim = self.ledger.scheduler_claim(claim_id)
+        self.assertIsNotNone(claim["side_effect_completed_at"])
+        self.assertIsNotNone(claim["finalized_at"])
+
     def test_terminal_applied_review_claim_is_historical_not_replayable(self) -> None:
         ticket = self.ticket("terminal-review", state=CanonicalState.DONE)
         self.ledger.connection.execute(

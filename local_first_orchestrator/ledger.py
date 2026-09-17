@@ -1641,6 +1641,20 @@ class Ledger:
         """Historical attempts, including retired failures, are never reused."""
         return int(self.connection.execute("SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM attempts WHERE ticket_id=?", (ticket_id,)).fetchone()[0])
 
+    def pending_repair_attempt_number(self, ticket_id: str) -> int | None:
+        row = self.connection.execute(
+            """SELECT CAST(json_extract(r.detail,'$.next_attempt_number') AS INTEGER) AS attempt_number
+               FROM tickets t JOIN runtime_stages r ON r.ticket_id=t.id
+               WHERE t.id=? AND t.state='repairing'
+                 AND r.stage=('repair-routing-' || r.attempt_number)
+                 AND json_valid(r.detail)=1 AND json_extract(r.detail,'$.action')='repair'
+                 AND json_type(r.detail,'$.next_attempt_number')='integer'
+                 AND r.attempt_number=(SELECT MAX(rr.attempt_number) FROM runtime_stages rr WHERE rr.ticket_id=t.id AND rr.stage LIKE 'repair-routing-%')
+               LIMIT 1""",
+            (ticket_id,),
+        ).fetchone()
+        return int(row["attempt_number"]) if row is not None else None
+
     def hermes_execution_reconciliation(self, external_task_id: str, hermes_run_id: int) -> dict[str, Any] | None:
         row = self.connection.execute(
             "SELECT * FROM hermes_execution_reconciliations WHERE external_task_id=? AND hermes_run_id=?",
@@ -1689,7 +1703,14 @@ class Ledger:
                 )
             else:
                 actual_attempt = (attempt["base_sha"], attempt["worktree_path"], attempt["post_diff_hash"])
-                if actual_attempt != (base_sha, workspace_path, diff_hash):
+                if attempt["post_diff_hash"] is None and ticket["state"] == CanonicalState.REPAIRING.value:
+                    if (attempt["base_sha"], attempt["worktree_path"]) != (base_sha, workspace_path):
+                        raise RuntimeError("hermes_execution_attempt_conflict")
+                    conn.execute(
+                        "UPDATE attempts SET post_diff_hash=? WHERE ticket_id=? AND attempt_number=? AND post_diff_hash IS NULL",
+                        (diff_hash, ticket_id, attempt_number),
+                    )
+                elif actual_attempt != (base_sha, workspace_path, diff_hash):
                     raise RuntimeError("hermes_execution_attempt_conflict")
             stage = conn.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='implementation'", (ticket_id, attempt_number)).fetchone()
             if stage is None:
@@ -2367,6 +2388,79 @@ class Ledger:
             raise KeyError(claim_id)
         return dict(row)
 
+    def release_abandoned_scheduler_claim(self, claim_id: str, *, operator_id: str, reason: str, now: int | None = None) -> dict[str, Any]:
+        """Expire an abandoned replay-safe claim while Local First is paused.
+
+        The claim's reconciliation policy remains authoritative: only RETRY/REPLAY
+        claims may be released. Ambiguous or externally completed effects stay
+        fail-closed and require their normal reconciliation path.
+        """
+        from .reconciliation import ReconciliationAction
+
+        if not operator_id.strip() or not reason.strip():
+            raise ValueError("abandoned scheduler claim recovery requires operator identity and reason")
+        now = self._now() if now is None else now
+        decision = self.scheduler_reconciliation(claim_id)
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not paused["paused"]:
+                raise PermissionError("abandoned scheduler claim recovery requires Local First paused")
+            row = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if row is None:
+                raise KeyError(claim_id)
+            if row["status"] != "claimed":
+                raise ValueError("abandoned scheduler claim recovery requires a claimed stage")
+            if row["side_effect_completed_at"] is not None:
+                raise PermissionError("completed scheduler side effects must be reconciled, not released")
+            authorized_review_retry = False
+            if str(row["stage"]).startswith("review:"):
+                try:
+                    identity = json.loads(str(row["candidate_identity_json"] or ""))
+                    attempt_number = int(identity["attempt_number"])
+                    candidate_fingerprint = str(identity["implementation_diff_hash"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise PermissionError("review claim recovery requires valid frozen candidate identity") from exc
+                latest = conn.execute(
+                    "SELECT * FROM model_invocations WHERE ticket_id=? AND attempt_number=? AND stage='review' ORDER BY started_at DESC,invocation_id DESC LIMIT 1",
+                    (row["ticket_id"], attempt_number),
+                ).fetchone()
+                if latest is not None and str(latest["status"]) in {"process_error", "timeout", "malformed_output"}:
+                    authorization = conn.execute(
+                        """SELECT * FROM review_retry_authorizations
+                           WHERE ticket_id=? AND attempt_number=? AND candidate_fingerprint=?
+                             AND failed_invocation_id=? AND consumed_invocation_id IS NULL
+                           ORDER BY authorized_at DESC LIMIT 1""",
+                        (row["ticket_id"], attempt_number, candidate_fingerprint, latest["invocation_id"]),
+                    ).fetchone()
+                    authorized_review_retry = authorization is not None
+            if decision.action not in {ReconciliationAction.RETRY, ReconciliationAction.REPLAY} and not authorized_review_retry:
+                if str(row["stage"]).startswith("review:"):
+                    raise PermissionError("review claim recovery requires unconsumed retry authorization")
+                raise PermissionError(f"scheduler claim recovery is not replay-safe: {decision.action.value}")
+            previous_owner = row["lease_owner"]
+            previous_expiry = row["lease_expires_at"]
+            conn.execute(
+                "UPDATE scheduler_stage_claims SET lease_owner=NULL,lease_expires_at=?,updated_at=? WHERE claim_id=? AND status='claimed'",
+                (now - 1, now, claim_id),
+            )
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=str(row["ticket_id"]),
+                event_type="scheduler_stage_claim_abandoned_released",
+                actor_id=operator_id,
+                payload={
+                    "claim_id": claim_id,
+                    "stage": str(row["stage"]),
+                    "reason": reason,
+                    "reconciliation_action": "authorized_review_retry" if authorized_review_retry else decision.action.value,
+                    "reconciliation_state": decision.state.value,
+                    "previous_lease_owner": previous_owner,
+                    "previous_lease_expires_at": previous_expiry,
+                },
+            )
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
     @staticmethod
     def _scheduler_stage_family(stage: str) -> str:
         for prefix in ("implementation", "validation", "review", "repair_routing", "triage", "acceptance", "git_integration", "completion"):
@@ -2465,6 +2559,18 @@ class Ledger:
                     return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.EXTERNAL_EFFECT_COMPLETED_LOCAL_INCOMPLETE, ReconciliationAction.RECONCILE, "model_invocations", "model invocation completed; reconcile durable artifact/result into the scheduler stage", evidence)
                 if invocation["status"] == "started":
                     return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN, ReconciliationAction.STOP, "model_invocations", "model invocation outcome is unknown; automatic retry would risk duplicate inference", evidence)
+                if family == "review" and invocation["status"] in {"process_error", "timeout", "malformed_output"}:
+                    fingerprint = str(identity.get("implementation_diff_hash") or "")
+                    authorization = self.connection.execute(
+                        """SELECT * FROM review_retry_authorizations
+                           WHERE ticket_id=? AND attempt_number=? AND candidate_fingerprint=?
+                             AND failed_invocation_id=? AND consumed_invocation_id IS NULL
+                           ORDER BY authorized_at DESC LIMIT 1""",
+                        (ticket_id, attempt, fingerprint, invocation["invocation_id"]),
+                    ).fetchone()
+                    if authorization is not None:
+                        evidence["retry_authorization_id"] = str(authorization["authorization_id"])
+                        return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN, ReconciliationAction.REPLAY, "review_retry_authorizations", "failed review invocation has an exact unconsumed operator retry authorization", evidence)
                 return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN, ReconciliationAction.STOP, "model_invocations", "model invocation ended terminally and requires explicit recovery policy", evidence)
 
         if family in {"paid_checkpoint", "paid_escalation"}:
@@ -3957,8 +4063,23 @@ class Ledger:
             if str(result.get("hermes_status") or "") != "ready":
                 raise RuntimeError("native_dependency_release_reconciliation_required: Hermes did not expose child as ready")
             expected_routing = identity.get("routing_authority", {})
-            if result.get("routing_authority") != expected_routing:
+            observed_routing = result.get("routing_authority")
+            if not isinstance(observed_routing, dict):
                 raise RuntimeError("native_dependency_release_reconciliation_required: routing authority evidence drift")
+            if not expected_routing:
+                if observed_routing != {}:
+                    raise RuntimeError("native_dependency_release_reconciliation_required: routing authority evidence drift")
+            else:
+                if observed_routing != expected_routing:
+                    if any(observed_routing.get(key) != value for key, value in expected_routing.items()):
+                        raise RuntimeError("native_dependency_release_reconciliation_required: routing authority evidence drift")
+                    allowed_routing_keys = set(expected_routing) | {"workspace_kind", "workspace_path"}
+                    if set(observed_routing) != allowed_routing_keys or observed_routing.get("workspace_kind") != "worktree":
+                        raise RuntimeError("native_dependency_release_reconciliation_required: routing authority evidence drift")
+                    repository_text = str(expected_routing.get("canonical_repository") or "")
+                    expected_workspace = str(Path(repository_text) / ".worktrees" / str(identity["child_external_id"]))
+                    if observed_routing.get("workspace_path") != expected_workspace:
+                        raise RuntimeError("native_dependency_release_reconciliation_required: routing authority evidence drift")
             existing = conn.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (claim["ticket_id"],)).fetchone()
             values = (
                 str(identity["graph_hash"]),
@@ -4805,8 +4926,38 @@ class Ledger:
             "FROM tickets t JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket' "
             "WHERE b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL AND b.superseded_at IS NULL "
             "AND t.state IN (?,?,?) "
+            "AND (t.state<>? OR EXISTS ("
+            "  SELECT 1 FROM runtime_stages ra WHERE ra.ticket_id=t.id "
+            "  AND ra.stage=('generated-repair-activation-' || ra.attempt_number) "
+            "  AND ra.attempt_number > COALESCE((SELECT MAX(he.attempt_number) FROM hermes_execution_reconciliations he WHERE he.ticket_id=t.id),0)"
+            ")) "
             "ORDER BY t.created_at,t.id,b.external_task_id",
-            (CanonicalState.READY_LOCAL.value, CanonicalState.IMPLEMENTING.value, CanonicalState.REPAIRING.value),
+            (CanonicalState.READY_LOCAL.value, CanonicalState.IMPLEMENTING.value, CanonicalState.REPAIRING.value, CanonicalState.REPAIRING.value),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def generated_repair_activation_candidates(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """SELECT t.id AS ticket_id,b.external_task_id,r.attempt_number AS previous_attempt_number,
+                      CAST(json_extract(r.detail,'$.next_attempt_number') AS INTEGER) AS attempt_number,
+                      COALESCE(json_extract(r.detail,'$.failure_evidence'),'repair requested by Local First review') AS failure_evidence,
+                      t.created_at
+               FROM tickets t
+               JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket'
+               JOIN runtime_stages r ON r.ticket_id=t.id
+                 AND r.stage=('repair-routing-' || r.attempt_number)
+                 AND r.attempt_number=(SELECT MAX(rr.attempt_number) FROM runtime_stages rr WHERE rr.ticket_id=t.id AND rr.stage LIKE 'repair-routing-%')
+               WHERE t.state='repairing'
+                 AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL AND b.superseded_at IS NULL
+                 AND json_valid(r.detail)=1 AND json_extract(r.detail,'$.action')='repair'
+                 AND json_type(r.detail,'$.next_attempt_number')='integer'
+                 AND EXISTS (SELECT 1 FROM attempts a WHERE a.ticket_id=t.id AND a.attempt_number=CAST(json_extract(r.detail,'$.next_attempt_number') AS INTEGER))
+                 AND EXISTS (SELECT 1 FROM hermes_execution_reconciliations he WHERE he.ticket_id=t.id AND he.attempt_number=r.attempt_number)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM runtime_stages ra WHERE ra.ticket_id=t.id
+                       AND ra.stage=('generated-repair-activation-' || CAST(json_extract(r.detail,'$.next_attempt_number') AS INTEGER))
+                 )
+               ORDER BY t.created_at,t.id,b.external_task_id"""
         ).fetchall()
         return [dict(row) for row in rows]
 

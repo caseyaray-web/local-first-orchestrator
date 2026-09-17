@@ -23,7 +23,7 @@ from .git_adapter import AttemptWorktree, GitWorktreeAdapter
 from .git_security import safe_git_argv, safe_git_env
 from .historical_revalidation import attestation_hash_from_row, authorization_hash_from_row, classify_obsolete_validation_failure, derive_obsolete_validation_failure, historical_validation_result_hash
 from .hermes_profiles import review_profile_identity
-from .execution_handoff import HANDOFF_SENTINEL
+from .execution_handoff import HANDOFF_MARKER, HANDOFF_SENTINEL
 from .ledger import Ledger, _completion_evidence_hash, _recheck_evidence_hash
 from .local_qwen import LocalQwenAdapter, REVIEW_JSON_SCHEMA
 from .paid_model import PaidModelAdapter
@@ -685,10 +685,6 @@ class LocalFirstController:
         snapshot = self.board.execution_snapshot(external_task_id)
         if snapshot.task.id != external_task_id:
             raise RuntimeError("Hermes execution task identity conflict")
-        if snapshot.task.status == "done":
-            raise RuntimeError("hermes_completion_authority_bypassed_reconciliation_required")
-        if require_handoff and snapshot.task.status != "blocked":
-            raise RuntimeError("Hermes execution handoff is not blocked for reconciliation")
         rows = self.ledger.connection.execute(
             "SELECT DISTINCT t.* FROM tickets t LEFT JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL AND b.superseded_at IS NULL "
             "WHERE t.external_id=? OR b.external_task_id=? ORDER BY t.created_at,t.id LIMIT 2",
@@ -702,6 +698,24 @@ class LocalFirstController:
         ticket_id = str(ticket_row["id"])
         if self.ledger.resolve_external_task_id(ticket_id) != external_task_id:
             raise RuntimeError("Hermes execution external identity conflict")
+        generated_projection = self.ledger.connection.execute(
+            """SELECT b.event_id FROM board_projection_outbox b JOIN events e ON e.id=b.event_id
+               WHERE b.ticket_id=? AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL
+                 AND b.superseded_at IS NULL AND b.external_task_id=? AND e.entity_type='ticket' AND e.entity_id=?
+                 AND e.event_type IN ('generated_microticket_created','generated_microticket_projection_recovered')""",
+            (ticket_id, external_task_id, ticket_id),
+        ).fetchall()
+        generated_owned = ticket_row["external_id"] is None and len(generated_projection) == 1
+        completed_generated_handoff = (
+            require_handoff
+            and snapshot.task.status == "done"
+            and generated_owned
+            and HANDOFF_MARKER in str(snapshot.task.body or "")
+        )
+        if snapshot.task.status == "done" and not completed_generated_handoff:
+            raise RuntimeError("hermes_completion_authority_bypassed_reconciliation_required")
+        if require_handoff and snapshot.task.status != "blocked" and not completed_generated_handoff:
+            raise RuntimeError("Hermes execution handoff is not blocked for reconciliation")
         activation = self.ledger.connection.execute(
             """SELECT i.*, e.acknowledged_at FROM native_release_activation_intents i
                JOIN native_release_activation_evidence e ON e.request_key=i.request_key
@@ -738,16 +752,24 @@ class LocalFirstController:
             if snapshot.task.status != "blocked" or not require_handoff:
                 require_handoff = True
         if require_handoff:
-            candidates = [
-                run for run in snapshot.runs
-                if run.status == "blocked"
-                and run.outcome == "blocked"
-                and str(run.summary or "") == HANDOFF_SENTINEL
-            ]
+            if completed_generated_handoff:
+                candidates = [
+                    run for run in snapshot.runs
+                    if run.status in {"done", "completed"}
+                    and run.outcome in {"completed", "success", "succeeded"}
+                    and not str(run.summary or "").startswith("local-first projection ")
+                ]
+            else:
+                candidates = [
+                    run for run in snapshot.runs
+                    if run.status == "blocked"
+                    and run.outcome == "blocked"
+                    and str(run.summary or "") == HANDOFF_SENTINEL
+                ]
         else:
             candidates = [
                 run for run in snapshot.runs
-                if run.status in {"completed", "blocked"}
+                if run.status in {"done", "completed", "blocked"}
                 and (
                     run.outcome in {"completed", "success", "succeeded"}
                     or (run.outcome == "blocked" and str(run.summary or "") == HANDOFF_SENTINEL)
@@ -803,7 +825,8 @@ class LocalFirstController:
         if not diff.strip():
             raise RuntimeError("Hermes execution produced no candidate diff")
 
-        attempt_number = self.ledger.next_attempt_number(ticket_id)
+        pending_repair_attempt = self.ledger.pending_repair_attempt_number(ticket_id)
+        attempt_number = pending_repair_attempt if pending_repair_attempt is not None else self.ledger.next_attempt_number(ticket_id)
         artifact_dir = artifact_root / ticket_id / str(attempt_number)
         artifact_dir.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -922,6 +945,52 @@ class LocalFirstController:
             validate_native_workspace_path(target, repository=repository, external_task_id=external_task_id)
             pin.final_revalidate()
             return {"workspace_path": str(target), "branch_name": branch, "base_sha": base_sha}
+
+    def prepare_hermes_repair_worktree(self, ticket_id: str, external_task_id: str, attempt_number: int) -> dict[str, str]:
+        """Verify a generated repair retry starts from the previous reconciled Hermes head."""
+        repository, _, _ = self.config.validate_execution_roots()
+        if self.ledger.resolve_external_task_id(ticket_id) != external_task_id:
+            raise RuntimeError("hermes_repair_worktree_reconciliation_required: external identity drift")
+        attempt = self.ledger.connection.execute(
+            "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?",
+            (ticket_id, attempt_number),
+        ).fetchone()
+        prior = self.ledger.connection.execute(
+            "SELECT * FROM hermes_execution_reconciliations WHERE ticket_id=? AND attempt_number=?",
+            (ticket_id, attempt_number - 1),
+        ).fetchone()
+        if attempt is None or prior is None:
+            raise RuntimeError("hermes_repair_worktree_reconciliation_required: repair provenance is incomplete")
+        target, _ = validate_native_workspace_path(
+            canonical_native_workspace_path(repository, external_task_id),
+            repository=repository,
+            external_task_id=external_task_id,
+        )
+        expected_branch = str(prior["branch_name"] or f"wt/{external_task_id}")
+        expected_head = str(prior["head_sha"])
+        if str(attempt["worktree_path"] or "") != str(target) or str(attempt["base_sha"]) != str(prior["base_sha"]):
+            raise RuntimeError("hermes_repair_worktree_reconciliation_required: preallocated repair attempt drift")
+        with PinnedNativeWorkspace.open(repository, target) as pin:
+            pin.pin_existing_target(already_created=True)
+            target_git_fd = pin.target_git_fd()
+            target_root = Path(pin.git("rev-parse", "--show-toplevel", target=True, git_fd_override=target_git_fd).stdout.strip()).resolve(strict=True)
+            common_raw = pin.git("rev-parse", "--git-common-dir", target=True, git_fd_override=target_git_fd).stdout.strip()
+            target_common = (target / common_raw).resolve(strict=True) if not Path(common_raw).is_absolute() else Path(common_raw).resolve(strict=True)
+            repo_common_raw = pin.git("rev-parse", "--git-common-dir").stdout.strip()
+            repo_common = (repository / repo_common_raw).resolve(strict=True) if not Path(repo_common_raw).is_absolute() else Path(repo_common_raw).resolve(strict=True)
+            head = pin.git("rev-parse", "HEAD", target=True, git_fd_override=target_git_fd).stdout.strip()
+            branch = pin.git("branch", "--show-current", target=True, git_fd_override=target_git_fd).stdout.strip()
+            status = pin.git("status", "--porcelain=v1", target=True, git_fd_override=target_git_fd).stdout.strip()
+            if target_root != target or target_common != repo_common or head != expected_head or branch != expected_branch or status:
+                raise RuntimeError("hermes_repair_worktree_reconciliation_required: existing repair worktree drift")
+            pin.final_revalidate()
+        return {
+            "workspace_path": str(target),
+            "branch_name": expected_branch,
+            "base_sha": str(prior["base_sha"]),
+            "starting_head_sha": expected_head,
+            "attempt_number": str(attempt_number),
+        }
 
     def dry_run(self, task_id: str) -> dict[str, object]:
         row=self.ledger.get_ticket(task_id); binding=self.ledger.runtime_binding(task_id)
@@ -1526,7 +1595,10 @@ class LocalFirstController:
                 raise RuntimeError("validation_reconciliation_required: persisted validation evidence is incomplete")
         else:
             validation = DeterministicValidator(artifact_root=artifact_root / ticket_id / str(attempt_number)).validate(
-                path, ticket_from_ledger(ticket_row), base_sha=expected["base_sha"]
+                path,
+                ticket_from_ledger(ticket_row),
+                base_sha=expected["base_sha"],
+                expected_head_sha=(str(hermes_execution["head_sha"]) if hermes_execution is not None else None),
             )
             validation_path = Path(validation.full_evidence_path).resolve()
             # Commands are an external effect.  Rebuild the complete candidate
@@ -2924,7 +2996,7 @@ class LocalFirstController:
         elif hermes_execution is not None:
             if invocation is not None or manual_adoption is not None:
                 raise PermissionError("accepted Hermes execution provenance is ambiguous")
-            if str(hermes_execution["run_status"]) != "completed" or str(hermes_execution["run_outcome"]) not in {"completed", "success", "succeeded"}:
+            if str(hermes_execution["run_status"]) not in {"done", "completed"} or str(hermes_execution["run_outcome"]) not in {"completed", "success", "succeeded"}:
                 raise PermissionError("accepted Hermes execution is not a completed successful run")
             if str(hermes_execution["workspace_path"]) != str(impl["worktree_path"]) or str(hermes_execution["base_sha"]) != str(impl["base_sha"]) or str(hermes_execution["diff_hash"]) != str(impl["diff_hash"]) or str(hermes_execution["artifact_path"]) != str(impl["response_artifact"]):
                 raise PermissionError("accepted Hermes execution provenance conflicts with implementation")

@@ -123,6 +123,31 @@ class Phase2Tests(unittest.TestCase):
             DeterministicValidator(artifact_root=self.root / "artifacts").validate(attempt.path, self.ticket, base_sha=self.base)
         adapter.teardown(attempt)
 
+    def test_validator_accepts_exact_authorized_committed_descendant_head(self) -> None:
+        adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
+        attempt = adapter.create_attempt(self.ticket.ticket_id, 1, self.base)
+        (attempt.path / "app.py").write_text("def classify(value):\n    return 'ok'\n", encoding="utf-8")
+        self.run_git("add", "app.py", cwd=attempt.path)
+        self.run_git("commit", "-m", "Hermes worker commit", cwd=attempt.path)
+        head = self.run_git("rev-parse", "HEAD", cwd=attempt.path).stdout.strip()
+
+        result = DeterministicValidator(artifact_root=self.root / "artifacts").validate(
+            attempt.path,
+            self.ticket,
+            base_sha=self.base,
+            expected_head_sha=head,
+        )
+
+        self.assertTrue(result.passed)
+        with self.assertRaisesRegex(ValidationError, "unexpected_head_movement"):
+            DeterministicValidator(artifact_root=self.root / "artifacts-2").validate(
+                attempt.path,
+                self.ticket,
+                base_sha=self.base,
+                expected_head_sha=self.base,
+            )
+        adapter.teardown(attempt)
+
     def test_validator_only_runs_ticket_allowlisted_commands(self) -> None:
         profile = VerificationProfile(commands=(("python", "-c", "print('allowed')"),), working_directory=".")
         ticket = MicroTicket(**{**self.ticket.__dict__, "verification": profile})

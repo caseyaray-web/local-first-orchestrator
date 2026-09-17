@@ -118,14 +118,16 @@ class DeterministicValidator:
             return f"secret material detected in changed file: {relative_path}"
         return None
 
-    def validate(self, worktree: Path, ticket: MicroTicket, *, base_sha: str) -> ValidationResult:
+    def validate(self, worktree: Path, ticket: MicroTicket, *, base_sha: str, expected_head_sha: str | None = None) -> ValidationResult:
         worktree = Path(worktree).resolve()
         base_sha = self._validated_base_sha(base_sha)
         # Resolve before diffing: no revision expression reaches the diff parser.
         self._git(worktree, "rev-parse", "--verify", f"{base_sha}^{{commit}}")
         head = self._git(worktree, "rev-parse", "HEAD").strip()
-        if head != base_sha:
-            raise ValidationError("unexpected_head_movement: worktree HEAD differs from recorded base")
+        expected_head = base_sha if expected_head_sha is None else self._validated_base_sha(expected_head_sha)
+        self._git(worktree, "rev-parse", "--verify", f"{expected_head}^{{commit}}")
+        if head != expected_head:
+            raise ValidationError("unexpected_head_movement: worktree HEAD differs from authorized validation head")
         actual_base = self._git(worktree, "merge-base", "HEAD", base_sha).strip()
         if actual_base != base_sha:
             raise ValidationError("worktree base SHA does not match recorded base")

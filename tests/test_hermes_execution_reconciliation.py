@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import unittest
@@ -8,7 +9,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
-from local_first_orchestrator.execution_handoff import HANDOFF_SENTINEL
+from local_first_orchestrator.execution_handoff import HANDOFF_MARKER, HANDOFF_SENTINEL
 from local_first_orchestrator.hermes_board import ExternalExecutionRun, ExternalExecutionSnapshot, ExternalTicket
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.scheduler import ProcessNextScheduler
@@ -141,6 +142,38 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
         self.assertEqual(self.ledger.attempt_count(self.ticket_id), 0)
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM hermes_execution_reconciliations").fetchone()[0], 0)
 
+    def test_generated_owned_done_with_handoff_marker_reconciles_for_local_validation(self) -> None:
+        self._make_generated_owned()
+        self.board.snapshot = ExternalExecutionSnapshot(
+            task=ExternalTicket("H-1", "external", HANDOFF_MARKER, "done", str(self.repo)),
+            session_id=self.snapshot.session_id,
+            branch_name=self.snapshot.branch_name,
+            started_at=self.snapshot.started_at,
+            completed_at=self.snapshot.completed_at,
+            runs=(ExternalExecutionRun(7, "done", "completed", 10, 20, "worker completed; awaiting Local First validation", "worker-code", None, {"source": "dispatcher"}),),
+        )
+
+        result = self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7, require_handoff=True)
+
+        self.assertEqual(result["status"], "reconciled")
+        self.assertEqual(result["attempt_number"], 1)
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.IMPLEMENTING.value)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM hermes_execution_reconciliations WHERE ticket_id=?", (self.ticket_id,)).fetchone()[0], 1)
+
+    def test_generated_owned_done_without_handoff_marker_still_fails_closed(self) -> None:
+        self._make_generated_owned()
+        self.board.snapshot = ExternalExecutionSnapshot(
+            task=ExternalTicket("H-1", "external", "", "done", str(self.repo)),
+            session_id=self.snapshot.session_id,
+            branch_name=self.snapshot.branch_name,
+            started_at=self.snapshot.started_at,
+            completed_at=self.snapshot.completed_at,
+            runs=self.snapshot.runs,
+        )
+        with self.assertRaisesRegex(RuntimeError, "completion_authority_bypassed"):
+            self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7, require_handoff=True)
+        self.assertEqual(self.ledger.attempt_count(self.ticket_id), 0)
+
     def _make_generated_owned(self) -> None:
         self.ledger.connection.execute("UPDATE tickets SET external_id=NULL WHERE id=?", (self.ticket_id,))
         event_id = self.ledger.connection.execute(
@@ -155,6 +188,60 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
     def test_generated_hermes_owned_ticket_is_never_locally_claimable(self) -> None:
         self._make_generated_owned()
         self.assertIsNone(self.ledger.claim_next_scheduler_implementation("local-worker", lease_seconds=30, now=100))
+
+    def _seed_generated_repair_attempt_two(self) -> None:
+        self._make_generated_owned()
+        self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7)
+        stage = self.ledger.model_stage(self.ticket_id, 1, "implementation")
+        self.assertIsNotNone(stage)
+        self.ledger.connection.execute("UPDATE tickets SET state=? WHERE id=?", (CanonicalState.REPAIRING.value, self.ticket_id))
+        detail = json.dumps({"action": "repair", "attempt_number": 1, "next_attempt_number": 2, "failure_evidence": "fix restore parity"}, sort_keys=True, separators=(",", ":"))
+        self.ledger.record_runtime_stage(self.ticket_id, "repair-routing-1", detail, attempt_number=1)
+        self.ledger.connection.execute(
+            "INSERT INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,created_at) VALUES (?,?,?,?,?,?,?)",
+            (self.ticket_id, 2, self.base, "worker-branch", str(self.repo.resolve()), str(stage["diff_hash"]), 30),
+        )
+
+    def test_repair_discovery_hides_reconciled_run_until_generated_repair_activation(self) -> None:
+        self._seed_generated_repair_attempt_two()
+        self.assertEqual(self.ledger.hermes_execution_candidates(), [])
+        candidates = self.ledger.generated_repair_activation_candidates()
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["ticket_id"], self.ticket_id)
+        self.assertEqual(int(candidates[0]["attempt_number"]), 2)
+
+        self.ledger.record_runtime_stage(
+            self.ticket_id,
+            "generated-repair-activation-2",
+            json.dumps({"ticket_id": self.ticket_id, "attempt_number": 2}, sort_keys=True, separators=(",", ":")),
+            attempt_number=2,
+            base_sha=self.base,
+        )
+        visible = self.ledger.hermes_execution_candidates()
+        self.assertEqual([row["ticket_id"] for row in visible], [self.ticket_id])
+
+    def test_fresh_hermes_repair_run_completes_preallocated_attempt_two(self) -> None:
+        self._seed_generated_repair_attempt_two()
+        (self.repo / "app.py").write_text('def value():\n    return "repaired"\n')
+        self.board.snapshot = ExternalExecutionSnapshot(
+            task=ExternalTicket("H-1", "external", "", "scheduled", str(self.repo)),
+            session_id="session-2",
+            branch_name="worker-branch",
+            started_at=30,
+            completed_at=40,
+            runs=(
+                self.snapshot.runs[0],
+                ExternalExecutionRun(8, "completed", "completed", 30, 40, "worker repaired", "worker-code", 456, {"source": "dispatcher"}),
+            ),
+        )
+
+        result = self.controller.reconcile_hermes_execution("H-1", hermes_run_id=8)
+
+        self.assertEqual(result["attempt_number"], 2)
+        self.assertEqual(self.ledger.attempt_count(self.ticket_id), 2)
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=2", (self.ticket_id,)).fetchone()
+        self.assertIsNotNone(attempt["post_diff_hash"])
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM attempts WHERE ticket_id=? AND attempt_number=3", (self.ticket_id,)).fetchone()[0], 0)
 
     def test_prepare_stops_when_git_directory_is_replaced(self) -> None:
         original_git = self.repo / ".git-original"

@@ -66,6 +66,46 @@ class NativeReleaseAuthorityStep1Tests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "authority"):
                 adapter.verify_native_release_task(task, expected_workspace_path=expected["workspace_path"])
 
+    def test_predispatch_bind_assigns_profile_and_allows_unbound_workspace(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / ".worktrees" / "T-1"
+            workspace.mkdir(parents=True)
+            task = {"id": "T-1", "title": "title", "body": "", "status": "ready", "workspace_path": None, "workspace_kind": "worktree", "assignee": None}
+            calls = []
+
+            def runner(argv, **kwargs):
+                calls.append(list(argv))
+                if "show" in argv:
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"task": dict(task), "parents": [], "children": [], "comments": [], "events": [], "runs": []}), "")
+                if "assign" in argv:
+                    task["assignee"] = "worker-code-local"
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                raise AssertionError(argv)
+
+            adapter = HermesBoardAdapter(
+                executable="/bin/true", board="isolated", allow_writes=True, runner=runner,
+                implementation_profile="worker-code-local", canonical_repository=root,
+            )
+            routing = adapter.bind_native_release_task("T-1", expected_workspace_path=str(workspace))
+            self.assertEqual(routing, {"profile": "worker-code-local", "workspace_kind": "worktree", "workspace_path": str(workspace)})
+            self.assertIsNone(task["workspace_path"])
+            self.assertEqual(task["assignee"], "worker-code-local")
+            self.assertTrue(any("assign" in call for call in calls))
+
+    def test_strict_postdispatch_verifier_still_rejects_unbound_workspace(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / ".worktrees" / "T-1"
+            workspace.mkdir(parents=True)
+            adapter = HermesBoardAdapter(
+                executable="/bin/true", board="isolated", implementation_profile="worker-code-local",
+                canonical_repository=root,
+            )
+            task = ExternalTicket("T-1", "title", "", "ready", None, assignee="worker-code-local", workspace_kind="worktree")
+            with self.assertRaisesRegex(RuntimeError, "authority mismatch"):
+                adapter.verify_native_release_task(task, expected_workspace_path=str(workspace))
+
     def test_release_authority_accepts_exact_prepared_worktree(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -79,6 +119,42 @@ class NativeReleaseAuthorityStep1Tests(unittest.TestCase):
             self.assertEqual(adapter.verify_native_release_task(task, expected_workspace_path=str(workspace)), {
                 "profile": "worker-code-local", "workspace_kind": "worktree", "workspace_path": str(workspace),
             })
+
+    def test_release_effect_accepts_verified_runtime_workspace_but_persists_frozen_authority_subset(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger, ticket = self._ledger_with_root_graph(root)
+            try:
+                claim = ledger.claim_next_scheduler_native_dependency_release(
+                    "worker", lease_seconds=30, now=10,
+                    implementation_profile="worker-code-local", canonical_repository=str(root),
+                )
+                self.assertIsNotNone(claim)
+                ledger.begin_scheduler_claim_effect(claim["claim_id"], "worker", now=11)
+                identity = json.loads(claim["candidate_identity_json"])
+                result = {
+                    "ticket_id": ticket,
+                    "candidate_identity": identity,
+                    "actual_parent_external_ids": [],
+                    "hermes_status": "ready",
+                    "prepared_execution": {"workspace_path": str(root / ".worktrees" / "external-root")},
+                    "routing_authority": {
+                        "profile": "worker-code-local",
+                        "canonical_repository": str(root),
+                        "workspace_kind": "worktree",
+                        "workspace_path": str(root / ".worktrees" / "external-root"),
+                    },
+                }
+                ledger.apply_scheduler_native_dependency_release_effect(
+                    claim["claim_id"], "worker", result, now=12,
+                    implementation_profile="worker-code-local", canonical_repository=str(root),
+                )
+                release = ledger.native_dependency_release(ticket)
+                self.assertEqual(json.loads(release["routing_authority_json"]), {
+                    "profile": "worker-code-local", "canonical_repository": str(root),
+                })
+            finally:
+                ledger.close()
 
     def test_expired_claim_rejects_operator_route_drift(self):
         with TemporaryDirectory() as tmp:

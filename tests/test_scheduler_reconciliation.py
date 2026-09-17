@@ -91,6 +91,53 @@ class SchedulerReconciliationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "execution_reconciliation_required"):
             ProcessNextScheduler(self.ledger, Board(), worker_id="worker", lease_seconds=30, clock=lambda:100).process_next()
 
+    def test_paused_operator_can_release_replay_safe_abandoned_claim_but_not_ambiguous_model_effect(self) -> None:
+        replayable = self.claim("native_dependency_release", started=2, expires=500)
+        self.assertEqual(self.ledger.scheduler_reconciliation(replayable).action, ReconciliationAction.REPLAY)
+        with self.assertRaisesRegex(PermissionError, "requires Local First paused"):
+            self.ledger.release_abandoned_scheduler_claim(replayable, operator_id="operator", reason="worker exited", now=100)
+        self.ledger.pause("operator", reason="recover abandoned claim")
+        released = self.ledger.release_abandoned_scheduler_claim(replayable, operator_id="operator", reason="worker exited", now=100)
+        self.assertIsNone(released["lease_owner"])
+        self.assertEqual(int(released["lease_expires_at"]), 99)
+        event = self.ledger.connection.execute("SELECT event_type,payload_json FROM events WHERE entity_type='ticket' AND entity_id=? ORDER BY id DESC LIMIT 1", (self.ticket,)).fetchone()
+        self.assertEqual(event["event_type"], "scheduler_stage_claim_abandoned_released")
+        self.assertEqual(json.loads(event["payload_json"])["reconciliation_action"], "replay")
+
+        self.ledger.connection.execute("DELETE FROM scheduler_stage_claims")
+        ambiguous = self.claim("implementation:1", started=2, identity={"attempt_number": 1}, expires=500)
+        self.ledger.connection.execute(
+            "INSERT INTO model_invocations(invocation_id,ticket_id,attempt_number,stage,provider,model,packet_hash,worktree_path,timeout_seconds,started_at,status) VALUES ('inv-ambiguous',?,1,'implementation','p','m','hash','/tmp/w',30,2,'started')",
+            (self.ticket,),
+        )
+        with self.assertRaisesRegex(PermissionError, "not replay-safe"):
+            self.ledger.release_abandoned_scheduler_claim(ambiguous, operator_id="operator", reason="must remain protected", now=100)
+
+    def test_review_claim_release_requires_exact_unconsumed_retry_authorization(self) -> None:
+        self.ledger.connection.execute("UPDATE tickets SET state='local_review' WHERE id=?", (self.ticket,))
+        identity = {"attempt_number": 1, "implementation_diff_hash": "fp"}
+        claim_id = self.claim("review:1", started=2, identity=identity, expires=500)
+        runtime_identity = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        self.ledger.connection.execute(
+            "INSERT INTO review_candidates(ticket_id,attempt_number,candidate_fingerprint,validation_evidence,implementation_invocation_id,runtime_identity_json,status,last_outcome,created_at,updated_at) VALUES (?,1,'fp','ok','impl',?,'review_infrastructure_failed','review_process_error',1,1)",
+            (self.ticket, runtime_identity),
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO model_invocations(invocation_id,ticket_id,attempt_number,stage,provider,model,packet_hash,worktree_path,timeout_seconds,started_at,status,completed_at,error_json) VALUES ('review-failed',?,1,'review','p','m','packet','packet-only',30,2,'process_error',3,'{}')",
+            (self.ticket,),
+        )
+        self.ledger.pause("operator", reason="authorize review retry")
+        with self.assertRaisesRegex(PermissionError, "unconsumed retry authorization"):
+            self.ledger.release_abandoned_scheduler_claim(claim_id, operator_id="operator", reason="not yet authorized", now=100)
+        authorization = self.ledger.authorize_review_retry(self.ticket, operator_id="operator", candidate_fingerprint="fp")
+        self.assertIsNone(authorization["consumed_invocation_id"])
+
+        released = self.ledger.release_abandoned_scheduler_claim(claim_id, operator_id="operator", reason="authorized review retry", now=100)
+
+        self.assertIsNone(released["lease_owner"])
+        event = self.ledger.connection.execute("SELECT payload_json FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='scheduler_stage_claim_abandoned_released' ORDER BY id DESC LIMIT 1", (self.ticket,)).fetchone()
+        self.assertEqual(json.loads(event["payload_json"])["reconciliation_action"], "authorized_review_retry")
+
     def test_paid_unknown_outcome_stops_but_completed_paid_call_reconciles(self) -> None:
         self.ledger.connection.execute("INSERT INTO features(id,title,status,created_at,updated_at) VALUES ('F','F','active',1,1)")
         claim_id = self.claim("paid_checkpoint", started=2)

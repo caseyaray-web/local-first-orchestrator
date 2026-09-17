@@ -82,18 +82,67 @@ def normalize_review(payload: object, ticket: MicroTicket) -> ReviewResult:
 
 
 class ReviewPacketBuilder:
-    """Builds a fresh review context with only the review contract inputs."""
+    """Builds a bounded fresh review context with all authoritative review inputs."""
+
+    max_packet_chars = 90_000
+    max_selected_file_chars = 24_000
+    min_selected_file_chars = 1_024
+
+    @staticmethod
+    def _section(name: str, value: str) -> str:
+        return f"## {name}\n{value}"
+
+    @staticmethod
+    def _compact_selected_file(name: str, text: str, budget: int) -> str:
+        if len(text) <= budget:
+            return text
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        marker = f"[selected file excerpt: {name}; original_chars={len(text)}; sha256={digest}]\n"
+        omission = "\n...<middle omitted; full validated diff is included above>...\n"
+        remaining = budget - len(marker) - len(omission)
+        if remaining < 2:
+            raise ValueError("review packet selected-file budget is too small")
+        head = remaining // 2
+        tail = remaining - head
+        return marker + text[:head] + omission + text[-tail:]
+
     def build(self, ticket: MicroTicket, *, diff: str, selected_files: Mapping[str, str], validation_evidence: str) -> str:
         if not diff.strip() or not selected_files or not validation_evidence.strip():
             raise ValueError("diff, selected files, and validation evidence are mandatory")
+        prefix = "\n\n".join((
+            self._section("ticket_contract", json.dumps(ticket.contract(), sort_keys=True)),
+            self._section("current_diff", diff),
+        ))
+        suffix = "\n\n".join((
+            self._section("validation_evidence", validation_evidence[:4000]),
+            self._section("review_instruction", "Return one JSON object matching verdict, criterion_results, findings, and suggestions. Review only existing criteria and allowed files. The complete validated diff is authoritative; large selected-file snapshots may be bounded excerpts with SHA-256 metadata."),
+        ))
+        ordered = sorted(selected_files.items())
+        selected_header_overhead = sum(len(f"\n\n## selected_file:{name}\n") for name, _ in ordered)
+        available = self.max_packet_chars - len(prefix) - len(suffix) - 2 - selected_header_overhead
+        minimum_required = self.min_selected_file_chars * len(ordered)
+        if available < minimum_required:
+            raise ValueError("review packet fixed inputs leave insufficient selected-file context budget")
+        rendered: list[tuple[str, str]] = []
+        remaining = available
+        for index, (name, text) in enumerate(ordered):
+            remaining_files = len(ordered) - index
+            reserved_for_rest = self.min_selected_file_chars * (remaining_files - 1)
+            budget = min(self.max_selected_file_chars, remaining - reserved_for_rest)
+            compacted = self._compact_selected_file(name, text, budget)
+            rendered.append((name, compacted))
+            remaining -= len(compacted)
         sections = [
             ("ticket_contract", json.dumps(ticket.contract(), sort_keys=True)),
             ("current_diff", diff),
-            *[(f"selected_file:{name}", text) for name, text in sorted(selected_files.items())],
+            *[(f"selected_file:{name}", text) for name, text in rendered],
             ("validation_evidence", validation_evidence[:4000]),
-            ("review_instruction", "Return one JSON object matching verdict, criterion_results, findings, and suggestions. Review only existing criteria and allowed files."),
+            ("review_instruction", "Return one JSON object matching verdict, criterion_results, findings, and suggestions. Review only existing criteria and allowed files. The complete validated diff is authoritative; large selected-file snapshots may be bounded excerpts with SHA-256 metadata."),
         ]
-        return "\n\n".join(f"## {name}\n{value}" for name, value in sections)
+        packet = "\n\n".join(self._section(name, value) for name, value in sections)
+        if len(packet) > self.max_packet_chars:
+            raise ValueError("review packet exceeds bounded context budget")
+        return packet
 
 
 class LocalReviewAdapter:

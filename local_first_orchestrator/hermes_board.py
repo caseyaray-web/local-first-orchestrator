@@ -332,10 +332,8 @@ class HermesBoardAdapter:
             raise PermissionError("real board writes require --allow-board-writes")
         task = self.get_task(ticket_id)
         if expected_routing is not None:
-            self.verify_native_release_task(task, expected_workspace_path=expected_routing["workspace_path"])
-            if {"profile": task.assignee, "workspace_kind": task.workspace_kind, "workspace_path": task.workspace_path} != {
-                "profile": expected_routing.get("profile"), "workspace_kind": expected_routing.get("workspace_kind"), "workspace_path": expected_routing.get("workspace_path")
-            }:
+            verified = self._verify_native_release_route(task, expected_workspace_path=expected_routing["workspace_path"], allow_unbound_workspace=True)
+            if verified != {"profile": expected_routing.get("profile"), "workspace_kind": expected_routing.get("workspace_kind"), "workspace_path": expected_routing.get("workspace_path")}:
                 raise RuntimeError("native release authority mismatch")
         current = task.status
         handoff = HANDOFF_MARKER in task.body
@@ -404,6 +402,17 @@ class HermesBoardAdapter:
             raise RuntimeError("native release activation did not produce ready state")
         return updated
 
+    def reclaim_for_repair(self, ticket_id: str, *, reason: str) -> ExternalTicket:
+        if not self.allow_writes:
+            raise PermissionError("real board writes require --allow-board-writes")
+        task = self.get_task(ticket_id)
+        if task.status not in {"todo", "ready"}:
+            self._run("reclaim", ticket_id, "--reason", reason)
+            task = self.get_task(ticket_id)
+        if task.status not in {"todo", "ready"}:
+            raise RuntimeError(f"Hermes repair reclaim did not make task dispatchable: {task.status}")
+        return task
+
     def create_microticket(self, title: str, body: str, *, idempotency_key: str) -> str:
         if not self.allow_writes:
             raise PermissionError("real board writes require --allow-board-writes")
@@ -420,19 +429,63 @@ class HermesBoardAdapter:
             raise RuntimeError("Hermes create JSON missing task id")
         return payload["id"]
 
-    def verify_native_release_task(self, task: ExternalTicket, *, expected_workspace_path: str) -> dict[str, str]:
-        """Verify the externally resolved handoff against operator-owned authority."""
+    def _verify_native_release_route(self, task: ExternalTicket, *, expected_workspace_path: str, allow_unbound_workspace: bool) -> dict[str, str]:
         if self.implementation_profile is None or self.canonical_repository is None:
             raise RuntimeError("native release authority is not configured")
         expected = canonical_native_workspace_path(self.canonical_repository, task.id)
         if expected_workspace_path != str(expected):
             raise RuntimeError("native release authority mismatch")
         validate_native_workspace_path(
-            task.workspace_path or "", repository=self.canonical_repository, external_task_id=task.id,
+            expected_workspace_path,
+            repository=self.canonical_repository,
+            external_task_id=task.id,
         )
         if task.assignee != self.implementation_profile or task.workspace_kind != "worktree":
             raise RuntimeError("native release authority mismatch")
+        if task.workspace_path is None:
+            if not allow_unbound_workspace:
+                raise RuntimeError("native release authority mismatch")
+        else:
+            validate_native_workspace_path(
+                task.workspace_path,
+                repository=self.canonical_repository,
+                external_task_id=task.id,
+            )
+            if task.workspace_path != str(expected):
+                raise RuntimeError("native release authority mismatch")
         return {"profile": self.implementation_profile, "workspace_kind": "worktree", "workspace_path": str(expected)}
+
+    def bind_native_release_task(self, ticket_id: str, *, expected_workspace_path: str) -> dict[str, str]:
+        """Bind pre-dispatch profile authority while Hermes still has no concrete workspace path."""
+        if not self.allow_writes:
+            raise PermissionError("real board writes require --allow-board-writes")
+        if self.implementation_profile is None or self.canonical_repository is None:
+            raise RuntimeError("native release authority is not configured")
+        task = self.get_task(ticket_id)
+        expected = canonical_native_workspace_path(self.canonical_repository, task.id)
+        if expected_workspace_path != str(expected):
+            raise RuntimeError("native release authority mismatch")
+        validate_native_workspace_path(
+            expected_workspace_path,
+            repository=self.canonical_repository,
+            external_task_id=task.id,
+        )
+        if task.workspace_kind != "worktree":
+            raise RuntimeError("native release authority mismatch")
+        if task.workspace_path is not None:
+            validate_native_workspace_path(task.workspace_path, repository=self.canonical_repository, external_task_id=task.id)
+            if task.workspace_path != str(expected):
+                raise RuntimeError("native release authority mismatch")
+        if task.assignee is None:
+            self._run("assign", ticket_id, self.implementation_profile)
+            task = self.get_task(ticket_id)
+        elif task.assignee != self.implementation_profile:
+            raise RuntimeError("native release authority mismatch")
+        return self._verify_native_release_route(task, expected_workspace_path=expected_workspace_path, allow_unbound_workspace=True)
+
+    def verify_native_release_task(self, task: ExternalTicket, *, expected_workspace_path: str) -> dict[str, str]:
+        """Strictly verify a Hermes task after a concrete workspace has been bound."""
+        return self._verify_native_release_route(task, expected_workspace_path=expected_workspace_path, allow_unbound_workspace=False)
 
     def link_dependency(self, parent_task_id: str, child_task_id: str) -> None:
         if not self.allow_writes:

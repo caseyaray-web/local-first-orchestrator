@@ -604,8 +604,14 @@ class InvocationLifecycleTests(unittest.TestCase):
         from local_first_orchestrator.validation import DeterministicValidator
         original_validate = DeterministicValidator.validate
 
-        def mutate_after_validation(validator, worktree, ticket_value, *, base_sha):
-            result = original_validate(validator, worktree, ticket_value, base_sha=base_sha)
+        def mutate_after_validation(validator, worktree, ticket_value, *, base_sha, expected_head_sha=None):
+            result = original_validate(
+                validator,
+                worktree,
+                ticket_value,
+                base_sha=base_sha,
+                expected_head_sha=expected_head_sha,
+            )
             (worktree / "app.py").write_text("def value():\n    return 'drifted'\n", encoding="utf-8")
             return result
 
