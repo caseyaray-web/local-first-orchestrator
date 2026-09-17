@@ -158,6 +158,28 @@ class RegisteredRuntimeCliTests(unittest.TestCase):
         )]
         self.assertEqual(events[-2:], ["paused", "resumed"])
 
+    def test_historical_claim_retirement_cli_supports_exact_operator_targets(self) -> None:
+        parser = argparse.ArgumentParser(); register_cli(parser)
+        for selector, value in (("--ticket-id", "internal-ticket"), ("--external-id", "t-generated"), ("--claim-id", "claim-1")):
+            args = parser.parse_args([
+                "--database", str(self.database),
+                "retire-historical-claims", selector, value,
+                "--reason", "terminal historical residue",
+            ])
+            self.assertEqual(args.command, "retire-historical-claims")
+            self.assertEqual(getattr(args, selector[2:].replace("-", "_")), value)
+        with self.assertRaises(SystemExit):
+            parser.parse_args([
+                "--database", str(self.database),
+                "retire-historical-claims", "--reason", "missing selector",
+            ])
+        with self.assertRaises(SystemExit):
+            parser.parse_args([
+                "--database", str(self.database),
+                "retire-historical-claims", "--ticket-id", "one", "--claim-id", "two",
+                "--reason", "ambiguous selector",
+            ])
+
     def test_recovery_status_surfaces_incomplete_invocation_and_exact_inspection_hint(self) -> None:
         ticket = self.ledger.create_ticket(title="recovery")
         self.ledger.start_model_invocation(

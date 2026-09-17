@@ -561,6 +561,13 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     resume=commands.add_parser("resume", help="durably resume scheduler work after recovery/maintenance")
     resume.add_argument("--reason", required=True)
     resume.add_argument("--operator-id", default="local-first-cli")
+    retire_claims=commands.add_parser("retire-historical-claims", help="finalize expired completed scheduler claims proven obsolete by terminal ledger evidence")
+    retire_target=retire_claims.add_mutually_exclusive_group(required=True)
+    retire_target.add_argument("--ticket-id")
+    retire_target.add_argument("--external-id")
+    retire_target.add_argument("--claim-id")
+    retire_claims.add_argument("--reason", required=True)
+    retire_claims.add_argument("--operator-id", default="local-first-cli")
     status=commands.add_parser("status"); status.add_argument("--active",action="store_true"); status.add_argument("--scheduler-detail",action="store_true",help="include one read-only scheduler lifecycle boundary snapshot")
     imported=commands.add_parser("import"); imported.add_argument("--task-id",required=True)
     run=commands.add_parser("run-once"); run.add_argument("--task-id",required=True); run.add_argument("--dry-run",action="store_true",default=True); run.add_argument("--execute",action="store_true"); run.add_argument("--allow-board-writes",action="store_true")
@@ -753,6 +760,16 @@ def run_command(args: argparse.Namespace) -> int:
         elif args.command=="resume":
             ledger.resume(args.operator_id,reason=args.reason)
             print(json.dumps({"paused":False,"operator_id":args.operator_id,"reason":args.reason},sort_keys=True))
+        elif args.command=="retire-historical-claims":
+            if args.claim_id:
+                row=ledger.retire_historical_scheduler_claim(args.claim_id,operator_id=args.operator_id,reason=args.reason)
+                print(json.dumps({"retired_count":1,"skipped_count":0,"claims":[{"claim_id":row["claim_id"],"stage":row["stage"],"proof_kind":row.get("proof_kind"),"status":row["status"]}],"skipped":[]},sort_keys=True))
+            else:
+                ticket_id=args.ticket_id or ledger.ticket_id_for_external_id(args.external_id)
+                result=ledger.retire_historical_scheduler_claims(ticket_id=ticket_id,operator_id=args.operator_id,reason=args.reason)
+                retired=result["retired"]
+                skipped=result["skipped"]
+                print(json.dumps({"ticket_id":ticket_id,"external_id":args.external_id,"retired_count":len(retired),"skipped_count":len(skipped),"claims":[{"claim_id":row["claim_id"],"stage":row["stage"],"proof_kind":row.get("proof_kind"),"status":row["status"]} for row in retired],"skipped":skipped},sort_keys=True))
         elif args.command=="status":
             data=ledger.status()
             if args.active: data["active"]=[dict(r) for r in ledger.connection.execute("SELECT id, external_id, state, lease_owner, lease_expires_at FROM tickets WHERE state IN ('implementing','verifying','local_review','repairing') ORDER BY updated_at")]

@@ -2461,6 +2461,103 @@ class Ledger:
             )
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
+    def retire_historical_scheduler_claim(self, claim_id: str, *, operator_id: str, reason: str, now: int | None = None) -> dict[str, Any]:
+        """Finalize an expired, durably-completed claim proven obsolete by later state."""
+        if not operator_id.strip() or not reason.strip():
+            raise ValueError("historical scheduler claim retirement requires operator identity and reason")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not paused["paused"]:
+                raise PermissionError("historical scheduler claim retirement requires Local First paused")
+            row = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if row is None:
+                raise KeyError(claim_id)
+            if row["status"] == "completed":
+                return {**dict(row), "retirement_status": "already_finalized"}
+            if row["status"] != "claimed":
+                raise ValueError("historical scheduler claim retirement requires a claimed stage")
+            if row["lease_expires_at"] is None or int(row["lease_expires_at"]) > now:
+                raise PermissionError("historical scheduler claim retirement requires an expired lease")
+            if row["side_effect_completed_at"] is None or row["result_json"] is None:
+                raise PermissionError("historical scheduler claim retirement requires durable completed side-effect evidence")
+
+            stage = str(row["stage"])
+            proof_kind: str | None = None
+            if stage.startswith("validation:"):
+                retired = conn.execute(
+                    "SELECT 1 FROM failed_attempt_reconciliations WHERE ticket_id=? AND ?=('validation:' || retired_attempt_number)",
+                    (row["ticket_id"], stage),
+                ).fetchone()
+                if retired is not None:
+                    proof_kind = "retired_attempt"
+            elif stage.startswith("review:"):
+                terminal = conn.execute(
+                    "SELECT 1 FROM review_results rr JOIN tickets t ON t.id=rr.ticket_id "
+                    "WHERE rr.ticket_id=? AND ?=('review:' || rr.attempt_number) AND t.state IN ('accepted','done') LIMIT 1",
+                    (row["ticket_id"], stage),
+                ).fetchone()
+                if terminal is not None:
+                    proof_kind = "terminal_review_applied"
+            if proof_kind is None:
+                raise PermissionError("scheduler claim has no supported terminal supersession proof")
+
+            changed = conn.execute(
+                "UPDATE scheduler_stage_claims SET status='completed',lease_owner=NULL,lease_expires_at=NULL,finalized_at=?,updated_at=? "
+                "WHERE claim_id=? AND status='claimed' AND side_effect_completed_at IS NOT NULL",
+                (now, now, claim_id),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("historical scheduler claim changed during retirement")
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=str(row["ticket_id"]),
+                event_type="scheduler_stage_historical_retired",
+                actor_id=operator_id,
+                payload={"claim_id": claim_id, "stage": stage, "reason": reason, "proof_kind": proof_kind},
+            )
+            retired_row = dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+            retired_row["retirement_status"] = "retired"
+            retired_row["proof_kind"] = proof_kind
+            return retired_row
+
+    def ticket_id_for_external_id(self, external_id: str) -> str:
+        """Resolve one exact external task id to its internal ticket id."""
+        if not external_id.strip():
+            raise ValueError("external id must be non-empty")
+        row = self.connection.execute("SELECT id FROM tickets WHERE external_id=?", (external_id,)).fetchone()
+        if row is None:
+            raise KeyError(external_id)
+        return str(row["id"])
+
+    def retire_historical_scheduler_claims(self, *, ticket_id: str, operator_id: str, reason: str, now: int | None = None) -> dict[str, list[dict[str, Any]]]:
+        """Retire supported historical claims for one exact ticket and report skips."""
+        if not ticket_id.strip():
+            raise ValueError("historical scheduler claim retirement requires ticket id")
+        now = self._now() if now is None else now
+        rows = self.connection.execute(
+            "SELECT claim_id,stage FROM scheduler_stage_claims WHERE ticket_id=? AND status='claimed' "
+            "AND lease_expires_at IS NOT NULL AND lease_expires_at<=? AND side_effect_completed_at IS NOT NULL "
+            "ORDER BY created_at,claim_id",
+            (ticket_id, now),
+        ).fetchall()
+        retired: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for historical_row in rows:
+            historical_claim_id = str(historical_row["claim_id"])
+            try:
+                retired.append(self.retire_historical_scheduler_claim(historical_claim_id, operator_id=operator_id, reason=reason, now=now))
+            except PermissionError as exc:
+                if "no supported terminal supersession proof" not in str(exc):
+                    raise
+                skipped.append({
+                    "claim_id": historical_claim_id,
+                    "stage": str(historical_row["stage"]),
+                    "reason": str(exc),
+                })
+        return {"retired": retired, "skipped": skipped}
+
     @staticmethod
     def _scheduler_stage_family(stage: str) -> str:
         for prefix in ("implementation", "validation", "review", "repair_routing", "triage", "acceptance", "git_integration", "completion"):

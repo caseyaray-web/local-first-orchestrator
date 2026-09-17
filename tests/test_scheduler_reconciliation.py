@@ -138,6 +138,65 @@ class SchedulerReconciliationTests(unittest.TestCase):
         event = self.ledger.connection.execute("SELECT payload_json FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='scheduler_stage_claim_abandoned_released' ORDER BY id DESC LIMIT 1", (self.ticket,)).fetchone()
         self.assertEqual(json.loads(event["payload_json"])["reconciliation_action"], "authorized_review_retry")
 
+    def test_paused_operator_can_retire_completed_validation_claim_for_retired_attempt(self) -> None:
+        claim_id = self.claim("validation:1", started=2, completed=3, expires=50)
+        self.ledger.connection.execute(
+            "INSERT INTO failed_attempt_reconciliations(ticket_id,retired_attempt_number,classification,previous_ticket_state,resulting_ticket_state,operator_id,runtime_identity_json,retry_base_sha,prospective_next_attempt_number,cleanup_required,forensic_artifact_paths_json,reconciled_at) VALUES (?,1,'validation_failure','verifying','ready_local','operator','{}',?,2,0,'[]',4)",
+            (self.ticket, "a" * 40),
+        )
+        with self.assertRaisesRegex(PermissionError, "requires Local First paused"):
+            self.ledger.retire_historical_scheduler_claim(claim_id, operator_id="operator", reason="historical residue", now=100)
+        self.ledger.pause("operator", reason="maintenance")
+        retired = self.ledger.retire_historical_scheduler_claim(claim_id, operator_id="operator", reason="historical residue", now=100)
+        self.assertEqual((retired["status"], retired["retirement_status"], retired["proof_kind"]), ("completed", "retired", "retired_attempt"))
+        self.assertIsNone(retired["lease_owner"])
+        self.assertIsNone(retired["lease_expires_at"])
+        self.assertEqual(int(retired["finalized_at"]), 100)
+        event = self.ledger.connection.execute("SELECT event_type,payload_json FROM events WHERE entity_id=? ORDER BY id DESC LIMIT 1", (self.ticket,)).fetchone()
+        self.assertEqual(event["event_type"], "scheduler_stage_historical_retired")
+        self.assertEqual(json.loads(event["payload_json"])["proof_kind"], "retired_attempt")
+
+    def test_paused_operator_can_retire_completed_review_claim_after_terminal_application(self) -> None:
+        self.ledger.connection.execute("UPDATE tickets SET state='done' WHERE id=?", (self.ticket,))
+        claim_id = self.claim("review:2", started=2, completed=3, identity={"attempt_number": 2}, expires=50)
+        self.ledger.connection.execute(
+            "INSERT INTO review_results(ticket_id,attempt_number,verdict,payload_json,created_at) VALUES (?,2,'repair','{}',4)",
+            (self.ticket,),
+        )
+        self.ledger.pause("operator", reason="maintenance")
+        result = self.ledger.retire_historical_scheduler_claims(ticket_id=self.ticket, operator_id="operator", reason="historical residue", now=100)
+        self.assertEqual(result["skipped"], [])
+        self.assertEqual(len(result["retired"]), 1)
+        row = result["retired"][0]
+        self.assertEqual((row["claim_id"], row["proof_kind"], row["status"]), (claim_id, "terminal_review_applied", "completed"))
+
+    def test_historical_retirement_refuses_completed_effect_without_terminal_supersession(self) -> None:
+        claim_id = self.claim("validation:1", started=2, completed=3, expires=50)
+        self.ledger.pause("operator", reason="maintenance")
+        with self.assertRaisesRegex(PermissionError, "no supported terminal supersession proof"):
+            self.ledger.retire_historical_scheduler_claim(claim_id, operator_id="operator", reason="historical residue", now=100)
+
+    def test_bulk_historical_retirement_reports_unsupported_claims_as_skipped(self) -> None:
+        supported = self.claim("validation:1", started=2, completed=3, expires=50)
+        unsupported = self.claim("completion:2", started=4, completed=5, expires=50)
+        self.ledger.connection.execute(
+            "INSERT INTO failed_attempt_reconciliations(ticket_id,retired_attempt_number,classification,previous_ticket_state,resulting_ticket_state,operator_id,runtime_identity_json,retry_base_sha,prospective_next_attempt_number,cleanup_required,forensic_artifact_paths_json,reconciled_at) VALUES (?,1,'validation_failure','verifying','ready_local','operator','{}',?,2,0,'[]',6)",
+            (self.ticket, "a" * 40),
+        )
+        self.ledger.pause("operator", reason="maintenance")
+        result = self.ledger.retire_historical_scheduler_claims(ticket_id=self.ticket, operator_id="operator", reason="historical residue", now=100)
+        self.assertEqual([row["claim_id"] for row in result["retired"]], [supported])
+        self.assertEqual(result["skipped"], [{"claim_id": unsupported, "stage": "completion:2", "reason": "scheduler claim has no supported terminal supersession proof"}])
+        remaining = self.ledger.connection.execute("SELECT status,finalized_at FROM scheduler_stage_claims WHERE claim_id=?", (unsupported,)).fetchone()
+        self.assertEqual(remaining["status"], "claimed")
+        self.assertIsNone(remaining["finalized_at"])
+
+    def test_external_id_resolves_exact_internal_ticket(self) -> None:
+        self.ledger.connection.execute("UPDATE tickets SET external_id='t-generated' WHERE id=?", (self.ticket,))
+        self.assertEqual(self.ledger.ticket_id_for_external_id("t-generated"), self.ticket)
+        with self.assertRaises(KeyError):
+            self.ledger.ticket_id_for_external_id("missing")
+
     def test_paid_unknown_outcome_stops_but_completed_paid_call_reconciles(self) -> None:
         self.ledger.connection.execute("INSERT INTO features(id,title,status,created_at,updated_at) VALUES ('F','F','active',1,1)")
         claim_id = self.claim("paid_checkpoint", started=2)
