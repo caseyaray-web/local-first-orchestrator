@@ -1957,6 +1957,7 @@ class Ledger:
         self, *, ticket_id: str, attempt_number: int, operator_id: str, reason: str,
         branch: str, workspace_path: str, base_sha: str, diff_hash: str,
         artifact_path: str, artifact_sha256: str,
+        resolve_terminal: bool = False,
     ) -> dict[str, Any]:
         """Durably adopt an existing implementation without inventing model/worker provenance."""
         if not operator_id.strip() or not reason.strip():
@@ -1993,14 +1994,149 @@ class Ledger:
                 actual_stage = tuple(existing_stage[key] for key in ("adapter", "request_hash", "response_artifact", "worktree_path", "base_sha", "diff_hash"))
                 if actual_stage != expected_stage or str(existing_adoption["detail"]) != detail or str(existing_adoption["artifact_sha256"] or "") != artifact_sha256:
                     raise RuntimeError("manual_adoption_reconciliation_required: identity conflict")
+                if resolve_terminal:
+                    provenance_event = conn.execute(
+                        "SELECT * FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='manual_attempt_slot_authorized' ORDER BY id DESC LIMIT 1",
+                        (ticket_id,),
+                    ).fetchone()
+                    if provenance_event is None:
+                        raise RuntimeError("terminal manual adoption replay lacks terminal adoption provenance")
+                    try:
+                        provenance = json.loads(str(provenance_event["payload_json"] or "{}"))
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise RuntimeError("terminal manual adoption replay has invalid provenance") from exc
+                    if provenance.get("mode") != "adopt_existing" or int(provenance.get("manual_attempt_number") or 0) != attempt_number:
+                        raise RuntimeError("terminal manual adoption replay provenance does not match manual attempt")
+                    resolved_terminal = conn.execute(
+                        "SELECT * FROM terminal_ticket_failures WHERE ticket_id=? AND resolved_at IS NOT NULL",
+                        (ticket_id,),
+                    ).fetchone()
+                    if resolved_terminal is None:
+                        raise RuntimeError("terminal manual adoption replay lacks resolved terminal episode")
+                    if (
+                        int(provenance.get("terminal_generation") or 0) != int(resolved_terminal["generation"] or 0)
+                        or str(provenance.get("terminal_failure_fingerprint") or "") != str(resolved_terminal["failure_fingerprint"] or "")
+                    ):
+                        raise RuntimeError("terminal manual adoption replay terminal provenance mismatch")
+                    retired_attempt_number = int(provenance.get("retired_attempt_number") or 0)
+                    retired_attempt = conn.execute(
+                        "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?",
+                        (ticket_id, retired_attempt_number),
+                    ).fetchone()
+                    manual_attempt = conn.execute(
+                        "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?",
+                        (ticket_id, attempt_number),
+                    ).fetchone()
+                    if retired_attempt is None or retired_attempt["outcome"] != "failed_retired" or manual_attempt is None:
+                        raise RuntimeError("terminal manual adoption replay lacks retired/manual attempt provenance")
+                    reconciliation = conn.execute(
+                        "SELECT * FROM failed_attempt_reconciliations WHERE ticket_id=? AND retired_attempt_number=?",
+                        (ticket_id, retired_attempt_number),
+                    ).fetchone()
+                    if reconciliation is None:
+                        runtime_identity = json.dumps({
+                            "source": "terminal_manual_adoption",
+                            "retired_attempt_number": retired_attempt_number,
+                            "manual_attempt_number": attempt_number,
+                            "branch": branch,
+                            "worktree_path": workspace_path,
+                            "terminal_generation": int(provenance["terminal_generation"]),
+                            "terminal_failure_fingerprint": str(provenance["terminal_failure_fingerprint"]),
+                        }, sort_keys=True, separators=(",", ":"))
+                        conn.execute(
+                            "INSERT INTO failed_attempt_reconciliations(ticket_id,retired_attempt_number,classification,previous_ticket_state,resulting_ticket_state,operator_id,runtime_identity_json,retry_base_sha,prospective_next_attempt_number,cleanup_required,forensic_artifact_paths_json,reconciled_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (ticket_id, retired_attempt_number, "terminal_manual_adoption", CanonicalState.BLOCKED.value, CanonicalState.READY_LOCAL.value, operator_id, runtime_identity, base_sha, attempt_number, 0, "[]", self._now()),
+                        )
+                    elif int(reconciliation["prospective_next_attempt_number"]) != attempt_number or str(reconciliation["retry_base_sha"]) != base_sha:
+                        raise RuntimeError("terminal manual adoption replay reconciliation conflicts with durable adoption")
                 return {"ticket_id": ticket_id, "attempt_number": attempt_number, "status": "already_adopted", "detail": detail}
-            if ticket["state"] != CanonicalState.READY_LOCAL.value:
-                raise RuntimeError("manual adoption requires ready_local ticket")
-            if attempt_number > int(ticket["max_attempts"]):
-                raise RuntimeError("manual adoption exceeds ticket max_attempts")
             pre_diff_hash = empty_hash
             prior_attempts = conn.execute("SELECT * FROM attempts WHERE ticket_id=? ORDER BY attempt_number", (ticket_id,)).fetchall()
-            if attempt_number == 1:
+            terminal_resolution_payload: dict[str, Any] | None = None
+            if resolve_terminal:
+                if ticket["state"] != CanonicalState.BLOCKED.value:
+                    raise RuntimeError("terminal manual adoption requires blocked ticket")
+                terminal = conn.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=? AND resolved_at IS NULL", (ticket_id,)).fetchone()
+                if terminal is None:
+                    raise RuntimeError("terminal manual adoption requires unresolved terminal failure")
+                if not prior_attempts:
+                    raise RuntimeError("terminal manual adoption requires prior attempt history")
+                latest = prior_attempts[-1]
+                if attempt_number != int(latest["attempt_number"]) + 1:
+                    raise RuntimeError("terminal manual adoption attempt number is not the next attempt")
+                if not latest["base_sha"] or not latest["post_diff_hash"]:
+                    raise RuntimeError("terminal manual adoption requires complete predecessor provenance")
+                if str(latest["base_sha"]) != base_sha:
+                    raise RuntimeError("terminal manual adoption base does not match predecessor")
+                if str(latest["post_diff_hash"]) == diff_hash:
+                    raise RuntimeError("terminal manual adoption must change the failed candidate diff")
+                if conn.execute("SELECT 1 FROM accepted_evidence WHERE ticket_id=?", (ticket_id,)).fetchone():
+                    raise RuntimeError("manual adoption refuses accepted ticket")
+                if conn.execute("SELECT 1 FROM model_invocations WHERE ticket_id=? AND status='started'", (ticket_id,)).fetchone():
+                    raise RuntimeError("terminal manual adoption refuses incomplete model invocation history")
+                terminal_generation = int(terminal["generation"] or 1)
+                terminal_fingerprint = str(terminal["failure_fingerprint"])
+                notices = conn.execute(
+                    "SELECT operation_id,status FROM gateway_notification_outbox WHERE ticket_id=? AND failure_fingerprint=? AND terminal_generation=?",
+                    (ticket_id, terminal_fingerprint, terminal_generation),
+                ).fetchall()
+                if any(str(row["status"]) in {"delivering", "delivery_unknown"} for row in notices):
+                    raise RuntimeError("terminal notification delivery is in-flight or ambiguous; reconcile it before manual adoption")
+                superseded = [str(row["operation_id"]) for row in notices if str(row["status"]) in {"pending", "retryable"}]
+                now = self._now()
+                if superseded:
+                    placeholders = ",".join("?" for _ in superseded)
+                    conn.execute(
+                        f"UPDATE gateway_notification_outbox SET status='superseded',superseded_at=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,updated_at=? WHERE operation_id IN ({placeholders}) AND status IN ('pending','retryable')",
+                        (now, now, *superseded),
+                    )
+                new_max_attempts = max(int(ticket["max_attempts"]), attempt_number)
+                conn.execute("UPDATE attempts SET outcome='failed_retired',failure_fingerprint=? WHERE ticket_id=? AND attempt_number=?", (terminal_fingerprint, ticket_id, int(latest["attempt_number"])))
+                runtime_identity = json.dumps({
+                    "source": "terminal_manual_adoption",
+                    "retired_attempt_number": int(latest["attempt_number"]),
+                    "manual_attempt_number": attempt_number,
+                    "branch": branch,
+                    "worktree_path": workspace_path,
+                    "terminal_generation": terminal_generation,
+                    "terminal_failure_fingerprint": terminal_fingerprint,
+                }, sort_keys=True, separators=(",", ":"))
+                conn.execute(
+                    "INSERT INTO failed_attempt_reconciliations(ticket_id,retired_attempt_number,classification,previous_ticket_state,resulting_ticket_state,operator_id,runtime_identity_json,retry_base_sha,prospective_next_attempt_number,cleanup_required,forensic_artifact_paths_json,reconciled_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (ticket_id, int(latest["attempt_number"]), "terminal_manual_adoption", CanonicalState.BLOCKED.value, CanonicalState.READY_LOCAL.value, operator_id, runtime_identity, base_sha, attempt_number, 0, "[]", now),
+                )
+                validate_transition(CanonicalState.BLOCKED, CanonicalState.READY_LOCAL)
+                conn.execute(
+                    "UPDATE tickets SET state=?,max_attempts=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND state=?",
+                    (CanonicalState.READY_LOCAL.value, new_max_attempts, now, ticket_id, CanonicalState.BLOCKED.value),
+                )
+                conn.execute(
+                    "UPDATE terminal_ticket_failures SET resolved_at=?,resolved_by=?,resolution_reason=? WHERE ticket_id=? AND resolved_at IS NULL",
+                    (now, operator_id, reason[:2000], ticket_id),
+                )
+                pre_diff_hash = str(latest["post_diff_hash"])
+                terminal_resolution_payload = {
+                    "mode": "adopt_existing",
+                    "reason": reason,
+                    "terminal_generation": terminal_generation,
+                    "terminal_failure_fingerprint": terminal_fingerprint,
+                    "retired_attempt_number": int(latest["attempt_number"]),
+                    "manual_attempt_number": attempt_number,
+                    "prior_max_attempts": int(ticket["max_attempts"]),
+                    "new_max_attempts": new_max_attempts,
+                    "superseded_notification_operation_ids": superseded,
+                }
+                self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="terminal_unresolvable_resolved", actor_id=operator_id, payload=terminal_resolution_payload)
+                self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="manual_attempt_slot_authorized", actor_id=operator_id, payload=terminal_resolution_payload)
+            else:
+                if ticket["state"] != CanonicalState.READY_LOCAL.value:
+                    raise RuntimeError("manual adoption requires ready_local ticket")
+                if attempt_number > int(ticket["max_attempts"]):
+                    raise RuntimeError("manual adoption exceeds ticket max_attempts")
+
+            if resolve_terminal:
+                pass
+            elif attempt_number == 1:
                 if prior_attempts:
                     raise RuntimeError("manual adoption attempt 1 requires ticket with no prior attempts")
                 if conn.execute("SELECT 1 FROM model_invocations WHERE ticket_id=?", (ticket_id,)).fetchone():
@@ -2060,7 +2196,7 @@ class Ledger:
                 artifact_path=artifact_path, artifact_sha256=artifact_sha256, base_sha=base_sha, now=now,
             )
             conn.execute("UPDATE tickets SET state=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=?", (CanonicalState.IMPLEMENTING.value, now, ticket_id))
-            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="manual_implementation_adopted", actor_id=operator_id, from_state=CanonicalState.READY_LOCAL.value, to_state=CanonicalState.IMPLEMENTING.value, payload={"attempt_number": attempt_number, "reason": reason, "artifact_sha256": artifact_sha256, "diff_hash": diff_hash})
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="manual_implementation_adopted", actor_id=operator_id, from_state=CanonicalState.READY_LOCAL.value, to_state=CanonicalState.IMPLEMENTING.value, payload={"attempt_number": attempt_number, "reason": reason, "artifact_sha256": artifact_sha256, "diff_hash": diff_hash, "terminal_resolution": terminal_resolution_payload})
             return {"ticket_id": ticket_id, "attempt_number": attempt_number, "status": "adopted", "detail": detail}
 
     def failed_attempt_reconciliation(self, ticket_id: str, retired_attempt_number: int | None = None) -> dict[str, Any] | None:
@@ -6945,6 +7081,199 @@ class Ledger:
                 state_payload={"terminal_resolution_mode": "retry_local", **resolution_payload},
             )
             return {"ticket_id": ticket_id, "state": CanonicalState.REPAIRING.value, **resolution_payload}
+
+    def recover_terminal_validation_controller_defect(
+        self,
+        ticket_id: str,
+        *,
+        attempt_number: int,
+        operator_id: str,
+        reason: str,
+        archived_validation_artifact_path: str,
+        archived_validation_artifact_sha256: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Reopen the same candidate after a proven deterministic-validation controller defect."""
+        if attempt_number < 1 or not operator_id.strip() or not reason.strip() or not archived_validation_artifact_path or not archived_validation_artifact_sha256:
+            raise ValueError("validation controller-defect recovery requires attempt, operator, reason, and archived validation artifact")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            controller = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if controller is None or not bool(controller["paused"]):
+                raise PermissionError("validation controller-defect recovery requires paused controller")
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None:
+                raise KeyError(ticket_id)
+            if str(ticket["state"]) != CanonicalState.BLOCKED.value:
+                raise ValueError("validation controller-defect recovery requires blocked ticket")
+            terminal = conn.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=? AND resolved_at IS NULL", (ticket_id,)).fetchone()
+            if terminal is None or int(terminal["attempt_number"]) != attempt_number:
+                raise ValueError("validation controller-defect recovery requires current unresolved terminal attempt")
+            try:
+                terminal_summary = json.loads(str(terminal["summary_json"] or "{}"))
+            except json.JSONDecodeError as exc:
+                raise ValueError("validation controller-defect recovery terminal summary is malformed") from exc
+            deterministic_failure = terminal_summary.get("deterministic_failure") if isinstance(terminal_summary, dict) else None
+            if not isinstance(deterministic_failure, dict) or deterministic_failure.get("source") != "validation" or int(deterministic_failure.get("attempt_number") or 0) != attempt_number:
+                raise ValueError("validation controller-defect recovery requires validation terminal evidence")
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"validation:{attempt_number}")).fetchone()
+            if claim is None or claim["status"] != "claimed" or claim["side_effect_started_at"] is None or claim["side_effect_completed_at"] is not None or not claim["candidate_identity_json"]:
+                raise ValueError("validation controller-defect recovery requires unfinished frozen validation claim")
+            validation_stage = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"validation-{attempt_number}")).fetchone()
+            if validation_stage is None or not validation_stage["artifact_path"] or not validation_stage["artifact_sha256"]:
+                raise ValueError("validation controller-defect recovery requires persisted failed validation evidence")
+            try:
+                original_artifact = Path(str(validation_stage["artifact_path"])).resolve(strict=True)
+                archived_artifact = Path(archived_validation_artifact_path).resolve(strict=True)
+            except OSError as exc:
+                raise ValueError("validation controller-defect recovery archive does not match failed validation evidence") from exc
+            if (
+                not archived_artifact.is_file()
+                or archived_artifact == original_artifact
+                or archived_artifact.parent.name != "controller-defect-archive"
+                or hashlib.sha256(archived_artifact.read_bytes()).hexdigest() != archived_validation_artifact_sha256
+                or archived_validation_artifact_sha256 != str(validation_stage["artifact_sha256"])
+            ):
+                raise ValueError("validation controller-defect recovery requires a distinct dedicated archive matching failed validation evidence")
+            try:
+                validation_record = json.loads(str(validation_stage["detail"] or "{}"))
+            except json.JSONDecodeError as exc:
+                raise ValueError("validation controller-defect recovery validation detail is malformed") from exc
+            if validation_record.get("passed") is not False:
+                raise ValueError("validation controller-defect recovery requires failed validation evidence")
+            if conn.execute("SELECT 1 FROM review_candidates WHERE ticket_id=? AND attempt_number=? UNION SELECT 1 FROM review_results WHERE ticket_id=? AND attempt_number=? UNION SELECT 1 FROM accepted_evidence WHERE ticket_id=?", (ticket_id, attempt_number, ticket_id, attempt_number, ticket_id)).fetchone() is not None:
+                raise ValueError("validation controller-defect recovery refuses review or acceptance activity")
+            generation = int(terminal["generation"] or 1)
+            archive_stage = f"validation-controller-defect-archive-{attempt_number}-{generation}"
+            if conn.execute("SELECT 1 FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, archive_stage)).fetchone() is not None:
+                raise ValueError("validation controller-defect recovery archive already exists")
+            archive_detail = json.dumps({"original_stage": f"validation-{attempt_number}", "terminal_generation": generation, "reason": reason, "record": validation_record}, sort_keys=True, separators=(",", ":"))
+            conn.execute(
+                "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (ticket_id, archive_stage, archive_detail, attempt_number, str(archived_artifact), archived_validation_artifact_sha256, validation_stage["base_sha"], now),
+            )
+            completed = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage='validation_completed'", (ticket_id,)).fetchone()
+            completed_archive_stage = None
+            if completed is not None:
+                completed_archive_stage = f"validation-completed-controller-defect-archive-{attempt_number}-{generation}"
+                completed_archive_detail = json.dumps({
+                    "original_stage": "validation_completed",
+                    "original_attempt_number": int(completed["attempt_number"] or 0),
+                    "terminal_generation": generation,
+                    "reason": reason,
+                    "detail": str(completed["detail"]),
+                }, sort_keys=True, separators=(",", ":"))
+                conn.execute(
+                    "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (ticket_id, completed_archive_stage, completed_archive_detail, completed["attempt_number"], completed["artifact_path"], completed["artifact_sha256"], completed["base_sha"], now),
+                )
+                conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage='validation_completed'", (ticket_id,))
+            conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"validation-{attempt_number}"))
+            notices = conn.execute(
+                "SELECT operation_id,status FROM gateway_notification_outbox WHERE ticket_id=? AND failure_fingerprint=? AND terminal_generation=?",
+                (ticket_id, str(terminal["failure_fingerprint"]), generation),
+            ).fetchall()
+            if any(str(row["status"]) in {"delivering", "delivery_unknown"} for row in notices):
+                raise ValueError("terminal notification delivery is in-flight or ambiguous; reconcile it before validation recovery")
+            superseded = [str(row["operation_id"]) for row in notices if str(row["status"]) in {"pending", "retryable"}]
+            if superseded:
+                placeholders = ",".join("?" for _ in superseded)
+                conn.execute(
+                    f"UPDATE gateway_notification_outbox SET status='superseded',superseded_at=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,updated_at=? WHERE operation_id IN ({placeholders}) AND status IN ('pending','retryable')",
+                    (now, now, *superseded),
+                )
+            conn.execute("UPDATE terminal_ticket_failures SET resolved_at=?,resolved_by=?,resolution_reason=? WHERE ticket_id=? AND resolved_at IS NULL", (now, operator_id, reason[:2000], ticket_id))
+            states = (CanonicalState.READY_LOCAL, CanonicalState.IMPLEMENTING, CanonicalState.VERIFYING)
+            current = CanonicalState.BLOCKED
+            final_event = None
+            for target in states:
+                validate_transition(current, target)
+                changed = conn.execute("UPDATE tickets SET state=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND state=?", (target.value, now, ticket_id, current.value))
+                if changed.rowcount != 1:
+                    raise RuntimeError("ticket changed during validation controller-defect recovery")
+                final_event = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="state_transition", actor_id=operator_id, from_state=current.value, to_state=target.value, payload={"reason": "validation_controller_defect_recovery", "attempt_number": attempt_number, "terminal_generation": generation})
+                current = target
+            conn.execute("UPDATE scheduler_stage_claims SET lease_owner=NULL,lease_expires_at=?,updated_at=? WHERE claim_id=? AND status='claimed'", (now - 1, now, claim["claim_id"]))
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="terminal_unresolvable_resolved", actor_id=operator_id, payload={"mode": "validation_controller_defect", "reason": reason, "attempt_number": attempt_number, "terminal_generation": generation, "archived_validation_stage": archive_stage, "archived_validation_completed_stage": completed_archive_stage, "superseded_notification_operation_ids": superseded})
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="validation_controller_defect_recovery_authorized", actor_id=operator_id, payload={"attempt_number": attempt_number, "terminal_generation": generation, "claim_id": str(claim["claim_id"]), "archived_validation_stage": archive_stage, "reason": reason})
+            return {"ticket_id": ticket_id, "attempt_number": attempt_number, "state": CanonicalState.VERIFYING.value, "claim_id": str(claim["claim_id"]), "terminal_generation": generation, "archived_validation_stage": archive_stage, "superseded_notification_operation_ids": superseded}
+
+    def reconcile_validation_controller_defect_completion_marker(
+        self,
+        ticket_id: str,
+        *,
+        attempt_number: int,
+        operator_id: str,
+        reason: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Repair a stale validation_completed marker after an authorized controller-defect recovery."""
+        if attempt_number < 1 or not operator_id.strip() or not reason.strip():
+            raise ValueError("validation marker reconciliation requires attempt, operator, and reason")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not bool(paused["paused"]):
+                raise PermissionError("validation marker reconciliation requires paused controller")
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None:
+                raise KeyError(ticket_id)
+            if str(ticket["state"]) not in {CanonicalState.VERIFYING.value, CanonicalState.LOCAL_REVIEW.value}:
+                raise ValueError("validation marker reconciliation requires recovered validating ticket")
+            authorization = None
+            rows = conn.execute("SELECT payload_json FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='validation_controller_defect_recovery_authorized' ORDER BY id DESC", (ticket_id,)).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(str(row["payload_json"] or "{}"))
+                except json.JSONDecodeError:
+                    continue
+                if int(payload.get("attempt_number") or 0) == attempt_number:
+                    authorization = payload
+                    break
+            if authorization is None:
+                raise PermissionError("validation marker reconciliation lacks controller-defect recovery authorization")
+            stage = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"validation-{attempt_number}")).fetchone()
+            if stage is None or not stage["artifact_path"] or not stage["artifact_sha256"]:
+                raise ValueError("validation marker reconciliation requires current validation evidence")
+            try:
+                record = json.loads(str(stage["detail"] or "{}"))
+            except json.JSONDecodeError as exc:
+                raise ValueError("validation marker reconciliation validation detail is malformed") from exc
+            artifact = Path(str(stage["artifact_path"]))
+            if record.get("passed") is not True or not artifact.is_file() or hashlib.sha256(artifact.read_bytes()).hexdigest() != str(stage["artifact_sha256"]):
+                raise ValueError("validation marker reconciliation requires passing intact validation evidence")
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"validation:{attempt_number}")).fetchone()
+            if claim is None or claim["status"] != "claimed" or not claim["candidate_identity_json"] or record.get("candidate_identity") != json.loads(str(claim["candidate_identity_json"])):
+                raise ValueError("validation marker reconciliation requires matching frozen validation claim")
+            existing = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage='validation_completed'", (ticket_id,)).fetchone()
+            archive_stage = None
+            if existing is not None and int(existing["attempt_number"] or 0) != attempt_number:
+                generation = int(authorization.get("terminal_generation") or 0)
+                archive_stage = f"validation-completed-controller-defect-late-archive-{attempt_number}-{generation}"
+                if conn.execute("SELECT 1 FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, archive_stage)).fetchone() is None:
+                    archive_detail = json.dumps({"original_attempt_number": int(existing["attempt_number"] or 0), "reason": reason, "detail": str(existing["detail"])}, sort_keys=True, separators=(",", ":"))
+                    conn.execute(
+                        "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                        (ticket_id, archive_stage, archive_detail, existing["attempt_number"], existing["artifact_path"], existing["artifact_sha256"], existing["base_sha"], now),
+                    )
+                conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage='validation_completed'", (ticket_id,))
+                existing = None
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (ticket_id, "validation_completed", str(stage["detail"]), attempt_number, stage["artifact_path"], stage["artifact_sha256"], stage["base_sha"], now),
+                )
+            elif int(existing["attempt_number"] or 0) != attempt_number:
+                raise RuntimeError("validation marker reconciliation could not replace stale marker")
+            claim_released = False
+            if claim["side_effect_completed_at"] is None:
+                changed = conn.execute(
+                    "UPDATE scheduler_stage_claims SET lease_owner=NULL,lease_expires_at=?,updated_at=? WHERE claim_id=? AND status='claimed' AND side_effect_completed_at IS NULL",
+                    (now - 1, now, claim["claim_id"]),
+                )
+                claim_released = changed.rowcount == 1
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="validation_controller_defect_marker_reconciled", actor_id=operator_id, payload={"attempt_number": attempt_number, "reason": reason, "archived_stage": archive_stage})
+            return {"ticket_id": ticket_id, "attempt_number": attempt_number, "status": "reconciled", "archived_stage": archive_stage, "claim_released": claim_released}
 
     def reopen_terminal_ticket_after_paid_budget(
         self,

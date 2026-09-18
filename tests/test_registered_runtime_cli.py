@@ -235,6 +235,47 @@ class RegisteredRuntimeCliTests(unittest.TestCase):
         notice = self.ledger.connection.execute("SELECT status FROM gateway_notification_outbox WHERE operation_id=?", (terminal["operation_id"],)).fetchone()
         self.assertEqual(notice["status"], "superseded")
 
+    def test_resolve_terminal_adopt_existing_cli_uses_registered_manual_adoption(self) -> None:
+        controller = mock.Mock()
+        controller.adopt_existing_implementation.return_value = {
+            "ticket_id": "ticket-manual",
+            "attempt_number": 3,
+            "status": "adopted",
+            "state": "implementing",
+        }
+        registered = argparse.Namespace(canonical_repository=self.repo.resolve())
+        output = io.StringIO()
+        with mock.patch("local_first_orchestrator.cli._registered_controller", return_value=(controller, registered)) as factory:
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(cli_main([
+                    "--database", str(self.database),
+                    "--operator-config-path", str(self.config_path),
+                    "resolve-terminal",
+                    "--ticket-id", "ticket-manual",
+                    "--mode", "adopt-existing",
+                    "--reason", "operator fixed candidate",
+                    "--operator-id", "operator",
+                ]), 0)
+        factory.assert_called_once()
+        controller.adopt_existing_implementation.assert_called_once_with(
+            "ticket-manual",
+            repository=self.repo.resolve(),
+            operator_id="operator",
+            reason="operator fixed candidate",
+            resolve_terminal=True,
+        )
+        self.assertEqual(json.loads(output.getvalue())["state"], "implementing")
+
+        with self.assertRaisesRegex(ValueError, "does not accept --additional-local-attempts"):
+            cli_main([
+                "--database", str(self.database),
+                "resolve-terminal",
+                "--ticket-id", "ticket-manual",
+                "--mode", "adopt-existing",
+                "--additional-local-attempts", "1",
+                "--reason", "invalid mixed mode",
+            ])
+
     def test_historical_claim_retirement_cli_supports_exact_operator_targets(self) -> None:
         parser = argparse.ArgumentParser(); register_cli(parser)
         for selector, value in (("--ticket-id", "internal-ticket"), ("--external-id", "t-generated"), ("--claim-id", "claim-1")):

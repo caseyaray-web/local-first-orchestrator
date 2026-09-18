@@ -152,8 +152,13 @@ class NewTestFilesContractTests(unittest.TestCase):
         (worktree / "package.json").write_text('{"scripts": {"test": "python -m unittest"}}\n', encoding="utf-8")
         result = DeterministicValidator(artifact_root=self.root / "artifacts").validate(worktree, self.ticket(lines=200), base_sha=self.base)
         self.assertTrue(result.passed, result.errors)
-        self.assertIn("tests/test_new_behavior.py", json.loads(result.full_evidence_path.read_text())["changed_files"])
-        self.assertGreaterEqual(json.loads(result.full_evidence_path.read_text())["changed_lines"], 20)
+        evidence = json.loads(result.full_evidence_path.read_text())
+        self.assertIn("tests/test_new_behavior.py", evidence["changed_files"])
+        self.assertGreaterEqual(evidence["changed_lines"], 20)
+        self.git("add", "tests/test_new_behavior.py")
+        staged = DeterministicValidator(artifact_root=self.root / "artifacts-staged").validate(worktree, self.ticket(lines=200), base_sha=self.base)
+        self.assertTrue(staged.passed, staged.errors)
+        self.assertEqual(json.loads(staged.full_evidence_path.read_text())["changed_lines"], evidence["changed_lines"])
 
     def test_validator_rejects_undeclared_or_over_budget_new_file(self) -> None:
         (self.repo / "tests").mkdir()

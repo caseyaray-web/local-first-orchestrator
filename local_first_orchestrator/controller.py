@@ -1004,7 +1004,7 @@ class LocalFirstController:
         row=self.ledger.get_ticket(task_id); binding=self.ledger.runtime_binding(task_id)
         return {"ticket_id":task_id,"state":row["state"],"repository":binding["repository_path"],"starting_sha":binding["starting_sha"],"would_invoke_model":False,"would_write_board":False,"would_modify_repository":False}
 
-    def adopt_existing_implementation(self, ticket_id: str, *, repository: Path, operator_id: str, reason: str) -> dict[str, object]:
+    def adopt_existing_implementation(self, ticket_id: str, *, repository: Path, operator_id: str, reason: str, resolve_terminal: bool = False) -> dict[str, object]:
         """Adopt a pre-existing native-worktree diff without claiming model or worker provenance."""
         if not operator_id.strip() or not reason.strip():
             raise ValueError("manual adoption requires operator identity and reason")
@@ -1012,20 +1012,66 @@ class LocalFirstController:
         if paused is None or not paused["paused"]:
             raise PermissionError("manual implementation adoption requires Local First paused")
         ticket_row = self.ledger.get_ticket(ticket_id)
-        if ticket_row["state"] not in {CanonicalState.READY_LOCAL.value, CanonicalState.IMPLEMENTING.value}:
-            raise RuntimeError("manual adoption requires ready_local ticket or exact replay")
+        allowed_states = {CanonicalState.BLOCKED.value, CanonicalState.IMPLEMENTING.value} if resolve_terminal else {CanonicalState.READY_LOCAL.value, CanonicalState.IMPLEMENTING.value}
+        if ticket_row["state"] not in allowed_states:
+            raise RuntimeError("manual adoption requires ready_local ticket, blocked terminal ticket, or exact replay")
         binding = self.ledger.runtime_binding(ticket_id)
         repo, worktree_root, artifact_root = self.config.validate_execution_roots()
         if repo != Path(repository).resolve(strict=True) or str(repo) != str(binding["repository_path"]):
             raise ValueError("repository mismatch with imported binding")
         ticket = ticket_from_ledger(ticket_row)
         external_task_id = self.ledger.resolve_external_task_id(ticket_id)
-        reconciliation = self.ledger.failed_attempt_reconciliation(ticket_id)
-        attempt_number = int(reconciliation["prospective_next_attempt_number"]) if reconciliation is not None else 1
-        if attempt_number > ticket.max_attempts:
-            raise RuntimeError("manual adoption exceeds ticket max_attempts")
-        if reconciliation is not None and bool(reconciliation["cleanup_required"]) and not self.ledger.cleanup_confirmed(ticket_id, int(reconciliation["retired_attempt_number"])):
-            raise RuntimeError("manual adoption retry requires retired-attempt cleanup confirmation")
+        reconciliation = None if resolve_terminal else self.ledger.failed_attempt_reconciliation(ticket_id)
+        latest_attempt = None
+        if resolve_terminal:
+            if ticket_row["state"] == CanonicalState.BLOCKED.value:
+                terminal = self.ledger.connection.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=? AND resolved_at IS NULL", (ticket_id,)).fetchone()
+                if terminal is None:
+                    raise RuntimeError("terminal manual adoption requires unresolved terminal failure")
+                latest_attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? ORDER BY attempt_number DESC LIMIT 1", (ticket_id,)).fetchone()
+                if latest_attempt is None or not latest_attempt["base_sha"] or not latest_attempt["post_diff_hash"]:
+                    raise RuntimeError("terminal manual adoption requires complete prior attempt provenance")
+                attempt_number = int(latest_attempt["attempt_number"]) + 1
+            else:
+                prior_adoption = self.ledger.connection.execute(
+                    "SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND stage='implementation' AND adapter='manual-adoption' ORDER BY attempt_number DESC LIMIT 1",
+                    (ticket_id,),
+                ).fetchone()
+                if prior_adoption is None:
+                    raise RuntimeError("terminal manual adoption replay requires existing manual adoption")
+                attempt_number = int(prior_adoption["attempt_number"])
+                provenance_event = self.ledger.connection.execute(
+                    "SELECT * FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='manual_attempt_slot_authorized' ORDER BY id DESC LIMIT 1",
+                    (ticket_id,),
+                ).fetchone()
+                if provenance_event is None:
+                    raise RuntimeError("terminal manual adoption replay lacks terminal adoption provenance")
+                try:
+                    provenance = json.loads(str(provenance_event["payload_json"] or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("terminal manual adoption replay has invalid provenance") from exc
+                if provenance.get("mode") != "adopt_existing" or int(provenance.get("manual_attempt_number") or 0) != attempt_number:
+                    raise RuntimeError("terminal manual adoption replay provenance does not match manual attempt")
+                resolved_terminal = self.ledger.connection.execute(
+                    "SELECT * FROM terminal_ticket_failures WHERE ticket_id=? AND resolved_at IS NOT NULL",
+                    (ticket_id,),
+                ).fetchone()
+                if resolved_terminal is None:
+                    raise RuntimeError("terminal manual adoption replay lacks resolved terminal episode")
+                if (
+                    int(provenance.get("terminal_generation") or 0) != int(resolved_terminal["generation"] or 0)
+                    or str(provenance.get("terminal_failure_fingerprint") or "") != str(resolved_terminal["failure_fingerprint"] or "")
+                ):
+                    raise RuntimeError("terminal manual adoption replay terminal provenance mismatch")
+                latest_attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+                if latest_attempt is None or not latest_attempt["base_sha"] or not latest_attempt["post_diff_hash"]:
+                    raise RuntimeError("terminal manual adoption replay is missing attempt provenance")
+        else:
+            attempt_number = int(reconciliation["prospective_next_attempt_number"]) if reconciliation is not None else 1
+            if attempt_number > ticket.max_attempts:
+                raise RuntimeError("manual adoption exceeds ticket max_attempts")
+            if reconciliation is not None and bool(reconciliation["cleanup_required"]) and not self.ledger.cleanup_confirmed(ticket_id, int(reconciliation["retired_attempt_number"])):
+                raise RuntimeError("manual adoption retry requires retired-attempt cleanup confirmation")
         path, _ = validate_native_workspace_path(
             canonical_native_workspace_path(repo, external_task_id), repository=repo, external_task_id=external_task_id
         )
@@ -1047,7 +1093,7 @@ class LocalFirstController:
             raise RuntimeError("manual adoption worktree is not attached to canonical repository")
         if git("branch", "--show-current").stdout.strip() != branch:
             raise RuntimeError("manual adoption branch identity mismatch")
-        base = str(reconciliation["retry_base_sha"]) if reconciliation is not None else GitWorktreeAdapter(repo, worktree_root).resolve_execution_base(ticket_row.get("tranche_id") or None, str(binding["starting_sha"]))
+        base = str(latest_attempt["base_sha"]) if resolve_terminal and latest_attempt is not None else (str(reconciliation["retry_base_sha"]) if reconciliation is not None else GitWorktreeAdapter(repo, worktree_root).resolve_execution_base(ticket_row.get("tranche_id") or None, str(binding["starting_sha"])))
         if git("rev-parse", "HEAD").stdout.strip() != base:
             raise RuntimeError("manual adoption worktree HEAD does not match authoritative execution base")
 
@@ -1104,6 +1150,7 @@ class LocalFirstController:
             ticket_id=ticket_id, attempt_number=attempt_number, operator_id=operator_id, reason=reason,
             branch=branch, workspace_path=str(path), base_sha=base, diff_hash=diff_hash,
             artifact_path=str(artifact_path), artifact_sha256=artifact_sha256,
+            resolve_terminal=resolve_terminal,
         )
         return {
             "ticket_id": ticket_id,
@@ -1483,6 +1530,100 @@ class LocalFirstController:
             "diff_hash": diff_hash,
             "replayed": False,
         }
+
+    def recover_terminal_validation_controller_defect(
+        self,
+        ticket_id: str,
+        attempt_number: int,
+        *,
+        repository: Path,
+        operator_id: str,
+        reason: str,
+    ) -> dict[str, object]:
+        """Prove a frozen manual candidate passes the current validator before replaying its failed validation claim."""
+        paused = self.ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+        if paused is None or not bool(paused["paused"]):
+            raise PermissionError("validation controller-defect recovery requires Local First paused")
+        ticket_row = self.ledger.get_ticket(ticket_id)
+        if ticket_row["state"] != CanonicalState.BLOCKED.value:
+            raise ValueError("validation controller-defect recovery requires blocked ticket")
+        binding = self.ledger.runtime_binding(ticket_id)
+        raw_repository = Path(repository).resolve(strict=True)
+        repo, _, artifact_root = self.config.validate_execution_roots()
+        if repo != raw_repository or str(repo) != binding["repository_path"]:
+            raise ValueError("repository mismatch with imported binding")
+        implementation = self.ledger.model_stage(ticket_id, attempt_number, "implementation")
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        manual_adoption = self.ledger.runtime_stage(ticket_id, f"manual-adoption-{attempt_number}")
+        claim = self.ledger.connection.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"validation:{attempt_number}")).fetchone()
+        terminal = self.ledger.connection.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=? AND resolved_at IS NULL", (ticket_id,)).fetchone()
+        if implementation is None or attempt is None or manual_adoption is None or str(implementation["adapter"]) != "manual-adoption":
+            raise ValueError("validation controller-defect recovery requires manual-adoption provenance")
+        if claim is None or claim["status"] != "claimed" or claim["side_effect_started_at"] is None or claim["side_effect_completed_at"] is not None or not claim["candidate_identity_json"]:
+            raise ValueError("validation controller-defect recovery requires unfinished frozen validation claim")
+        if terminal is None or int(terminal["attempt_number"]) != attempt_number:
+            raise ValueError("validation controller-defect recovery requires current terminal attempt")
+        implementation_artifact = Path(str(implementation["response_artifact"]))
+        if not implementation_artifact.is_file():
+            raise RuntimeError("validation controller-defect recovery implementation artifact is missing")
+        identity = json.loads(str(claim["candidate_identity_json"]))
+        expected = {
+            "ticket_id": ticket_id,
+            "attempt_number": attempt_number,
+            "implementation_artifact": str(implementation_artifact),
+            "implementation_artifact_sha256": hashlib.sha256(implementation_artifact.read_bytes()).hexdigest(),
+            "worktree_path": str(implementation["worktree_path"]),
+            "base_sha": str(implementation["base_sha"]),
+            "implementation_diff_hash": str(implementation["diff_hash"]),
+            "validation_policy_hash": self.ledger._validation_policy_hash(ticket_row),
+        }
+        if identity != expected:
+            raise RuntimeError("validation controller-defect recovery candidate identity drift")
+        worktree = Path(expected["worktree_path"]).resolve(strict=True)
+        if str(attempt["worktree_path"] or "") != str(worktree):
+            raise RuntimeError("validation controller-defect recovery attempt workspace drift")
+        validation_ticket = ticket_from_ledger(ticket_row)
+        manual_new_paths = tuple(sorted(set(validation_ticket.create_files) | set(validation_ticket.new_test_files)))
+        live_root = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=worktree, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+        live_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
+        live_diff_hash = str(_isolated_candidate_diff(worktree, expected["base_sha"], allowed_new_paths=manual_new_paths)["diff_hash"])
+        if live_root != str(worktree) or live_head != expected["base_sha"] or live_diff_hash != expected["implementation_diff_hash"]:
+            raise RuntimeError("validation controller-defect recovery live candidate identity drift")
+        old_validation = self.ledger.runtime_stage(ticket_id, f"validation-{attempt_number}")
+        if old_validation is None or not old_validation["artifact_path"] or not old_validation["artifact_sha256"]:
+            raise ValueError("validation controller-defect recovery requires failed validation artifact")
+        old_artifact = Path(str(old_validation["artifact_path"])).resolve(strict=True)
+        old_sha = hashlib.sha256(old_artifact.read_bytes()).hexdigest()
+        if old_sha != str(old_validation["artifact_sha256"]):
+            raise RuntimeError("validation controller-defect recovery failed validation artifact drift")
+        try:
+            old_record = json.loads(str(old_validation["detail"] or "{}"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("validation controller-defect recovery failed validation detail is malformed") from exc
+        if old_record.get("passed") is not False or old_record.get("candidate_identity") != identity:
+            raise ValueError("validation controller-defect recovery requires failed validation for frozen candidate")
+        generation = int(terminal["generation"] or 1)
+        archive_dir = artifact_root / ticket_id / str(attempt_number) / "controller-defect-archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_artifact = archive_dir / f"validation-{generation}-{old_sha[:12]}.json"
+        if archive_artifact.exists():
+            if hashlib.sha256(archive_artifact.read_bytes()).hexdigest() != old_sha:
+                raise RuntimeError("validation controller-defect recovery archive path conflict")
+        else:
+            shutil.copyfile(old_artifact, archive_artifact)
+        preflight_root = artifact_root / ticket_id / str(attempt_number) / f"controller-defect-preflight-{generation}"
+        fresh = DeterministicValidator(artifact_root=preflight_root).validate(worktree, validation_ticket, base_sha=expected["base_sha"])
+        if not fresh.passed:
+            raise RuntimeError(f"validation controller-defect recovery fresh validation still fails: {fresh.compact_evidence}")
+        recovered = self.ledger.recover_terminal_validation_controller_defect(
+            ticket_id,
+            attempt_number=attempt_number,
+            operator_id=operator_id,
+            reason=reason,
+            archived_validation_artifact_path=str(archive_artifact),
+            archived_validation_artifact_sha256=old_sha,
+        )
+        return {**recovered, "preflight_validation_artifact": str(fresh.full_evidence_path), "preflight_compact_evidence": fresh.compact_evidence}
 
     def execute_deterministic_validation_only(self, ticket_id: str, *, repository: Path) -> dict[str, object]:
         """Validate one scheduler-claimed implementation candidate, without review or repair."""

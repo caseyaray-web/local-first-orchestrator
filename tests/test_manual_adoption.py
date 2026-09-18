@@ -72,6 +72,37 @@ class ManualAdoptionTests(unittest.TestCase):
         self.assertIsNotNone(self.ledger.runtime_stage(self.ticket_id, "manual-adoption-1"))
         after_adoption = subprocess.run(("git", "status", "--porcelain=v1", "--untracked-files=all"), cwd=self.worktree, text=True, capture_output=True, check=True).stdout
         self.assertEqual(after_adoption, self.initial_status)
+        with self.assertRaisesRegex(RuntimeError, "lacks terminal adoption provenance"):
+            self.controller.adopt_existing_implementation(
+                self.ticket_id,
+                repository=self.repo,
+                operator_id="operator",
+                reason="normal manual adoption",
+                resolve_terminal=True,
+            )
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (self.ticket_id,)).fetchone()
+        artifact = self.ledger.connection.execute(
+            "SELECT response_artifact FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=1 AND stage='implementation'",
+            (self.ticket_id,),
+        ).fetchone()
+        artifact_path = Path(str(artifact["response_artifact"]))
+        with self.assertRaisesRegex(RuntimeError, "lacks terminal adoption provenance"):
+            self.ledger.record_manual_implementation_adoption(
+                ticket_id=self.ticket_id,
+                attempt_number=1,
+                operator_id="operator",
+                reason="reuse verified pre-existing implementation",
+                branch=str(attempt["branch"]),
+                workspace_path=str(attempt["worktree_path"]),
+                base_sha=str(attempt["base_sha"]),
+                diff_hash=str(attempt["post_diff_hash"]),
+                artifact_path=str(artifact_path),
+                artifact_sha256=str(self.ledger.connection.execute(
+                    "SELECT request_hash FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=1 AND stage='implementation'",
+                    (self.ticket_id,),
+                ).fetchone()["request_hash"]),
+                resolve_terminal=True,
+            )
 
         self.ledger.resume("operator", reason="continue deterministic validation")
         claim = self.ledger.claim_next_scheduler_validation("validator", lease_seconds=60)
@@ -86,6 +117,247 @@ class ManualAdoptionTests(unittest.TestCase):
         candidate = self.ledger.connection.execute("SELECT * FROM review_candidates WHERE ticket_id=? AND attempt_number=1", (self.ticket_id,)).fetchone()
         self.assertIsNotNone(candidate)
         self.assertTrue(str(candidate["implementation_invocation_id"]).startswith("manual-adoption:"))
+
+    def test_terminal_manual_intervention_adopts_existing_candidate_and_enters_validation(self) -> None:
+        self.ledger.connection.execute(
+            "INSERT INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,post_diff_hash,outcome,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (self.ticket_id, 1, self.base, f"wt/{self.external_id}", str(self.worktree), hashlib.sha256(b"").hexdigest(), "d" * 64, "failed", 1),
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO runtime_stages(ticket_id,stage,attempt_number,detail,base_sha,created_at) VALUES (?,?,?,?,?,?)",
+            (self.ticket_id, "validation_completed", 1, json.dumps({"passed": False}), self.base, 1),
+        )
+        terminal = self.ledger.record_terminal_unresolvable(
+            self.ticket_id,
+            attempt_number=1,
+            failure_fingerprint="e" * 64,
+            reason="automatic recovery exhausted",
+            summary={"local_feedback": "manual intervention required"},
+            notification_target="mattermost:ops",
+        )
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.BLOCKED.value)
+
+        adopted = self.controller.adopt_existing_implementation(
+            self.ticket_id,
+            repository=self.repo,
+            operator_id="operator",
+            reason="operator corrected candidate manually",
+            resolve_terminal=True,
+        )
+        self.assertEqual((adopted["status"], adopted["attempt_number"], adopted["state"]), ("adopted", 2, CanonicalState.IMPLEMENTING.value))
+        first = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (self.ticket_id,)).fetchone()
+        second = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=2", (self.ticket_id,)).fetchone()
+        self.assertEqual((first["outcome"], first["failure_fingerprint"]), ("failed_retired", "e" * 64))
+        self.assertEqual(second["pre_diff_hash"], "d" * 64)
+        self.assertEqual(second["post_diff_hash"], adopted["diff_hash"])
+        self.assertEqual(self.ledger.model_stage(self.ticket_id, 2, "implementation")["adapter"], "manual-adoption")
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM model_invocations WHERE ticket_id=? AND stage='implementation'", (self.ticket_id,)).fetchone()[0], 0)
+        terminal_row = self.ledger.connection.execute("SELECT resolved_at,resolved_by,resolution_reason FROM terminal_ticket_failures WHERE ticket_id=?", (self.ticket_id,)).fetchone()
+        self.assertIsNotNone(terminal_row["resolved_at"])
+        self.assertEqual((terminal_row["resolved_by"], terminal_row["resolution_reason"]), ("operator", "operator corrected candidate manually"))
+        notice = self.ledger.connection.execute("SELECT status,superseded_at FROM gateway_notification_outbox WHERE operation_id=?", (terminal["operation_id"],)).fetchone()
+        self.assertEqual(notice["status"], "superseded")
+        self.assertIsNotNone(notice["superseded_at"])
+        audit = self.ledger.connection.execute("SELECT payload_json FROM events WHERE entity_id=? AND event_type='manual_attempt_slot_authorized' ORDER BY id DESC LIMIT 1", (self.ticket_id,)).fetchone()
+        self.assertEqual(json.loads(audit["payload_json"])["mode"], "adopt_existing")
+        reconciliation = self.ledger.connection.execute(
+            "SELECT * FROM failed_attempt_reconciliations WHERE ticket_id=? AND retired_attempt_number=1",
+            (self.ticket_id,),
+        ).fetchone()
+        self.assertIsNotNone(reconciliation)
+        self.assertEqual((reconciliation["classification"], reconciliation["prospective_next_attempt_number"], reconciliation["cleanup_required"]), ("terminal_manual_adoption", 2, 0))
+        replay = self.controller.adopt_existing_implementation(
+            self.ticket_id,
+            repository=self.repo,
+            operator_id="operator",
+            reason="operator corrected candidate manually",
+            resolve_terminal=True,
+        )
+        self.assertEqual((replay["status"], replay["attempt_number"]), ("already_adopted", 2))
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM attempts WHERE ticket_id=?", (self.ticket_id,)).fetchone()[0], 2)
+
+        self.ledger.resume("operator", reason="continue deterministic validation")
+        self.assertIsNone(self.ledger.claim_next_scheduler_implementation("worker", lease_seconds=60, ticket_id=self.ticket_id))
+        claim = self.ledger.claim_next_scheduler_validation("validator", lease_seconds=60, ticket_id=self.ticket_id)
+        self.assertIsNotNone(claim)
+        self.ledger.begin_scheduler_claim_effect(str(claim["claim_id"]), "validator")
+        result = self.controller.execute_deterministic_validation_only(self.ticket_id, repository=self.repo)
+        self.ledger.complete_scheduler_validation_effect(str(claim["claim_id"]), "validator", result)
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.LOCAL_REVIEW.value)
+        validation_marker = self.ledger.connection.execute(
+            "SELECT attempt_number FROM runtime_stages WHERE ticket_id=? AND stage='validation_completed'",
+            (self.ticket_id,),
+        ).fetchone()
+        self.assertEqual(validation_marker["attempt_number"], 2)
+
+    def test_terminal_validation_controller_defect_replays_same_manual_candidate(self) -> None:
+        self.ledger.connection.execute(
+            "INSERT INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,post_diff_hash,outcome,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (self.ticket_id, 1, self.base, f"wt/{self.external_id}", str(self.worktree), hashlib.sha256(b"").hexdigest(), "d" * 64, "failed", 1),
+        )
+        self.ledger.record_terminal_unresolvable(
+            self.ticket_id,
+            attempt_number=1,
+            failure_fingerprint="e" * 64,
+            reason="automatic recovery exhausted",
+            summary={"local_feedback": "manual intervention required"},
+            notification_target="mattermost:ops",
+        )
+        adopted = self.controller.adopt_existing_implementation(
+            self.ticket_id,
+            repository=self.repo,
+            operator_id="operator",
+            reason="operator corrected candidate manually",
+            resolve_terminal=True,
+        )
+        self.assertEqual(adopted["attempt_number"], 2)
+        self.ledger.resume("operator", reason="claim validation")
+        claim = self.ledger.claim_next_scheduler_validation("validator", lease_seconds=60, ticket_id=self.ticket_id)
+        self.assertIsNotNone(claim)
+        self.ledger.begin_scheduler_claim_effect(str(claim["claim_id"]), "validator")
+        identity = json.loads(str(claim["candidate_identity_json"]))
+        false_artifact = self.root / "false-validation.json"
+        false_artifact.write_text(json.dumps({"base_sha": self.base, "changed_files": ["app.py", "test_app.py"], "changed_lines": 999, "scope_unverified": False, "errors": ["changed line budget exceeded"], "commands": []}, sort_keys=True), encoding="utf-8")
+        false_sha = hashlib.sha256(false_artifact.read_bytes()).hexdigest()
+        false_record = {
+            "candidate_identity": identity,
+            "passed": False,
+            "compact_evidence": "changed line budget exceeded",
+            "validation_artifact": str(false_artifact),
+            "validation_artifact_sha256": false_sha,
+            "review_diff": "unused",
+            "review_selected_files": {},
+        }
+        self.assertTrue(self.ledger.record_runtime_stage(
+            self.ticket_id,
+            "validation-2",
+            json.dumps(false_record, sort_keys=True),
+            attempt_number=2,
+            artifact_path=str(false_artifact),
+            artifact_sha256=false_sha,
+            base_sha=self.base,
+        ))
+        self.assertTrue(self.ledger.record_runtime_stage(
+            self.ticket_id,
+            "validation_completed",
+            json.dumps({"passed": True, "historical_attempt": 1}, sort_keys=True),
+            attempt_number=1,
+            artifact_path=str(false_artifact),
+            artifact_sha256=false_sha,
+            base_sha=self.base,
+        ))
+        terminal = self.ledger.record_terminal_unresolvable(
+            self.ticket_id,
+            attempt_number=2,
+            failure_fingerprint="f" * 64,
+            reason="attempt limit reached after deterministic validation failure",
+            summary={"deterministic_failure": {"source": "validation", "attempt_number": 2, "failure_evidence": "changed line budget exceeded"}, "local_feedback": "validation failed"},
+            notification_target="mattermost:ops",
+        )
+        self.ledger.pause("operator", reason="recover validator defect")
+        with self.assertRaisesRegex(ValueError, "distinct dedicated archive"):
+            self.ledger.recover_terminal_validation_controller_defect(
+                self.ticket_id,
+                attempt_number=2,
+                operator_id="operator",
+                reason="unsafe direct-ledger archive alias",
+                archived_validation_artifact_path=str(false_artifact),
+                archived_validation_artifact_sha256=false_sha,
+            )
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.BLOCKED.value)
+        unresolved = self.ledger.connection.execute(
+            "SELECT resolved_at FROM terminal_ticket_failures WHERE ticket_id=?",
+            (self.ticket_id,),
+        ).fetchone()
+        self.assertIsNone(unresolved["resolved_at"])
+        recovered = self.controller.recover_terminal_validation_controller_defect(
+            self.ticket_id,
+            2,
+            repository=self.repo,
+            operator_id="operator",
+            reason="validator double-counted staged declared new files",
+        )
+        self.assertEqual(recovered["state"], CanonicalState.VERIFYING.value)
+        self.assertIn("validation passed", str(recovered["preflight_compact_evidence"]))
+        archive = self.ledger.runtime_stage(self.ticket_id, "validation-controller-defect-archive-2-2")
+        self.assertIsNotNone(archive)
+        self.assertEqual(Path(str(archive["artifact_path"])).read_bytes(), false_artifact.read_bytes())
+        self.assertIsNone(self.ledger.runtime_stage(self.ticket_id, "validation-2"))
+        terminal_row = self.ledger.connection.execute("SELECT resolved_at,resolution_reason FROM terminal_ticket_failures WHERE ticket_id=?", (self.ticket_id,)).fetchone()
+        self.assertIsNotNone(terminal_row["resolved_at"])
+        self.assertEqual(terminal_row["resolution_reason"], "validator double-counted staged declared new files")
+        notice = self.ledger.connection.execute("SELECT status FROM gateway_notification_outbox WHERE operation_id=?", (terminal["operation_id"],)).fetchone()
+        self.assertEqual(notice["status"], "superseded")
+        claim_row = self.ledger.scheduler_claim(str(claim["claim_id"]))
+        self.assertEqual(claim_row["status"], "claimed")
+        self.assertLess(int(claim_row["lease_expires_at"]), int(self.ledger._now()))
+
+        self.ledger.resume("operator", reason="replay corrected validation")
+        replay = self.ledger.claim_next_scheduler_validation("validator-2", lease_seconds=60, ticket_id=self.ticket_id)
+        self.assertIsNotNone(replay)
+        self.assertEqual(replay["claim_id"], claim["claim_id"])
+        result = self.controller.execute_deterministic_validation_only(self.ticket_id, repository=self.repo)
+        self.ledger.complete_scheduler_validation_effect(str(replay["claim_id"]), "validator-2", result)
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.LOCAL_REVIEW.value)
+
+        # A partially recovered process may discover an even older active completion marker
+        # after the fresh passing validation has already been persisted. Reconcile it without
+        # creating a new attempt or rerunning implementation.
+        current_marker = self.ledger.runtime_stage(self.ticket_id, "validation_completed")
+        self.assertEqual(current_marker["attempt_number"], 2)
+        self.ledger.pause("operator", reason="exercise late marker reconciliation")
+        self.ledger.connection.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage='validation_completed'", (self.ticket_id,))
+        self.ledger.connection.execute(
+            "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (self.ticket_id, "validation_completed", json.dumps({"passed": True, "historical_attempt": 1}), 1, str(false_artifact), false_sha, self.base, 1),
+        )
+        reconciled = self.ledger.reconcile_validation_controller_defect_completion_marker(
+            self.ticket_id,
+            attempt_number=2,
+            operator_id="operator",
+            reason="stale historical completion marker discovered after recovery",
+        )
+        self.assertEqual(reconciled["status"], "reconciled")
+        self.assertEqual(self.ledger.runtime_stage(self.ticket_id, "validation_completed")["attempt_number"], 2)
+
+    def test_terminal_manual_adoption_rolls_back_terminal_resolution_if_durable_adoption_fails(self) -> None:
+        self.ledger.connection.execute(
+            "INSERT INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,post_diff_hash,outcome,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (self.ticket_id, 1, self.base, f"wt/{self.external_id}", str(self.worktree), hashlib.sha256(b"").hexdigest(), "d" * 64, "failed", 1),
+        )
+        terminal = self.ledger.record_terminal_unresolvable(
+            self.ticket_id,
+            attempt_number=1,
+            failure_fingerprint="f" * 64,
+            reason="automatic recovery exhausted",
+            summary={"local_feedback": "manual intervention required"},
+            notification_target="mattermost:ops",
+        )
+        self.ledger.connection.execute(
+            "CREATE TRIGGER fail_terminal_manual_attempt BEFORE INSERT ON attempts WHEN NEW.ticket_id='" + self.ticket_id + "' AND NEW.attempt_number=2 BEGIN SELECT RAISE(ABORT, 'forced manual adoption failure'); END"
+        )
+        with self.assertRaisesRegex(Exception, "forced manual adoption failure"):
+            self.controller.adopt_existing_implementation(
+                self.ticket_id,
+                repository=self.repo,
+                operator_id="operator",
+                reason="operator corrected candidate manually",
+                resolve_terminal=True,
+            )
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.BLOCKED.value)
+        terminal_row = self.ledger.connection.execute("SELECT resolved_at FROM terminal_ticket_failures WHERE ticket_id=?", (self.ticket_id,)).fetchone()
+        self.assertIsNone(terminal_row["resolved_at"])
+        self.assertIsNone(self.ledger.connection.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number=2", (self.ticket_id,)).fetchone())
+        first = self.ledger.connection.execute("SELECT outcome,failure_fingerprint FROM attempts WHERE ticket_id=? AND attempt_number=1", (self.ticket_id,)).fetchone()
+        self.assertEqual((first["outcome"], first["failure_fingerprint"]), ("failed", None))
+        notice = self.ledger.connection.execute("SELECT status,superseded_at FROM gateway_notification_outbox WHERE operation_id=?", (terminal["operation_id"],)).fetchone()
+        self.assertEqual((notice["status"], notice["superseded_at"]), ("pending", None))
+        self.assertIsNone(self.ledger.connection.execute(
+            "SELECT 1 FROM failed_attempt_reconciliations WHERE ticket_id=? AND retired_attempt_number=1",
+            (self.ticket_id,),
+        ).fetchone())
 
     def test_persisted_review_application_includes_approved_untracked_manual_adoption_files(self) -> None:
         adopted = self.controller.adopt_existing_implementation(

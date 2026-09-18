@@ -166,8 +166,10 @@ class DeterministicValidator:
             symbol_errors, scope_unverified = enforce_symbol_scope(worktree, names, ticket, base_sha)
         errors.extend(symbol_errors)
         diff = self._git(worktree, "diff", "--numstat", base_sha, "--")
-        changed_lines = sum(int(a) + int(d) for a, d, *_ in (line.split("\t") for line in diff.splitlines() if line))
-        for path in declared_new & set(names):
+        numstat_rows = [line.split("\t") for line in diff.splitlines() if line]
+        changed_lines = sum(int(parts[0]) + int(parts[1]) for parts in numstat_rows)
+        numstat_paths = {parts[-1] for parts in numstat_rows if len(parts) >= 3}
+        for path in (declared_new & set(names)) - numstat_paths:
             candidate = worktree / path
             try:
                 content = candidate.read_text(encoding="utf-8")

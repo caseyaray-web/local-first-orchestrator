@@ -644,8 +644,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     reopen_terminal.add_argument("--operator-id", default="local-first-cli")
     resolve_terminal=commands.add_parser("resolve-terminal", help="paused operator-only: resolve one active terminal episode and choose a recovery mode")
     resolve_terminal.add_argument("--ticket-id", required=True)
-    resolve_terminal.add_argument("--mode", required=True, choices=("retry-local",))
-    resolve_terminal.add_argument("--additional-local-attempts", type=int, required=True)
+    resolve_terminal.add_argument("--mode", required=True, choices=("retry-local","adopt-existing"))
+    resolve_terminal.add_argument("--additional-local-attempts", type=int)
     resolve_terminal.add_argument("--reason", required=True)
     resolve_terminal.add_argument("--operator-id", default="local-first-cli")
     status=commands.add_parser("status"); status.add_argument("--active",action="store_true"); status.add_argument("--scheduler-detail",action="store_true",help="include one read-only scheduler lifecycle boundary snapshot")
@@ -854,14 +854,28 @@ def run_command(args: argparse.Namespace) -> int:
             row=ledger.reopen_terminal_ticket_after_paid_budget(args.ticket_id,operator_id=args.operator_id,reason=args.reason)
             print(json.dumps(row,sort_keys=True))
         elif args.command=="resolve-terminal":
-            if args.mode!="retry-local":
-                raise ValueError("unsupported terminal resolution mode")
-            row=ledger.resolve_terminal_with_additional_local_budget(
-                args.ticket_id,
-                additional_local_attempts=args.additional_local_attempts,
-                operator_id=args.operator_id,
-                reason=args.reason,
-            )
+            if args.mode=="retry-local":
+                if args.additional_local_attempts is None:
+                    raise ValueError("retry-local terminal resolution requires --additional-local-attempts")
+                row=ledger.resolve_terminal_with_additional_local_budget(
+                    args.ticket_id,
+                    additional_local_attempts=args.additional_local_attempts,
+                    operator_id=args.operator_id,
+                    reason=args.reason,
+                )
+            else:
+                if args.additional_local_attempts is not None:
+                    raise ValueError("adopt-existing terminal resolution does not accept --additional-local-attempts")
+                if args.ad_hoc_runtime:
+                    raise ValueError("terminal manual adoption requires registered operator runtime")
+                ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
+                row=ctl.adopt_existing_implementation(
+                    args.ticket_id,
+                    repository=registered.canonical_repository,
+                    operator_id=args.operator_id,
+                    reason=args.reason,
+                    resolve_terminal=True,
+                )
             print(json.dumps(row,sort_keys=True))
         elif args.command=="retire-historical-claims":
             if args.claim_id:
