@@ -14,7 +14,7 @@ from .gateway_notification import HermesGatewayNotificationWorker
 from .execution_handoff import HANDOFF_MARKER
 from .generated_projection import GeneratedProjectionWorker
 from .ledger import Ledger
-from .paid_model import PaidInvocationError
+from .paid_model import PaidInvocationError, PaidProviderRejectedError
 from .reconciliation import ReconciliationAction
 from .state_projection import StateProjectionWorker
 from .states import CanonicalState
@@ -903,7 +903,7 @@ def preview_ticket_database(database: Path, ticket_id: str, *, now: int | None =
                 and getattr(operator_config, "paid_escalation", None) is not None
                 and getattr(operator_config, "unresolvable_notification_target", None)
             )
-            if paid_ticket_escalation_enabled and ledger.ticket_paid_escalation_candidate(ticket_id=ticket_id) is not None:
+            if paid_ticket_escalation_enabled and ledger.ticket_paid_escalation_candidate(ticket_id=ticket_id, now=now) is not None:
                 return ProcessNextPreview(next_stage="ticket_paid_escalation", ticket_id=ticket_id, would_execute=True)
 
             for stage, claimer in (
@@ -911,7 +911,7 @@ def preview_ticket_database(database: Path, ticket_id: str, *, now: int | None =
                 ("validation", lambda: ledger.claim_next_scheduler_validation("preview", lease_seconds=60, now=now, ticket_id=ticket_id)),
                 ("review", lambda: ledger.claim_next_scheduler_review("preview", lease_seconds=60, review_execution_policy_hash=str(review_execution_policy_hash or ""), now=now, ticket_id=ticket_id)),
                 ("repair_routing", lambda: ledger.claim_next_scheduler_repair_routing("preview", lease_seconds=60, now=now, ticket_id=ticket_id)),
-                ("triage", lambda: ledger.claim_next_scheduler_triage("preview", lease_seconds=60, triage_execution_policy_hash=str(triage_execution_policy_hash or ""), now=now, ticket_id=ticket_id)),
+                ("triage", lambda: ledger.claim_next_scheduler_triage("preview", lease_seconds=60, triage_execution_policy_hash=str(triage_execution_policy_hash or ""), now=now, ticket_id=ticket_id, paid_ticket_escalation_enabled=paid_ticket_escalation_enabled)),
                 ("acceptance", lambda: ledger.claim_next_scheduler_acceptance("preview", lease_seconds=60, now=now, ticket_id=ticket_id)),
                 ("git_integration", lambda: ledger.claim_next_scheduler_git_integration("preview", lease_seconds=60, now=now, ticket_id=ticket_id)),
                 ("completion", lambda: ledger.claim_next_scheduler_completion("preview", lease_seconds=60, now=now, ticket_id=ticket_id)),
@@ -1377,7 +1377,7 @@ class ProcessNextScheduler:
             return ProcessNextResult("completed", "repair_routing", ticket_id, claim_id)
 
         if stage_allowed("ticket_paid_escalation") and self.ticket_escalation_runner is not None:
-            paid_ticket = self.ledger.ticket_paid_escalation_candidate(ticket_id=self.target_ticket_id)
+            paid_ticket = self.ledger.ticket_paid_escalation_candidate(ticket_id=self.target_ticket_id, now=now)
             if paid_ticket is not None:
                 ticket_id = str(paid_ticket["ticket_id"])
                 result = self.ticket_escalation_runner(ticket_id)
@@ -1390,6 +1390,7 @@ class ProcessNextScheduler:
                 triage_execution_policy_hash=str(self.triage_execution_policy_hash),
                 now=now,
                 ticket_id=self.target_ticket_id,
+                paid_ticket_escalation_enabled=self.ticket_escalation_runner is not None,
             )
             if triage_claim is not None:
                 claim_id = str(triage_claim["claim_id"])
@@ -1685,7 +1686,21 @@ class ProcessNextScheduler:
                 if current.get("side_effect_started_at") is None:
                     self.ledger.begin_scheduler_claim_effect(claim_id, execution_owner, now=now)
                 identity = json.loads(str(current["candidate_identity_json"]))
-                paid_result = runner(str(identity["tranche_id"]))
+                try:
+                    paid_result = runner(str(identity["tranche_id"]))
+                except PaidProviderRejectedError as exc:
+                    if not exc.retryable:
+                        raise
+                    retry_after_at = exc.retry_after_at if exc.retry_after_at is not None else now + 900
+                    self.ledger.defer_scheduler_paid_claim_after_provider_rejection(
+                        claim_id,
+                        execution_owner,
+                        retry_after_at=retry_after_at,
+                        error_kind=exc.kind,
+                        error_detail=exc.detail,
+                        now=now,
+                    )
+                    return ProcessNextResult("retryable", stage, ticket_id, claim_id)
                 current = self.ledger.apply_scheduler_paid_stage_effect(claim_id, execution_owner, paid_result, now=now)
                 paid_result = json.loads(str(current["result_json"]))
             self.ledger.complete_scheduler_claim(claim_id, execution_owner, paid_result, now=now)

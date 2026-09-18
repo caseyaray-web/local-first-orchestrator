@@ -293,7 +293,16 @@ CREATE TABLE IF NOT EXISTS paid_budgets (
 );
 CREATE TABLE IF NOT EXISTS paid_reservations (
     id TEXT PRIMARY KEY, feature_id TEXT NOT NULL, purpose TEXT NOT NULL, request_key TEXT NOT NULL,
-    status TEXT NOT NULL, reason TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+    status TEXT NOT NULL, reason TEXT,
+    provider_failure_count INTEGER NOT NULL DEFAULT 0,
+    provider_first_failure_at INTEGER,
+    provider_last_failure_at INTEGER,
+    provider_retry_after_at INTEGER,
+    provider_error_kind TEXT,
+    provider_error_detail TEXT,
+    provider_retryable INTEGER,
+    provider_alerted_at INTEGER,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
     UNIQUE(feature_id, purpose, request_key)
 );
 CREATE TABLE IF NOT EXISTS paid_approvals (
@@ -304,6 +313,10 @@ CREATE TABLE IF NOT EXISTS model_calls (
     id TEXT PRIMARY KEY, feature_id TEXT NOT NULL, purpose TEXT NOT NULL,
     reservation_id TEXT NOT NULL REFERENCES paid_reservations(id), status TEXT NOT NULL,
     request_artifact_json TEXT NOT NULL, response_artifact_json TEXT, input_tokens INTEGER, output_tokens INTEGER,
+    provider_attempt_count INTEGER NOT NULL DEFAULT 1,
+    last_provider_error_kind TEXT,
+    last_provider_error_detail TEXT,
+    last_provider_rejected_at INTEGER,
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
     UNIQUE(reservation_id)
 );
@@ -1263,6 +1276,26 @@ class Ledger:
         terminal_columns={row["name"] for row in self.connection.execute("PRAGMA table_info(terminal_ticket_failures)")}
         for name,definition in {"generation":"INTEGER NOT NULL DEFAULT 1","resolved_at":"INTEGER","resolved_by":"TEXT","resolution_reason":"TEXT"}.items():
             if name not in terminal_columns: self.connection.execute(f"ALTER TABLE terminal_ticket_failures ADD COLUMN {name} {definition}")
+        reservation_columns={row["name"] for row in self.connection.execute("PRAGMA table_info(paid_reservations)")}
+        for name,definition in {
+            "provider_failure_count":"INTEGER NOT NULL DEFAULT 0",
+            "provider_first_failure_at":"INTEGER",
+            "provider_last_failure_at":"INTEGER",
+            "provider_retry_after_at":"INTEGER",
+            "provider_error_kind":"TEXT",
+            "provider_error_detail":"TEXT",
+            "provider_retryable":"INTEGER",
+            "provider_alerted_at":"INTEGER",
+        }.items():
+            if name not in reservation_columns: self.connection.execute(f"ALTER TABLE paid_reservations ADD COLUMN {name} {definition}")
+        model_call_columns={row["name"] for row in self.connection.execute("PRAGMA table_info(model_calls)")}
+        for name,definition in {
+            "provider_attempt_count":"INTEGER NOT NULL DEFAULT 1",
+            "last_provider_error_kind":"TEXT",
+            "last_provider_error_detail":"TEXT",
+            "last_provider_rejected_at":"INTEGER",
+        }.items():
+            if name not in model_call_columns: self.connection.execute(f"ALTER TABLE model_calls ADD COLUMN {name} {definition}")
         gateway_sql_row = self.connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='gateway_notification_outbox'").fetchone()
         gateway_sql = str(gateway_sql_row["sql"] or "") if gateway_sql_row is not None else ""
         gateway_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(gateway_notification_outbox)")}
@@ -1618,9 +1651,26 @@ class Ledger:
         return (f"Local-first ticket {ticket_id} | state={state} | {safe}\n<!-- local-first-comment:{operation_id} -->")[:1000]
 
     @classmethod
+    def _is_terminal_retry_projection_event(cls, event: sqlite3.Row) -> bool:
+        if event["entity_type"] != "ticket" or event["event_type"] != "state_transition":
+            return False
+        if str(event["from_state"] or "") != CanonicalState.BLOCKED.value or str(event["to_state"] or "") != CanonicalState.REPAIRING.value:
+            return False
+        try:
+            payload = json.loads(str(event["payload_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return payload.get("mode") == "retry_local" and isinstance(payload.get("additional_local_attempts"), int) and payload["additional_local_attempts"] > 0
+
+    @classmethod
     def _is_projectable_state_event(cls, event: sqlite3.Row) -> bool:
-        return (event["entity_type"] == "ticket" and event["event_type"] in {"state_transition", "review_reconciliation_authorized"}
-                and event["to_state"] is not None and str(event["to_state"]) in cls._PROJECTABLE_STATES)
+        standard = (
+            event["entity_type"] == "ticket"
+            and event["event_type"] in {"state_transition", "review_reconciliation_authorized"}
+            and event["to_state"] is not None
+            and str(event["to_state"]) in cls._PROJECTABLE_STATES
+        )
+        return standard or cls._is_terminal_retry_projection_event(event)
 
     def _supersede_older_state_projections_in_transaction(self, conn: sqlite3.Connection, ticket_id: str, current_event_id: int) -> int:
         """Retain obsolete state intents as audit history, but make them ineligible."""
@@ -1727,7 +1777,21 @@ class Ledger:
             SELECT 'projectable_event_without_bundle', e.entity_id, e.id
             FROM events e LEFT JOIN board_projection_outbox b ON b.ticket_id=e.entity_id AND b.event_id=e.id
             LEFT JOIN evidence_comment_outbox c ON c.ticket_id=e.entity_id AND c.event_id=e.id
-            WHERE e.entity_type='ticket' AND e.event_type IN ('state_transition','review_reconciliation_authorized') AND e.to_state IS NOT NULL AND e.to_state IN ('needs_architecture','ready_local','accepted','needs_human_test','needs_checkpoint','needs_triage','blocked','done','rejected','reverted','local_review') AND (b.ticket_id IS NULL OR c.operation_id IS NULL)
+            WHERE e.entity_type='ticket'
+              AND e.event_type IN ('state_transition','review_reconciliation_authorized')
+              AND e.to_state IS NOT NULL
+              AND (
+                    e.to_state IN ('needs_architecture','ready_local','accepted','needs_human_test','needs_checkpoint','needs_triage','blocked','done','rejected','reverted','local_review')
+                    OR (
+                        e.event_type='state_transition'
+                        AND e.from_state='blocked'
+                        AND e.to_state='repairing'
+                        AND json_valid(e.payload_json)=1
+                        AND json_extract(e.payload_json,'$.mode')='retry_local'
+                        AND json_extract(e.payload_json,'$.additional_local_attempts')>0
+                    )
+                  )
+              AND (b.ticket_id IS NULL OR c.operation_id IS NULL)
         """).fetchall()
         return [dict(row) for row in rows]
 
@@ -2838,6 +2902,9 @@ class Ledger:
                     return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.EXTERNAL_EFFECT_COMPLETED_LOCAL_INCOMPLETE, ReconciliationAction.RECONCILE, "paid_reservations", "paid reservation completed; reconcile the durable model-call response without provider reinvocation", evidence)
                 if reservation["status"] in {"unknown_outcome", "in_flight"}:
                     return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN, ReconciliationAction.STOP, "paid_reservations", "paid provider outcome is ambiguous; automatic retry is forbidden", evidence)
+                if reservation["status"] == "provider_rejected" and bool(reservation["provider_retryable"]):
+                    evidence.update({"provider_error_kind": reservation["provider_error_kind"], "provider_retry_after_at": reservation["provider_retry_after_at"], "provider_failure_count": int(reservation["provider_failure_count"] or 0)})
+                    return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN, ReconciliationAction.REPLAY, "paid_reservations", "provider explicitly rejected the paid call before execution; retry the same logical reservation after backoff", evidence)
                 return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.STARTED_EXTERNAL_OUTCOME_UNKNOWN, ReconciliationAction.STOP, "paid_reservations", "paid reservation is terminal and requires a new explicitly authorized request", evidence)
             return SchedulerReconciliationDecision(claim_id, ticket_id, stage, ReconciliationState.NOT_STARTED, ReconciliationAction.RETRY, "paid_reservations", "no paid reservation exists, so no provider side effect was authorized", {})
 
@@ -2931,7 +2998,7 @@ class Ledger:
             "triage_execution_policy_hash": triage_execution_policy_hash,
         }
 
-    def claim_next_scheduler_triage(self, owner: str, *, lease_seconds: int, triage_execution_policy_hash: str, now: int | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
+    def claim_next_scheduler_triage(self, owner: str, *, lease_seconds: int, triage_execution_policy_hash: str, now: int | None = None, ticket_id: str | None = None, paid_ticket_escalation_enabled: bool = True) -> dict[str, Any] | None:
         """Claim one policy-routed needs-triage ticket for planning-only triage."""
         if not owner or lease_seconds < 1 or not triage_execution_policy_hash:
             raise ValueError("triage scheduler claim requires owner, lease, and execution policy")
@@ -2989,9 +3056,18 @@ class Ledger:
                   AND json_valid(r.detail)=1
                   AND json_extract(r.detail,'$.action')='triage'
                   AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('triage:' || r.attempt_number))
+                  AND (
+                      ?=0 OR NOT EXISTS (
+                          SELECT 1 FROM paid_reservations p
+                          WHERE p.feature_id=t.feature_id
+                            AND p.purpose='escalation'
+                            AND p.request_key=('ticket-escalation:' || t.id || ':' || r.attempt_number || ':' || json_extract(r.detail,'$.failure_fingerprint'))
+                            AND p.status='provider_rejected'
+                      )
+                  )
                   AND (? IS NULL OR t.id=?)
                 ORDER BY t.created_at,t.id,r.attempt_number DESC LIMIT 1
-            """, (CanonicalState.NEEDS_TRIAGE.value, ticket_id, ticket_id)).fetchone()
+            """, (CanonicalState.NEEDS_TRIAGE.value, int(paid_ticket_escalation_enabled), ticket_id, ticket_id)).fetchone()
             if row is None:
                 return None
             attempt_number = int(row["routing_attempt"])
@@ -5511,7 +5587,7 @@ class Ledger:
                FROM tickets t
                JOIN board_projection_outbox b ON b.ticket_id=t.id AND b.operation='create_microticket'
                JOIN runtime_stages r ON r.ticket_id=t.id
-                 AND (r.stage=('repair-routing-' || r.attempt_number) OR r.stage=('paid-repair-routing-' || r.attempt_number))
+                 AND (r.stage=('repair-routing-' || r.attempt_number) OR r.stage=('paid-repair-routing-' || r.attempt_number) OR r.stage=('operator-repair-routing-' || r.attempt_number))
                WHERE t.state='repairing'
                  AND b.acknowledged_at IS NOT NULL AND b.external_task_id IS NOT NULL AND b.superseded_at IS NULL
                  AND json_valid(r.detail)=1 AND json_extract(r.detail,'$.action')='repair'
@@ -6120,6 +6196,44 @@ class Ledger:
                 )
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
+    def defer_scheduler_paid_claim_after_provider_rejection(
+        self,
+        claim_id: str,
+        owner: str,
+        *,
+        retry_after_at: int,
+        error_kind: str,
+        error_detail: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        now = self._now() if now is None else now
+        if retry_after_at <= now:
+            retry_after_at = now + 1
+        safe_error_detail = self._safe_comment_error(error_detail, limit=1000)
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if row is None or row["stage"] not in {"paid_checkpoint", "paid_escalation"}:
+                raise ValueError("provider rejection defer requires a paid scheduler claim")
+            if row["status"] != "claimed" or row["side_effect_started_at"] is None or row["side_effect_completed_at"] is not None:
+                raise ValueError("paid scheduler claim is not safely deferrable")
+            if row["lease_owner"] != owner or int(row["lease_expires_at"] or 0) <= now:
+                raise PermissionError("scheduler claim lease is not owned")
+            changed = conn.execute(
+                "UPDATE scheduler_stage_claims SET lease_owner=NULL,lease_expires_at=?,last_error=?,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_owner=? AND side_effect_completed_at IS NULL",
+                (retry_after_at, self._safe_comment_error(f"provider_rejected:{error_kind}:{safe_error_detail}"), now, claim_id, owner),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("paid scheduler claim changed during provider defer")
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=str(row["ticket_id"]),
+                event_type="scheduler_paid_provider_rejected_deferred",
+                actor_id=owner,
+                payload={"claim_id": claim_id, "stage": str(row["stage"]), "retry_after_at": retry_after_at, "error_kind": error_kind, "error_detail": safe_error_detail},
+            )
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
     def record_runtime_stage(self, ticket_id: str, stage: str, detail: str, *, attempt_number: int | None = None, artifact_path: str | None = None, artifact_sha256: str | None = None, base_sha: str | None = None) -> bool:
         with self._transaction() as conn:
             try:
@@ -6479,10 +6593,15 @@ class Ledger:
     @staticmethod
     def _safe_comment_error(error: str, *, limit: int = 500) -> str:
         import re
+        error_text = re.sub(
+            r"(?i)(authorization)\s*[:=]\s*bearer\s+[^\s,;]+",
+            r"\1=Bearer [REDACTED]",
+            str(error),
+        )
         safe = re.sub(
             r"(?i)(password|token|secret|api[_-]?key|authorization|cookie)\s*[:=]\s*[^\s,;]+",
             r"\1=[REDACTED]",
-            str(error),
+            error_text,
         )
         safe = re.sub(r"(?i)bearer\s+[^\s,;]+", "Bearer [REDACTED]", safe)
         return safe[:limit]
@@ -6566,7 +6685,8 @@ class Ledger:
         detail = json.loads(str(row["detail"]))
         return {"attempt_number": int(row["attempt_number"]), **detail}
 
-    def ticket_paid_escalation_candidate(self, *, ticket_id: str | None = None) -> dict[str, Any] | None:
+    def ticket_paid_escalation_candidate(self, *, ticket_id: str | None = None, now: int | None = None) -> dict[str, Any] | None:
+        now = self._now() if now is None else now
         row = self.connection.execute(
             """SELECT t.id AS ticket_id,t.feature_id,t.max_attempts,r.attempt_number,r.detail,t.created_at
                FROM tickets t
@@ -6577,9 +6697,21 @@ class Ledger:
                  AND json_valid(r.detail)=1 AND json_extract(r.detail,'$.action')='triage'
                  AND r.attempt_number=(SELECT MAX(rr.attempt_number) FROM runtime_stages rr WHERE rr.ticket_id=t.id AND rr.stage LIKE 'repair-routing-%' AND json_valid(rr.detail)=1 AND json_extract(rr.detail,'$.action')='triage')
                  AND NOT EXISTS (SELECT 1 FROM terminal_ticket_failures f WHERE f.ticket_id=t.id AND f.resolved_at IS NULL)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM paid_reservations p
+                     WHERE p.feature_id=t.feature_id
+                       AND p.purpose='escalation'
+                       AND p.request_key=('ticket-escalation:' || t.id || ':' || r.attempt_number || ':' || json_extract(r.detail,'$.failure_fingerprint'))
+                       AND p.status='provider_rejected'
+                       AND (
+                           COALESCE(p.provider_retryable,0)=0
+                           OR p.provider_retry_after_at IS NULL
+                           OR p.provider_retry_after_at>?
+                       )
+                 )
                  AND (? IS NULL OR t.id=?)
                ORDER BY t.created_at,t.id LIMIT 1""",
-            (ticket_id, ticket_id),
+            (now, ticket_id, ticket_id),
         ).fetchone()
         if row is None:
             return None
@@ -6677,6 +6809,142 @@ class Ledger:
                 payload={"reason": "paid_repair_authorized", **detail},
             )
             return detail
+
+    def resolve_terminal_with_additional_local_budget(
+        self,
+        ticket_id: str,
+        *,
+        additional_local_attempts: int,
+        operator_id: str,
+        reason: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        if type(additional_local_attempts) is not int or additional_local_attempts < 1:
+            raise ValueError("additional local attempts must be a positive integer")
+        if not operator_id.strip() or not reason.strip():
+            raise ValueError("terminal local-budget resolution requires operator and reason")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            controller = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if controller is None or not bool(controller["paused"]):
+                raise PermissionError("terminal local-budget resolution requires paused controller")
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None:
+                raise KeyError(ticket_id)
+            terminal = conn.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if terminal is None or terminal["resolved_at"] is not None:
+                raise ValueError("ticket has no unresolved terminal failure")
+            if str(ticket["state"]) != CanonicalState.BLOCKED.value:
+                raise ValueError("terminal ticket must be blocked before resolution")
+
+            terminal_generation = int(terminal["generation"] or 1)
+            terminal_fingerprint = str(terminal["failure_fingerprint"])
+            notices = conn.execute(
+                "SELECT operation_id,status FROM gateway_notification_outbox WHERE ticket_id=? AND failure_fingerprint=? AND terminal_generation=?",
+                (ticket_id, terminal_fingerprint, terminal_generation),
+            ).fetchall()
+            unsafe_notice = next((row for row in notices if str(row["status"]) in {"delivering", "delivery_unknown"}), None)
+            if unsafe_notice is not None:
+                raise ValueError("terminal notification delivery is in-flight or ambiguous; reconcile it before resolving ticket")
+            superseded_operation_ids = [str(row["operation_id"]) for row in notices if str(row["status"]) in {"pending", "retryable"}]
+            if superseded_operation_ids:
+                placeholders = ",".join("?" for _ in superseded_operation_ids)
+                conn.execute(
+                    f"UPDATE gateway_notification_outbox SET status='superseded',superseded_at=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,updated_at=? WHERE operation_id IN ({placeholders}) AND status IN ('pending','retryable')",
+                    (now, now, *superseded_operation_ids),
+                )
+
+            highest_attempt = int(conn.execute("SELECT COALESCE(MAX(attempt_number),0) FROM attempts WHERE ticket_id=?", (ticket_id,)).fetchone()[0])
+            latest_attempt = conn.execute(
+                "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?",
+                (ticket_id, highest_attempt),
+            ).fetchone() if highest_attempt > 0 else None
+            if latest_attempt is None or not latest_attempt["worktree_path"] or not latest_attempt["post_diff_hash"]:
+                raise RuntimeError("terminal local retry requires complete latest attempt provenance")
+            prior_max_attempts = int(ticket["max_attempts"])
+            new_max_attempts = max(prior_max_attempts, highest_attempt) + additional_local_attempts
+            next_attempt_number = highest_attempt + 1
+            conn.execute(
+                "INSERT INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,created_at) VALUES (?,?,?,?,?,?,?)",
+                (ticket_id, next_attempt_number, latest_attempt["base_sha"], latest_attempt["branch"], latest_attempt["worktree_path"], latest_attempt["post_diff_hash"], now),
+            )
+            conn.execute(
+                "UPDATE attempts SET outcome='repair_requested',failure_fingerprint=? WHERE ticket_id=? AND attempt_number=?",
+                (terminal_fingerprint, ticket_id, highest_attempt),
+            )
+            operator_routing_detail = {
+                "action": "repair",
+                "source": "operator_terminal_budget",
+                "ticket_id": ticket_id,
+                "attempt_number": highest_attempt,
+                "next_attempt_number": next_attempt_number,
+                "failure_fingerprint": terminal_fingerprint,
+                "failure_evidence": str(terminal["reason"]),
+                "feedback": reason,
+                "operator_id": operator_id,
+                "additional_local_attempts": additional_local_attempts,
+            }
+            conn.execute(
+                "INSERT INTO runtime_stages(ticket_id,stage,attempt_number,detail,base_sha,created_at) VALUES (?,?,?,?,?,?)",
+                (ticket_id, f"operator-repair-routing-{highest_attempt}", highest_attempt, json.dumps(operator_routing_detail, sort_keys=True, separators=(",", ":")), latest_attempt["base_sha"], now),
+            )
+
+            validate_transition(CanonicalState.BLOCKED, CanonicalState.REPAIRING)
+            changed = conn.execute(
+                "UPDATE tickets SET state=?,max_attempts=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND state=?",
+                (CanonicalState.REPAIRING.value, new_max_attempts, now, ticket_id, CanonicalState.BLOCKED.value),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("ticket changed while resolving terminal failure")
+            conn.execute(
+                "UPDATE terminal_ticket_failures SET resolved_at=?,resolved_by=?,resolution_reason=? WHERE ticket_id=? AND resolved_at IS NULL",
+                (now, operator_id, reason[:2000], ticket_id),
+            )
+            resolution_payload = {
+                "mode": "retry_local",
+                "reason": reason,
+                "additional_local_attempts": additional_local_attempts,
+                "prior_max_attempts": prior_max_attempts,
+                "highest_existing_attempt": highest_attempt,
+                "new_max_attempts": new_max_attempts,
+                "next_attempt_number": next_attempt_number,
+                "terminal_generation": terminal_generation,
+                "superseded_notification_operation_ids": superseded_operation_ids,
+            }
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=ticket_id,
+                event_type="terminal_unresolvable_resolved",
+                actor_id=operator_id,
+                payload=resolution_payload,
+            )
+            self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=ticket_id,
+                event_type="local_attempt_budget_extended",
+                actor_id=operator_id,
+                payload=resolution_payload,
+            )
+            transition_event = self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=ticket_id,
+                event_type="state_transition",
+                actor_id=operator_id,
+                from_state=CanonicalState.BLOCKED.value,
+                to_state=CanonicalState.REPAIRING.value,
+                payload={"reason": "terminal_resolved_with_additional_local_budget", **resolution_payload},
+            )
+            self._enqueue_projection_bundle_in_transaction(
+                conn,
+                ticket_id=ticket_id,
+                event_id=transition_event,
+                evidence=f"terminal resolved into repair; additional local attempts={additional_local_attempts}; next attempt={next_attempt_number}",
+                state_payload={"terminal_resolution_mode": "retry_local", **resolution_payload},
+            )
+            return {"ticket_id": ticket_id, "state": CanonicalState.REPAIRING.value, **resolution_payload}
 
     def reopen_terminal_ticket_after_paid_budget(
         self,
@@ -6855,6 +7123,98 @@ class Ledger:
             elif (str(existing_notice["target"]), str(existing_notice["payload"]), str(existing_notice["failure_fingerprint"]), int(existing_notice["terminal_generation"])) != (notification_target, payload, failure_fingerprint, generation):
                 raise ValueError("terminal notification intent conflicts with durable record")
             return {"ticket_id": ticket_id, "operation_id": operation_id, "status": "unresolvable", "failure_fingerprint": failure_fingerprint}
+
+    def _enqueue_paid_provider_incident_alert_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        reservation_id: str,
+        ticket_id: str,
+        target: str,
+        provider: str,
+        model: str,
+        purpose: str,
+        error_kind: str,
+        error_detail: str,
+        failure_count: int,
+        retry_after_at: int | None,
+        now: int,
+    ) -> dict[str, Any]:
+        if not all(isinstance(value, str) and value.strip() for value in (reservation_id, ticket_id, target, provider, model, purpose, error_kind)):
+            raise ValueError("provider incident alert requires reservation, ticket, target, route, purpose, and error kind")
+        operation_key = f"paid-provider-incident:{reservation_id}"
+        operation_id = hashlib.sha256(operation_key.encode()).hexdigest()[:32]
+        incident_fingerprint = hashlib.sha256(operation_key.encode()).hexdigest()
+        safe_error_detail = self._safe_comment_error(error_detail, limit=2000)
+        payload = (
+            "Local First paid provider unavailable\n"
+            f"Ticket: {ticket_id}\n"
+            f"Provider/model: {provider}/{model}\n"
+            f"Purpose: {purpose}\n"
+            f"Failure kind: {error_kind}\n"
+            f"Confirmed rejections: {failure_count}\n"
+            f"Retry after: {retry_after_at if retry_after_at is not None else 'manual recovery required'}\n"
+            f"Detail: {safe_error_detail}"
+        )[:12000]
+        ticket = conn.execute("SELECT 1 FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+        reservation = conn.execute("SELECT * FROM paid_reservations WHERE id=?", (reservation_id,)).fetchone()
+        if ticket is None or reservation is None:
+            raise ValueError("provider incident alert authority is missing")
+        existing = conn.execute("SELECT * FROM gateway_notification_outbox WHERE operation_id=?", (operation_id,)).fetchone()
+        if existing is None:
+            conn.execute(
+                "INSERT INTO gateway_notification_outbox(operation_id,ticket_id,failure_fingerprint,terminal_generation,target,idempotency_key,payload,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,'pending',?,?)",
+                (operation_id, ticket_id, incident_fingerprint, 0, target, operation_key, payload, now, now),
+            )
+        elif (str(existing["ticket_id"]), str(existing["target"]), str(existing["payload"]), int(existing["terminal_generation"])) != (ticket_id, target, payload, 0):
+            raise ValueError("provider incident alert conflicts with durable notification")
+        conn.execute(
+            "UPDATE paid_reservations SET provider_alerted_at=COALESCE(provider_alerted_at,?),updated_at=? WHERE id=?",
+            (now, now, reservation_id),
+        )
+        self._append_event(
+            conn,
+            entity_type="ticket",
+            entity_id=ticket_id,
+            event_type="paid_provider_incident_alert_queued",
+            actor_id="paid-model-adapter",
+            payload={"reservation_id": reservation_id, "operation_id": operation_id, "provider": provider, "model": model, "purpose": purpose, "error_kind": error_kind, "failure_count": failure_count, "retry_after_at": retry_after_at},
+        )
+        return dict(conn.execute("SELECT * FROM gateway_notification_outbox WHERE operation_id=?", (operation_id,)).fetchone())
+
+    def enqueue_paid_provider_incident_alert(
+        self,
+        *,
+        reservation_id: str,
+        ticket_id: str,
+        target: str,
+        provider: str,
+        model: str,
+        purpose: str,
+        error_kind: str,
+        error_detail: str,
+        failure_count: int,
+        retry_after_at: int | None,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        if not all(isinstance(value, str) and value.strip() for value in (reservation_id, ticket_id, target, provider, model, purpose, error_kind)):
+            raise ValueError("provider incident alert requires reservation, ticket, target, route, purpose, and error kind")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            return self._enqueue_paid_provider_incident_alert_in_transaction(
+                conn,
+                reservation_id=reservation_id,
+                ticket_id=ticket_id,
+                target=target,
+                provider=provider,
+                model=model,
+                purpose=purpose,
+                error_kind=error_kind,
+                error_detail=error_detail,
+                failure_count=failure_count,
+                retry_after_at=retry_after_at,
+                now=now,
+            )
 
     def claim_next_gateway_notification(self, owner: str, *, lease_seconds: int = 60, now: int | None = None) -> dict[str, Any] | None:
         if not owner or lease_seconds < 1:
@@ -7593,8 +7953,8 @@ class Ledger:
         """Plan a projection without adapters or external commands."""
         row = self.connection.execute("SELECT id, state FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
         if row is None: raise KeyError(ticket_id)
-        event = self.connection.execute("SELECT id FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='state_transition' AND to_state=? ORDER BY id DESC LIMIT 1", (ticket_id, row["state"])).fetchone()
-        if event is None or str(row["state"]) not in self._PROJECTABLE_STATES: return None
+        event = self.connection.execute("SELECT * FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='state_transition' AND to_state=? ORDER BY id DESC LIMIT 1", (ticket_id, row["state"])).fetchone()
+        if event is None or not self._is_projectable_state_event(event): return None
         event_id = int(event["id"])
         state_row = self.connection.execute("SELECT * FROM board_projection_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()
         comment_row = self.connection.execute("SELECT * FROM evidence_comment_outbox WHERE ticket_id=? AND event_id=?", (ticket_id, event_id)).fetchone()

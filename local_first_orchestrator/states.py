@@ -37,7 +37,7 @@ _ALLOWED: dict[CanonicalState, frozenset[CanonicalState]] = {
     CanonicalState.NEEDS_HUMAN_TEST: frozenset({CanonicalState.DONE, CanonicalState.REPAIRING, CanonicalState.NEEDS_CHECKPOINT, CanonicalState.BLOCKED}),
     CanonicalState.NEEDS_CHECKPOINT: frozenset({CanonicalState.DONE, CanonicalState.REPAIRING, CanonicalState.NEEDS_TRIAGE, CanonicalState.BLOCKED, CanonicalState.REJECTED}),
     CanonicalState.NEEDS_TRIAGE: frozenset({CanonicalState.READY_LOCAL, CanonicalState.LOCAL_REVIEW, CanonicalState.REPAIRING, CanonicalState.NEEDS_CHECKPOINT, CanonicalState.BLOCKED, CanonicalState.REJECTED}),
-    CanonicalState.BLOCKED: frozenset({CanonicalState.DRAFT, CanonicalState.READY_LOCAL, CanonicalState.NEEDS_TRIAGE, CanonicalState.REJECTED}),
+    CanonicalState.BLOCKED: frozenset({CanonicalState.DRAFT, CanonicalState.READY_LOCAL, CanonicalState.NEEDS_TRIAGE, CanonicalState.REPAIRING, CanonicalState.REJECTED}),
     CanonicalState.DONE: frozenset(),
     CanonicalState.REJECTED: frozenset(),
     CanonicalState.REVERTED: frozenset(),

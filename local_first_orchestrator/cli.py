@@ -251,6 +251,7 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         model=registered.paid_checkpoint.model,
         profile=registered.paid_checkpoint.profile,
         timeout_seconds=ctl.config.review_timeout_seconds,
+        provider_alert_target=registered.unresolvable_notification_target,
     )
     paid_escalation = None if registered.paid_escalation is None else HermesPaidModelAdapter(
         ledger,
@@ -260,6 +261,7 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         model=registered.paid_escalation.model,
         profile=registered.paid_escalation.profile,
         timeout_seconds=ctl.config.review_timeout_seconds,
+        provider_alert_target=registered.unresolvable_notification_target,
     )
     successor_route = dict(registered.decomposition).get("standard")
     target_ticket_id = getattr(args, "ticket_id", None)
@@ -640,6 +642,12 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     reopen_terminal.add_argument("--ticket-id", required=True)
     reopen_terminal.add_argument("--reason", required=True)
     reopen_terminal.add_argument("--operator-id", default="local-first-cli")
+    resolve_terminal=commands.add_parser("resolve-terminal", help="paused operator-only: resolve one active terminal episode and choose a recovery mode")
+    resolve_terminal.add_argument("--ticket-id", required=True)
+    resolve_terminal.add_argument("--mode", required=True, choices=("retry-local",))
+    resolve_terminal.add_argument("--additional-local-attempts", type=int, required=True)
+    resolve_terminal.add_argument("--reason", required=True)
+    resolve_terminal.add_argument("--operator-id", default="local-first-cli")
     status=commands.add_parser("status"); status.add_argument("--active",action="store_true"); status.add_argument("--scheduler-detail",action="store_true",help="include one read-only scheduler lifecycle boundary snapshot")
     imported=commands.add_parser("import"); imported.add_argument("--task-id",required=True)
     run=commands.add_parser("run-once"); run.add_argument("--task-id",required=True); run.add_argument("--dry-run",action="store_true",default=True); run.add_argument("--execute",action="store_true"); run.add_argument("--allow-board-writes",action="store_true")
@@ -844,6 +852,16 @@ def run_command(args: argparse.Namespace) -> int:
             print(json.dumps({"operation_id":row["operation_id"],"ticket_id":row["ticket_id"],"status":row["status"],"action":args.action},sort_keys=True))
         elif args.command=="reopen-terminal":
             row=ledger.reopen_terminal_ticket_after_paid_budget(args.ticket_id,operator_id=args.operator_id,reason=args.reason)
+            print(json.dumps(row,sort_keys=True))
+        elif args.command=="resolve-terminal":
+            if args.mode!="retry-local":
+                raise ValueError("unsupported terminal resolution mode")
+            row=ledger.resolve_terminal_with_additional_local_budget(
+                args.ticket_id,
+                additional_local_attempts=args.additional_local_attempts,
+                operator_id=args.operator_id,
+                reason=args.reason,
+            )
             print(json.dumps(row,sort_keys=True))
         elif args.command=="retire-historical-claims":
             if args.claim_id:

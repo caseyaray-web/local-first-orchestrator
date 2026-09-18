@@ -113,6 +113,27 @@ class SchedulerReconciliationTests(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "not replay-safe"):
             self.ledger.release_abandoned_scheduler_claim(ambiguous, operator_id="operator", reason="must remain protected", now=100)
 
+    def test_provider_rejection_defer_redacts_error_detail_in_audit_event(self) -> None:
+        claim_id = self.claim("paid_checkpoint", started=2, expires=500)
+        row = self.ledger.defer_scheduler_paid_claim_after_provider_rejection(
+            claim_id,
+            "dead",
+            retry_after_at=200,
+            error_kind="rate_limited",
+            error_detail="429 api_key=super-secret Authorization: Bearer bearer-secret",
+            now=100,
+        )
+        self.assertIn("[REDACTED]", str(row["last_error"]))
+        self.assertNotIn("super-secret", str(row["last_error"]))
+        event = self.ledger.connection.execute(
+            "SELECT payload_json FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='scheduler_paid_provider_rejected_deferred' ORDER BY id DESC LIMIT 1",
+            (self.ticket,),
+        ).fetchone()
+        payload = json.loads(event["payload_json"])
+        self.assertIn("[REDACTED]", payload["error_detail"])
+        self.assertNotIn("super-secret", payload["error_detail"])
+        self.assertNotIn("bearer-secret", payload["error_detail"])
+
     def test_review_claim_release_requires_exact_unconsumed_retry_authorization(self) -> None:
         self.ledger.connection.execute("UPDATE tickets SET state='local_review' WHERE id=?", (self.ticket,))
         identity = {"attempt_number": 1, "implementation_diff_hash": "fp"}
@@ -207,6 +228,30 @@ class SchedulerReconciliationTests(unittest.TestCase):
         self.ledger.connection.execute("UPDATE paid_reservations SET status='completed' WHERE id='r1'")
         decision = self.ledger.scheduler_reconciliation(claim_id)
         self.assertEqual((decision.state, decision.action), (ReconciliationState.EXTERNAL_EFFECT_COMPLETED_LOCAL_INCOMPLETE, ReconciliationAction.RECONCILE))
+
+    def test_confirmed_paid_provider_rejection_defers_claim_until_retry_deadline_and_replays(self) -> None:
+        self.ledger.connection.execute("INSERT INTO features(id,title,status,created_at,updated_at) VALUES ('F','F','active',1,1)")
+        claim_id = self.claim("paid_checkpoint", started=2, expires=150)
+        self.ledger.connection.execute(
+            "INSERT INTO paid_reservations(id,feature_id,purpose,request_key,status,provider_failure_count,provider_retry_after_at,provider_error_kind,provider_error_detail,provider_retryable,created_at,updated_at) VALUES ('r-retry','F','integration_checkpoint',?,'provider_rejected',1,200,'rate_limited','429',1,1,1)",
+            (claim_id,),
+        )
+        deferred = self.ledger.defer_scheduler_paid_claim_after_provider_rejection(
+            claim_id,
+            "dead",
+            retry_after_at=200,
+            error_kind="rate_limited",
+            error_detail="429",
+            now=100,
+        )
+        self.assertIsNone(deferred["lease_owner"])
+        self.assertEqual(int(deferred["lease_expires_at"]), 200)
+        decision = self.ledger.scheduler_reconciliation(claim_id)
+        self.assertEqual((decision.action, decision.evidence["status"], decision.evidence["provider_error_kind"]), (ReconciliationAction.REPLAY, "provider_rejected", "rate_limited"))
+        self.assertIsNone(self.ledger.next_scheduler_reconciliation(now=199, ticket_id=self.ticket))
+        due = self.ledger.next_scheduler_reconciliation(now=200, ticket_id=self.ticket)
+        self.assertIsNotNone(due)
+        self.assertEqual((due.claim_id, due.action), (claim_id, ReconciliationAction.REPLAY))
 
     def test_git_intent_without_commit_evidence_is_exact_replay(self) -> None:
         claim_id = self.claim("git_integration:1", started=2)

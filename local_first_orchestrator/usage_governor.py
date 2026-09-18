@@ -54,9 +54,37 @@ class UsageGovernor:
         with self.ledger._transaction() as conn:
             existing = conn.execute("SELECT * FROM paid_reservations WHERE feature_id=? AND purpose=? AND request_key=?", (feature_id, purpose.value, request_key)).fetchone()
             if existing:
-                if existing["status"] == "unknown_outcome":
+                status = str(existing["status"])
+                if status == "unknown_outcome":
                     raise PermissionError("paid invocation has unknown outcome and must not be repeated")
-                if existing["status"] in {"in_flight", "completed"}:
+                if status in {"in_flight", "completed"}:
+                    return Reservation(existing["id"], feature_id, purpose, request_key)
+                if status == "provider_rejected":
+                    if not bool(existing["provider_retryable"]):
+                        raise PermissionError(f"paid provider rejected request: {existing['provider_error_kind'] or 'provider_rejected'}")
+                    retry_after_at = existing["provider_retry_after_at"]
+                    if retry_after_at is not None and int(retry_after_at) > now:
+                        raise PermissionError(f"paid provider retry not due until {int(retry_after_at)}")
+                    budget = conn.execute("SELECT * FROM paid_budgets WHERE feature_id=?", (feature_id,)).fetchone()
+                    if budget is None:
+                        raise PermissionError("no paid budget configured")
+                    used = int(conn.execute("SELECT COUNT(*) FROM paid_reservations WHERE feature_id=? AND purpose=? AND status IN ('in_flight', 'completed', 'unknown_outcome')", (feature_id, purpose.value)).fetchone()[0])
+                    approvals = int(conn.execute("SELECT COALESCE(SUM(calls), 0) FROM paid_approvals WHERE feature_id=? AND purpose=?", (feature_id, purpose.value)).fetchone()[0])
+                    if used >= int(budget[self._column(purpose)]) + approvals:
+                        self.ledger._append_event(conn, entity_type="feature", entity_id=feature_id, event_type="paid_provider_retry_budget_blocked", actor_id="governor", payload={"reservation_id": existing["id"], "purpose": purpose.value, "request_key": request_key, "used": used})
+                        raise PermissionError("paid budget exhausted while provider retry was waiting")
+                    conn.execute(
+                        "UPDATE paid_reservations SET status='in_flight',reason=NULL,updated_at=? WHERE id=? AND status='provider_rejected'",
+                        (now, existing["id"]),
+                    )
+                    self.ledger._append_event(
+                        conn,
+                        entity_type="feature",
+                        entity_id=feature_id,
+                        event_type="paid_provider_retry_started",
+                        actor_id="governor",
+                        payload={"reservation_id": existing["id"], "purpose": purpose.value, "request_key": request_key, "failure_count": int(existing["provider_failure_count"] or 0)},
+                    )
                     return Reservation(existing["id"], feature_id, purpose, request_key)
                 raise PermissionError("reservation was released; use an explicit new request key")
             budget = conn.execute("SELECT * FROM paid_budgets WHERE feature_id=?", (feature_id,)).fetchone()
@@ -88,6 +116,80 @@ class UsageGovernor:
 
     def unknown(self, reservation: Reservation, reason: str) -> None:
         self._finish(reservation, "unknown_outcome", reason)
+
+    def provider_rejected(
+        self,
+        reservation: Reservation,
+        model_call_id: str,
+        *,
+        kind: str,
+        detail: str,
+        retryable: bool,
+        retry_after_at: int | None,
+        alert_ticket_id: str | None = None,
+        alert_target: str | None = None,
+        alert_provider: str | None = None,
+        alert_model: str | None = None,
+        alert_failure_threshold: int = 3,
+    ) -> int:
+        now = self.ledger._now()
+        safe_detail = self.ledger._safe_comment_error(detail, limit=2000)
+        with self.ledger._transaction() as conn:
+            row = conn.execute("SELECT * FROM paid_reservations WHERE id=?", (reservation.reservation_id,)).fetchone()
+            if row is None or row["status"] != "in_flight":
+                raise ValueError("reservation is not in flight")
+            call = conn.execute("SELECT * FROM model_calls WHERE id=? AND reservation_id=?", (model_call_id, reservation.reservation_id)).fetchone()
+            if call is None or call["status"] != "in_flight":
+                raise ValueError("model call is not in flight")
+            failure_count = int(row["provider_failure_count"] or 0) + 1
+            first_failure_at = int(row["provider_first_failure_at"] or now)
+            conn.execute(
+                "UPDATE paid_reservations SET status='provider_rejected',reason=?,provider_failure_count=?,provider_first_failure_at=?,provider_last_failure_at=?,provider_retry_after_at=?,provider_error_kind=?,provider_error_detail=?,provider_retryable=?,updated_at=? WHERE id=?",
+                (f"provider_rejected:{kind}", failure_count, first_failure_at, now, retry_after_at, kind, safe_detail, int(retryable), now, reservation.reservation_id),
+            )
+            conn.execute(
+                "UPDATE model_calls SET status='provider_rejected',last_provider_error_kind=?,last_provider_error_detail=?,last_provider_rejected_at=?,updated_at=? WHERE id=?",
+                (kind, safe_detail, now, now, model_call_id),
+            )
+            self.ledger._append_event(
+                conn,
+                entity_type="feature",
+                entity_id=reservation.feature_id,
+                event_type="paid_provider_rejected",
+                actor_id="governor",
+                payload={
+                    "reservation_id": reservation.reservation_id,
+                    "purpose": reservation.purpose.value,
+                    "kind": kind,
+                    "detail": safe_detail[:1000],
+                    "retryable": retryable,
+                    "retry_after_at": retry_after_at,
+                    "failure_count": failure_count,
+                },
+            )
+            if (
+                alert_ticket_id
+                and alert_target
+                and alert_provider
+                and alert_model
+                and row["provider_alerted_at"] is None
+                and (not retryable or failure_count >= alert_failure_threshold)
+            ):
+                self.ledger._enqueue_paid_provider_incident_alert_in_transaction(
+                    conn,
+                    reservation_id=reservation.reservation_id,
+                    ticket_id=alert_ticket_id,
+                    target=alert_target,
+                    provider=alert_provider,
+                    model=alert_model,
+                    purpose=reservation.purpose.value,
+                    error_kind=kind,
+                    error_detail=detail,
+                    failure_count=failure_count,
+                    retry_after_at=retry_after_at,
+                    now=now,
+                )
+            return failure_count
 
     def approve(self, feature_id: str, purpose: PaidPurpose, actor_id: str, reason: str, idempotency_key: str, *, calls: int = 1) -> Approval:
         if calls != 1 or not reason.strip() or not idempotency_key.strip():

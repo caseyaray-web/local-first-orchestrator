@@ -66,6 +66,124 @@ class TicketEscalationTests(unittest.TestCase):
         self.ledger.close()
         self.temp.cleanup()
 
+    def test_paid_escalation_candidate_respects_provider_retry_backoff_and_nonretryable_rejection(self) -> None:
+        self.ledger.connection.execute(
+            "INSERT INTO features(id,title,status,created_at,updated_at) VALUES ('F-backoff','feature','active',1,1)"
+        )
+        self.ledger.connection.execute("UPDATE tickets SET feature_id='F-backoff' WHERE id=?", (self.ticket,))
+        request_key = f"ticket-escalation:{self.ticket}:2:{'d' * 64}"
+        self.ledger.connection.execute(
+            "INSERT INTO paid_reservations(id,feature_id,purpose,request_key,status,provider_retry_after_at,provider_error_kind,provider_retryable,created_at,updated_at) VALUES ('r-backoff','F-backoff','escalation',?,'provider_rejected',1100,'rate_limited',1,1,1)",
+            (request_key,),
+        )
+        self.assertIsNone(self.ledger.ticket_paid_escalation_candidate(ticket_id=self.ticket, now=1099))
+        self.assertIsNone(
+            self.ledger.claim_next_scheduler_triage(
+                "triage-worker", lease_seconds=30, triage_execution_policy_hash="policy", now=1099, ticket_id=self.ticket
+            )
+        )
+        self.assertIsNotNone(self.ledger.ticket_paid_escalation_candidate(ticket_id=self.ticket, now=1100))
+        self.ledger.connection.execute(
+            "UPDATE paid_reservations SET provider_retry_after_at=NULL,provider_retryable=0,provider_error_kind='authentication_rejected' WHERE id='r-backoff'"
+        )
+        self.assertIsNone(self.ledger.ticket_paid_escalation_candidate(ticket_id=self.ticket, now=5000))
+        self.assertIsNone(
+            self.ledger.claim_next_scheduler_triage(
+                "triage-worker", lease_seconds=30, triage_execution_policy_hash="policy", now=5000, ticket_id=self.ticket
+            )
+        )
+        released_to_legacy = self.ledger.claim_next_scheduler_triage(
+            "triage-worker",
+            lease_seconds=30,
+            triage_execution_policy_hash="policy",
+            now=5000,
+            ticket_id=self.ticket,
+            paid_ticket_escalation_enabled=False,
+        )
+        self.assertIsNotNone(released_to_legacy)
+
+    def test_terminal_resolution_with_additional_local_budget_materializes_fresh_attempt_and_supersedes_alert(self) -> None:
+        terminal = self.ledger.record_terminal_unresolvable(
+            self.ticket,
+            attempt_number=2,
+            failure_fingerprint="a" * 64,
+            reason="paid escalation declared unresolvable",
+            summary={"local_feedback": "terminal evidence"},
+            notification_target="mattermost:ops",
+        )
+        with self.assertRaisesRegex(PermissionError, "paused controller"):
+            self.ledger.resolve_terminal_with_additional_local_budget(
+                self.ticket,
+                additional_local_attempts=1,
+                operator_id="operator",
+                reason="grant one more local attempt",
+            )
+        self.ledger.pause("operator", reason="terminal intervention")
+        result = self.ledger.resolve_terminal_with_additional_local_budget(
+            self.ticket,
+            additional_local_attempts=1,
+            operator_id="operator",
+            reason="grant one more local attempt",
+        )
+        self.assertEqual((result["state"], result["prior_max_attempts"], result["new_max_attempts"], result["next_attempt_number"]), ("repairing", 2, 3, 3))
+        ticket = self.ledger.get_ticket(self.ticket)
+        self.assertEqual((ticket["state"], ticket["max_attempts"]), ("repairing", 3))
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=3", (self.ticket,)).fetchone()
+        self.assertIsNotNone(attempt)
+        self.assertEqual((attempt["pre_diff_hash"], attempt["worktree_path"]), ("c" * 64, str(self.root / "worktree")))
+        routing = self.ledger.connection.execute("SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage='operator-repair-routing-2'", (self.ticket,)).fetchone()
+        self.assertIsNotNone(routing)
+        terminal_row = self.ledger.connection.execute("SELECT resolved_at,resolved_by FROM terminal_ticket_failures WHERE ticket_id=?", (self.ticket,)).fetchone()
+        self.assertIsNotNone(terminal_row["resolved_at"])
+        self.assertEqual(terminal_row["resolved_by"], "operator")
+        notice = self.ledger.connection.execute("SELECT status,superseded_at FROM gateway_notification_outbox WHERE operation_id=?", (terminal["operation_id"],)).fetchone()
+        self.assertEqual(notice["status"], "superseded")
+        self.assertIsNotNone(notice["superseded_at"])
+        projection = self.ledger.connection.execute("SELECT operation FROM board_projection_outbox WHERE ticket_id=? AND operation='set_state' ORDER BY queued_at DESC,event_id DESC LIMIT 1", (self.ticket,)).fetchone()
+        self.assertIsNotNone(projection)
+        self.ledger.connection.execute(
+            "INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,attempt_count,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+            ("prior-implementation", self.ticket, "implementation", "completed", 1, 1, 1),
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO runtime_bindings(ticket_id,repository_path,starting_sha,ownership_verified,created_at) VALUES (?,?,?,?,?)",
+            (self.ticket, str(self.root), "a" * 40, 1, 1),
+        )
+        self.ledger.connection.execute("UPDATE board_projection_outbox SET acknowledged_at=COALESCE(acknowledged_at,queued_at) WHERE ticket_id=?", (self.ticket,))
+        self.ledger.resume("operator", reason="resume after terminal intervention")
+        claim = self.ledger.claim_next_scheduler_implementation("local-worker", lease_seconds=60, ticket_id=self.ticket)
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim["stage"], "implementation:3")
+
+    def test_terminal_resolution_budget_grant_starts_after_highest_existing_attempt(self) -> None:
+        now = self.ledger._now()
+        self.ledger.connection.execute(
+            "INSERT INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,post_diff_hash,outcome,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (self.ticket, 3, "a" * 40, "wt/t", str(self.root / "worktree"), "c" * 64, "e" * 64, "failed", now),
+        )
+        terminal = self.ledger.record_terminal_unresolvable(
+            self.ticket,
+            attempt_number=3,
+            failure_fingerprint="b" * 64,
+            reason="paid escalation declared unresolvable",
+            summary={"local_feedback": "paid attempt also failed"},
+            notification_target="mattermost:ops",
+        )
+        self.ledger.pause("operator", reason="grant extra local budget")
+        result = self.ledger.resolve_terminal_with_additional_local_budget(
+            self.ticket,
+            additional_local_attempts=1,
+            operator_id="operator",
+            reason="allow one fresh local implementation after paid failure",
+        )
+        self.assertEqual((result["highest_existing_attempt"], result["prior_max_attempts"], result["new_max_attempts"], result["next_attempt_number"]), (3, 2, 4, 4))
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=4", (self.ticket,)).fetchone()
+        self.assertIsNotNone(attempt)
+        self.assertEqual(attempt["pre_diff_hash"], "e" * 64)
+        self.assertEqual(self.ledger.get_ticket(self.ticket)["max_attempts"], 4)
+        notice = self.ledger.connection.execute("SELECT status FROM gateway_notification_outbox WHERE operation_id=?", (terminal["operation_id"],)).fetchone()
+        self.assertEqual(notice["status"], "superseded")
+
     def test_paid_repair_authorization_creates_exact_post_budget_attempt(self) -> None:
         result = self.ledger.apply_paid_repair_authorization(
             self.ticket,

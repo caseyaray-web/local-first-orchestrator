@@ -199,6 +199,42 @@ class RegisteredRuntimeCliTests(unittest.TestCase):
         self.assertEqual(notice_row["status"], "superseded")
         self.assertIsNotNone(notice_row["superseded_at"])
 
+    def test_resolve_terminal_retry_local_cli_grants_budget_and_returns_repairing(self) -> None:
+        ticket = self.ledger.create_ticket(title="terminal-local-budget", state=CanonicalState.NEEDS_TRIAGE)
+        worktree = self.root / "terminal-local-worktree"
+        worktree.mkdir()
+        self.ledger.connection.execute(
+            "INSERT INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,post_diff_hash,created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (ticket, 1, "a" * 40, "wt/terminal", str(worktree), "b" * 64, "c" * 64, 1),
+        )
+        terminal = self.ledger.record_terminal_unresolvable(
+            ticket,
+            attempt_number=1,
+            failure_fingerprint="c" * 64,
+            reason="manual intervention required",
+            summary={"local_feedback": "terminal evidence"},
+            notification_target="mattermost:ops",
+        )
+        cli_main(["--database", str(self.database), "pause", "--reason", "manual terminal recovery", "--operator-id", "operator"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(cli_main([
+                "--database", str(self.database),
+                "resolve-terminal",
+                "--ticket-id", ticket,
+                "--mode", "retry-local",
+                "--additional-local-attempts", "2",
+                "--reason", "grant two more local attempts",
+                "--operator-id", "operator",
+            ]), 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual((payload["ticket_id"], payload["state"], payload["additional_local_attempts"], payload["new_max_attempts"]), (ticket, "repairing", 2, 4))
+        self.assertEqual((self.ledger.get_ticket(ticket)["state"], self.ledger.get_ticket(ticket)["max_attempts"]), ("repairing", 4))
+        attempt = self.ledger.connection.execute("SELECT attempt_number,pre_diff_hash FROM attempts WHERE ticket_id=? ORDER BY attempt_number DESC LIMIT 1", (ticket,)).fetchone()
+        self.assertEqual((attempt["attempt_number"], attempt["pre_diff_hash"]), (2, "c" * 64))
+        notice = self.ledger.connection.execute("SELECT status FROM gateway_notification_outbox WHERE operation_id=?", (terminal["operation_id"],)).fetchone()
+        self.assertEqual(notice["status"], "superseded")
+
     def test_historical_claim_retirement_cli_supports_exact_operator_targets(self) -> None:
         parser = argparse.ArgumentParser(); register_cli(parser)
         for selector, value in (("--ticket-id", "internal-ticket"), ("--external-id", "t-generated"), ("--claim-id", "claim-1")):
