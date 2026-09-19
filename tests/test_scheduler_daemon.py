@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import unittest
 import json
 import math
@@ -8,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.daemon import SQLITE_INT_MAX, SchedulerDaemon, _saturating_exponential_backoff
+from local_first_orchestrator.cli import register_cli
 from local_first_orchestrator.ledger import Ledger, saturating_non_negative_counter, saturating_non_negative_counter_increment
 from local_first_orchestrator.scheduler import ProcessNextResult, ProcessNextScheduler
 from local_first_orchestrator.states import CanonicalState
@@ -569,6 +571,114 @@ class SchedulerDaemonTests(unittest.TestCase):
         status = self.ledger.operator_status()["daemon_status"]
         self.assertEqual(status[0]["status"], "no_work")
         self.assertEqual(status[0]["consecutive_undispatchable"], 0)
+
+    def test_daemon_cli_rejects_unsafe_worker_id_during_argument_parsing(self) -> None:
+        parser = argparse.ArgumentParser()
+        register_cli(parser)
+        for value in ("password=FAKE_CLI_SECRET", "bad worker", "w" * 129):
+            with self.subTest(worker_id=value[:32]), self.assertRaises(SystemExit):
+                parser.parse_args(["--database", str(self.database), "daemon", "--worker-id", value])
+
+    def test_worker_id_rejects_unsafe_or_overlong_identity_without_persistence(self) -> None:
+        unsafe = (
+            "password=FAKE_WORKER_SECRET",
+            "token:'FAKE_WORKER_SECRET'",
+            "bad worker",
+            "w" * 129,
+        )
+        for value in unsafe:
+            with self.subTest(worker_id=value[:32]):
+                with self.assertRaises(ValueError):
+                    SchedulerDaemon(
+                        self.ledger,
+                        lambda: FakeScheduler(ProcessNextResult("no_work")),
+                        worker_id=value,
+                        sleep=lambda _delay: None,
+                        clock=lambda: 100.0,
+                    )
+                self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM daemon_status").fetchone()[0], 0)
+                with self.assertRaises(ValueError):
+                    self.ledger.upsert_daemon_status(**self._daemon_status_kwargs(value))
+                self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM daemon_status").fetchone()[0], 0)
+
+    def test_in_memory_health_sanitizes_observational_result_fields(self) -> None:
+        stage_secret = 'password="FAKE_STAGE_SECRET"'
+        ticket_secret = "Authorization: Bearer FAKE_TICKET_BEARER"
+        daemon = SchedulerDaemon(
+            self.ledger,
+            lambda: FakeScheduler(ProcessNextResult("busy", stage_secret, ticket_secret)),
+            worker_id="daemon",
+            sleep=lambda _delay: None,
+            clock=lambda: 100.0,
+        )
+        result = daemon.run_iteration()
+        self.assertEqual(result.stage, stage_secret)
+        health = daemon.health()
+        status = daemon.status()
+        cli_json = json.dumps({"health": asdict(health)}, sort_keys=True)
+        for rendered in (health.last_stage, health.last_ticket_id, status["health"]["last_stage"], status["health"]["last_ticket_id"], cli_json):
+            self.assertNotIn("FAKE_STAGE_SECRET", rendered or "")
+            self.assertNotIn("FAKE_TICKET_BEARER", rendered or "")
+        self.assertEqual(health.last_stage, "[REDACTED]")
+        self.assertEqual(health.last_ticket_id, "[REDACTED]")
+
+        daemon._last_result = ProcessNextResult("token=FAKE_STATUS_SECRET", "safe-stage", "safe-ticket")
+        health = daemon.health()
+        self.assertEqual(health.last_status, "[REDACTED]")
+        self.assertNotIn("FAKE_STATUS_SECRET", json.dumps(asdict(health), sort_keys=True))
+
+    def test_legacy_daemon_rows_fail_closed_on_unsafe_required_identity_and_sanitize_optional_text(self) -> None:
+        credential_values = (
+            "password=FAKE_PASSWORD_UNQUOTED",
+            'password="FAKE_PASSWORD_QUOTED"',
+            "token=FAKE_TOKEN_UNQUOTED",
+            "token='FAKE_TOKEN_QUOTED'",
+            "secret=FAKE_SECRET_UNQUOTED",
+            'secret="FAKE_SECRET_QUOTED"',
+            "api_key=FAKE_API_UNQUOTED",
+            "api_key='FAKE_API_QUOTED'",
+            "private_key=FAKE_PRIVATE_UNQUOTED",
+            'private_key="FAKE_PRIVATE_QUOTED"',
+            "Authorization: Bearer FAKE_BEARER",
+            "Authorization: Basic FAKE_BASIC",
+            "https://user:FAKE_URL_PASSWORD@example.invalid/path",
+        )
+        optional_fields = ("last_status", "last_stage", "last_ticket_id", "reason_category", "reason", "last_error")
+
+        for index, value in enumerate(credential_values):
+            worker = f"legacy-worker-{index}"
+            self.ledger.connection.execute(
+                "INSERT INTO daemon_status(worker_id,status,consecutive_undispatchable,iterations,successful_ticks,idle_ticks,busy_ticks,paused_ticks,transient_errors,consecutive_errors,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (value, "idle", 0, 0, 0, 0, 0, 0, 0, 0, index + 1),
+            )
+            row = self.ledger.daemon_status_rows(limit=1)[0]
+            self.assertEqual(row["worker_id"], "<malformed>")
+            self.assertEqual(row["status"], "invalid_persisted_state")
+            self.ledger.connection.execute("DELETE FROM daemon_status")
+
+            self.ledger.connection.execute(
+                "INSERT INTO daemon_status(worker_id,status,consecutive_undispatchable,iterations,successful_ticks,idle_ticks,busy_ticks,paused_ticks,transient_errors,consecutive_errors,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (worker, value, 0, 0, 0, 0, 0, 0, 0, 0, index + 1),
+            )
+            for surface in (self.ledger.daemon_status_rows(limit=1), self.ledger.status()["daemon_status"], self.ledger.operator_status()["daemon_status"]):
+                row = surface[0]
+                self.assertEqual(row["worker_id"], "<malformed>")
+                self.assertEqual(row["status"], "invalid_persisted_state")
+            self.ledger.connection.execute("DELETE FROM daemon_status")
+
+            for field in optional_fields:
+                columns = ["worker_id", "status", field, "consecutive_undispatchable", "iterations", "successful_ticks", "idle_ticks", "busy_ticks", "paused_ticks", "transient_errors", "consecutive_errors", "updated_at"]
+                placeholders = ",".join("?" for _ in columns)
+                values = [worker, "idle", value, 0, 0, 0, 0, 0, 0, 0, 0, index + 1]
+                self.ledger.connection.execute(
+                    f"INSERT INTO daemon_status({','.join(columns)}) VALUES ({placeholders})",
+                    values,
+                )
+                for surface in (self.ledger.daemon_status_rows(limit=1), self.ledger.status()["daemon_status"], self.ledger.operator_status()["daemon_status"]):
+                    rendered = json.dumps(surface[0], sort_keys=True)
+                    self.assertNotIn("FAKE_", rendered)
+                    self.assertNotIn("user:FAKE", rendered)
+                self.ledger.connection.execute("DELETE FROM daemon_status")
 
     def test_daemon_error_sanitization_is_consistent_across_health_status_persistence_and_cli(self) -> None:
         supplied_values = (

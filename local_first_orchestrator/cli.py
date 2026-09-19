@@ -11,6 +11,7 @@ from .controller import LocalFirstController, RuntimeConfig, compute_review_exec
 from .admission import FeatureAdmissionSpec
 from .decomposition_planner import LocalDecompositionPlanner, resolve_hermes_identity
 from .daemon import ExternalProgressResult, SchedulerDaemon
+from .daemon_text import validate_daemon_worker_id
 from .planning_coordinator import PlanningCoordinator
 from .corrections import AcceptedPredecessor, CorrectionService, CorrectionTicketSpec, SupplementalCorrectionPlan
 from .generated_activation import GeneratedActivationError, activate_generated_ticket
@@ -669,7 +670,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     daemon=commands.add_parser("daemon", aliases=("run",), help="continuously drive Local First stages and authorized Hermes dispatch")
     daemon.add_argument("--execute", action="store_true")
     daemon.add_argument("--allow-board-writes", action="store_true")
-    daemon.add_argument("--worker-id", default="local-first-daemon")
+    daemon.add_argument("--worker-id", default="local-first-daemon", type=validate_daemon_worker_id)
     daemon.add_argument("--planner-executable", default="hermes")
     daemon.add_argument("--idle-sleep-seconds", type=float, default=1.0)
     daemon.add_argument("--busy-sleep-seconds", type=float, default=0.25)

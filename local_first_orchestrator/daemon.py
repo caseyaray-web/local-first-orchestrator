@@ -8,7 +8,7 @@ import time
 from numbers import Real
 from typing import Any, Callable
 
-from .daemon_text import bounded_daemon_text
+from .daemon_text import bounded_daemon_text, validate_daemon_status_label, validate_daemon_worker_id
 from .ledger import (
     SQLITE_INT_MAX,
     Ledger,
@@ -121,7 +121,7 @@ class SchedulerDaemon:
         self.ledger = ledger
         self.scheduler_factory = scheduler_factory
         self.external_progress_runner = external_progress_runner
-        self.worker_id = worker_id
+        self.worker_id = validate_daemon_worker_id(worker_id)
         self.idle_sleep_seconds = idle_sleep_seconds
         self.busy_sleep_seconds = busy_sleep_seconds
         self.error_backoff_seconds = error_backoff_seconds
@@ -183,8 +183,12 @@ class SchedulerDaemon:
 
     def health(self) -> DaemonHealth:
         result = self._last_result
+        try:
+            state = validate_daemon_status_label(self._state)
+        except ValueError as exc:
+            raise RuntimeError("daemon health state failed validation") from exc
         return DaemonHealth(
-            worker_id=self.worker_id,
+            worker_id=validate_daemon_worker_id(self.worker_id),
             running=self._running,
             stop_requested=self.stop_requested,
             iterations=self._iterations,
@@ -194,14 +198,14 @@ class SchedulerDaemon:
             paused_ticks=self._paused_ticks,
             transient_errors=self._transient_errors,
             consecutive_errors=self._consecutive_errors,
-            last_status=None if result is None else result.status,
-            last_stage=None if result is None else result.stage,
-            last_ticket_id=None if result is None else result.ticket_id,
-            state=self._state,
+            last_status=None if result is None else bounded_daemon_text(result.status, limit=80),
+            last_stage=None if result is None else bounded_daemon_text(result.stage, limit=80),
+            last_ticket_id=None if result is None else bounded_daemon_text(result.ticket_id, limit=160),
+            state=state,
             consecutive_undispatchable=self._consecutive_undispatchable,
-            last_reason_category=self._last_reason_category,
-            last_reason=self._last_reason,
-            last_error=self._last_error,
+            last_reason_category=bounded_daemon_text(self._last_reason_category, limit=80),
+            last_reason=bounded_daemon_text(self._last_reason, limit=500),
+            last_error=bounded_daemon_text(self._last_error, limit=500),
             last_tick_started_at=self._last_tick_started_at,
             last_tick_completed_at=self._last_tick_completed_at,
         )

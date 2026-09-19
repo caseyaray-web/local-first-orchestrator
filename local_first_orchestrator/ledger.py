@@ -25,7 +25,7 @@ from .historical_revalidation import authorization_hash, authorization_identity,
 from .ticket import MicroTicket
 from .revalidation_boundary import validate_and_consume_revalidation_capability
 from .native_release_approval import snapshot_authority
-from .daemon_text import bounded_daemon_text
+from .daemon_text import bounded_daemon_text, validate_daemon_status_label, validate_daemon_worker_id
 
 class _LegacyRevalidationCompatibility(Exception):
     pass
@@ -8977,17 +8977,15 @@ class Ledger:
         last_tick_started_at: float | None,
         last_tick_completed_at: float | None,
     ) -> dict[str, Any]:
-        if not isinstance(worker_id, str) or not worker_id.strip():
-            raise ValueError("daemon worker id is required")
-        if not isinstance(status, str) or not status.strip():
-            raise ValueError("daemon status is required")
+        worker_id = validate_daemon_worker_id(worker_id)
+        status = validate_daemon_status_label(status)
         counters = (consecutive_undispatchable, iterations, successful_ticks, idle_ticks, busy_ticks, paused_ticks, transient_errors, consecutive_errors)
         for counter in counters:
             validate_sqlite_non_negative_counter(counter)
         last_tick_started_at = _finite_optional_real(last_tick_started_at, name="last_tick_started_at")
         last_tick_completed_at = _finite_optional_real(last_tick_completed_at, name="last_tick_completed_at")
         values = (
-            self._bounded_daemon_text(worker_id, limit=128), self._bounded_daemon_text(status, limit=80),
+            worker_id, self._bounded_daemon_text(status, limit=80),
             self._bounded_daemon_text(last_status, limit=80), self._bounded_daemon_text(last_stage, limit=128),
             self._bounded_daemon_text(last_ticket_id, limit=128), self._bounded_daemon_text(reason_category, limit=80),
             self._bounded_daemon_text(reason), consecutive_undispatchable, iterations, successful_ticks,
@@ -9001,7 +8999,10 @@ class Ledger:
                 "ON CONFLICT(worker_id) DO UPDATE SET status=excluded.status,last_status=excluded.last_status,last_stage=excluded.last_stage,last_ticket_id=excluded.last_ticket_id,reason_category=excluded.reason_category,reason=excluded.reason,consecutive_undispatchable=excluded.consecutive_undispatchable,iterations=excluded.iterations,successful_ticks=excluded.successful_ticks,idle_ticks=excluded.idle_ticks,busy_ticks=excluded.busy_ticks,paused_ticks=excluded.paused_ticks,transient_errors=excluded.transient_errors,consecutive_errors=excluded.consecutive_errors,last_error=excluded.last_error,last_tick_started_at=excluded.last_tick_started_at,last_tick_completed_at=excluded.last_tick_completed_at,updated_at=excluded.updated_at",
                 values,
             )
-        return dict(self.connection.execute("SELECT * FROM daemon_status WHERE worker_id=?", (worker_id,)).fetchone())
+        row = self.connection.execute("SELECT * FROM daemon_status WHERE worker_id=?", (worker_id,)).fetchone()
+        if row is None:
+            raise RuntimeError("daemon status persistence reconciliation failed")
+        return dict(row)
 
     @staticmethod
     def _operator_daemon_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -9010,7 +9011,9 @@ class Ledger:
         timestamp_fields = ("last_tick_started_at", "last_tick_completed_at")
         timestamps: dict[str, float | None] = {}
         try:
-            malformed = any(not isinstance(row[field], str) or not str(row[field]).strip() for field in required_text)
+            worker_id = validate_daemon_worker_id(row["worker_id"])
+            status = validate_daemon_status_label(row["status"])
+            malformed = False
             malformed = malformed or any(
                 type(row[field]) is not int or row[field] < 0 or row[field] > SQLITE_INT_MAX
                 for field in counter_fields
@@ -9024,7 +9027,7 @@ class Ledger:
         if malformed:
             return {"worker_id": "<malformed>", "status": "invalid_persisted_state", "reason_category": "malformed_persisted_state", "reason": "daemon status record failed validation"}
         return {
-            "worker_id": str(row["worker_id"])[:128], "status": str(row["status"])[:80],
+            "worker_id": worker_id, "status": status,
             "last_status": Ledger._bounded_daemon_text(row["last_status"], limit=80),
             "last_stage": Ledger._bounded_daemon_text(row["last_stage"], limit=128),
             "last_ticket_id": Ledger._bounded_daemon_text(row["last_ticket_id"], limit=128),
