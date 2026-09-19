@@ -41,11 +41,37 @@ from .native_workspace import PinnedNativeWorkspace, canonical_native_workspace_
 from .worktree_lifecycle import cleanup_completed_worktree
 
 
-def _isolated_candidate_diff(path: Path, base_sha: str, *, allowed_new_paths: tuple[str, ...] = ()) -> dict[str, object]:
-    """Build a candidate diff including approved new files without mutating the real Git index."""
+def _isolated_candidate_diff(
+    path: Path,
+    base_sha: str,
+    *,
+    allowed_new_paths: tuple[str, ...] = (),
+    target_sha: str | None = None,
+) -> dict[str, object]:
+    """Serialize candidate identity identically across review, acceptance, and integration."""
     path = Path(path).resolve(strict=True)
+    env = safe_git_env()
+    if target_sha is not None:
+        def committed_git(*args: str) -> str:
+            completed = subprocess.run(
+                safe_git_argv(args), cwd=path, env=env, text=True, capture_output=True,
+                check=True, timeout=30,
+            )
+            return completed.stdout
+
+        diff = committed_git("diff", "--binary", "--no-ext-diff", base_sha, target_sha, "--")
+        changed = tuple(item for item in committed_git("diff", "--name-only", base_sha, target_sha, "--").splitlines() if item)
+        numstat = committed_git("diff", "--numstat", base_sha, target_sha, "--")
+        return {
+            "diff": diff,
+            "diff_hash": hashlib.sha256(diff.encode()).hexdigest(),
+            "changed_paths": changed,
+            "numstat": numstat,
+            "untracked_paths": (),
+        }
+
     with tempfile.TemporaryDirectory(prefix="local-first-index-") as temp_dir:
-        env = safe_git_env()
+        env = dict(env)
         env["GIT_INDEX_FILE"] = str(Path(temp_dir) / "index")
 
         def git(*args: str) -> str:
@@ -60,7 +86,7 @@ def _isolated_candidate_diff(path: Path, base_sha: str, *, allowed_new_paths: tu
         approved_new = tuple(sorted(set(untracked) & set(allowed_new_paths)))
         if approved_new:
             git("add", "-N", "--", *approved_new)
-        diff = git("diff", "--binary", base_sha, "--")
+        diff = git("diff", "--binary", "--no-ext-diff", base_sha, "--")
         changed = tuple(item for item in git("diff", "--name-only", base_sha, "--").splitlines() if item)
         numstat = git("diff", "--numstat", base_sha, "--")
     return {
@@ -145,7 +171,10 @@ class RuntimeConfig:
 
 def ticket_from_ledger(row: dict[str, Any]) -> MicroTicket:
     verification = json.loads(row["verification_json"])
-    return MicroTicket(row["id"], row["objective"], tuple(json.loads(row["criterion_ids_json"])), row["primary_symbol"], tuple(json.loads(row["allowed_files_json"])), tuple(json.loads(row["forbidden_changes_json"])), PatchBudget(**json.loads(row["patch_budget_json"])), VerificationProfile(tuple(tuple(c) for c in verification["commands"]), verification.get("working_directory", "."), int(verification.get("timeout_seconds", 60)), int(verification.get("output_limit", 20000))), row["risk"], bool(row["review_required"]), int(row["max_attempts"]), tuple(json.loads(row["dependencies_json"])), tuple(json.loads(row.get("new_test_files_json") or "[]")), tuple(json.loads(row.get("create_files_json") or "[]")))
+    keys = set(row.keys()) if hasattr(row, "keys") else set(row)
+    new_test_files_json = row["new_test_files_json"] if "new_test_files_json" in keys else "[]"
+    create_files_json = row["create_files_json"] if "create_files_json" in keys else "[]"
+    return MicroTicket(row["id"], row["objective"], tuple(json.loads(row["criterion_ids_json"])), row["primary_symbol"], tuple(json.loads(row["allowed_files_json"])), tuple(json.loads(row["forbidden_changes_json"])), PatchBudget(**json.loads(row["patch_budget_json"])), VerificationProfile(tuple(tuple(c) for c in verification["commands"]), verification.get("working_directory", "."), int(verification.get("timeout_seconds", 60)), int(verification.get("output_limit", 20000))), row["risk"], bool(row["review_required"]), int(row["max_attempts"]), tuple(json.loads(row["dependencies_json"])), tuple(json.loads(new_test_files_json or "[]")), tuple(json.loads(create_files_json or "[]")))
 
 
 class InjectedCrash(RuntimeError):
@@ -950,8 +979,19 @@ class LocalFirstController:
         head_sha = git("rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
         if git("merge-base", "--is-ancestor", base_sha, head_sha, check=False).returncode != 0:
             raise RuntimeError("Hermes execution HEAD does not descend from the authoritative execution base")
-        diff = git("diff", "--binary", "--no-ext-diff", base_sha, "--").stdout
-        diff_hash = hashlib.sha256(diff.encode()).hexdigest()
+        ticket_contract = ticket_from_ledger(ticket_row)
+        authorized_new_files = tuple(sorted(set(ticket_contract.create_files) | set(ticket_contract.new_test_files)))
+        candidate = _isolated_candidate_diff(workspace, base_sha, allowed_new_paths=authorized_new_files)
+        unauthorized_untracked = sorted(
+            path for path in candidate["untracked_paths"]
+            if path not in set(authorized_new_files) and "__pycache__" not in path
+        )
+        if unauthorized_untracked:
+            raise RuntimeError(
+                "Hermes execution produced unauthorized untracked content: " + ", ".join(unauthorized_untracked)
+            )
+        diff = str(candidate["diff"])
+        diff_hash = str(candidate["diff_hash"])
         if not diff.strip():
             if review_generated_handoff:
                 reopener = getattr(self.board, "reopen_review_handoff", None)
@@ -1536,12 +1576,14 @@ class LocalFirstController:
         if row and row["worktree_path"] and Path(row["worktree_path"]).exists():
             path=Path(row["worktree_path"]); branch=str(row["branch"] or "")
             stage = self.ledger.model_stage(ticket_id, number, "implementation")
-            current_diff = worktrees.diff_hash(path)
+            ticket = ticket_from_ledger(self.ledger.get_ticket(ticket_id))
+            allowed_new_paths = tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files)))
+            current_diff = str(_isolated_candidate_diff(path, base, allowed_new_paths=allowed_new_paths)["diff_hash"])
             if stage and current_diff != stage["diff_hash"]:
                 raise RuntimeError("persisted worktree diff does not match; reconciliation required")
             if not stage and current_diff != str(row["pre_diff_hash"] or current_diff):
                 raise RuntimeError("persisted worktree diff does not match; reconciliation required")
-            return AttemptWorktree(ticket_id,number,base,branch,path,str(row["pre_diff_hash"] or worktrees.diff_hash(path)))
+            return AttemptWorktree(ticket_id,number,base,branch,path,str(row["pre_diff_hash"] or current_diff))
         attempt=worktrees.create_attempt(ticket_id,number,base)
         self.ledger.connection.execute("UPDATE attempts SET base_sha=?, branch=?, worktree_path=?, pre_diff_hash=? WHERE ticket_id=? AND attempt_number=?",(base,attempt.branch,str(attempt.path),attempt.pre_diff_hash,ticket_id,number))
         return attempt
@@ -1624,7 +1666,9 @@ class LocalFirstController:
         if candidate is None: raise ValueError("validated review candidate evidence unavailable")
         path=Path(candidate.get("worktree_path") or self.ledger.connection.execute("SELECT worktree_path FROM attempts WHERE ticket_id=? AND attempt_number=?",(ticket_id,candidate["attempt_number"])).fetchone()["worktree_path"])
         if not path.is_dir(): raise ValueError("validated attempt worktree is missing")
-        adapter=GitWorktreeAdapter(repository,worktree_root); fingerprint=adapter.diff_hash(path)
+        ticket = ticket_from_ledger(self.ledger.get_ticket(ticket_id))
+        allowed_new_paths = tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files)))
+        fingerprint = str(_isolated_candidate_diff(path, str(self.ledger.model_stage(ticket_id, int(candidate["attempt_number"]), "implementation")["base_sha"]), allowed_new_paths=allowed_new_paths)["diff_hash"])
         return self.ledger.authorize_review_resume(ticket_id,operator_id=operator_id,candidate_fingerprint=fingerprint,runtime_identity=self.effective_runtime_identity())
 
     def execute_implementation_model_only(self, ticket_id: str, *, repository: Path) -> dict[str, object]:
@@ -1688,7 +1732,8 @@ class LocalFirstController:
                 attempt_path = Path(str(prior_invocation["worktree_path"]))
                 if not artifact.is_file() or not attempt_path.is_dir():
                     raise RuntimeError("completed implementation invocation artifacts are incomplete; reconciliation required")
-                diff_hash = worktrees.diff_hash(attempt_path)
+                allowed_new_paths = tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files)))
+                diff_hash = str(_isolated_candidate_diff(attempt_path, base, allowed_new_paths=allowed_new_paths)["diff_hash"])
                 recorded = self.ledger.record_model_stage(
                     ticket_id,
                     attempt_number,
@@ -1719,7 +1764,8 @@ class LocalFirstController:
             artifact = Path(str(existing_stage["response_artifact"]))
             if not artifact.is_file():
                 raise RuntimeError("persisted implementation artifact is missing")
-            if worktrees.diff_hash(attempt.path) != str(existing_stage["diff_hash"]):
+            allowed_new_paths = tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files)))
+            if str(_isolated_candidate_diff(attempt.path, base, allowed_new_paths=allowed_new_paths)["diff_hash"]) != str(existing_stage["diff_hash"]):
                 raise RuntimeError("persisted implementation diff does not match; reconciliation required")
             return {
                 "ticket_id": ticket_id,
@@ -1782,7 +1828,8 @@ class LocalFirstController:
         response_path = getattr(result, "artifact_path", artifacts_root / "implementation-result.json")
         self.ledger.finish_model_invocation(invocation_id, status="completed", duration_seconds=time.monotonic() - started, model_artifact=str(response_path))
         self._crash("implementation_invocation_completed")
-        diff_hash = worktrees.diff_hash(attempt.path)
+        allowed_new_paths = tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files)))
+        diff_hash = str(_isolated_candidate_diff(attempt.path, base, allowed_new_paths=allowed_new_paths)["diff_hash"])
         self.ledger.record_model_stage(ticket_id, attempt_number, "implementation", purpose="implementation", adapter=type(self.local_model).__name__, request_hash=request_hash, response_artifact=str(response_path), worktree_path=str(attempt.path), base_sha=base, diff_hash=diff_hash)
         self.ledger.record_runtime_stage(ticket_id, f"implementation-{attempt_number}", str(response_path))
         self.ledger.record_runtime_stage(ticket_id, "implementation_completed", str(response_path))
@@ -1981,13 +2028,8 @@ class LocalFirstController:
         try:
             live_root = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
             live_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
-            if manual_adoption is not None:
-                live_diff_hash = str(_isolated_candidate_diff(path, expected["base_sha"], allowed_new_paths=manual_new_paths)["diff_hash"])
-            elif hermes_execution is None:
-                live_diff_hash = worktrees.diff_hash(path)
-            else:
-                live_diff = subprocess.run(("git", "diff", "--binary", "--no-ext-diff", expected["base_sha"], "--"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout
-                live_diff_hash = hashlib.sha256(live_diff.encode()).hexdigest()
+            allowed_new_paths = tuple(sorted(set(validation_ticket.create_files) | set(validation_ticket.new_test_files)))
+            live_diff_hash = str(_isolated_candidate_diff(path, expected["base_sha"], allowed_new_paths=allowed_new_paths)["diff_hash"])
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeError("validation_reconciliation_required: live worktree inspection failed") from exc
         expected_head = expected["base_sha"] if hermes_execution is None else str(hermes_execution["head_sha"])
@@ -2024,13 +2066,8 @@ class LocalFirstController:
             try:
                 post_root = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
                 post_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
-                if manual_adoption is not None:
-                    post_diff_hash = str(_isolated_candidate_diff(path, expected["base_sha"], allowed_new_paths=manual_new_paths)["diff_hash"])
-                elif hermes_execution is None:
-                    post_diff_hash = worktrees.diff_hash(path)
-                else:
-                    post_diff = subprocess.run(("git", "diff", "--binary", "--no-ext-diff", expected["base_sha"], "--"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout
-                    post_diff_hash = hashlib.sha256(post_diff.encode()).hexdigest()
+                allowed_new_paths = tuple(sorted(set(validation_ticket.create_files) | set(validation_ticket.new_test_files)))
+                post_diff_hash = str(_isolated_candidate_diff(path, expected["base_sha"], allowed_new_paths=allowed_new_paths)["diff_hash"])
             except (OSError, subprocess.SubprocessError) as exc:
                 raise RuntimeError("validation_reconciliation_required: post-validation worktree inspection failed") from exc
             if (
@@ -2043,10 +2080,8 @@ class LocalFirstController:
             ):
                 raise RuntimeError("validation_reconciliation_required: live candidate changed during validation")
             validation_sha256 = hashlib.sha256(validation_path.read_bytes()).hexdigest()
-            if manual_adoption is not None:
-                review_diff = str(_isolated_candidate_diff(path, expected["base_sha"], allowed_new_paths=manual_new_paths)["diff"])
-            else:
-                review_diff = subprocess.run(("git", "diff", expected["base_sha"]), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout
+            allowed_new_paths = tuple(sorted(set(validation_ticket.create_files) | set(validation_ticket.new_test_files)))
+            review_diff = str(_isolated_candidate_diff(path, expected["base_sha"], allowed_new_paths=allowed_new_paths)["diff"])
             selected_files = {relative: (path / relative).read_text(encoding="utf-8") for relative in (*validation_ticket.allowed_files, *validation_ticket.create_files, *validation_ticket.new_test_files) if (path / relative).is_file()}
             if hashlib.sha256(review_diff.encode()).hexdigest() != expected["implementation_diff_hash"] or not selected_files:
                 raise RuntimeError("validation_reconciliation_required: review packet inputs drift")
@@ -2153,7 +2188,8 @@ class LocalFirstController:
                         raise
                     response_path=getattr(result,"artifact_path",artifacts_root/"implementation-result.json")
                     self.ledger.finish_model_invocation(invocation_id,status="completed",duration_seconds=time.monotonic()-started,model_artifact=str(response_path))
-                    self.ledger.record_model_stage(ticket_id,attempt_number,"implementation",purpose="implementation",adapter=type(self.local_model).__name__,request_hash=request_hash,response_artifact=str(response_path),worktree_path=str(attempt.path),base_sha=base,diff_hash=worktrees.diff_hash(attempt.path))
+                    implementation_hash = str(_isolated_candidate_diff(attempt.path, base, allowed_new_paths=tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files))))["diff_hash"])
+                    self.ledger.record_model_stage(ticket_id,attempt_number,"implementation",purpose="implementation",adapter=type(self.local_model).__name__,request_hash=request_hash,response_artifact=str(response_path),worktree_path=str(attempt.path),base_sha=base,diff_hash=implementation_hash)
                     self.ledger.record_runtime_stage(ticket_id,f"implementation-{attempt_number}",str(response_path)); self.ledger.record_runtime_stage(ticket_id,"implementation_completed",str(response_path)); self._crash("implementation_completed")
                 else:
                     artifacts_root=artifact_root/ticket_id/str(attempt_number)
@@ -2826,11 +2862,12 @@ class LocalFirstController:
         path = Path(str(attempt["worktree_path"]))
         if not path.is_dir():
             raise RuntimeError("acceptance_reconciliation_required: worktree missing")
-        adapter = GitWorktreeAdapter(repo, worktree_root)
         try:
             live_root = subprocess.run(("git", "rev-parse", "--show-toplevel"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
             live_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=path, text=True, capture_output=True, check=True, timeout=15).stdout.strip()
-            diff_hash = adapter.diff_hash(path)
+            ticket = ticket_from_ledger(self.ledger.get_ticket(ticket_id))
+            allowed_new_paths = tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files)))
+            diff_hash = str(_isolated_candidate_diff(path, str(attempt["base_sha"]), allowed_new_paths=allowed_new_paths)["diff_hash"])
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeError("acceptance_reconciliation_required: live worktree inspection failed") from exc
         if live_root != str(path.resolve()) or live_head != str(attempt["base_sha"]):
@@ -2966,12 +3003,17 @@ class LocalFirstController:
                 for line in git("status", "--porcelain=v1").stdout.splitlines()
                 if line.startswith("?? ") and "__pycache__" not in line
             ]
-            if untracked:
-                raise RuntimeError("git_integration_reconciliation_required: accepted fingerprint does not bind untracked content")
+            if any(path not in authorized_files for path in untracked):
+                raise RuntimeError("git_integration_reconciliation_required: candidate contains unauthorized untracked content")
             paths = status_paths()
             if not paths or any(path not in authorized_files for path in paths):
                 raise RuntimeError("git_integration_reconciliation_required: candidate status contains unauthorized or missing changes")
-            if adapter.diff_hash(worktree) != candidate_fingerprint:
+            integration_candidate = _isolated_candidate_diff(
+                worktree,
+                base,
+                allowed_new_paths=tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files))),
+            )
+            if str(integration_candidate["diff_hash"]) != candidate_fingerprint:
                 raise RuntimeError("git_integration_reconciliation_required: accepted candidate diff drift")
             current = adapter.existing_execution_base(None if tranche_id is None else str(tranche_id), base)
             if current != base:
@@ -2989,19 +3031,19 @@ class LocalFirstController:
             if intent is None:
                 raise RuntimeError("git_integration_reconciliation_required: missing git commit intent")
             parent = git("rev-parse", "HEAD^").stdout.strip()
-            committed_diff = git("diff", "--binary", "--no-ext-diff", base, "HEAD").stdout
-            names = git("diff", "--name-only", base, "HEAD").stdout.splitlines()
+            committed_candidate = _isolated_candidate_diff(worktree, base, target_sha="HEAD")
+            names = list(committed_candidate["changed_paths"])
             clean = git("status", "--porcelain=v1").stdout.strip() == ""
             actual_message = git("log", "-1", "--format=%B").stdout.strip()
-            if parent != base or hashlib.sha256(committed_diff.encode()).hexdigest() != candidate_fingerprint or not names or any(name not in authorized_files for name in names) or not clean or actual_message != commit_message:
+            if parent != base or str(committed_candidate["diff_hash"]) != candidate_fingerprint or not names or any(name not in authorized_files for name in names) or not clean or actual_message != commit_message:
                 raise RuntimeError("git_integration_reconciliation_required: post-commit state is ambiguous")
             commit_sha = live_head
 
         final_parent = git("rev-parse", f"{commit_sha}^").stdout.strip()
-        final_diff = git("diff", "--binary", "--no-ext-diff", base, commit_sha).stdout
-        final_names = git("diff", "--name-only", base, commit_sha).stdout.splitlines()
+        final_candidate = _isolated_candidate_diff(worktree, base, target_sha=commit_sha)
+        final_names = list(final_candidate["changed_paths"])
         final_message = git("log", "-1", "--format=%B", commit_sha).stdout.strip()
-        if final_parent != base or hashlib.sha256(final_diff.encode()).hexdigest() != candidate_fingerprint or not final_names or any(name not in authorized_files for name in final_names) or final_message != commit_message or git("status", "--porcelain=v1").stdout.strip():
+        if final_parent != base or str(final_candidate["diff_hash"]) != candidate_fingerprint or not final_names or any(name not in authorized_files for name in final_names) or final_message != commit_message or git("status", "--porcelain=v1").stdout.strip():
             raise RuntimeError("git_integration_reconciliation_required: committed candidate identity drift")
 
         if tranche_id is not None:
@@ -3495,8 +3537,9 @@ class LocalFirstController:
         path = Path(str(attempt["worktree_path"])).resolve(); base = str(candidate["historical_provenance_json"] and json.loads(str(candidate["historical_provenance_json"])).get("base_sha", ""))
         if not base or str(repo) != binding["repository_path"]:
             raise PermissionError("historical candidate repository provenance is invalid")
-        diff = subprocess.run(("git", "diff", base), cwd=path, text=True, capture_output=True, check=True).stdout
-        if hashlib.sha256(diff.encode()).hexdigest() != str(candidate["candidate_fingerprint"]):
+        historical_candidate = _isolated_candidate_diff(path, base, allowed_new_paths=tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files))))
+        diff = str(historical_candidate["diff"])
+        if str(historical_candidate["diff_hash"]) != str(candidate["candidate_fingerprint"]):
             raise PermissionError("historical candidate fingerprint mismatch")
         selected_files = {relative: (path / relative).read_text(encoding="utf-8") for relative in (*ticket.allowed_files, *ticket.create_files, *ticket.new_test_files) if (path / relative).is_file()}
         packet = ReviewPacketBuilder().build(ticket, diff=diff, selected_files=selected_files, validation_evidence=str(candidate["validation_evidence"]))
@@ -3560,14 +3603,9 @@ class LocalFirstController:
             if stage is None or attempt is None or str(repo) != str(binding["repository_path"]):
                 raise PermissionError("ordinary review application provenance is invalid")
             path = Path(str(attempt["worktree_path"])).resolve()
-            implementation = self.ledger.model_stage(ticket_id, attempt_number, "implementation")
-            if implementation is not None and str(implementation["adapter"]) == "manual-adoption":
-                ticket = ticket_from_ledger(self.ledger.get_ticket(ticket_id))
-                allowed_new_paths = tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files)))
-                live_diff_hash = str(_isolated_candidate_diff(path, str(stage["base_sha"]), allowed_new_paths=allowed_new_paths)["diff_hash"])
-            else:
-                diff = subprocess.run(("git", "diff", str(stage["base_sha"])), cwd=path, text=True, capture_output=True, check=True).stdout
-                live_diff_hash = hashlib.sha256(diff.encode()).hexdigest()
+            ticket = ticket_from_ledger(self.ledger.get_ticket(ticket_id))
+            allowed_new_paths = tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files)))
+            live_diff_hash = str(_isolated_candidate_diff(path, str(stage["base_sha"]), allowed_new_paths=allowed_new_paths)["diff_hash"])
             if live_diff_hash != str(candidate["candidate_fingerprint"]) or str(stage["diff_hash"]) != str(candidate["candidate_fingerprint"]):
                 raise PermissionError("ordinary review candidate fingerprint mismatch")
         elif current_state == CanonicalState.NEEDS_TRIAGE.value:
@@ -3621,12 +3659,9 @@ class LocalFirstController:
         implementation_stage = self.ledger.model_stage(ticket_id, attempt_number, "implementation")
         manual_adoption = implementation_stage is not None and str(implementation_stage["adapter"]) == "manual-adoption"
         commit_parent = subprocess.run(("git", "rev-parse", f"{accepted}^"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
-        names = subprocess.run(("git", "diff", "--name-only", base, accepted), cwd=repo, text=True, capture_output=True, check=True).stdout.splitlines()
-        identity_diff = (
-            subprocess.run(("git", "diff", "--binary", "--no-ext-diff", base, accepted, "--"), cwd=repo, text=True, capture_output=True, check=True).stdout
-            if manual_adoption
-            else subprocess.run(("git", "diff", base, accepted, "--", *(*ticket.allowed_files, *ticket.create_files, *ticket.new_test_files)), cwd=repo, text=True, capture_output=True, check=True).stdout
-        )
+        committed_candidate = _isolated_candidate_diff(repo, base, target_sha=accepted)
+        names = list(committed_candidate["changed_paths"])
+        identity_diff = str(committed_candidate["diff"])
         current = adapter.existing_execution_base(str(ticket_row["tranche_id"]), base)
         if commit_parent != base or not names or any(name not in authorized for name in names) or hashlib.sha256(identity_diff.encode()).hexdigest() != candidate_fp:
             raise PermissionError("accepted commit no longer matches frozen candidate")
@@ -3709,15 +3744,10 @@ class LocalFirstController:
             raise PermissionError("acceptance requires authorized candidate files")
         live_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); live_branch = subprocess.run(("git", "branch", "--show-current"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); base = str(attempt["base_sha"])
         candidate_fp = str(candidate["candidate_fingerprint"])
-        if manual_adoption is not None:
-            manual_new_paths = tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files)))
-            canonical_live = _isolated_candidate_diff(worktree, base, allowed_new_paths=manual_new_paths)
-            live_diff = str(canonical_live["diff"])
-            live_candidate_hash = str(canonical_live["diff_hash"])
-        else:
-            live_diff = subprocess.run(("git", "diff", str(base)), cwd=worktree, text=True, capture_output=True, check=True).stdout
-            identity_diff = subprocess.run(("git", "diff", str(base), "--", *(*ticket.allowed_files, *ticket.create_files, *ticket.new_test_files)), cwd=worktree, text=True, capture_output=True, check=True).stdout
-            live_candidate_hash = hashlib.sha256(identity_diff.encode()).hexdigest()
+        allowed_new_paths = tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files)))
+        canonical_live = _isolated_candidate_diff(worktree, base, allowed_new_paths=allowed_new_paths)
+        live_diff = str(canonical_live["diff"])
+        live_candidate_hash = str(canonical_live["diff_hash"])
         status_lines = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True).stdout.splitlines(); status_paths = [line[3:].strip() for line in status_lines if "__pycache__" not in line]
         if live_branch != str(attempt["branch"]):
             raise PermissionError("accepted candidate branch mismatch")
@@ -3739,14 +3769,12 @@ class LocalFirstController:
             created_new_commit = True
             self._crash("accepted_commit_created")
         else:
-            parent = subprocess.run(("git", "rev-parse", "HEAD^"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); committed_diff = subprocess.run(("git", "diff", base, "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout; names = subprocess.run(("git", "diff", "--name-only", base, "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.splitlines(); clean = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() == ""
-            committed_identity_diff = subprocess.run(("git", "diff", "--binary", "--no-ext-diff", base, "HEAD", "--"), cwd=worktree, text=True, capture_output=True, check=True).stdout if manual_adoption is not None else subprocess.run(("git", "diff", base, "HEAD", "--", *(*ticket.allowed_files, *ticket.create_files, *ticket.new_test_files)), cwd=worktree, text=True, capture_output=True, check=True).stdout
-            if parent != base or hashlib.sha256(committed_identity_diff.encode()).hexdigest() != candidate_fp or not names or any(name not in authorized_files for name in names) or not clean:
+            parent = subprocess.run(("git", "rev-parse", "HEAD^"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); committed_candidate = _isolated_candidate_diff(worktree, base, target_sha="HEAD"); names = list(committed_candidate["changed_paths"]); clean = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() == ""
+            if parent != base or str(committed_candidate["diff_hash"]) != candidate_fp or not names or any(name not in authorized_files for name in names) or not clean:
                 raise RuntimeError("post-commit acceptance state is ambiguous")
             accepted_sha = live_head
-        final_parent = subprocess.run(("git", "rev-parse", "HEAD^"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); final_diff = subprocess.run(("git", "diff", base, "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout; final_names = subprocess.run(("git", "diff", "--name-only", base, "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.splitlines(); final_clean = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() == ""
-        final_identity_diff = subprocess.run(("git", "diff", "--binary", "--no-ext-diff", base, "HEAD", "--"), cwd=worktree, text=True, capture_output=True, check=True).stdout if manual_adoption is not None else subprocess.run(("git", "diff", base, "HEAD", "--", *(*ticket.allowed_files, *ticket.create_files, *ticket.new_test_files)), cwd=worktree, text=True, capture_output=True, check=True).stdout
-        if accepted_sha != subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() or final_parent != base or hashlib.sha256(final_identity_diff.encode()).hexdigest() != candidate_fp or not final_names or any(name not in authorized_files for name in final_names) or not final_clean:
+        final_parent = subprocess.run(("git", "rev-parse", "HEAD^"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); final_candidate = _isolated_candidate_diff(worktree, base, target_sha="HEAD"); final_names = list(final_candidate["changed_paths"]); final_clean = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() == ""
+        if accepted_sha != subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() or final_parent != base or str(final_candidate["diff_hash"]) != candidate_fp or not final_names or any(name not in authorized_files for name in final_names) or not final_clean:
             raise RuntimeError("accepted commit does not match frozen candidate")
         provenance = json.loads(str(candidate["historical_provenance_json"]))
         if provenance.get("authorization_hash"):
@@ -3792,11 +3820,11 @@ class LocalFirstController:
                         malformed_artifact=str(getattr(exc,"artifact_path","")) or None; self.ledger.finish_model_invocation(invocation_id,status="malformed_output",duration_seconds=time.monotonic()-started,error={"type":type(exc).__name__,"message":str(exc)[:1000]},model_artifact=malformed_artifact); self.ledger.record_review_infrastructure_failure(ticket_id,attempt_number,outcome="review_malformed_output"); raise
                     except Exception as exc:
                         self.ledger.finish_model_invocation(invocation_id,status="process_error",duration_seconds=time.monotonic()-started,error={"type":type(exc).__name__,"message":str(exc)[:1000]}); self.ledger.record_review_infrastructure_failure(ticket_id,attempt_number,outcome="review_process_error"); self.ledger.transition(ticket_id,CanonicalState.NEEDS_TRIAGE,payload={"review_infrastructure":"review_process_error; reconciliation required","attempt_number":attempt_number}); raise
-                    path=artifacts_root/"review-result.json"; path.write_text(json.dumps({"payload":result.raw},sort_keys=True),encoding="utf-8"); self.ledger.finish_model_invocation(invocation_id,status="completed",duration_seconds=time.monotonic()-started,model_artifact=str(path)); self.ledger.record_model_stage(ticket_id,attempt_number,"review",purpose="review",adapter=type(self.local_model).__name__,request_hash=hashlib.sha256(review_packet.encode()).hexdigest(),response_artifact=str(path),worktree_path=str(attempt.path),base_sha=base,diff_hash=worktrees.diff_hash(attempt.path)); self.ledger.record_runtime_stage(ticket_id,"review_completed",str(path)); self._crash("review_completed"); review=result
+                    path=artifacts_root/"review-result.json"; path.write_text(json.dumps({"payload":result.raw},sort_keys=True),encoding="utf-8"); self.ledger.finish_model_invocation(invocation_id,status="completed",duration_seconds=time.monotonic()-started,model_artifact=str(path)); review_diff_hash=str(_isolated_candidate_diff(attempt.path,base,allowed_new_paths=tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files))))["diff_hash"]); self.ledger.record_model_stage(ticket_id,attempt_number,"review",purpose="review",adapter=type(self.local_model).__name__,request_hash=hashlib.sha256(review_packet.encode()).hexdigest(),response_artifact=str(path),worktree_path=str(attempt.path),base_sha=base,diff_hash=review_diff_hash); self.ledger.record_runtime_stage(ticket_id,"review_completed",str(path)); self._crash("review_completed"); review=result
                 outcome=SameTicketRepairCoordinator(self.ledger).apply(ticket_id,attempt_number,review)
                 if outcome=="repair":
                     repair_evidence="; ".join(f"{f.criterion_id}: {f.evidence}; repair: {f.minimal_repair}" for f in review.findings)
-                    self.ledger.transition(ticket_id,CanonicalState.IMPLEMENTING); next_attempt=attempt_number+1; self.ledger.ensure_attempt(ticket_id,next_attempt); self.ledger.connection.execute("UPDATE attempts SET base_sha=?, branch=?, worktree_path=?, pre_diff_hash=? WHERE ticket_id=? AND attempt_number=?",(base,attempt.branch,str(attempt.path),worktrees.diff_hash(attempt.path),ticket_id,next_attempt)); result_failure_evidence=repair_evidence
+                    current_candidate_hash=str(_isolated_candidate_diff(attempt.path,base,allowed_new_paths=tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files))))["diff_hash"]); self.ledger.transition(ticket_id,CanonicalState.IMPLEMENTING); next_attempt=attempt_number+1; self.ledger.ensure_attempt(ticket_id,next_attempt); self.ledger.connection.execute("UPDATE attempts SET base_sha=?, branch=?, worktree_path=?, pre_diff_hash=? WHERE ticket_id=? AND attempt_number=?",(base,attempt.branch,str(attempt.path),current_candidate_hash,ticket_id,next_attempt)); result_failure_evidence=repair_evidence
                     result=self._implementation_stage(ticket_id,repository=repository,owner=owner,allow_validation_repair=True,failure_evidence=result_failure_evidence)
                     if result is None: self.ledger.project_ticket(ticket_id,self.board); return True
                     ticket=result["ticket"]; base=str(result["base"]); worktrees=result["worktrees"]; attempt=result["attempt"]; artifacts_root=result["artifacts_root"]; validation=result["validation"]; diff=str(result["diff"]); attempt_number=int(result["attempt_number"]); continue

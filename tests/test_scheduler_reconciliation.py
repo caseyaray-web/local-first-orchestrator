@@ -177,6 +177,50 @@ class SchedulerReconciliationTests(unittest.TestCase):
         self.assertEqual(event["event_type"], "scheduler_stage_historical_retired")
         self.assertEqual(json.loads(event["payload_json"])["proof_kind"], "retired_attempt")
 
+    def test_paused_operator_can_retire_expired_dependency_release_after_local_review_supersedes_it(self) -> None:
+        self.ledger.connection.execute("UPDATE tickets SET state='local_review' WHERE id=?", (self.ticket,))
+        claim_id = self.claim("native_dependency_release", started=2, identity={"child_external_id": "old"}, expires=50)
+        self.ledger.connection.execute(
+            "INSERT INTO review_results(ticket_id,attempt_number,verdict,payload_json,created_at) VALUES (?,1,'pass','{}',4)",
+            (self.ticket,),
+        )
+        self.ledger.pause("operator", reason="repair stale graph claim")
+
+        retired = self.ledger.retire_historical_scheduler_claim(claim_id, operator_id="operator", reason="generated identity superseded after implementation", now=100)
+
+        self.assertEqual((retired["status"], retired["retirement_status"], retired["proof_kind"]), ("failed", "retired", "advanced_review_superseded_dependency_release"))
+        self.assertIsNone(retired["lease_owner"])
+        self.assertIsNone(retired["lease_expires_at"])
+        self.assertEqual(int(retired["finalized_at"]), 100)
+        self.assertIn("superseded historical stage", retired["last_error"])
+
+    def test_dependency_release_without_advanced_review_cannot_retire_incomplete_effect(self) -> None:
+        claim_id = self.claim("native_dependency_release", started=2, identity={"child_external_id": "old"}, expires=50)
+        self.ledger.pause("operator", reason="repair stale graph claim")
+        with self.assertRaisesRegex(PermissionError, "durable completed side-effect evidence"):
+            self.ledger.retire_historical_scheduler_claim(claim_id, operator_id="operator", reason="not proven obsolete", now=100)
+
+    def test_bulk_retirement_selects_incomplete_dependency_release_and_applies_strict_proof(self) -> None:
+        self.ledger.connection.execute("UPDATE tickets SET state='local_review' WHERE id=?", (self.ticket,))
+        supported = self.claim("native_dependency_release", started=2, identity={"child_external_id": "old"}, expires=50)
+        self.ledger.connection.execute(
+            "INSERT INTO review_results(ticket_id,attempt_number,verdict,payload_json,created_at) VALUES (?,1,'pass','{}',4)",
+            (self.ticket,),
+        )
+        self.ledger.pause("operator", reason="repair stale graph claims")
+
+        result = self.ledger.retire_historical_scheduler_claims(
+            ticket_id=self.ticket,
+            operator_id="operator",
+            reason="generated identity superseded after implementation",
+            now=100,
+        )
+
+        self.assertEqual([row["claim_id"] for row in result["retired"]], [supported])
+        self.assertEqual(result["skipped"], [])
+        retired = self.ledger.connection.execute("SELECT status,finalized_at FROM scheduler_stage_claims WHERE claim_id=?", (supported,)).fetchone()
+        self.assertEqual((retired["status"], int(retired["finalized_at"])), ("failed", 100))
+
     def test_paused_operator_can_retire_completed_review_claim_after_terminal_application(self) -> None:
         self.ledger.connection.execute("UPDATE tickets SET state='done' WHERE id=?", (self.ticket,))
         claim_id = self.claim("review:2", started=2, completed=3, identity={"attempt_number": 2}, expires=50)

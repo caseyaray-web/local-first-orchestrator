@@ -602,7 +602,7 @@ class HermesBoardAdapter:
         )
         if task.assignee != self.implementation_profile or task.workspace_kind != "worktree":
             raise RuntimeError("native release authority mismatch")
-        if task.workspace_path is None:
+        if task.workspace_path is None or (allow_unbound_workspace and task.workspace_path == str(self.canonical_repository)):
             if not allow_unbound_workspace:
                 raise RuntimeError("native release authority mismatch")
         else:
@@ -632,7 +632,7 @@ class HermesBoardAdapter:
         )
         if task.workspace_kind != "worktree":
             raise RuntimeError("native release authority mismatch")
-        if task.workspace_path is not None:
+        if task.workspace_path is not None and task.workspace_path != str(self.canonical_repository):
             validate_native_workspace_path(task.workspace_path, repository=self.canonical_repository, external_task_id=task.id)
             if task.workspace_path != str(expected):
                 raise RuntimeError("native release authority mismatch")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -8,7 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
+from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig, _isolated_candidate_diff
 from local_first_orchestrator.execution_handoff import HANDOFF_MARKER, HANDOFF_SENTINEL
 from local_first_orchestrator.hermes_board import ExternalExecutionRun, ExternalExecutionSnapshot, ExternalTicket
 from local_first_orchestrator.ledger import Ledger
@@ -125,6 +126,44 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
         self.assertIsNotNone(claim)
         self.assertEqual(claim["ticket_id"], self.ticket_id)
         self.assertEqual(claim["stage"], "validation:1")
+
+    def test_authorized_untracked_file_is_bound_into_candidate_fingerprint(self) -> None:
+        self.ledger.connection.execute(
+            "UPDATE tickets SET create_files_json=? WHERE id=?",
+            ('["new.py"]', self.ticket_id),
+        )
+        (self.repo / "new.py").write_text('VALUE = "new file"\n')
+
+        result = self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7)
+
+        recorded = str(result["diff_hash"])
+        status = subprocess.run(("git", "status", "--short", "--", "new.py"), cwd=self.repo, text=True, capture_output=True, check=True).stdout.strip()
+        self.assertEqual(status, "?? new.py")
+        frozen = _isolated_candidate_diff(self.repo, self.base, allowed_new_paths=("new.py",))
+        self.assertEqual(recorded, frozen["diff_hash"])
+        self.assertIn("new.py", str(frozen["diff"]))
+        (self.repo / "new.py").write_text('VALUE = "changed after freeze"\n')
+        changed = _isolated_candidate_diff(self.repo, self.base, allowed_new_paths=("new.py",))
+        self.assertNotEqual(recorded, changed["diff_hash"])
+
+    def test_binary_new_file_hash_is_identical_before_and_after_commit(self) -> None:
+        payload = bytes(range(256)) * 4
+        (self.repo / "blob.bin").write_bytes(payload)
+        before = _isolated_candidate_diff(self.repo, self.base, allowed_new_paths=("blob.bin",))
+        subprocess.run(("git", "add", "-A"), cwd=self.repo, check=True)
+        subprocess.run(("git", "commit", "-qm", "binary candidate"), cwd=self.repo, check=True)
+        head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=self.repo, text=True, capture_output=True, check=True).stdout.strip()
+        after = _isolated_candidate_diff(self.repo, self.base, target_sha=head)
+        self.assertEqual(before["diff_hash"], after["diff_hash"])
+        self.assertEqual(before["diff"], after["diff"])
+        self.assertIn("GIT binary patch", str(before["diff"]))
+
+    def test_unauthorized_untracked_file_fails_before_attempt_creation(self) -> None:
+        (self.repo / "rogue.txt").write_text("unexpected\n")
+        with self.assertRaisesRegex(RuntimeError, "unauthorized untracked content"):
+            self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7)
+        self.assertEqual(self.ledger.attempt_count(self.ticket_id), 0)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM hermes_execution_reconciliations WHERE ticket_id=?", (self.ticket_id,)).fetchone()[0], 0)
 
     def test_replay_returns_same_attempt_without_duplicate_stage(self) -> None:
         first = self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7)

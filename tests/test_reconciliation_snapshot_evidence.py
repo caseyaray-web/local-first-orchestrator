@@ -115,6 +115,92 @@ class ReconciliationSnapshotEvidenceTests(unittest.TestCase):
         self.assertEqual(replacement["external_task_id"], "original")
         self.assertIsNotNone(replacement["acknowledged_at"])
 
+    def completed_retry_fixture(self, *, cause_state: CanonicalState = CanonicalState.DONE) -> tuple[str, str]:
+        cause = self.ledger.create_ticket(title="retry-cause", state=cause_state)
+        downstream = self.ledger.create_ticket(
+            title="retry-downstream",
+            state=CanonicalState.DRAFT,
+            contract={"dependencies": [cause]},
+        )
+        accepted_sha = "a" * 40
+        base_sha = "b" * 40
+        self.ledger.record_accepted_evidence(cause, accepted_sha, "accepted", "validated")
+        self.ledger.connection.execute(
+            "INSERT INTO attempts(ticket_id,attempt_number,base_sha,accepted_commit_sha,created_at) VALUES (?,?,?,?,?)",
+            (cause, 1, base_sha, accepted_sha, 1),
+        )
+        self.generated_projection(cause, "original-parent")
+        self.ledger.record_runtime_stage(
+            cause,
+            "generated-repair-activation-1",
+            json.dumps({"external_task_id": "retry-parent"}, sort_keys=True, separators=(",", ":")),
+            attempt_number=1,
+            base_sha=base_sha,
+        )
+        graph_hash = self.ledger._native_dependency_graph_hash(
+            downstream,
+            "child",
+            (cause,),
+            ("original-parent",),
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO native_dependency_graphs(ticket_id,child_external_id,local_dependency_ids_json,parent_external_ids_json,graph_hash,verified_at) VALUES (?,?,?,?,?,?)",
+            (downstream, "child", json.dumps([cause]), json.dumps(["original-parent"]), graph_hash, 1),
+        )
+        return cause, downstream
+
+    def reconcile_completed_retry(self, cause: str, downstream: str, *, attempt_number: int = 1, parents: tuple[str, ...] = ("retry-parent",), now: int = 10):
+        return self.ledger.reconcile_completed_retry_dependency_graph(
+            downstream_ticket_id=downstream,
+            cause_ticket_id=cause,
+            cause_attempt_number=attempt_number,
+            predecessor_external_task_id="original-parent",
+            replacement_external_task_id="retry-parent",
+            observed_child_external_id="child",
+            observed_parent_external_ids=parents,
+            operator_id="operator",
+            reason="accepted generated retry replaced premature terminal parent",
+            now=now,
+        )
+
+    def test_completed_retry_graph_reconciles_and_replays_idempotently(self) -> None:
+        cause, downstream = self.completed_retry_fixture()
+        first = self.reconcile_completed_retry(cause, downstream, now=10)
+        replay = self.reconcile_completed_retry(cause, downstream, now=20)
+        self.assertEqual(first["revision_id"], replay["revision_id"])
+        self.assertEqual(first["created_at"], 10)
+        self.assertEqual(replay["created_at"], 10)
+        self.assertEqual(json.loads(first["parent_external_ids_json"]), ["retry-parent"])
+
+    def test_completed_retry_graph_rejects_wrong_live_parents(self) -> None:
+        cause, downstream = self.completed_retry_fixture()
+        with self.assertRaisesRegex(ValueError, "observed Hermes parents drift"):
+            self.reconcile_completed_retry(cause, downstream, parents=("wrong-parent",))
+
+    def test_completed_retry_graph_rejects_released_downstream(self) -> None:
+        cause, downstream = self.completed_retry_fixture()
+        graph = self.ledger.connection.execute("SELECT * FROM native_dependency_graphs WHERE ticket_id=?", (downstream,)).fetchone()
+        self.ledger.connection.execute(
+            "INSERT INTO native_dependency_releases(ticket_id,graph_hash,child_external_id,parent_completion_hash,routing_authority_json,hermes_status,observed_at) VALUES (?,?,?,?,?,?,?)",
+            (downstream, graph["graph_hash"], "child", "completion", "{}", "ready", 2),
+        )
+        with self.assertRaisesRegex(ValueError, "refuses released downstream ticket"):
+            self.reconcile_completed_retry(cause, downstream)
+
+    def test_completed_retry_graph_rejects_non_done_cause(self) -> None:
+        cause, downstream = self.completed_retry_fixture(cause_state=CanonicalState.ACCEPTED)
+        with self.assertRaisesRegex(ValueError, "requires done accepted cause attempt"):
+            self.reconcile_completed_retry(cause, downstream)
+
+    def test_completed_retry_graph_rejects_wrong_accepted_attempt(self) -> None:
+        cause, downstream = self.completed_retry_fixture()
+        self.ledger.connection.execute(
+            "INSERT INTO attempts(ticket_id,attempt_number,base_sha,accepted_commit_sha,created_at) VALUES (?,?,?,?,?)",
+            (cause, 2, "c" * 40, "d" * 40, 2),
+        )
+        with self.assertRaisesRegex(RuntimeError, "accepted commit drift"):
+            self.reconcile_completed_retry(cause, downstream, attempt_number=2)
+
     def test_completed_repair_graph_rejects_parent_drift_and_replays_at_new_time(self) -> None:
         cause = self.ledger.create_ticket(title="cause", state=CanonicalState.DONE)
         downstream = self.ledger.create_ticket(

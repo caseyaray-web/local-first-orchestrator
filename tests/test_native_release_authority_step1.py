@@ -93,6 +93,26 @@ class NativeReleaseAuthorityStep1Tests(unittest.TestCase):
             self.assertEqual(task["assignee"], "worker-code-local")
             self.assertTrue(any("assign" in call for call in calls))
 
+    def test_predispatch_bind_accepts_hermes_repository_root_worktree_placeholder(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / ".worktrees" / "T-1"
+            workspace.mkdir(parents=True)
+            task = {"id": "T-1", "title": "title", "body": "", "status": "blocked", "workspace_path": str(root), "workspace_kind": "worktree", "assignee": "worker-code-local"}
+
+            def runner(argv, **kwargs):
+                if "show" in argv:
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"task": dict(task), "parents": [], "children": [], "comments": [], "events": [], "runs": []}), "")
+                raise AssertionError(argv)
+
+            adapter = HermesBoardAdapter(
+                executable="/bin/true", board="isolated", allow_writes=True, runner=runner,
+                implementation_profile="worker-code-local", canonical_repository=root,
+            )
+            self.assertEqual(adapter.bind_native_release_task("T-1", expected_workspace_path=str(workspace)), {
+                "profile": "worker-code-local", "workspace_kind": "worktree", "workspace_path": str(workspace),
+            })
+
     def test_strict_postdispatch_verifier_still_rejects_unbound_workspace(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -105,6 +125,9 @@ class NativeReleaseAuthorityStep1Tests(unittest.TestCase):
             task = ExternalTicket("T-1", "title", "", "ready", None, assignee="worker-code-local", workspace_kind="worktree")
             with self.assertRaisesRegex(RuntimeError, "authority mismatch"):
                 adapter.verify_native_release_task(task, expected_workspace_path=str(workspace))
+            repo_placeholder = ExternalTicket("T-1", "title", "", "ready", str(root), assignee="worker-code-local", workspace_kind="worktree")
+            with self.assertRaisesRegex(RuntimeError, "authority mismatch"):
+                adapter.verify_native_release_task(repo_placeholder, expected_workspace_path=str(workspace))
 
     def test_release_authority_accepts_exact_prepared_worktree(self):
         with TemporaryDirectory() as tmp:

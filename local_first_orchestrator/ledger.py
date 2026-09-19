@@ -2971,11 +2971,23 @@ class Ledger:
                 raise ValueError("historical scheduler claim retirement requires a claimed stage")
             if row["lease_expires_at"] is None or int(row["lease_expires_at"]) > now:
                 raise PermissionError("historical scheduler claim retirement requires an expired lease")
-            if row["side_effect_completed_at"] is None or row["result_json"] is None:
-                raise PermissionError("historical scheduler claim retirement requires durable completed side-effect evidence")
 
             stage = str(row["stage"])
             proof_kind: str | None = None
+            incomplete_supersession = False
+            if row["side_effect_completed_at"] is None or row["result_json"] is None:
+                if stage == "native_dependency_release":
+                    advanced = conn.execute(
+                        "SELECT 1 FROM tickets t JOIN review_results rr ON rr.ticket_id=t.id "
+                        "WHERE t.id=? AND t.state IN ('local_review','accepted','done') LIMIT 1",
+                        (row["ticket_id"],),
+                    ).fetchone()
+                    if advanced is not None:
+                        proof_kind = "advanced_review_superseded_dependency_release"
+                        incomplete_supersession = True
+                if proof_kind is None:
+                    raise PermissionError("historical scheduler claim retirement requires durable completed side-effect evidence")
+
             if stage.startswith("validation:"):
                 retired = conn.execute(
                     "SELECT 1 FROM failed_attempt_reconciliations WHERE ticket_id=? AND ?=('validation:' || retired_attempt_number)",
@@ -2994,11 +3006,18 @@ class Ledger:
             if proof_kind is None:
                 raise PermissionError("scheduler claim has no supported terminal supersession proof")
 
-            changed = conn.execute(
-                "UPDATE scheduler_stage_claims SET status='completed',lease_owner=NULL,lease_expires_at=NULL,finalized_at=?,updated_at=? "
-                "WHERE claim_id=? AND status='claimed' AND side_effect_completed_at IS NOT NULL",
-                (now, now, claim_id),
-            )
+            if incomplete_supersession:
+                changed = conn.execute(
+                    "UPDATE scheduler_stage_claims SET status='failed',lease_owner=NULL,lease_expires_at=NULL,last_error=?,finalized_at=?,updated_at=? "
+                    "WHERE claim_id=? AND status='claimed' AND side_effect_completed_at IS NULL",
+                    (f"superseded historical stage: {reason}", now, now, claim_id),
+                )
+            else:
+                changed = conn.execute(
+                    "UPDATE scheduler_stage_claims SET status='completed',lease_owner=NULL,lease_expires_at=NULL,finalized_at=?,updated_at=? "
+                    "WHERE claim_id=? AND status='claimed' AND side_effect_completed_at IS NOT NULL",
+                    (now, now, claim_id),
+                )
             if changed.rowcount != 1:
                 raise RuntimeError("historical scheduler claim changed during retirement")
             self._append_event(
@@ -3030,7 +3049,8 @@ class Ledger:
         now = self._now() if now is None else now
         rows = self.connection.execute(
             "SELECT claim_id,stage FROM scheduler_stage_claims WHERE ticket_id=? AND status='claimed' "
-            "AND lease_expires_at IS NOT NULL AND lease_expires_at<=? AND side_effect_completed_at IS NOT NULL "
+            "AND lease_expires_at IS NOT NULL AND lease_expires_at<=? "
+            "AND (side_effect_completed_at IS NOT NULL OR stage='native_dependency_release') "
             "ORDER BY created_at,claim_id",
             (ticket_id, now),
         ).fetchall()
@@ -3041,7 +3061,11 @@ class Ledger:
             try:
                 retired.append(self.retire_historical_scheduler_claim(historical_claim_id, operator_id=operator_id, reason=reason, now=now))
             except PermissionError as exc:
-                if "no supported terminal supersession proof" not in str(exc):
+                message = str(exc)
+                if (
+                    "no supported terminal supersession proof" not in message
+                    and "durable completed side-effect evidence" not in message
+                ):
                     raise
                 skipped.append({
                     "claim_id": historical_claim_id,
@@ -4542,6 +4566,94 @@ class Ledger:
                 )
                 results.append(dict(conn.execute("SELECT * FROM native_dependency_graph_revisions WHERE revision_id=?", (revision_id,)).fetchone()))
             return results
+
+    def reconcile_completed_retry_dependency_graph(
+        self,
+        *,
+        downstream_ticket_id: str,
+        cause_ticket_id: str,
+        cause_attempt_number: int,
+        predecessor_external_task_id: str,
+        replacement_external_task_id: str,
+        observed_child_external_id: str,
+        observed_parent_external_ids: tuple[str, ...],
+        operator_id: str,
+        reason: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Revise one unreleased downstream graph after a generated retry becomes the accepted parent identity."""
+        if cause_attempt_number < 1:
+            raise ValueError("completed retry dependency reconciliation requires accepted attempt")
+        if not all(isinstance(value, str) and value for value in (
+            downstream_ticket_id, cause_ticket_id, predecessor_external_task_id, replacement_external_task_id,
+            observed_child_external_id, operator_id, reason,
+        )):
+            raise ValueError("completed retry dependency reconciliation identity is incomplete")
+        if predecessor_external_task_id == replacement_external_task_id:
+            raise ValueError("completed retry dependency reconciliation requires distinct predecessor and replacement")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not bool(paused["paused"]):
+                raise PermissionError("completed retry dependency reconciliation requires paused controller")
+            cause = conn.execute("SELECT state FROM tickets WHERE id=?", (cause_ticket_id,)).fetchone()
+            accepted = conn.execute("SELECT accepted_commit_sha FROM accepted_evidence WHERE ticket_id=?", (cause_ticket_id,)).fetchone()
+            attempt = conn.execute("SELECT accepted_commit_sha FROM attempts WHERE ticket_id=? AND attempt_number=?", (cause_ticket_id, cause_attempt_number)).fetchone()
+            if cause is None or str(cause["state"]) != CanonicalState.DONE.value or accepted is None or attempt is None or not str(attempt["accepted_commit_sha"] or ""):
+                raise ValueError("completed retry dependency reconciliation requires done accepted cause attempt")
+            if str(attempt["accepted_commit_sha"]) != str(accepted["accepted_commit_sha"]):
+                raise RuntimeError("completed retry dependency reconciliation accepted commit drift")
+            current_external = self._resolve_external_task_id_in_transaction(conn, cause_ticket_id)
+            if str(current_external) != replacement_external_task_id:
+                raise ValueError("completed retry dependency reconciliation replacement is not current effective identity")
+            original = conn.execute("""
+                SELECT 1 FROM board_projection_outbox b
+                JOIN events e ON e.id=b.event_id
+                WHERE b.ticket_id=? AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL
+                  AND b.external_task_id=? AND e.entity_type='ticket' AND e.entity_id=?
+                  AND e.event_type IN ('generated_microticket_created','generated_microticket_projection_recovered')
+                LIMIT 1
+            """, (cause_ticket_id, predecessor_external_task_id, cause_ticket_id)).fetchone()
+            if original is None:
+                raise ValueError("completed retry dependency reconciliation predecessor is not generated authority")
+            if conn.execute("SELECT 1 FROM native_dependency_releases WHERE ticket_id=?", (downstream_ticket_id,)).fetchone() is not None:
+                raise ValueError("completed retry dependency reconciliation refuses released downstream ticket")
+            effective = self._effective_native_dependency_graph_in_transaction(conn, downstream_ticket_id)
+            if effective is None:
+                raise ValueError("completed retry dependency reconciliation native graph is missing")
+            if str(effective["child_external_id"]) != observed_child_external_id:
+                raise ValueError("completed retry dependency reconciliation child identity drift")
+            dependency_ids = tuple(json.loads(str(effective["local_dependency_ids_json"])))
+            parent_external_ids = list(json.loads(str(effective["parent_external_ids_json"])))
+            indices = [index for index, dependency_id in enumerate(dependency_ids) if dependency_id == cause_ticket_id]
+            if len(indices) != 1:
+                raise ValueError("completed retry dependency reconciliation cause dependency is missing or ambiguous")
+            index = indices[0]
+            if parent_external_ids[index] == replacement_external_task_id:
+                existing = conn.execute("SELECT * FROM native_dependency_graph_revisions WHERE ticket_id=? AND cause_ticket_id=? AND cause_attempt_number=? ORDER BY generation DESC LIMIT 1", (downstream_ticket_id, cause_ticket_id, cause_attempt_number)).fetchone()
+                if existing is None:
+                    raise RuntimeError("completed retry dependency reconciliation replacement lacks revision evidence")
+                return dict(existing)
+            if parent_external_ids[index] != predecessor_external_task_id:
+                raise ValueError("completed retry dependency reconciliation predecessor identity drift")
+            parent_external_ids[index] = replacement_external_task_id
+            parent_tuple = tuple(str(value) for value in parent_external_ids)
+            if tuple(sorted(observed_parent_external_ids)) != tuple(sorted(parent_tuple)):
+                raise ValueError("completed retry dependency reconciliation observed Hermes parents drift")
+            new_hash = self._native_dependency_graph_hash(downstream_ticket_id, observed_child_external_id, dependency_ids, parent_tuple)
+            generation = int(effective["generation"]) + 1
+            revision_id = hashlib.sha256(f"native-completed-retry-graph:{downstream_ticket_id}:{cause_ticket_id}:{cause_attempt_number}:{new_hash}".encode()).hexdigest()[:32]
+            existing = conn.execute("SELECT * FROM native_dependency_graph_revisions WHERE revision_id=?", (revision_id,)).fetchone()
+            if existing is not None:
+                return dict(existing)
+            values = (
+                revision_id, downstream_ticket_id, generation, str(effective["graph_hash"]), observed_child_external_id,
+                str(effective["local_dependency_ids_json"]), json.dumps(list(parent_tuple), sort_keys=True, separators=(",", ":")), new_hash,
+                cause_ticket_id, cause_attempt_number, predecessor_external_task_id, replacement_external_task_id, reason, now,
+            )
+            conn.execute("INSERT INTO native_dependency_graph_revisions(revision_id,ticket_id,generation,supersedes_graph_hash,child_external_id,local_dependency_ids_json,parent_external_ids_json,graph_hash,cause_ticket_id,cause_attempt_number,predecessor_external_task_id,replacement_external_task_id,reason,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
+            self._append_event(conn, entity_type="ticket", entity_id=downstream_ticket_id, event_type="native_dependency_graph_reconciled_after_completed_retry", actor_id=operator_id, payload={"revision_id": revision_id, "generation": generation, "supersedes_graph_hash": str(effective["graph_hash"]), "graph_hash": new_hash, "cause_ticket_id": cause_ticket_id, "cause_attempt_number": cause_attempt_number, "predecessor_external_task_id": predecessor_external_task_id, "replacement_external_task_id": replacement_external_task_id, "reason": reason})
+            return dict(conn.execute("SELECT * FROM native_dependency_graph_revisions WHERE revision_id=?", (revision_id,)).fetchone())
 
     def reconcile_completed_repair_dependency_graph(
         self,
