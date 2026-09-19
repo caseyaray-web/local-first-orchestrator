@@ -159,6 +159,34 @@ class RegisteredRuntimeCliTests(unittest.TestCase):
         )]
         self.assertEqual(events[-2:], ["paused", "resumed"])
 
+    def test_operator_status_cli_never_exposes_legacy_daemon_authority_or_updated_at_secrets(self) -> None:
+        cases = (
+            ("PaSsWoRd-PRIMARY_SECRET_7d2e", "idle", 1, "PRIMARY_SECRET_7d2e"),
+            ("SeCrEt-PRIMARY_SECRET_7d2e", "idle", 1, "PRIMARY_SECRET_7d2e"),
+            ("API_KEY-PRIMARY_SECRET_7d2e", "idle", 1, "PRIMARY_SECRET_7d2e"),
+            ("PRIVATE_KEY-PRIMARY_SECRET_7d2e", "idle", 1, "PRIMARY_SECRET_7d2e"),
+            ("safe-worker", "idle", "token=FINAL_CLI_SECRET_7d2e", "FINAL_CLI_SECRET_7d2e"),
+        )
+        for worker_id, status, updated_at, supplied in cases:
+            with self.subTest(worker_id=worker_id, updated_at=repr(updated_at)):
+                self.ledger.connection.execute("DELETE FROM daemon_status")
+                self.ledger.connection.execute(
+                    "INSERT INTO daemon_status(worker_id,status,consecutive_undispatchable,iterations,successful_ticks,idle_ticks,busy_ticks,paused_ticks,transient_errors,consecutive_errors,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (worker_id, status, 0, 0, 0, 0, 0, 0, 0, 0, updated_at),
+                )
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(cli_main([
+                        "--database", str(self.database),
+                        "operator-status", "--limit", "10",
+                    ]), 0)
+                rendered = output.getvalue()
+                payload = json.loads(rendered)
+                self.assertNotIn(supplied, rendered)
+                self.assertEqual(payload["daemon_status"][0]["worker_id"], "<malformed>")
+                self.assertEqual(payload["daemon_status"][0]["status"], "invalid_persisted_state")
+        self.ledger.connection.execute("DELETE FROM daemon_status")
+
     def test_reopen_terminal_cli_requires_pause_and_reopens_budget_exhaustion_terminal(self) -> None:
         now = self.ledger._now()
         self.ledger.connection.execute(

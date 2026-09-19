@@ -575,13 +575,20 @@ class SchedulerDaemonTests(unittest.TestCase):
     def test_daemon_cli_rejects_unsafe_worker_id_during_argument_parsing(self) -> None:
         parser = argparse.ArgumentParser()
         register_cli(parser)
-        for value in ("password=FAKE_CLI_SECRET", "bad worker", "w" * 129):
+        for value in (
+            "password=FAKE_CLI_SECRET", "PaSsWoRd-PRIMARY_SECRET_7d2e", "SeCrEt-PRIMARY_SECRET_7d2e",
+            "API_KEY-PRIMARY_SECRET_7d2e", "PRIVATE_KEY-PRIMARY_SECRET_7d2e", "bad worker", "w" * 129,
+        ):
             with self.subTest(worker_id=value[:32]), self.assertRaises(SystemExit):
                 parser.parse_args(["--database", str(self.database), "daemon", "--worker-id", value])
 
     def test_worker_id_rejects_unsafe_or_overlong_identity_without_persistence(self) -> None:
         unsafe = (
             "password=FAKE_WORKER_SECRET",
+            "PaSsWoRd-PRIMARY_SECRET_7d2e",
+            "SeCrEt-PRIMARY_SECRET_7d2e",
+            "API_KEY-PRIMARY_SECRET_7d2e",
+            "PRIVATE_KEY-PRIMARY_SECRET_7d2e",
             "token:'FAKE_WORKER_SECRET'",
             "bad worker",
             "w" * 129,
@@ -600,6 +607,113 @@ class SchedulerDaemonTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.ledger.upsert_daemon_status(**self._daemon_status_kwargs(value))
                 self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM daemon_status").fetchone()[0], 0)
+
+    def test_legacy_credential_shaped_authority_ids_fail_closed_case_insensitively(self) -> None:
+        values = (
+            "password-PRIMARY_SECRET_7d2e",
+            "PaSsWoRd-PRIMARY_SECRET_7d2e",
+            "secret-PRIMARY_SECRET_7d2e",
+            "SeCrEt-PRIMARY_SECRET_7d2e",
+            "api_key-PRIMARY_SECRET_7d2e",
+            "API_KEY-PRIMARY_SECRET_7d2e",
+            "private_key-PRIMARY_SECRET_7d2e",
+            "PRIVATE_KEY-PRIMARY_SECRET_7d2e",
+        )
+        for index, value in enumerate(values):
+            with self.subTest(value=value):
+                self.ledger.connection.execute(
+                    "INSERT INTO daemon_status(worker_id,status,consecutive_undispatchable,iterations,successful_ticks,idle_ticks,busy_ticks,paused_ticks,transient_errors,consecutive_errors,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (value, "idle", 0, 0, 0, 0, 0, 0, 0, 0, index + 1),
+                )
+                for surface in (
+                    self.ledger.daemon_status_rows(limit=1),
+                    self.ledger.status()["daemon_status"],
+                    self.ledger.operator_status()["daemon_status"],
+                ):
+                    row = surface[0]
+                    self.assertEqual(row["worker_id"], "<malformed>")
+                    self.assertEqual(row["status"], "invalid_persisted_state")
+                    self.assertNotIn("PRIMARY_SECRET_7d2e", json.dumps(row, sort_keys=True))
+                self.ledger.connection.execute("DELETE FROM daemon_status")
+
+    def test_required_status_labels_reject_credential_shaped_values_case_insensitively(self) -> None:
+        values = (
+            "PaSsWoRd-STATUS_SECRET_7d2e",
+            "SeCrEt-STATUS_SECRET_7d2e",
+            "API_KEY-STATUS_SECRET_7d2e",
+            "PRIVATE_KEY-STATUS_SECRET_7d2e",
+        )
+        for index, value in enumerate(values):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.ledger.upsert_daemon_status(**self._daemon_status_kwargs(status=value))
+                self.ledger.connection.execute(
+                    "INSERT INTO daemon_status(worker_id,status,consecutive_undispatchable,iterations,successful_ticks,idle_ticks,busy_ticks,paused_ticks,transient_errors,consecutive_errors,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (f"safe-worker-{index}", value, 0, 0, 0, 0, 0, 0, 0, 0, index + 1),
+                )
+                row = self.ledger.operator_status()["daemon_status"][0]
+                self.assertEqual(row["worker_id"], "<malformed>")
+                self.assertEqual(row["status"], "invalid_persisted_state")
+                self.assertNotIn("STATUS_SECRET_7d2e", json.dumps(row, sort_keys=True))
+                self.ledger.connection.execute("DELETE FROM daemon_status")
+
+    def test_legacy_updated_at_malformed_values_fail_closed_without_exposure(self) -> None:
+        malformed_values = (
+            -1,
+            1.5,
+            float("inf"),
+            "9223372036854775808",
+            "token=FINAL_CLI_SECRET_7d2e",
+        )
+        for index, value in enumerate(malformed_values):
+            with self.subTest(value=repr(value)):
+                self.ledger.connection.execute(
+                    "INSERT INTO daemon_status(worker_id,status,consecutive_undispatchable,iterations,successful_ticks,idle_ticks,busy_ticks,paused_ticks,transient_errors,consecutive_errors,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (f"legacy-updated-{index}", "idle", 0, 0, 0, 0, 0, 0, 0, 0, value),
+                )
+                for surface in (
+                    self.ledger.daemon_status_rows(limit=1),
+                    self.ledger.status()["daemon_status"],
+                    self.ledger.operator_status()["daemon_status"],
+                ):
+                    row = surface[0]
+                    self.assertEqual(row["worker_id"], "<malformed>")
+                    self.assertEqual(row["status"], "invalid_persisted_state")
+                    rendered = json.dumps(row, sort_keys=True)
+                    self.assertNotIn("FINAL_CLI_SECRET_7d2e", rendered)
+                    self.assertNotIn("token=", rendered)
+                self.ledger.connection.execute("DELETE FROM daemon_status")
+
+    def test_operator_daemon_reader_rejects_unrepresentable_updated_at_types(self) -> None:
+        base = {
+            "worker_id": "synthetic-worker",
+            "status": "idle",
+            "last_status": None,
+            "last_stage": None,
+            "last_ticket_id": None,
+            "reason_category": None,
+            "reason": None,
+            "consecutive_undispatchable": 0,
+            "iterations": 0,
+            "successful_ticks": 0,
+            "idle_ticks": 0,
+            "busy_ticks": 0,
+            "paused_ticks": 0,
+            "transient_errors": 0,
+            "consecutive_errors": 0,
+            "last_error": None,
+            "last_tick_started_at": None,
+            "last_tick_completed_at": None,
+            "updated_at": 1,
+        }
+        for value in (None, True, False, -1, 2**63, 1.5, float("nan"), float("inf"), "token=SYNTHETIC_SECRET"):
+            with self.subTest(value=repr(value)):
+                row = dict(base)
+                row["updated_at"] = value
+                rendered = Ledger._operator_daemon_row(row)
+                self.assertEqual(rendered["worker_id"], "<malformed>")
+                self.assertEqual(rendered["status"], "invalid_persisted_state")
+                self.assertNotIn("SYNTHETIC_SECRET", json.dumps(rendered, sort_keys=True))
 
     def test_in_memory_health_sanitizes_observational_result_fields(self) -> None:
         stage_secret = 'password="FAKE_STAGE_SECRET"'

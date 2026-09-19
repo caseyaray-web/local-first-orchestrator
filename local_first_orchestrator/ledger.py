@@ -9022,6 +9022,7 @@ class Ledger:
                 field: _finite_optional_real(row[field], name=field)
                 for field in timestamp_fields
             }
+            updated_at = validate_sqlite_non_negative_counter(row["updated_at"])
         except (KeyError, TypeError, ValueError):
             malformed = True
         if malformed:
@@ -9036,7 +9037,7 @@ class Ledger:
             **{field: int(row[field]) for field in counter_fields},
             "last_error": Ledger._bounded_daemon_text(row["last_error"]),
             **timestamps,
-            "updated_at": row["updated_at"],
+            "updated_at": updated_at,
         }
 
     def daemon_status_rows(self, *, limit: int = 25) -> list[dict[str, Any]]:

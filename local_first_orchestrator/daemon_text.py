@@ -40,6 +40,8 @@ def validate_daemon_worker_id(value: object) -> str:
     """Return one exact safe daemon worker identity or fail closed."""
     if not isinstance(value, str) or not _DAEMON_WORKER_ID.fullmatch(value):
         raise ValueError("worker_id must be 1-128 ASCII characters using letters, digits, '.', '_', ':', or '-'")
+    if bounded_daemon_text(value, limit=128) != value:
+        raise ValueError("worker_id must not contain credential-like text")
     return value
 
 
@@ -47,4 +49,6 @@ def validate_daemon_status_label(value: object) -> str:
     """Return one exact safe required daemon status/state label or fail closed."""
     if not isinstance(value, str) or not _DAEMON_STATUS_LABEL.fullmatch(value):
         raise ValueError("daemon status must be 1-80 ASCII characters using letters, digits, '.', '_', ':', or '-'")
+    if bounded_daemon_text(value, limit=80) != value:
+        raise ValueError("daemon status must not contain credential-like text")
     return value
