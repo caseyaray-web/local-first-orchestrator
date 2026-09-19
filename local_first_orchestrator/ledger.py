@@ -518,6 +518,40 @@ CREATE TRIGGER IF NOT EXISTS accepted_candidates_immutable_update
 BEFORE UPDATE ON accepted_candidates BEGIN SELECT RAISE(ABORT, 'accepted candidates are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS accepted_candidates_immutable_delete
 BEFORE DELETE ON accepted_candidates BEGIN SELECT RAISE(ABORT, 'accepted candidates are append-only'); END;
+CREATE TABLE IF NOT EXISTS accepted_candidate_invalidations (
+    ticket_id TEXT PRIMARY KEY REFERENCES tickets(id),
+    invalidated_attempt_number INTEGER NOT NULL,
+    invalidated_evidence_hash TEXT NOT NULL,
+    corrected_candidate_fingerprint TEXT NOT NULL,
+    operator_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS accepted_candidate_invalidations_immutable_update
+BEFORE UPDATE ON accepted_candidate_invalidations BEGIN SELECT RAISE(ABORT, 'accepted candidate invalidations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS accepted_candidate_invalidations_immutable_delete
+BEFORE DELETE ON accepted_candidate_invalidations BEGIN SELECT RAISE(ABORT, 'accepted candidate invalidations are append-only'); END;
+CREATE TABLE IF NOT EXISTS accepted_candidate_replacements (
+    ticket_id TEXT PRIMARY KEY REFERENCES tickets(id),
+    attempt_number INTEGER NOT NULL,
+    candidate_fingerprint TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    worktree_path TEXT NOT NULL,
+    implementation_artifact TEXT NOT NULL,
+    implementation_artifact_sha256 TEXT NOT NULL,
+    validation_artifact TEXT NOT NULL,
+    validation_artifact_sha256 TEXT NOT NULL,
+    review_artifact TEXT NOT NULL,
+    review_artifact_sha256 TEXT NOT NULL,
+    review_result_id INTEGER NOT NULL,
+    evidence_hash TEXT NOT NULL,
+    supersedes_evidence_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS accepted_candidate_replacements_immutable_update
+BEFORE UPDATE ON accepted_candidate_replacements BEGIN SELECT RAISE(ABORT, 'accepted candidate replacements are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS accepted_candidate_replacements_immutable_delete
+BEFORE DELETE ON accepted_candidate_replacements BEGIN SELECT RAISE(ABORT, 'accepted candidate replacements are append-only'); END;
 CREATE TABLE IF NOT EXISTS git_commit_intents (
     ticket_id TEXT PRIMARY KEY REFERENCES tickets(id),
     attempt_number INTEGER NOT NULL,
@@ -3468,7 +3502,13 @@ class Ledger:
                   AND json_valid(route.detail)=1
                   AND json_extract(route.detail,'$.action')='pass'
                   AND rr.verdict='pass'
-                  AND NOT EXISTS (SELECT 1 FROM accepted_candidates ac WHERE ac.ticket_id=t.id)
+                  AND (
+                      NOT EXISTS (SELECT 1 FROM accepted_candidates ac WHERE ac.ticket_id=t.id)
+                      OR (
+                          EXISTS (SELECT 1 FROM accepted_candidate_invalidations ai WHERE ai.ticket_id=t.id)
+                          AND NOT EXISTS (SELECT 1 FROM accepted_candidate_replacements ar WHERE ar.ticket_id=t.id)
+                      )
+                  )
                   AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('acceptance:' || rr.attempt_number))
                   AND (? IS NULL OR t.id=?)
                 ORDER BY t.created_at,t.id LIMIT 1
@@ -3583,16 +3623,27 @@ class Ledger:
                 "review_result_id": int(review["id"]),
             }
             evidence_hash = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-            existing = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket_id,)).fetchone()
-            if existing is not None:
-                if str(existing["evidence_hash"]) != evidence_hash:
+            historical = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket_id,)).fetchone()
+            invalidation = conn.execute("SELECT * FROM accepted_candidate_invalidations WHERE ticket_id=?", (ticket_id,)).fetchone()
+            replacement = conn.execute("SELECT * FROM accepted_candidate_replacements WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if invalidation is not None:
+                if historical is None or str(historical["evidence_hash"]) != str(invalidation["invalidated_evidence_hash"]):
+                    raise RuntimeError("acceptance_reconciliation_required: invalidated acceptance authority drift")
+                if replacement is not None:
+                    if str(replacement["evidence_hash"]) != evidence_hash:
+                        raise RuntimeError("acceptance_reconciliation_required: replacement accepted candidate conflicts")
+                else:
+                    conn.execute("INSERT INTO accepted_candidate_replacements(ticket_id,attempt_number,candidate_fingerprint,base_sha,worktree_path,implementation_artifact,implementation_artifact_sha256,validation_artifact,validation_artifact_sha256,review_artifact,review_artifact_sha256,review_result_id,evidence_hash,supersedes_evidence_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (ticket_id,attempt_number,evidence["candidate_fingerprint"],evidence["base_sha"],evidence["worktree_path"],evidence["implementation_artifact"],implementation_sha,evidence["validation_artifact"],validation_sha,evidence["review_artifact"],review_sha,evidence["review_result_id"],evidence_hash,str(invalidation["invalidated_evidence_hash"]),now))
+            elif historical is not None:
+                if str(historical["evidence_hash"]) != evidence_hash:
                     raise RuntimeError("acceptance_reconciliation_required: accepted candidate conflicts")
             else:
                 conn.execute("INSERT INTO accepted_candidates(ticket_id,attempt_number,candidate_fingerprint,base_sha,worktree_path,implementation_artifact,implementation_artifact_sha256,validation_artifact,validation_artifact_sha256,review_artifact,review_artifact_sha256,review_result_id,evidence_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (ticket_id,attempt_number,evidence["candidate_fingerprint"],evidence["base_sha"],evidence["worktree_path"],evidence["implementation_artifact"],implementation_sha,evidence["validation_artifact"],validation_sha,evidence["review_artifact"],review_sha,evidence["review_result_id"],evidence_hash,now))
+            if str(ticket["state"]) == CanonicalState.LOCAL_REVIEW.value:
                 validate_transition(CanonicalState.LOCAL_REVIEW, CanonicalState.ACCEPTED)
                 if conn.execute("UPDATE tickets SET state=?,updated_at=? WHERE id=? AND state=?", (CanonicalState.ACCEPTED.value,now,ticket_id,CanonicalState.LOCAL_REVIEW.value)).rowcount != 1:
                     raise RuntimeError("ticket changed concurrently")
-                event_id = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="state_transition", actor_id="acceptance", from_state=CanonicalState.LOCAL_REVIEW.value, to_state=CanonicalState.ACCEPTED.value, payload={"attempt_number":attempt_number,"candidate_fingerprint":evidence["candidate_fingerprint"],"evidence_hash":evidence_hash})
+                event_id = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="state_transition", actor_id="acceptance", from_state=CanonicalState.LOCAL_REVIEW.value, to_state=CanonicalState.ACCEPTED.value, payload={"attempt_number":attempt_number,"candidate_fingerprint":evidence["candidate_fingerprint"],"evidence_hash":evidence_hash,"supersedes_evidence_hash":None if invalidation is None else str(invalidation["invalidated_evidence_hash"])})
                 if CanonicalState.ACCEPTED.value in self._PROJECTABLE_STATES:
                     self._enqueue_projection_bundle_in_transaction(conn, ticket_id=ticket_id, event_id=event_id, evidence=f"candidate accepted {evidence_hash}")
             result = {**evidence, "evidence_hash": evidence_hash}
@@ -3602,8 +3653,122 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id":claim_id,"stage":"acceptance","result":result})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
+    def _effective_accepted_candidate_in_transaction(self, conn: sqlite3.Connection, ticket_id: str) -> sqlite3.Row | None:
+        replacement = conn.execute("SELECT * FROM accepted_candidate_replacements WHERE ticket_id=?", (ticket_id,)).fetchone()
+        if replacement is not None:
+            return replacement
+        invalidated = conn.execute("SELECT 1 FROM accepted_candidate_invalidations WHERE ticket_id=?", (ticket_id,)).fetchone()
+        if invalidated is not None:
+            return None
+        return conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket_id,)).fetchone()
+
+    def invalidate_preintegration_acceptance(
+        self,
+        ticket_id: str,
+        *,
+        corrected_candidate_fingerprint: str,
+        manual_artifact_path: str,
+        manual_artifact_sha256: str,
+        operator_id: str,
+        reason: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Append-only recovery for an accepted candidate whose fingerprint was incomplete before any Git commit."""
+        if not all(isinstance(value, str) and value for value in (
+            ticket_id, corrected_candidate_fingerprint, manual_artifact_path, manual_artifact_sha256, operator_id, reason,
+        )):
+            raise ValueError("acceptance invalidation identity is incomplete")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not bool(paused["paused"]):
+                raise PermissionError("acceptance invalidation requires Local First paused")
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            accepted = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket_id,)).fetchone()
+            existing = conn.execute("SELECT * FROM accepted_candidate_invalidations WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if existing is not None:
+                if ticket is None or accepted is None:
+                    raise ValueError("acceptance invalidation replay is missing historical authority")
+                expected = (
+                    int(accepted["attempt_number"]), str(accepted["evidence_hash"]), corrected_candidate_fingerprint, operator_id, reason,
+                )
+                actual = (
+                    int(existing["invalidated_attempt_number"]), str(existing["invalidated_evidence_hash"]), str(existing["corrected_candidate_fingerprint"]), str(existing["operator_id"]), str(existing["reason"]),
+                )
+                if actual != expected:
+                    raise ValueError("acceptance invalidation conflicts with durable evidence")
+                next_attempt = int(existing["invalidated_attempt_number"]) + 1
+                return {**dict(existing), "next_attempt_number": next_attempt, "status": "already_invalidated"}
+            if ticket is None or accepted is None or str(ticket["state"]) != CanonicalState.ACCEPTED.value:
+                raise ValueError("acceptance invalidation requires one accepted historical candidate")
+            if conn.execute("SELECT 1 FROM accepted_candidate_replacements WHERE ticket_id=?", (ticket_id,)).fetchone() is not None:
+                raise ValueError("acceptance invalidation replacement already exists")
+            if conn.execute("SELECT 1 FROM git_commit_intents WHERE ticket_id=? UNION SELECT 1 FROM git_commit_evidence WHERE ticket_id=? UNION SELECT 1 FROM accepted_evidence WHERE ticket_id=?", (ticket_id, ticket_id, ticket_id)).fetchone() is not None:
+                raise ValueError("acceptance invalidation refuses existing Git/final acceptance authority")
+            attempt_number = int(accepted["attempt_number"])
+            attempt = conn.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            implementation = conn.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='implementation'", (ticket_id, attempt_number)).fetchone()
+            if attempt is None or implementation is None or not attempt["base_sha"] or not attempt["worktree_path"]:
+                raise ValueError("acceptance invalidation requires complete implementation provenance")
+            if corrected_candidate_fingerprint == str(accepted["candidate_fingerprint"]):
+                raise ValueError("acceptance invalidation requires a corrected fingerprint")
+            if conn.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number>?", (ticket_id, attempt_number)).fetchone() is not None:
+                raise ValueError("acceptance invalidation refuses later attempt history")
+            next_attempt = attempt_number + 1
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=? AND status='claimed'", (ticket_id, f"git_integration:{attempt_number}")).fetchone()
+            if claim is not None:
+                if claim["side_effect_completed_at"] is not None:
+                    raise ValueError("acceptance invalidation refuses completed Git integration effect")
+                conn.execute(
+                    "UPDATE scheduler_stage_claims SET status='failed',lease_owner=NULL,lease_expires_at=NULL,last_error=?,finalized_at=?,updated_at=? WHERE claim_id=? AND status='claimed'",
+                    ("superseded by pre-integration acceptance invalidation", now, now, claim["claim_id"]),
+                )
+            conn.execute(
+                "INSERT INTO accepted_candidate_invalidations(ticket_id,invalidated_attempt_number,invalidated_evidence_hash,corrected_candidate_fingerprint,operator_id,reason,created_at) VALUES (?,?,?,?,?,?,?)",
+                (ticket_id, attempt_number, str(accepted["evidence_hash"]), corrected_candidate_fingerprint, operator_id, reason, now),
+            )
+            conn.execute(
+                "INSERT INTO attempts(ticket_id,attempt_number,outcome,base_sha,branch,worktree_path,pre_diff_hash,post_diff_hash,created_at) VALUES (?,?,NULL,?,?,?,?,?,?)",
+                (ticket_id, next_attempt, str(attempt["base_sha"]), str(attempt["branch"] or ""), str(attempt["worktree_path"]), corrected_candidate_fingerprint, corrected_candidate_fingerprint, now),
+            )
+            conn.execute(
+                "INSERT INTO model_stage_artifacts(ticket_id,attempt_number,stage,purpose,adapter,request_hash,response_artifact,worktree_path,base_sha,diff_hash,completed_at,status) VALUES (?,?, 'implementation','implementation','manual-adoption',?,?,?,?,?,?, 'completed')",
+                (ticket_id, next_attempt, manual_artifact_sha256, manual_artifact_path, str(attempt["worktree_path"]), str(attempt["base_sha"]), corrected_candidate_fingerprint, now),
+            )
+            manual_detail = json.dumps({
+                "ticket_id": ticket_id,
+                "attempt_number": next_attempt,
+                "source_attempt_number": attempt_number,
+                "diff_hash": corrected_candidate_fingerprint,
+                "artifact_path": manual_artifact_path,
+                "artifact_sha256": manual_artifact_sha256,
+                "workspace_path": str(attempt["worktree_path"]),
+                "base_sha": str(attempt["base_sha"]),
+                "reason": reason,
+                "source": "preintegration_acceptance_invalidation",
+            }, sort_keys=True, separators=(",", ":"))
+            conn.execute(
+                "INSERT INTO runtime_stages(ticket_id,stage,detail,created_at,attempt_number,artifact_path,artifact_sha256,base_sha) VALUES (?,?,?,?,?,?,?,?)",
+                (ticket_id, f"manual-adoption-{next_attempt}", manual_detail, now, next_attempt, manual_artifact_path, manual_artifact_sha256, str(attempt["base_sha"])),
+            )
+            new_max = max(int(ticket["max_attempts"]), next_attempt)
+            conn.execute(
+                "UPDATE tickets SET state=?,max_attempts=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND state=?",
+                (CanonicalState.IMPLEMENTING.value, new_max, now, ticket_id, CanonicalState.ACCEPTED.value),
+            )
+            payload = {
+                "invalidated_attempt_number": attempt_number,
+                "next_attempt_number": next_attempt,
+                "invalidated_evidence_hash": str(accepted["evidence_hash"]),
+                "old_candidate_fingerprint": str(accepted["candidate_fingerprint"]),
+                "corrected_candidate_fingerprint": corrected_candidate_fingerprint,
+                "reason": reason,
+            }
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="accepted_candidate_invalidated_before_git", actor_id=operator_id, from_state=CanonicalState.ACCEPTED.value, to_state=CanonicalState.IMPLEMENTING.value, payload=payload)
+            return {"ticket_id": ticket_id, **payload, "status": "invalidated"}
+
     def accepted_candidate(self, ticket_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket_id,)).fetchone()
+        row = self._effective_accepted_candidate_in_transaction(self.connection, ticket_id)
         return dict(row) if row else None
 
     def git_commit_intent(self, ticket_id: str) -> dict[str, Any] | None:
@@ -5148,7 +5313,7 @@ class Ledger:
             ).fetchone()
             if replay is not None:
                 ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (replay["ticket_id"],)).fetchone()
-                accepted = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (replay["ticket_id"],)).fetchone()
+                accepted = self._effective_accepted_candidate_in_transaction(conn, str(replay["ticket_id"]))
                 git_evidence = conn.execute("SELECT * FROM git_commit_evidence WHERE ticket_id=?", (replay["ticket_id"],)).fetchone()
                 if ticket is None or accepted is None or git_evidence is None:
                     raise RuntimeError("completion_reconciliation_required: completion authority is missing")
@@ -5183,22 +5348,32 @@ class Ledger:
                 return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
 
             row = conn.execute("""
-                SELECT t.id,ac.attempt_number
+                SELECT t.id,
+                       COALESCE(ar.attempt_number, CASE WHEN ai.ticket_id IS NULL THEN ac.attempt_number END) AS attempt_number
                 FROM tickets t
-                JOIN accepted_candidates ac ON ac.ticket_id=t.id
-                JOIN git_commit_evidence ge ON ge.ticket_id=t.id AND ge.attempt_number=ac.attempt_number
-                JOIN git_commit_intents gi ON gi.ticket_id=t.id AND gi.attempt_number=ac.attempt_number
+                LEFT JOIN accepted_candidate_replacements ar ON ar.ticket_id=t.id
+                LEFT JOIN accepted_candidate_invalidations ai ON ai.ticket_id=t.id
+                LEFT JOIN accepted_candidates ac ON ac.ticket_id=t.id
+                JOIN git_commit_evidence ge ON ge.ticket_id=t.id
+                  AND ge.attempt_number=COALESCE(ar.attempt_number, CASE WHEN ai.ticket_id IS NULL THEN ac.attempt_number END)
+                JOIN git_commit_intents gi ON gi.ticket_id=t.id
+                  AND gi.attempt_number=COALESCE(ar.attempt_number, CASE WHEN ai.ticket_id IS NULL THEN ac.attempt_number END)
                 WHERE t.state='accepted'
+                  AND (ar.ticket_id IS NOT NULL OR (ai.ticket_id IS NULL AND ac.ticket_id IS NOT NULL))
                   AND gi.status='completed'
                   AND gi.commit_sha=ge.commit_sha
                   AND NOT EXISTS (SELECT 1 FROM accepted_evidence ae WHERE ae.ticket_id=t.id)
-                  AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('completion:' || ac.attempt_number))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM scheduler_stage_claims c
+                      WHERE c.ticket_id=t.id
+                        AND c.stage=('completion:' || COALESCE(ar.attempt_number, CASE WHEN ai.ticket_id IS NULL THEN ac.attempt_number END))
+                  )
                   AND (? IS NULL OR t.id=?)
                 ORDER BY t.created_at,t.id LIMIT 1
             """, (ticket_id, ticket_id)).fetchone()
             if row is None:
                 return None
-            accepted = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (row["id"],)).fetchone()
+            accepted = self._effective_accepted_candidate_in_transaction(conn, str(row["id"]))
             git_evidence = conn.execute("SELECT * FROM git_commit_evidence WHERE ticket_id=?", (row["id"],)).fetchone()
             identity = self._scheduler_completion_identity(accepted, git_evidence)
             encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
@@ -5259,7 +5434,7 @@ class Ledger:
                 raise RuntimeError("completion_reconciliation_required: claim identity malformed") from exc
             ticket_id = str(claim["ticket_id"])
             ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
-            accepted = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket_id,)).fetchone()
+            accepted = self._effective_accepted_candidate_in_transaction(conn, ticket_id)
             git_evidence = conn.execute("SELECT * FROM git_commit_evidence WHERE ticket_id=?", (ticket_id,)).fetchone()
             git_intent = conn.execute("SELECT * FROM git_commit_intents WHERE ticket_id=?", (ticket_id,)).fetchone()
             attempt = None if accepted is None else conn.execute(
@@ -5414,7 +5589,7 @@ class Ledger:
             ).fetchone()
             if replay is not None:
                 ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (replay["ticket_id"],)).fetchone()
-                accepted = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (replay["ticket_id"],)).fetchone()
+                accepted = self._effective_accepted_candidate_in_transaction(conn, str(replay["ticket_id"]))
                 attempt = None if accepted is None else conn.execute(
                     "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?",
                     (replay["ticket_id"], accepted["attempt_number"]),
@@ -5459,27 +5634,28 @@ class Ledger:
                 return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
 
             row = conn.execute("""
-                SELECT t.id,t.title,t.tranche_id,ac.attempt_number,ac.evidence_hash,ac.candidate_fingerprint,
-                       ac.base_sha,ac.worktree_path,a.branch
-                FROM tickets t
-                JOIN accepted_candidates ac ON ac.ticket_id=t.id
-                JOIN attempts a ON a.ticket_id=t.id AND a.attempt_number=ac.attempt_number
+                SELECT t.* FROM tickets t
                 WHERE t.state='accepted'
                   AND NOT EXISTS (SELECT 1 FROM git_commit_evidence ge WHERE ge.ticket_id=t.id)
-                  AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('git_integration:' || ac.attempt_number))
                   AND (? IS NULL OR t.id=?)
                 ORDER BY t.created_at,t.id LIMIT 1
             """, (ticket_id, ticket_id)).fetchone()
             if row is None:
                 return None
+            accepted = self._effective_accepted_candidate_in_transaction(conn, str(row["id"]))
+            if accepted is None:
+                return None
+            attempt = conn.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (row["id"], accepted["attempt_number"])).fetchone()
+            if attempt is None or conn.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (row["id"], f"git_integration:{int(accepted['attempt_number'])}")).fetchone() is not None:
+                return None
             identity = {
                 "ticket_id": str(row["id"]),
-                "attempt_number": int(row["attempt_number"]),
-                "accepted_evidence_hash": str(row["evidence_hash"]),
-                "candidate_fingerprint": str(row["candidate_fingerprint"]),
-                "base_sha": str(row["base_sha"]),
-                "worktree_path": str(row["worktree_path"]),
-                "branch": str(row["branch"] or ""),
+                "attempt_number": int(accepted["attempt_number"]),
+                "accepted_evidence_hash": str(accepted["evidence_hash"]),
+                "candidate_fingerprint": str(accepted["candidate_fingerprint"]),
+                "base_sha": str(accepted["base_sha"]),
+                "worktree_path": str(accepted["worktree_path"]),
+                "branch": str(attempt["branch"] or ""),
                 "tranche_id": None if row["tranche_id"] is None else str(row["tranche_id"]),
                 "commit_message": f"local-first: {row['title']}",
             }
@@ -5513,7 +5689,7 @@ class Ledger:
         if candidate_identity.get("ticket_id") != ticket_id or any(not candidate_identity.get(key) for key in required):
             raise ValueError("invalid git commit intent identity")
         with self._transaction() as conn:
-            accepted = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket_id,)).fetchone()
+            accepted = self._effective_accepted_candidate_in_transaction(conn, ticket_id)
             if accepted is None:
                 raise RuntimeError("git_integration_reconciliation_required: accepted candidate is missing")
             expected = (
@@ -5589,7 +5765,7 @@ class Ledger:
             if not commit_sha or not before or after != commit_sha:
                 raise RuntimeError("git_integration_reconciliation_required: incomplete commit/integration result")
             intent = conn.execute("SELECT * FROM git_commit_intents WHERE ticket_id=?", (ticket_id,)).fetchone()
-            accepted = conn.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket_id,)).fetchone()
+            accepted = self._effective_accepted_candidate_in_transaction(conn, ticket_id)
             attempt = conn.execute(
                 "SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?",
                 (ticket_id, int(identity["attempt_number"])),
@@ -6840,11 +7016,29 @@ class Ledger:
                 (ticket_id, current),
             ).fetchone()
             successor = conn.execute(
-                "SELECT base_sha FROM attempts WHERE ticket_id=? AND attempt_number=?",
+                "SELECT base_sha,pre_diff_hash,post_diff_hash FROM attempts WHERE ticket_id=? AND attempt_number=?",
                 (ticket_id, current + 1),
             ).fetchone()
             if attempt is None or successor is None:
                 return False
+            invalidation = conn.execute(
+                "SELECT ai.invalidated_evidence_hash,ai.corrected_candidate_fingerprint,ac.evidence_hash,a.base_sha "
+                "FROM accepted_candidate_invalidations ai "
+                "JOIN accepted_candidates ac ON ac.ticket_id=ai.ticket_id "
+                "JOIN attempts a ON a.ticket_id=ai.ticket_id AND a.attempt_number=ai.invalidated_attempt_number "
+                "WHERE ai.ticket_id=? AND ai.invalidated_attempt_number=?",
+                (ticket_id, current),
+            ).fetchone()
+            if invalidation is not None:
+                corrected = str(invalidation["corrected_candidate_fingerprint"] or "")
+                if (
+                    str(invalidation["invalidated_evidence_hash"] or "") != str(invalidation["evidence_hash"] or "")
+                    or str(successor["base_sha"] or "") != str(invalidation["base_sha"] or "")
+                    or str(successor["pre_diff_hash"] or "") != corrected
+                    or str(successor["post_diff_hash"] or "") != corrected
+                ):
+                    return False
+                continue
             outcome = str(attempt["outcome"] or "")
             if outcome == "repair_requested":
                 routing = conn.execute(

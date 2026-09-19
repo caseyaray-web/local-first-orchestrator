@@ -136,13 +136,17 @@ def scheduler_observability(ledger: Ledger, *, now: int | None = None, signer_pu
         ).fetchone()
         if row is not None:
             review = dict(row)
-        row = ledger.connection.execute(
-            "SELECT attempt_number,candidate_fingerprint,implementation_artifact,implementation_artifact_sha256,validation_artifact,validation_artifact_sha256,review_artifact,review_artifact_sha256,review_result_id,evidence_hash,created_at "
-            "FROM accepted_candidates WHERE ticket_id=?",
-            (ticket_id,),
-        ).fetchone()
-        if row is not None:
-            accepted = dict(row)
+        effective_accepted = ledger.accepted_candidate(ticket_id)
+        if effective_accepted is not None:
+            accepted = {
+                key: effective_accepted[key]
+                for key in (
+                    "attempt_number", "candidate_fingerprint", "implementation_artifact", "implementation_artifact_sha256",
+                    "validation_artifact", "validation_artifact_sha256", "review_artifact", "review_artifact_sha256",
+                    "review_result_id", "evidence_hash", "created_at",
+                )
+                if key in effective_accepted
+            }
         row = ledger.connection.execute(
             "SELECT attempt_number,status,commit_sha,created_at,completed_at FROM git_commit_intents WHERE ticket_id=?",
             (ticket_id,),
@@ -494,7 +498,13 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
           AND json_valid(route.detail)=1
           AND json_extract(route.detail,'$.action')='pass'
           AND rr.verdict='pass'
-          AND NOT EXISTS (SELECT 1 FROM accepted_candidates ac WHERE ac.ticket_id=t.id)
+          AND (
+              NOT EXISTS (SELECT 1 FROM accepted_candidates ac WHERE ac.ticket_id=t.id)
+              OR (
+                  EXISTS (SELECT 1 FROM accepted_candidate_invalidations ai WHERE ai.ticket_id=t.id)
+                  AND NOT EXISTS (SELECT 1 FROM accepted_candidate_replacements ar WHERE ar.ticket_id=t.id)
+              )
+          )
           AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('acceptance:' || route.attempt_number))
         ORDER BY t.created_at,t.id LIMIT 1
     """).fetchone()
@@ -509,10 +519,17 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
         return ProcessNextPreview(next_stage="git_integration", ticket_id=str(git_replay["ticket_id"]), would_execute=True)
     git_candidate = ledger.connection.execute("""
         SELECT t.id FROM tickets t
-        JOIN accepted_candidates ac ON ac.ticket_id=t.id
+        LEFT JOIN accepted_candidate_replacements ar ON ar.ticket_id=t.id
+        LEFT JOIN accepted_candidate_invalidations ai ON ai.ticket_id=t.id
+        LEFT JOIN accepted_candidates ac ON ac.ticket_id=t.id
         WHERE t.state='accepted'
+          AND (ar.ticket_id IS NOT NULL OR (ai.ticket_id IS NULL AND ac.ticket_id IS NOT NULL))
           AND NOT EXISTS (SELECT 1 FROM git_commit_evidence ge WHERE ge.ticket_id=t.id)
-          AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('git_integration:' || ac.attempt_number))
+          AND NOT EXISTS (
+              SELECT 1 FROM scheduler_stage_claims c
+              WHERE c.ticket_id=t.id
+                AND c.stage=('git_integration:' || COALESCE(ar.attempt_number, CASE WHEN ai.ticket_id IS NULL THEN ac.attempt_number END))
+          )
         ORDER BY t.created_at,t.id LIMIT 1
     """).fetchone()
     if git_candidate is not None:
@@ -526,14 +543,23 @@ def preview_next(ledger: Ledger, *, now: int | None = None, signer_public_key: b
         return ProcessNextPreview(next_stage="completion", ticket_id=str(completion_replay["ticket_id"]), would_execute=True)
     completion = ledger.connection.execute("""
         SELECT t.id FROM tickets t
-        JOIN accepted_candidates ac ON ac.ticket_id=t.id
-        JOIN git_commit_evidence ge ON ge.ticket_id=t.id AND ge.attempt_number=ac.attempt_number
-        JOIN git_commit_intents gi ON gi.ticket_id=t.id AND gi.attempt_number=ac.attempt_number
+        LEFT JOIN accepted_candidate_replacements ar ON ar.ticket_id=t.id
+        LEFT JOIN accepted_candidate_invalidations ai ON ai.ticket_id=t.id
+        LEFT JOIN accepted_candidates ac ON ac.ticket_id=t.id
+        JOIN git_commit_evidence ge ON ge.ticket_id=t.id
+          AND ge.attempt_number=COALESCE(ar.attempt_number, CASE WHEN ai.ticket_id IS NULL THEN ac.attempt_number END)
+        JOIN git_commit_intents gi ON gi.ticket_id=t.id
+          AND gi.attempt_number=COALESCE(ar.attempt_number, CASE WHEN ai.ticket_id IS NULL THEN ac.attempt_number END)
         WHERE t.state='accepted'
+          AND (ar.ticket_id IS NOT NULL OR (ai.ticket_id IS NULL AND ac.ticket_id IS NOT NULL))
           AND gi.status='completed'
           AND gi.commit_sha=ge.commit_sha
           AND NOT EXISTS (SELECT 1 FROM accepted_evidence ae WHERE ae.ticket_id=t.id)
-          AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims c WHERE c.ticket_id=t.id AND c.stage=('completion:' || ac.attempt_number))
+          AND NOT EXISTS (
+              SELECT 1 FROM scheduler_stage_claims c
+              WHERE c.ticket_id=t.id
+                AND c.stage=('completion:' || COALESCE(ar.attempt_number, CASE WHEN ai.ticket_id IS NULL THEN ac.attempt_number END))
+          )
         ORDER BY t.created_at,t.id LIMIT 1
     """).fetchone()
     if completion is not None:

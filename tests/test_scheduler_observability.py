@@ -10,7 +10,7 @@ from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.cli import register_cli, run_command
 from local_first_orchestrator.ledger import Ledger
-from local_first_orchestrator.scheduler import scheduler_observability
+from local_first_orchestrator.scheduler import preview_next, scheduler_observability
 from local_first_orchestrator.states import CanonicalState
 
 
@@ -131,6 +131,39 @@ class SchedulerObservabilityTests(unittest.TestCase):
         self.assertEqual(snapshot["accepted_candidate"]["evidence_hash"], "e" * 64)
         self.assertEqual(snapshot["git"]["evidence"]["commit_sha"], "f" * 40)
         self.assertEqual(snapshot["pending_effects"]["state_projection"], 1)
+
+    def test_replacement_acceptance_drives_preview_and_snapshot_authority(self) -> None:
+        ticket = self.ticket("replacement", CanonicalState.ACCEPTED)
+        self.ledger.connection.execute(
+            "INSERT INTO accepted_candidates(ticket_id,attempt_number,candidate_fingerprint,base_sha,worktree_path,implementation_artifact,implementation_artifact_sha256,validation_artifact,validation_artifact_sha256,review_artifact,review_artifact_sha256,review_result_id,evidence_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ticket, 1, "old-diff", "a" * 40, str(self.root), "old-implementation.json", "1" * 64, "old-validation.json", "2" * 64, "old-review.json", "3" * 64, 1, "4" * 64, 1),
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO accepted_candidate_invalidations(ticket_id,invalidated_attempt_number,invalidated_evidence_hash,corrected_candidate_fingerprint,operator_id,reason,created_at) VALUES (?,?,?,?,?,?,?)",
+            (ticket, 1, "4" * 64, "new-diff", "operator", "rebind", 2),
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO accepted_candidate_replacements(ticket_id,attempt_number,candidate_fingerprint,base_sha,worktree_path,implementation_artifact,implementation_artifact_sha256,validation_artifact,validation_artifact_sha256,review_artifact,review_artifact_sha256,review_result_id,evidence_hash,supersedes_evidence_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ticket, 2, "new-diff", "a" * 40, str(self.root), "new-implementation.json", "5" * 64, "new-validation.json", "6" * 64, "new-review.json", "7" * 64, 2, "8" * 64, "4" * 64, 3),
+        )
+
+        first = preview_next(self.ledger, now=100)
+        snapshot = scheduler_observability(self.ledger, now=100)
+        self.assertEqual((first.next_stage, first.ticket_id), ("git_integration", ticket))
+        self.assertEqual(snapshot["accepted_candidate"]["attempt_number"], 2)
+        self.assertEqual(snapshot["accepted_candidate"]["candidate_fingerprint"], "new-diff")
+        self.assertEqual(snapshot["accepted_candidate"]["evidence_hash"], "8" * 64)
+
+        self.ledger.connection.execute(
+            "INSERT INTO git_commit_intents(ticket_id,attempt_number,accepted_evidence_hash,candidate_fingerprint,base_sha,worktree_path,commit_message,status,commit_sha,created_at,completed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (ticket, 2, "8" * 64, "new-diff", "a" * 40, str(self.root), "commit", "completed", "f" * 40, 4, 5),
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO git_commit_evidence(ticket_id,attempt_number,accepted_evidence_hash,candidate_fingerprint,base_sha,worktree_path,branch,commit_message,commit_sha,tranche_id,integration_head_before,integration_head_after,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ticket, 2, "8" * 64, "new-diff", "a" * 40, str(self.root), "branch", "commit", "f" * 40, None, "a" * 40, "f" * 40, 5),
+        )
+        second = preview_next(self.ledger, now=100)
+        self.assertEqual((second.next_stage, second.ticket_id), ("completion", ticket))
 
     def test_paid_claim_reports_reservation_state(self) -> None:
         ticket = self.ticket("paid")

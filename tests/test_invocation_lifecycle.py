@@ -178,6 +178,89 @@ class InvocationLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(self.ledger.accepted_candidate(ticket))
         return ctl, ticket, model
 
+    def test_preintegration_acceptance_invalidation_rebinds_fresh_review_to_attempt_two(self) -> None:
+        ctl, ticket, model = self.prepare_scheduler_accepted()
+        historical = self.ledger.connection.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket,)).fetchone()
+        self.assertIsNotNone(historical)
+        attempt1 = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=1", (ticket,)).fetchone()
+        self.assertIsNotNone(attempt1)
+        worktree = Path(str(attempt1["worktree_path"]))
+        self.ledger.connection.execute("UPDATE tickets SET create_files_json=? WHERE id=?", ('[\"extra.py\"]', ticket))
+        (worktree / "extra.py").write_text("VALUE = 'new'\n", encoding="utf-8")
+        old_fingerprint = str(historical["candidate_fingerprint"])
+        self.ledger.pause("operator", reason="historical candidate omitted authorized new file")
+
+        invalidated = ctl.invalidate_preintegration_acceptance(
+            ticket,
+            operator_id="operator",
+            reason="historical fingerprint omitted authorized new file",
+        )
+
+        self.assertEqual(invalidated["status"], "invalidated")
+        self.assertEqual(invalidated["invalidated_attempt_number"], 1)
+        self.assertEqual(invalidated["next_attempt_number"], 2)
+        self.assertNotEqual(invalidated["corrected_candidate_fingerprint"], old_fingerprint)
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], CanonicalState.IMPLEMENTING.value)
+        self.assertIsNone(self.ledger.accepted_candidate(ticket))
+        historical_after = self.ledger.connection.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket,)).fetchone()
+        self.assertEqual(str(historical_after["evidence_hash"]), str(historical["evidence_hash"]))
+        manual = self.ledger.runtime_stage(ticket, "manual-adoption-2")
+        self.assertIsNotNone(manual)
+        self.assertEqual(manual["attempt_number"], 2)
+        artifact_path = Path(str(manual["artifact_path"]))
+        artifact_before = artifact_path.read_bytes()
+        replay = ctl.invalidate_preintegration_acceptance(
+            ticket,
+            operator_id="operator",
+            reason="historical fingerprint omitted authorized new file",
+        )
+        self.assertEqual(replay["status"], "already_invalidated")
+        self.assertEqual(artifact_path.read_bytes(), artifact_before)
+        with self.assertRaisesRegex(ValueError, "conflicts with durable evidence"):
+            ctl.invalidate_preintegration_acceptance(
+                ticket,
+                operator_id="operator",
+                reason="conflicting replay reason",
+            )
+        self.assertEqual(artifact_path.read_bytes(), artifact_before)
+
+        self.ledger.resume("operator", reason="fresh validation/review required")
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            Board(),
+            worker_id="scheduler-rebind",
+            lease_seconds=30,
+            clock=lambda: 200,
+            implementation_runner=lambda value: (_ for _ in ()).throw(AssertionError("implementation must not rerun")),
+            validation_runner=lambda value: ctl.execute_deterministic_validation_only(value, repository=self.repo),
+            review_runner=lambda value: ctl.execute_fresh_review_only(value, repository=self.repo),
+            review_execution_policy_hash=ctl.review_execution_policy_hash(),
+            acceptance_runner=lambda value: ctl.inspect_acceptance_candidate_only(value, repository=self.repo),
+        )
+        self.assertEqual(scheduler.process_next().stage, "validation")
+        self.run_until_stage(scheduler, "review")
+        self.run_until_stage(scheduler, "repair_routing")
+        self.run_until_stage(scheduler, "acceptance")
+        for _ in range(6):
+            result = scheduler.process_next()
+            if result.stage is None:
+                break
+
+        self.assertEqual(self.ledger.get_ticket(ticket)["state"], CanonicalState.ACCEPTED.value)
+        replacement = self.ledger.connection.execute("SELECT * FROM accepted_candidate_replacements WHERE ticket_id=?", (ticket,)).fetchone()
+        self.assertIsNotNone(replacement)
+        self.assertEqual(int(replacement["attempt_number"]), 2)
+        self.assertEqual(str(replacement["supersedes_evidence_hash"]), str(historical["evidence_hash"]))
+        effective = self.ledger.accepted_candidate(ticket)
+        self.assertEqual(int(effective["attempt_number"]), 2)
+        self.assertEqual(str(effective["candidate_fingerprint"]), str(invalidated["corrected_candidate_fingerprint"]))
+        claim = self.ledger.claim_next_scheduler_git_integration("git", lease_seconds=30, now=300, ticket_id=ticket)
+        self.assertIsNotNone(claim)
+        identity = json.loads(str(claim["candidate_identity_json"]))
+        self.assertEqual(identity["attempt_number"], 2)
+        self.assertEqual(identity["candidate_fingerprint"], str(invalidated["corrected_candidate_fingerprint"]))
+        self.assertEqual(model.implementation_calls, 1)
+
     def triage_parent(self) -> tuple[LocalFirstController, str]:
         ctl, ticket = self.controller(LifecycleModel())
         # Establish the already-durable repair-routing precondition directly;
@@ -1294,7 +1377,7 @@ class InvocationLifecycleTests(unittest.TestCase):
             self.ledger, Board(), worker_id="git-replay", lease_seconds=30, clock=lambda: 131,
             git_integration_runner=lambda value: ctl.execute_git_integration_only(value, repository=self.repo),
         )
-        with self.assertRaisesRegex(RuntimeError, "accepted fingerprint does not bind untracked content"):
+        with self.assertRaisesRegex(RuntimeError, "candidate contains unauthorized untracked content"):
             replay.process_next()
         self.assertIsNone(self.ledger.git_commit_intent(ticket))
         self.assertIsNone(self.ledger.git_commit_evidence(ticket))

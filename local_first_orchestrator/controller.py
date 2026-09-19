@@ -1628,6 +1628,94 @@ class LocalFirstController:
         repository, worktree_root, artifact_root = self.config.validate_execution_roots()
         return {"canonical_repository": str(repository), "worktree_root": str(worktree_root), "artifact_root": str(artifact_root), "implementation_timeout_seconds": self.config.implementation_timeout_seconds, "review_timeout_seconds": self.config.review_timeout_seconds, "provider": str(getattr(self.local_model, "provider", type(self.local_model).__name__)), "model": str(getattr(self.local_model, "model", type(self.local_model).__name__))}
 
+    def invalidate_preintegration_acceptance(self, ticket_id: str, *, operator_id: str, reason: str) -> dict[str, object]:
+        """Invalidate one pre-Git acceptance whose historical fingerprint omitted authorized candidate content."""
+        if self.ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()["paused"] != 1:
+            raise PermissionError("preintegration acceptance invalidation requires Local First paused")
+        repo, _, artifact_root = self.config.validate_execution_roots()
+        binding = self.ledger.runtime_binding(ticket_id)
+        if str(repo) != str(binding["repository_path"]):
+            raise ValueError("repository mismatch with imported binding")
+        ticket = ticket_from_ledger(self.ledger.get_ticket(ticket_id))
+        accepted = self.ledger.connection.execute("SELECT * FROM accepted_candidates WHERE ticket_id=?", (ticket_id,)).fetchone()
+        if accepted is None:
+            raise ValueError("historical accepted candidate is missing")
+        attempt_number = int(accepted["attempt_number"])
+        attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        if attempt is None or not attempt["base_sha"] or not attempt["worktree_path"]:
+            raise ValueError("accepted attempt provenance is incomplete")
+        worktree = Path(str(attempt["worktree_path"])).resolve(strict=True)
+        allowed_new_paths = tuple(sorted(set(ticket.create_files) | set(ticket.new_test_files)))
+        candidate = _isolated_candidate_diff(worktree, str(attempt["base_sha"]), allowed_new_paths=allowed_new_paths)
+        unauthorized_untracked = sorted(
+            path for path in candidate["untracked_paths"]
+            if path not in set(allowed_new_paths) and "__pycache__" not in path
+        )
+        if unauthorized_untracked:
+            raise RuntimeError("acceptance invalidation refuses unauthorized untracked content: " + ", ".join(unauthorized_untracked))
+        corrected_fingerprint = str(candidate["diff_hash"])
+        if corrected_fingerprint == str(accepted["candidate_fingerprint"]):
+            raise ValueError("accepted candidate fingerprint already matches live candidate")
+        next_attempt = attempt_number + 1
+        existing_invalidation = self.ledger.connection.execute(
+            "SELECT * FROM accepted_candidate_invalidations WHERE ticket_id=?",
+            (ticket_id,),
+        ).fetchone()
+        if existing_invalidation is not None:
+            if (
+                str(existing_invalidation["corrected_candidate_fingerprint"]) != corrected_fingerprint
+                or str(existing_invalidation["operator_id"]) != operator_id
+                or str(existing_invalidation["reason"]) != reason
+            ):
+                raise ValueError("acceptance invalidation conflicts with durable evidence")
+            manual = self.ledger.runtime_stage(ticket_id, f"manual-adoption-{next_attempt}")
+            if manual is None or not manual.get("artifact_path") or not manual.get("artifact_sha256"):
+                raise RuntimeError("acceptance invalidation replay is missing durable artifact evidence")
+            artifact_path = Path(str(manual["artifact_path"]))
+            expected_sha = str(manual["artifact_sha256"])
+            if not artifact_path.is_file() or hashlib.sha256(artifact_path.read_bytes()).hexdigest() != expected_sha:
+                raise RuntimeError("acceptance invalidation replay artifact drift")
+            return self.ledger.invalidate_preintegration_acceptance(
+                ticket_id,
+                corrected_candidate_fingerprint=corrected_fingerprint,
+                manual_artifact_path=str(artifact_path),
+                manual_artifact_sha256=expected_sha,
+                operator_id=operator_id,
+                reason=reason,
+            )
+        artifact_dir = artifact_root / ticket_id / f"attempt-{next_attempt}"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ticket_id": ticket_id,
+            "source_attempt_number": attempt_number,
+            "attempt_number": next_attempt,
+            "base_sha": str(attempt["base_sha"]),
+            "worktree_path": str(worktree),
+            "old_candidate_fingerprint": str(accepted["candidate_fingerprint"]),
+            "diff_hash": corrected_fingerprint,
+            "changed_paths": list(candidate["changed_paths"]),
+            "untracked_paths": list(candidate["untracked_paths"]),
+            "reason": reason,
+            "operator_id": operator_id,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        artifact_sha = hashlib.sha256(encoded).hexdigest()
+        artifact_path = artifact_dir / f"acceptance-rebind-{artifact_sha}.json"
+        try:
+            with artifact_path.open("xb") as handle:
+                handle.write(encoded)
+        except FileExistsError:
+            if artifact_path.read_bytes() != encoded:
+                raise RuntimeError("acceptance invalidation artifact path collision")
+        return self.ledger.invalidate_preintegration_acceptance(
+            ticket_id,
+            corrected_candidate_fingerprint=corrected_fingerprint,
+            manual_artifact_path=str(artifact_path),
+            manual_artifact_sha256=artifact_sha,
+            operator_id=operator_id,
+            reason=reason,
+        )
+
     def reconcile_failed_attempt(self, ticket_id: str, *, operator_id: str, classification: str, forensic_artifact_paths: tuple[Path, ...] = ()) -> dict[str, object]:
         """Retire failed history without cleanup or a subsequent model invocation."""
         binding = self.ledger.runtime_binding(ticket_id)
