@@ -96,6 +96,27 @@ CREATE TABLE IF NOT EXISTS controller_state (
     paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
     updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS daemon_status (
+    worker_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    last_status TEXT,
+    last_stage TEXT,
+    last_ticket_id TEXT,
+    reason_category TEXT,
+    reason TEXT,
+    consecutive_undispatchable INTEGER NOT NULL DEFAULT 0 CHECK(consecutive_undispatchable >= 0),
+    iterations INTEGER NOT NULL DEFAULT 0 CHECK(iterations >= 0),
+    successful_ticks INTEGER NOT NULL DEFAULT 0 CHECK(successful_ticks >= 0),
+    idle_ticks INTEGER NOT NULL DEFAULT 0 CHECK(idle_ticks >= 0),
+    busy_ticks INTEGER NOT NULL DEFAULT 0 CHECK(busy_ticks >= 0),
+    paused_ticks INTEGER NOT NULL DEFAULT 0 CHECK(paused_ticks >= 0),
+    transient_errors INTEGER NOT NULL DEFAULT 0 CHECK(transient_errors >= 0),
+    consecutive_errors INTEGER NOT NULL DEFAULT 0 CHECK(consecutive_errors >= 0),
+    last_error TEXT,
+    last_tick_started_at REAL,
+    last_tick_completed_at REAL,
+    updated_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS scheduler_tick_lease (
     id INTEGER PRIMARY KEY CHECK(id = 1),
     lease_owner TEXT NOT NULL,
@@ -1517,6 +1538,10 @@ class Ledger:
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_state_projection_claimable ON board_projection_outbox(operation, acknowledged_at, superseded_at, next_attempt_at, lease_expires_at, queued_at)")
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)",
+            (self._now(),),
+        )
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)",
             (self._now(),),
         )
         self.connection.execute(
@@ -8886,6 +8911,88 @@ class Ledger:
             changed=conn.execute("UPDATE board_projection_outbox SET external_task_id=?,acknowledged_at=?,lease_owner=NULL,lease_expires_at=NULL WHERE ticket_id=? AND event_id=? AND lease_owner=? AND lease_expires_at>?",(external_task_id,now,ticket_id,event_id,owner,now))
             if not changed.rowcount: raise PermissionError('create projection lease not owned')
 
+    @staticmethod
+    def _bounded_daemon_text(value: object, *, limit: int = 500) -> str | None:
+        if value is None:
+            return None
+        text = str(value).replace("\x00", "")
+        text = " ".join(text.split())
+        text = re.sub(r"(?i)\b(?:password|token|secret|api[_-]?key|private[_-]?key)(?:\s*[:=]|[-_])\S+", "[REDACTED]", text)
+        return text[:limit]
+
+    def upsert_daemon_status(
+        self,
+        *,
+        worker_id: str,
+        status: str,
+        last_status: str | None,
+        last_stage: str | None,
+        last_ticket_id: str | None,
+        reason_category: str | None,
+        reason: str | None,
+        consecutive_undispatchable: int,
+        iterations: int,
+        successful_ticks: int,
+        idle_ticks: int,
+        busy_ticks: int,
+        paused_ticks: int,
+        transient_errors: int,
+        consecutive_errors: int,
+        last_error: str | None,
+        last_tick_started_at: float | None,
+        last_tick_completed_at: float | None,
+    ) -> dict[str, Any]:
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise ValueError("daemon worker id is required")
+        if not isinstance(status, str) or not status.strip():
+            raise ValueError("daemon status is required")
+        counters = (consecutive_undispatchable, iterations, successful_ticks, idle_ticks, busy_ticks, paused_ticks, transient_errors, consecutive_errors)
+        if any(type(value) is not int or value < 0 for value in counters):
+            raise ValueError("daemon counters must be non-negative integers")
+        values = (
+            self._bounded_daemon_text(worker_id, limit=128), self._bounded_daemon_text(status, limit=80),
+            self._bounded_daemon_text(last_status, limit=80), self._bounded_daemon_text(last_stage, limit=128),
+            self._bounded_daemon_text(last_ticket_id, limit=128), self._bounded_daemon_text(reason_category, limit=80),
+            self._bounded_daemon_text(reason), consecutive_undispatchable, iterations, successful_ticks,
+            idle_ticks, busy_ticks, paused_ticks, transient_errors, consecutive_errors,
+            self._bounded_daemon_text(last_error), last_tick_started_at, last_tick_completed_at, self._now(),
+        )
+        with self._transaction() as conn:
+            conn.execute(
+                "INSERT INTO daemon_status(worker_id,status,last_status,last_stage,last_ticket_id,reason_category,reason,consecutive_undispatchable,iterations,successful_ticks,idle_ticks,busy_ticks,paused_ticks,transient_errors,consecutive_errors,last_error,last_tick_started_at,last_tick_completed_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(worker_id) DO UPDATE SET status=excluded.status,last_status=excluded.last_status,last_stage=excluded.last_stage,last_ticket_id=excluded.last_ticket_id,reason_category=excluded.reason_category,reason=excluded.reason,consecutive_undispatchable=excluded.consecutive_undispatchable,iterations=excluded.iterations,successful_ticks=excluded.successful_ticks,idle_ticks=excluded.idle_ticks,busy_ticks=excluded.busy_ticks,paused_ticks=excluded.paused_ticks,transient_errors=excluded.transient_errors,consecutive_errors=excluded.consecutive_errors,last_error=excluded.last_error,last_tick_started_at=excluded.last_tick_started_at,last_tick_completed_at=excluded.last_tick_completed_at,updated_at=excluded.updated_at",
+                values,
+            )
+        return dict(self.connection.execute("SELECT * FROM daemon_status WHERE worker_id=?", (worker_id,)).fetchone())
+
+    @staticmethod
+    def _operator_daemon_row(row: sqlite3.Row) -> dict[str, Any]:
+        required_text = ("worker_id", "status")
+        counter_fields = ("consecutive_undispatchable", "iterations", "successful_ticks", "idle_ticks", "busy_ticks", "paused_ticks", "transient_errors", "consecutive_errors")
+        malformed = any(not isinstance(row[field], str) or not str(row[field]).strip() for field in required_text)
+        malformed = malformed or any(type(row[field]) is not int or row[field] < 0 for field in counter_fields)
+        if malformed:
+            return {"worker_id": "<malformed>", "status": "invalid_persisted_state", "reason_category": "malformed_persisted_state", "reason": "daemon status record failed validation"}
+        return {
+            "worker_id": str(row["worker_id"])[:128], "status": str(row["status"])[:80],
+            "last_status": Ledger._bounded_daemon_text(row["last_status"], limit=80),
+            "last_stage": Ledger._bounded_daemon_text(row["last_stage"], limit=128),
+            "last_ticket_id": Ledger._bounded_daemon_text(row["last_ticket_id"], limit=128),
+            "reason_category": Ledger._bounded_daemon_text(row["reason_category"], limit=80),
+            "reason": Ledger._bounded_daemon_text(row["reason"]),
+            **{field: int(row[field]) for field in counter_fields},
+            "last_error": Ledger._bounded_daemon_text(row["last_error"]),
+            "last_tick_started_at": row["last_tick_started_at"], "last_tick_completed_at": row["last_tick_completed_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def daemon_status_rows(self, *, limit: int = 25) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 100:
+            raise ValueError("daemon status limit must be between 1 and 100")
+        rows = self.connection.execute("SELECT * FROM daemon_status ORDER BY updated_at DESC, worker_id LIMIT ?", (limit,)).fetchall()
+        return [self._operator_daemon_row(row) for row in rows]
+
     def status(self) -> dict[str, Any]:
         paused = self.connection.execute("SELECT paused FROM controller_state WHERE id = 1").fetchone()
         states = self.connection.execute("SELECT state, COUNT(*) AS count FROM tickets GROUP BY state ORDER BY state").fetchall()
@@ -8896,6 +9003,7 @@ class Ledger:
             "tickets": {row["state"]: row["count"] for row in states},
             "scheduler_tick": dict(tick) if tick else None,
             "scheduler_claims": [dict(row) for row in claims],
+            "daemon_status": self.daemon_status_rows(),
         }
 
     def operator_status(self, *, active_limit: int = 25) -> dict[str, Any]:
@@ -8963,6 +9071,8 @@ class Ledger:
             "pending_state_projections": int(pending_state_projections),
             "superseded_state_projections": int(superseded_state_projections),
             "failed_attempt_reconciliations": reconciliations,
+            "daemon_status": self.daemon_status_rows(limit=active_limit),
+            "daemon_status_truncated": len(self.daemon_status_rows(limit=active_limit)) == active_limit and self.connection.execute("SELECT COUNT(*) FROM daemon_status").fetchone()[0] > active_limit,
         }
 
     def plan_projection(self, ticket_id: str, *, evidence: str | None = None, state_payload: dict[str, Any] | None = None) -> dict[str, Any] | None:

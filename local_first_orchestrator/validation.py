@@ -43,8 +43,9 @@ class ValidationResult:
 
 class DeterministicValidator:
     denied_suffixes = (".lock", ".pem", ".key", ".env")
+    documentation_suffixes = (".adoc", ".md", ".mdx", ".rst", ".txt")
     default_secret_assignment_patterns = (
-        re.compile(r"(?im)^\s*(?:[A-Za-z][A-Za-z0-9_-]*[_-])?(?:api[_-]?key|secret|password|token|private[_-]?key)\s*[:=]\s*(?:['\"][^'\"]+['\"]|[^\s#]{8,})"),
+        re.compile(r"(?im)^\s*(?:[A-Za-z][A-Za-z0-9_-]*[_-])?(?:api[_-]?key|secret|password|token|private[_-]?key)\s*[:=]\s*(?P<value>['\"][^'\"]+['\"]|\.\.\.|[^\s#]{8,})"),
     )
     TIMEOUT_RETURN_CODE = -124
     LAUNCH_FAILURE_RETURN_CODE = -127
@@ -114,8 +115,15 @@ class DeterministicValidator:
             return f"unable to safely scan changed content: {relative_path}"
         if any(secret.casefold() in content.casefold() for secret in self.secret_patterns):
             return f"secret material detected in changed file: {relative_path}"
-        if any(pattern.search(content) for pattern in self.default_secret_assignment_patterns):
-            return f"secret material detected in changed file: {relative_path}"
+        for pattern in self.default_secret_assignment_patterns:
+            for match in pattern.finditer(content):
+                value = match.group("value")
+                if relative_path.casefold().endswith(self.documentation_suffixes):
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                        value = value[1:-1]
+                    if value == "...":
+                        continue
+                return f"secret material detected in changed file: {relative_path}"
         return None
 
     def validate(self, worktree: Path, ticket: MicroTicket, *, base_sha: str, expected_head_sha: str | None = None) -> ValidationResult:

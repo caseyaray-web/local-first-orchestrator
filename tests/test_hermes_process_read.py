@@ -105,6 +105,62 @@ class ProcessReadTests(unittest.TestCase):
   self.assertEqual(tasks['child']['parents'],['repair']); self.assertEqual(tasks['old']['children'],['repair']); self.assertEqual(tasks['repair']['children'],['child'])
   actions=[call[4] for call in calls if call[4] in {'block','link','unlink','unblock'}]
   self.assertLess(actions.index('block'),actions.index('unlink')); self.assertEqual(actions[-1],'unblock')
+ def test_blocked_terminal_handoff_repair_has_lineage_without_parent_dependency(self):
+  calls=[]
+  tasks={
+   'blocked':{'id':'blocked','title':'TK-2','body':'body','status':'blocked','workspace_path':'/repo','assignee':'worker-code-local','parents':[],'children':[]},
+  }
+  def payload(task_id):
+   row=tasks[task_id]
+   result={'task':{k:v for k,v in row.items() if k not in {'parents','children'}},'parents':list(row['parents']),'children':list(row['children']),'comments':[]}
+   if task_id == 'blocked':
+    result['runs']=[{'id':9,'status':'blocked','outcome':'blocked','started_at':1,'ended_at':2,'summary':'local-first-awaiting-reconciliation','profile':'worker-code-local','worker_pid':123,'metadata':{}}]
+   return result
+  def runner(argv,**kwargs):
+   calls.append(list(argv)); action=argv[4]
+   if action == 'show': return subprocess.CompletedProcess(argv,0,json.dumps(payload(argv[5])),'')
+   if action == 'create':
+    self.assertNotIn('--parent',argv)
+    tasks['repair']={'id':'repair','title':argv[5],'body':argv[argv.index('--body')+1],'status':'blocked','workspace_path':'/repo','assignee':'worker-code-local','parents':[],'children':[]}
+    return subprocess.CompletedProcess(argv,0,json.dumps({'id':'repair'}),'')
+   if action == 'unblock': tasks[argv[5]]['status']='ready'; return subprocess.CompletedProcess(argv,0,'','')
+   raise AssertionError(argv)
+  adapter=HermesBoardAdapter(executable=str(self.exe),board='board',allow_writes=True,runner=runner,implementation_profile='worker-code-local')
+  repair=adapter.create_repair_task('blocked',title='repair',body='repair body',workspace_path='/repo',downstream_child_ids=(),idempotency_key='repair-blocked',reason='repair blocked handoff')
+  self.assertEqual(repair.status,'ready')
+  self.assertEqual(repair.parents,())
+  self.assertEqual(repair.children,())
+  self.assertNotIn('complete',[call[4] for call in calls])
+
+ def test_replay_heals_invalid_blocked_predecessor_edge_and_promotes_todo_repair(self):
+  calls=[]
+  tasks={
+   'blocked':{'id':'blocked','title':'TK-2','body':'body','status':'blocked','workspace_path':'/repo','assignee':'worker-code-local','parents':[],'children':['repair']},
+   'repair':{'id':'repair','title':'repair','body':'body','status':'todo','workspace_path':'/repo','assignee':'worker-code-local','parents':['blocked'],'children':[]},
+  }
+  def payload(task_id):
+   row=tasks[task_id]
+   result={'task':{k:v for k,v in row.items() if k not in {'parents','children'}},'parents':list(row['parents']),'children':list(row['children']),'comments':[]}
+   if task_id == 'blocked':
+    result['runs']=[{'id':9,'status':'blocked','outcome':'blocked','started_at':1,'ended_at':2,'summary':'local-first-awaiting-reconciliation','profile':'worker-code-local','worker_pid':123,'metadata':{}}]
+   return result
+  def runner(argv,**kwargs):
+   calls.append(list(argv)); action=argv[4]
+   if action == 'show': return subprocess.CompletedProcess(argv,0,json.dumps(payload(argv[5])),'')
+   if action == 'create': return subprocess.CompletedProcess(argv,0,json.dumps({'id':'repair'}),'')
+   if action == 'unlink':
+    self.assertEqual(list(argv[5:7]),['blocked','repair']); tasks['repair']['parents'].remove('blocked'); tasks['blocked']['children'].remove('repair'); return subprocess.CompletedProcess(argv,0,'','')
+   if action == 'promote':
+    self.assertEqual(argv[5], 'repair'); tasks['repair']['status']='ready'; return subprocess.CompletedProcess(argv,0,'','')
+   raise AssertionError(argv)
+  adapter=HermesBoardAdapter(executable=str(self.exe),board='board',allow_writes=True,runner=runner,implementation_profile='worker-code-local')
+  repair=adapter.create_repair_task('blocked',title='repair',body='repair body',workspace_path='/repo',downstream_child_ids=(),idempotency_key='repair-blocked',reason='repair blocked handoff')
+  self.assertEqual(repair.status,'ready')
+  self.assertEqual(repair.parents,())
+  self.assertEqual(tasks['blocked']['children'],[])
+  self.assertNotIn('complete',[call[4] for call in calls])
+  self.assertEqual(sum(call[4] == 'unlink' for call in calls),1)
+  self.assertEqual(sum(call[4] == 'promote' for call in calls),1)
  def test_guarded_dispatch_spawns_only_authorized_task(self):
   calls=[]
   def runner(argv,**kwargs):

@@ -25,9 +25,24 @@ class DaemonHealth:
     last_status: str | None
     last_stage: str | None
     last_ticket_id: str | None
+    state: str
+    consecutive_undispatchable: int
+    last_reason_category: str | None
+    last_reason: str | None
     last_error: str | None
     last_tick_started_at: float | None
     last_tick_completed_at: float | None
+
+
+@dataclass(frozen=True)
+class ExternalProgressResult:
+    """Bounded result of the authorized Hermes progress probe."""
+
+    status: str
+    stage: str | None = None
+    ticket_id: str | None = None
+    reason_category: str | None = None
+    reason: str | None = None
 
 
 class SchedulerDaemon:
@@ -37,20 +52,24 @@ class SchedulerDaemon:
         self,
         ledger: Ledger,
         scheduler_factory: Callable[[], ProcessNextScheduler],
-        external_progress_runner: Callable[[], str | None] | None = None,
+        external_progress_runner: Callable[[], ExternalProgressResult | str | dict[str, Any] | None] | None = None,
         *,
         worker_id: str,
         idle_sleep_seconds: float = 1.0,
         busy_sleep_seconds: float = 0.25,
         error_backoff_seconds: float = 1.0,
         max_error_backoff_seconds: float = 30.0,
+        undispatchable_backoff_seconds: float = 1.0,
+        max_undispatchable_backoff_seconds: float = 30.0,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        if idle_sleep_seconds < 0 or busy_sleep_seconds < 0 or error_backoff_seconds < 0 or max_error_backoff_seconds < 0:
+        if idle_sleep_seconds < 0 or busy_sleep_seconds < 0 or error_backoff_seconds < 0 or max_error_backoff_seconds < 0 or undispatchable_backoff_seconds < 0 or max_undispatchable_backoff_seconds < 0:
             raise ValueError("daemon sleep/backoff values must be non-negative")
         if error_backoff_seconds > max_error_backoff_seconds:
             raise ValueError("initial error backoff cannot exceed maximum error backoff")
+        if undispatchable_backoff_seconds > max_undispatchable_backoff_seconds:
+            raise ValueError("initial undispatchable backoff cannot exceed maximum undispatchable backoff")
         self.ledger = ledger
         self.scheduler_factory = scheduler_factory
         self.external_progress_runner = external_progress_runner
@@ -59,6 +78,8 @@ class SchedulerDaemon:
         self.busy_sleep_seconds = busy_sleep_seconds
         self.error_backoff_seconds = error_backoff_seconds
         self.max_error_backoff_seconds = max_error_backoff_seconds
+        self.undispatchable_backoff_seconds = undispatchable_backoff_seconds
+        self.max_undispatchable_backoff_seconds = max_undispatchable_backoff_seconds
         self.sleep = sleep
         self.clock = clock
         self._stop = threading.Event()
@@ -72,8 +93,16 @@ class SchedulerDaemon:
         self._consecutive_errors = 0
         self._last_result: ProcessNextResult | None = None
         self._last_error: str | None = None
+        self._state = "starting"
+        self._consecutive_undispatchable = 0
+        self._last_reason_category: str | None = None
+        self._last_reason: str | None = None
         self._last_tick_started_at: float | None = None
         self._last_tick_completed_at: float | None = None
+        # Do not erase a prior worker record during restart.  The previous
+        # result/error remains operator-visible until the first new tick.
+        if self.ledger.connection.execute("SELECT 1 FROM daemon_status WHERE worker_id=?", (self.worker_id,)).fetchone() is None:
+            self._persist_status()
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -98,6 +127,10 @@ class SchedulerDaemon:
             last_status=None if result is None else result.status,
             last_stage=None if result is None else result.stage,
             last_ticket_id=None if result is None else result.ticket_id,
+            state=self._state,
+            consecutive_undispatchable=self._consecutive_undispatchable,
+            last_reason_category=self._last_reason_category,
+            last_reason=self._last_reason,
             last_error=self._last_error,
             last_tick_started_at=self._last_tick_started_at,
             last_tick_completed_at=self._last_tick_completed_at,
@@ -107,12 +140,63 @@ class SchedulerDaemon:
         return {
             "health": asdict(self.health()),
             "scheduler": scheduler_observability(self.ledger),
+            "daemon_status": self.ledger.daemon_status_rows(limit=1),
         }
+
+    @staticmethod
+    def _external_result(value: ExternalProgressResult | str | dict[str, Any] | None) -> ExternalProgressResult:
+        if value is None:
+            return ExternalProgressResult("no_authorized_work")
+        if isinstance(value, str):
+            return ExternalProgressResult("dispatched", stage="hermes_dispatch", ticket_id=value)
+        if isinstance(value, ExternalProgressResult):
+            outcome = value
+        elif isinstance(value, dict):
+            outcome = ExternalProgressResult(
+                status=str(value.get("status") or ""),
+                stage=None if value.get("stage") is None else str(value["stage"]),
+                ticket_id=None if value.get("ticket_id") is None else str(value["ticket_id"]),
+                reason_category=None if value.get("reason_category") is None else str(value["reason_category"]),
+                reason=None if value.get("reason") is None else str(value["reason"]),
+            )
+        else:
+            raise RuntimeError("external progress runner returned an unsupported result")
+        if outcome.status not in {"no_authorized_work", "dispatched", "authorized_undispatchable"}:
+            raise RuntimeError("external progress runner returned an unsupported status")
+        if outcome.status == "dispatched" and not outcome.ticket_id:
+            raise RuntimeError("external progress runner reported dispatch without a task")
+        return outcome
+
+    def _persist_status(self) -> None:
+        result = self._last_result
+        self.ledger.upsert_daemon_status(
+            worker_id=self.worker_id,
+            status=self._state,
+            last_status=None if result is None else result.status,
+            last_stage=None if result is None else result.stage,
+            last_ticket_id=None if result is None else result.ticket_id,
+            reason_category=self._last_reason_category,
+            reason=self._last_reason,
+            consecutive_undispatchable=self._consecutive_undispatchable,
+            iterations=self._iterations,
+            successful_ticks=self._successful_ticks,
+            idle_ticks=self._idle_ticks,
+            busy_ticks=self._busy_ticks,
+            paused_ticks=self._paused_ticks,
+            transient_errors=self._transient_errors,
+            consecutive_errors=self._consecutive_errors,
+            last_error=self._last_error,
+            last_tick_started_at=self._last_tick_started_at,
+            last_tick_completed_at=self._last_tick_completed_at,
+        )
 
     def _sleep_after_result(self, result: ProcessNextResult) -> None:
         if self.stop_requested:
             return
-        if result.status in {"idle", "no_work"}:
+        if result.status == "authorized_undispatchable":
+            delay = min(self.max_undispatchable_backoff_seconds, self.undispatchable_backoff_seconds * (2 ** max(0, self._consecutive_undispatchable - 1)))
+            self.sleep(delay)
+        elif result.status in {"idle", "no_work"}:
             self._idle_ticks += 1
             self.sleep(self.idle_sleep_seconds)
         elif result.status == "busy":
@@ -130,14 +214,35 @@ class SchedulerDaemon:
         try:
             result = self.scheduler_factory().process_next()
             if result.status in {"idle", "no_work"} and self.external_progress_runner is not None:
-                external_ticket_id = self.external_progress_runner()
-                if external_ticket_id is not None:
-                    result = ProcessNextResult("external_progress", "hermes_dispatch", external_ticket_id)
+                external = self._external_result(self.external_progress_runner())
+                if external.status == "dispatched":
+                    result = ProcessNextResult("external_progress", external.stage or "hermes_dispatch", external.ticket_id)
+                    self._consecutive_undispatchable = 0
+                    self._last_reason_category = None
+                    self._last_reason = None
+                elif external.status == "authorized_undispatchable":
+                    self._consecutive_undispatchable += 1
+                    category = external.reason_category or "no_dispatchable_plan"
+                    self._last_reason_category = category if category.replace("_", "").replace("-", "").replace(":", "").isalnum() and len(category) <= 80 else "no_dispatchable_plan"
+                    # Keep operator state categorical. Do not copy Hermes/model
+                    # output or card text into the durable status record.
+                    self._last_reason = "authorized work has no dispatchable plan"
+                    result = ProcessNextResult("authorized_undispatchable", external.stage or "hermes_dispatch", external.ticket_id)
+                else:
+                    self._consecutive_undispatchable = 0
+                    self._last_reason_category = None
+                    self._last_reason = None
+            else:
+                self._consecutive_undispatchable = 0
+                self._last_reason_category = None
+                self._last_reason = None
         except Exception as exc:
             self._transient_errors += 1
             self._consecutive_errors += 1
             self._last_error = f"{type(exc).__name__}: {exc}"
+            self._state = "error"
             self._last_tick_completed_at = self.clock()
+            self._persist_status()
             delay = min(
                 self.max_error_backoff_seconds,
                 self.error_backoff_seconds * (2 ** max(0, self._consecutive_errors - 1)),
@@ -149,8 +254,10 @@ class SchedulerDaemon:
         self._last_error = None
         self._successful_ticks += 1
         self._consecutive_errors = 0
+        self._state = result.status
         self._last_tick_completed_at = self.clock()
         self._sleep_after_result(result)
+        self._persist_status()
         return result
 
     def run(self, *, max_iterations: int | None = None, continue_on_error: bool = True) -> DaemonHealth:

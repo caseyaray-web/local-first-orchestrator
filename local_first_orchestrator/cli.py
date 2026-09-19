@@ -10,7 +10,7 @@ from typing import Any
 from .controller import LocalFirstController, RuntimeConfig, compute_review_execution_policy_hash
 from .admission import FeatureAdmissionSpec
 from .decomposition_planner import LocalDecompositionPlanner, resolve_hermes_identity
-from .daemon import SchedulerDaemon
+from .daemon import ExternalProgressResult, SchedulerDaemon
 from .planning_coordinator import PlanningCoordinator
 from .corrections import AcceptedPredecessor, CorrectionService, CorrectionTicketSpec, SupplementalCorrectionPlan
 from .generated_activation import GeneratedActivationError, activate_generated_ticket
@@ -675,6 +675,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     daemon.add_argument("--busy-sleep-seconds", type=float, default=0.25)
     daemon.add_argument("--error-backoff-seconds", type=float, default=1.0)
     daemon.add_argument("--max-error-backoff-seconds", type=float, default=30.0)
+    daemon.add_argument("--undispatchable-backoff-seconds", type=float, default=1.0)
+    daemon.add_argument("--max-undispatchable-backoff-seconds", type=float, default=30.0)
     daemon.add_argument("--max-iterations", type=int)
     implementation=commands.add_parser("implementation-only", aliases=("implement-only",), help="run exactly implementation and deterministic validation; never review or accept")
     implementation.add_argument("--task-id",required=True)
@@ -925,9 +927,14 @@ def run_command(args: argparse.Namespace) -> int:
             if not args.hermes_executable or not args.board: raise ValueError("daemon execution requires --hermes-executable and --board")
             registered=load_operator_config(Path(args.operator_config_path) if args.operator_config_path else None)
             dispatch_board=_board_for_cli(args,True,implementation_profile=registered.implementation.profile,canonical_repository=registered.canonical_repository)
-            def dispatch_authorized_work() -> str | None:
+            def dispatch_authorized_work() -> ExternalProgressResult:
                 allowed=set(ledger.dispatchable_external_task_ids())
-                return dispatch_board.dispatch_one_if_allowed(allowed)
+                if not allowed:
+                    return ExternalProgressResult("no_authorized_work")
+                task_id = dispatch_board.dispatch_one_if_allowed(allowed)
+                if task_id is None:
+                    return ExternalProgressResult("authorized_undispatchable", stage="hermes_dispatch", reason_category="no_dispatchable_plan")
+                return ExternalProgressResult("dispatched", stage="hermes_dispatch", ticket_id=task_id)
             daemon=SchedulerDaemon(
                 ledger,
                 lambda: _registered_process_next_scheduler(ledger,args),
@@ -937,6 +944,8 @@ def run_command(args: argparse.Namespace) -> int:
                 busy_sleep_seconds=args.busy_sleep_seconds,
                 error_backoff_seconds=args.error_backoff_seconds,
                 max_error_backoff_seconds=args.max_error_backoff_seconds,
+                undispatchable_backoff_seconds=args.undispatchable_backoff_seconds,
+                max_undispatchable_backoff_seconds=args.max_undispatchable_backoff_seconds,
             )
             previous=daemon.install_signal_handlers()
             try:

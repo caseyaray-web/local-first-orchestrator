@@ -11,6 +11,60 @@ from local_first_orchestrator.ticket import MicroTicket, PatchBudget, Verificati
 
 
 class SafeGitInvocationTests(unittest.TestCase):
+    def _ticket(self, path: str) -> MicroTicket:
+        return MicroTicket(
+            "T-doc", "Change documentation.", ("AC-1",), f"{path}::value", (path,),
+            ("No unrelated files.",), PatchBudget(1, 20), VerificationProfile((("python", "-c", "print(1)"),)),
+            "low", True, 1, (),
+        )
+
+    def _repo_with_base(self, root: Path, content: str) -> tuple[Path, str]:
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(("git", "init", "-q"), cwd=repo, check=True)
+        subprocess.run(("git", "config", "user.email", "test@example.invalid"), cwd=repo, check=True)
+        subprocess.run(("git", "config", "user.name", "Test"), cwd=repo, check=True)
+        (repo / "README.md").write_text(content, encoding="utf-8")
+        subprocess.run(("git", "add", "README.md"), cwd=repo, check=True)
+        subprocess.run(("git", "commit", "-qm", "base"), cwd=repo, check=True)
+        base = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+        return repo, base
+
+    def test_preexisting_documentation_placeholder_is_not_secret_material(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo, base = self._repo_with_base(root, "HC_ISOLATION_ADMIN_PASSWORD='...'\n\nold line\n")
+            (repo / "README.md").write_text("HC_ISOLATION_ADMIN_PASSWORD='...'\n\nchanged line\n", encoding="utf-8")
+            result = DeterministicValidator(artifact_root=root / "artifacts").validate(repo, self._ticket("README.md"), base_sha=base)
+            self.assertTrue(result.passed, result.errors)
+
+    def test_preexisting_real_documentation_credentials_are_still_rejected_without_value_evidence(self):
+        for assignment in ("HC_ISOLATION_ADMIN_PASSWORD='correct-horse-battery-staple-123'", "SERVICE_API_TOKEN=tok_live_1234567890abcdef"):
+            with self.subTest(assignment=assignment), TemporaryDirectory() as temp:
+                root = Path(temp)
+                repo, base = self._repo_with_base(root, assignment + "\n\nold line\n")
+                (repo / "README.md").write_text(assignment + "\n\nchanged line\n", encoding="utf-8")
+                result = DeterministicValidator(artifact_root=root / "artifacts").validate(repo, self._ticket("README.md"), base_sha=base)
+                self.assertFalse(result.passed)
+                self.assertIn("secret material detected in changed file: README.md", result.errors)
+                self.assertNotIn("correct-horse-battery-staple-123", result.compact_evidence)
+                self.assertNotIn("tok_live_1234567890abcdef", result.compact_evidence)
+
+    def test_scope_unverified_is_a_review_signal_not_a_deterministic_error(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo, base = self._repo_with_base(root, "manifest: enabled\n\nold line\n")
+            (repo / "README.md").write_text("manifest: enabled\n\nchanged line\n", encoding="utf-8")
+            ticket = MicroTicket(
+                "T-scope", "Change documentation manifest.", ("AC-1",), "README.md::unknown", ("README.md",),
+                ("No unrelated files.",), PatchBudget(1, 20), VerificationProfile((("python", "-c", "print(1)"),)),
+                "low", True, 1, (),
+            )
+            result = DeterministicValidator(artifact_root=root / "artifacts").validate(repo, ticket, base_sha=base)
+            self.assertTrue(result.passed, result.errors)
+            self.assertTrue(result.scope_unverified)
+            self.assertEqual(result.errors, ())
+            self.assertIn("scope_unverified", result.compact_evidence)
     def test_internal_git_disables_interactive_and_external_diff_paths(self):
         with TemporaryDirectory() as temp:
             calls=[]

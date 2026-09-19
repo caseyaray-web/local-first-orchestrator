@@ -486,11 +486,15 @@ class HermesBoardAdapter:
         args = [
             "create", title,
             "--body", attach_execution_handoff(body),
-            "--parent", predecessor_task_id,
             "--workspace", (f"dir:{workspace_path}" if workspace_path else (f"worktree:{self.canonical_repository}" if self.canonical_repository is not None else "worktree")),
             "--idempotency-key", idempotency_key,
             "--initial-status", "blocked",
         ]
+        # A completed Hermes predecessor is an executable dependency.  A
+        # terminal Local First handoff is only repair lineage: keeping it as a
+        # Hermes parent makes the replacement permanently undispatchable.
+        if predecessor.status == "done":
+            args[4:4] = ["--parent", predecessor_task_id]
         assignee = self.implementation_profile or predecessor.assignee
         if assignee:
             args += ["--assignee", assignee]
@@ -502,7 +506,16 @@ class HermesBoardAdapter:
         if repair_task_id == predecessor_task_id:
             raise RuntimeError("Hermes repair task identity conflicts with predecessor")
         repair = self.get_task(repair_task_id)
-        if predecessor_task_id not in set(repair.parents):
+        expected_parents = {predecessor_task_id} if predecessor.status == "done" else set()
+        parents = set(repair.parents)
+        if predecessor.status != "done" and predecessor_task_id in parents:
+            self._run("unlink", predecessor_task_id, repair_task_id)
+            repair = self.get_task(repair_task_id)
+            parents = set(repair.parents)
+        unexpected_parents = parents - expected_parents
+        if unexpected_parents:
+            raise RuntimeError("Hermes repair task has unexpected parent dependencies")
+        if expected_parents and predecessor_task_id not in parents:
             raise RuntimeError("Hermes repair task is missing predecessor dependency")
         extra_children = set(repair.children) - set(expected_children)
         if extra_children:
@@ -536,6 +549,9 @@ class HermesBoardAdapter:
             raise RuntimeError("Hermes repair task downstream graph did not converge")
         if workspace_path is not None and repair.status == "blocked":
             self._run("unblock", repair_task_id, "--reason", reason)
+            repair = self.get_task(repair_task_id)
+        if predecessor.status != "done" and repair.status == "todo":
+            self._run("promote", repair_task_id, reason)
             repair = self.get_task(repair_task_id)
         if repair.status not in {"todo", "ready", "scheduled", "running", "blocked", "done"}:
             raise RuntimeError(f"Hermes repair task entered an unsupported status: {repair.status}")

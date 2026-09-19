@@ -96,6 +96,59 @@ class SchedulerDaemonTests(unittest.TestCase):
         self.assertEqual(health.last_status, "external_progress")
         self.assertEqual(health.last_stage, "hermes_dispatch")
 
+    def test_authorized_but_undispatchable_is_durable_and_backed_off(self) -> None:
+        sleeps: list[float] = []
+        outcomes = [{"status": "authorized_undispatchable", "stage": "hermes_dispatch", "reason_category": "no_dispatchable_plan"}, {"status": "authorized_undispatchable", "stage": "hermes_dispatch", "reason_category": "no_dispatchable_plan"}, {"status": "no_authorized_work"}]
+        daemon = SchedulerDaemon(
+            self.ledger,
+            lambda: FakeScheduler(ProcessNextResult("no_work")),
+            external_progress_runner=lambda: outcomes.pop(0),
+            worker_id="daemon",
+            idle_sleep_seconds=7.0,
+            undispatchable_backoff_seconds=1.0,
+            max_undispatchable_backoff_seconds=4.0,
+            sleep=sleeps.append,
+            clock=lambda: 100.0,
+        )
+        daemon.run(max_iterations=3)
+        self.assertEqual(sleeps, [1.0, 2.0, 7.0])
+        status = self.ledger.operator_status()["daemon_status"]
+        self.assertEqual(status[0]["status"], "no_work")
+        self.assertEqual(status[0]["consecutive_undispatchable"], 0)
+
+    def test_persisted_daemon_error_survives_new_ledger_and_is_bounded(self) -> None:
+        daemon = SchedulerDaemon(
+            self.ledger,
+            lambda: FakeScheduler(RuntimeError("secret-token-should-not-be-unbounded")),
+            worker_id="daemon",
+            sleep=lambda _delay: None,
+            clock=lambda: 100.0,
+        )
+        daemon.run(max_iterations=1)
+        self.ledger.close()
+        reopened = Ledger(self.database)
+        try:
+            reopened.migrate()
+            row = reopened.operator_status()["daemon_status"][0]
+            self.assertEqual(row["status"], "error")
+            self.assertTrue(row["last_error"].startswith("RuntimeError: "))
+            self.assertLessEqual(len(row["last_error"]), 500)
+            self.assertNotIn("secret-token-should-not-be-unbounded", row["last_error"])
+        finally:
+            reopened.close()
+
+    def test_daemon_status_migration_is_idempotent_and_malformed_rows_are_safe(self) -> None:
+        self.ledger.migrate()
+        self.ledger.migrate()
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=2").fetchone()[0], 1)
+        self.ledger.connection.execute(
+            "INSERT INTO daemon_status(worker_id,status,consecutive_undispatchable,iterations,successful_ticks,idle_ticks,busy_ticks,paused_ticks,transient_errors,consecutive_errors,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            ("malformed", "bad", "not-an-int", 0, 0, 0, 0, 0, 0, 0, 1),
+        )
+        row = self.ledger.operator_status()["daemon_status"][0]
+        self.assertEqual(row["status"], "invalid_persisted_state")
+        self.assertEqual(row["reason_category"], "malformed_persisted_state")
+
     def test_dispatch_authority_requires_durable_release_or_repair_activation(self) -> None:
         imported = self.ledger.create_ticket(
             title="imported",
