@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import unittest
 import json
 import math
@@ -575,12 +577,20 @@ class SchedulerDaemonTests(unittest.TestCase):
     def test_daemon_cli_rejects_unsafe_worker_id_during_argument_parsing(self) -> None:
         parser = argparse.ArgumentParser()
         register_cli(parser)
-        for value in (
-            "password=FAKE_CLI_SECRET", "PaSsWoRd-PRIMARY_SECRET_7d2e", "SeCrEt-PRIMARY_SECRET_7d2e",
-            "API_KEY-PRIMARY_SECRET_7d2e", "PRIVATE_KEY-PRIMARY_SECRET_7d2e", "bad worker", "w" * 129,
-        ):
-            with self.subTest(worker_id=value[:32]), self.assertRaises(SystemExit):
-                parser.parse_args(["--database", str(self.database), "daemon", "--worker-id", value])
+        for command in ("daemon", "process-next"):
+            for value in (
+                "password=PARSER_LEAK_SECRET_7d2e", "PaSsWoRd-PRIMARY_SECRET_7d2e", "SeCrEt-PRIMARY_SECRET_7d2e",
+                "API_KEY-PRIMARY_SECRET_7d2e", "PRIVATE_KEY-PRIMARY_SECRET_7d2e", "bad worker", "w" * 129,
+            ):
+                with self.subTest(command=command, worker_id=value[:32]):
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+                        parser.parse_args(["--database", str(self.database), command, "--worker-id", value])
+                    rendered = stderr.getvalue()
+                    self.assertNotIn("PARSER_LEAK_SECRET_7d2e", rendered)
+                    self.assertNotIn("PRIMARY_SECRET_7d2e", rendered)
+                    self.assertNotIn(value, rendered)
+                    self.assertIn("worker_id must be an accepted daemon authority identity", rendered)
 
     def test_worker_id_rejects_unsafe_or_overlong_identity_without_persistence(self) -> None:
         unsafe = (

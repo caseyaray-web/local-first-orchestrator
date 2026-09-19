@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .comment_delivery import CommentDeliveryWorker
+from .daemon_text import validate_daemon_worker_id
 from .gateway_notification import HermesGatewayNotificationWorker
 from .execution_handoff import HANDOFF_MARKER
 from .generated_projection import GeneratedProjectionWorker
@@ -1018,7 +1019,8 @@ class ProcessNextScheduler:
         gateway_notification_executable: str | None = None,
         next_tranche_materialize_runner: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
-        if not worker_id or lease_seconds < 1:
+        worker_id = validate_daemon_worker_id(worker_id)
+        if lease_seconds < 1:
             raise ValueError("process-next requires a worker id and positive lease")
         timeout = getattr(board, "timeout_seconds", None)
         if type(timeout) is not int or timeout < 1:

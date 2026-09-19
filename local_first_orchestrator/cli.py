@@ -31,6 +31,15 @@ from .triage import LocalTriagePlanner
 from .usage_governor import PaidPurpose, UsageGovernor
 
 
+def _daemon_worker_id_cli_arg(value: str) -> str:
+    try:
+        return validate_daemon_worker_id(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "worker_id must be an accepted daemon authority identity"
+        ) from exc
+
+
 def _correction_service(ledger: Ledger, args: argparse.Namespace) -> CorrectionService:
     root=Path(args.repository).resolve(strict=True)
     allowlist=tuple(Path(item).resolve(strict=True) for item in args.allow_repository) or (root,)
@@ -664,13 +673,13 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     process_next=commands.add_parser("process-next", help="run at most one durable Local First control stage; dry-run by default")
     process_next.add_argument("--execute", action="store_true")
     process_next.add_argument("--allow-board-writes", action="store_true")
-    process_next.add_argument("--worker-id", default="local-first-process-next")
+    process_next.add_argument("--worker-id", default="local-first-process-next", type=_daemon_worker_id_cli_arg)
     process_next.add_argument("--planner-executable", default="hermes")
     process_next.add_argument("--ticket-id", help="scope this scheduler tick to exactly one ticket; tranche-wide stages are suppressed")
     daemon=commands.add_parser("daemon", aliases=("run",), help="continuously drive Local First stages and authorized Hermes dispatch")
     daemon.add_argument("--execute", action="store_true")
     daemon.add_argument("--allow-board-writes", action="store_true")
-    daemon.add_argument("--worker-id", default="local-first-daemon", type=validate_daemon_worker_id)
+    daemon.add_argument("--worker-id", default="local-first-daemon", type=_daemon_worker_id_cli_arg)
     daemon.add_argument("--planner-executable", default="hermes")
     daemon.add_argument("--idle-sleep-seconds", type=float, default=1.0)
     daemon.add_argument("--busy-sleep-seconds", type=float, default=0.25)
