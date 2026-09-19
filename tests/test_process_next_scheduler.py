@@ -125,6 +125,23 @@ class ProcessNextSchedulerTests(unittest.TestCase):
         self.ledger.close()
         self.temp.cleanup()
 
+    def test_constructor_rejects_credential_shaped_worker_authority_ids(self) -> None:
+        for worker_id in (
+            "password_SYNTHETIC_LEAK_7d2e",
+            "ToKeN_SYNTHETIC_LEAK_7d2e",
+            "SeCrEt_SYNTHETIC_LEAK_7d2e",
+            "API-KEY_SYNTHETIC_LEAK_7d2e",
+            "PRIVATE-KEY_SYNTHETIC_LEAK_7d2e",
+        ):
+            with self.subTest(worker_id=worker_id), self.assertRaises(ValueError):
+                ProcessNextScheduler(
+                    self.ledger,
+                    self.board,
+                    worker_id=worker_id,
+                    lease_seconds=30,
+                    clock=lambda: 100,
+                )
+
     @staticmethod
     def contract(*, dependencies: tuple[str, ...] = ()) -> dict[str, object]:
         return {

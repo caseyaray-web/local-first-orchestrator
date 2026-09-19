@@ -577,10 +577,12 @@ class SchedulerDaemonTests(unittest.TestCase):
     def test_daemon_cli_rejects_unsafe_worker_id_during_argument_parsing(self) -> None:
         parser = argparse.ArgumentParser()
         register_cli(parser)
-        for command in ("daemon", "process-next"):
+        for command in ("daemon", "run", "process-next"):
             for value in (
-                "password=PARSER_LEAK_SECRET_7d2e", "PaSsWoRd-PRIMARY_SECRET_7d2e", "SeCrEt-PRIMARY_SECRET_7d2e",
-                "API_KEY-PRIMARY_SECRET_7d2e", "PRIVATE_KEY-PRIMARY_SECRET_7d2e", "bad worker", "w" * 129,
+                "password=PARSER_LEAK_SECRET_7d2e", "password_SYNTHETIC_LEAK_7d2e", "ToKeN_SYNTHETIC_LEAK_7d2e",
+                "SeCrEt_SYNTHETIC_LEAK_7d2e", "API-KEY_SYNTHETIC_LEAK_7d2e", "PRIVATE-KEY_SYNTHETIC_LEAK_7d2e",
+                "PaSsWoRd-PRIMARY_SECRET_7d2e", "SeCrEt-PRIMARY_SECRET_7d2e", "API_KEY-PRIMARY_SECRET_7d2e",
+                "PRIVATE_KEY-PRIMARY_SECRET_7d2e", "bad worker", "w" * 129,
             ):
                 with self.subTest(command=command, worker_id=value[:32]):
                     stderr = io.StringIO()
@@ -595,6 +597,11 @@ class SchedulerDaemonTests(unittest.TestCase):
     def test_worker_id_rejects_unsafe_or_overlong_identity_without_persistence(self) -> None:
         unsafe = (
             "password=FAKE_WORKER_SECRET",
+            "password_SYNTHETIC_LEAK_7d2e",
+            "ToKeN_SYNTHETIC_LEAK_7d2e",
+            "SeCrEt_SYNTHETIC_LEAK_7d2e",
+            "API-KEY_SYNTHETIC_LEAK_7d2e",
+            "PRIVATE-KEY_SYNTHETIC_LEAK_7d2e",
             "PaSsWoRd-PRIMARY_SECRET_7d2e",
             "SeCrEt-PRIMARY_SECRET_7d2e",
             "API_KEY-PRIMARY_SECRET_7d2e",
@@ -621,6 +628,11 @@ class SchedulerDaemonTests(unittest.TestCase):
     def test_legacy_credential_shaped_authority_ids_fail_closed_case_insensitively(self) -> None:
         values = (
             "password-PRIMARY_SECRET_7d2e",
+            "password_SYNTHETIC_LEAK_7d2e",
+            "token_SYNTHETIC_LEAK_7d2e",
+            "secret_SYNTHETIC_LEAK_7d2e",
+            "API-KEY_SYNTHETIC_LEAK_7d2e",
+            "PRIVATE-KEY_SYNTHETIC_LEAK_7d2e",
             "PaSsWoRd-PRIMARY_SECRET_7d2e",
             "secret-PRIMARY_SECRET_7d2e",
             "SeCrEt-PRIMARY_SECRET_7d2e",

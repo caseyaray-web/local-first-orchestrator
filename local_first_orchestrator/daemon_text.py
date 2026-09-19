@@ -4,7 +4,7 @@ import re
 
 
 _DAEMON_CREDENTIAL_ASSIGNMENT = re.compile(
-    r"(?i)\b(?:password|token|secret|api[_-]?key|private[_-]?key)\b"
+    r"(?i)\b(?:password|token|secret|api[_-]?key|private[_-]?key)"
     r"\s*(?:[:=]\s*|[-_])"
     r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;]+)"
 )
