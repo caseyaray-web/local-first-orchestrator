@@ -356,8 +356,10 @@ class SchedulerDaemon:
         if max_iterations is not None and max_iterations < 0:
             raise ValueError("max_iterations must be non-negative")
         self._running = True
+        invocation_iterations = 0
         try:
-            while not self.stop_requested and (max_iterations is None or self._iterations < max_iterations):
+            while not self.stop_requested and (max_iterations is None or invocation_iterations < max_iterations):
+                invocation_iterations += 1
                 try:
                     self.run_iteration()
                 except Exception:

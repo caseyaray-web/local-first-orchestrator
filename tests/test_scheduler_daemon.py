@@ -110,6 +110,47 @@ class SchedulerDaemonTests(unittest.TestCase):
         self.assertEqual(health.last_status, "external_progress")
         self.assertEqual(health.last_stage, "hermes_dispatch")
 
+    def test_restart_run_budget_is_invocation_local_not_durable_lifetime(self) -> None:
+        self.ledger.upsert_daemon_status(
+            worker_id="daemon",
+            status="no_work",
+            last_status="no_work",
+            last_stage="validation",
+            last_ticket_id=None,
+            reason_category=None,
+            reason=None,
+            consecutive_undispatchable=0,
+            iterations=7,
+            successful_ticks=7,
+            idle_ticks=7,
+            busy_ticks=0,
+            paused_ticks=0,
+            transient_errors=0,
+            consecutive_errors=0,
+            last_error=None,
+            last_tick_started_at=100.0,
+            last_tick_completed_at=100.0,
+        )
+        scheduler_calls: list[str] = []
+
+        def factory():
+            scheduler_calls.append("process_next")
+            return FakeScheduler(ProcessNextResult("no_work"))
+
+        daemon = SchedulerDaemon(
+            self.ledger,
+            factory,
+            worker_id="daemon",
+            sleep=lambda _delay: None,
+            clock=lambda: 101.0,
+        )
+
+        health = daemon.run(max_iterations=1)
+
+        self.assertEqual(scheduler_calls, ["process_next"])
+        self.assertEqual(health.iterations, 8)
+        self.assertEqual(self.ledger.operator_status()["daemon_status"][0]["iterations"], 8)
+
     def test_interrupted_undispatchable_sleep_commits_counter_and_restarts_backoff(self) -> None:
         def interrupt(_delay: float) -> None:
             raise SystemExit("interrupt during backoff")
@@ -146,7 +187,7 @@ class SchedulerDaemonTests(unittest.TestCase):
             clock=lambda: 101.0,
         )
         second.run(max_iterations=2)
-        self.assertEqual(sleeps, [2.0])
+        self.assertEqual(sleeps, [2.0, 2.0])
 
         self.ledger.close()
         self.ledger = Ledger(self.database)
@@ -163,7 +204,7 @@ class SchedulerDaemonTests(unittest.TestCase):
             clock=lambda: 102.0,
         )
         third.run(max_iterations=3)
-        self.assertEqual(third_sleeps, [2.0])
+        self.assertEqual(third_sleeps, [2.0, 2.0, 2.0])
 
     def test_sqlite_signed_max_undispatchable_counter_saturates_before_persist_and_sleep(self) -> None:
         sqlite_int_max = SQLITE_INT_MAX
