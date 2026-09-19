@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 import signal
 import threading
 import time
@@ -8,6 +9,17 @@ from typing import Any, Callable
 
 from .ledger import Ledger
 from .scheduler import ProcessNextResult, ProcessNextScheduler, scheduler_observability
+
+
+def _saturating_exponential_backoff(base: float, exponent: int, maximum: float) -> float:
+    """Double a non-negative delay without overflowing before applying its cap."""
+    if base == 0 or maximum == 0:
+        return 0.0
+    try:
+        scaled = math.ldexp(base, exponent)
+    except OverflowError:
+        return maximum
+    return min(maximum, scaled)
 
 
 @dataclass(frozen=True)
@@ -199,7 +211,11 @@ class SchedulerDaemon:
         if self.stop_requested:
             return
         if result.status == "authorized_undispatchable":
-            delay = min(self.max_undispatchable_backoff_seconds, self.undispatchable_backoff_seconds * (2 ** max(0, self._consecutive_undispatchable - 1)))
+            delay = _saturating_exponential_backoff(
+                self.undispatchable_backoff_seconds,
+                max(0, self._consecutive_undispatchable - 1),
+                self.max_undispatchable_backoff_seconds,
+            )
             self.sleep(delay)
         elif result.status in {"idle", "no_work"}:
             self.sleep(self.idle_sleep_seconds)
@@ -245,9 +261,10 @@ class SchedulerDaemon:
             self._state = "error"
             self._last_tick_completed_at = self.clock()
             self._persist_status()
-            delay = min(
+            delay = _saturating_exponential_backoff(
+                self.error_backoff_seconds,
+                max(0, self._consecutive_errors - 1),
                 self.max_error_backoff_seconds,
-                self.error_backoff_seconds * (2 ** max(0, self._consecutive_errors - 1)),
             )
             if not self.stop_requested:
                 self.sleep(delay)

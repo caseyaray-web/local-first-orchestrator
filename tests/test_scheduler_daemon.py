@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from local_first_orchestrator.daemon import SchedulerDaemon
+from local_first_orchestrator.daemon import SchedulerDaemon, _saturating_exponential_backoff
 from local_first_orchestrator.ledger import Ledger
 from local_first_orchestrator.scheduler import ProcessNextResult, ProcessNextScheduler
 from local_first_orchestrator.states import CanonicalState
@@ -51,6 +51,19 @@ class SchedulerDaemonTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.ledger.close()
         self.temp.cleanup()
+
+    def test_saturating_backoff_preserves_zero_base_semantics(self) -> None:
+        self.assertEqual(_saturating_exponential_backoff(0.0, 10**9, 4.0), 0.0)
+        self.assertEqual(_saturating_exponential_backoff(1.0, 10, 0.0), 0.0)
+
+    def test_saturating_backoff_doubles_normally_before_capping(self) -> None:
+        self.assertEqual(_saturating_exponential_backoff(1.0, 0, 4.0), 1.0)
+        self.assertEqual(_saturating_exponential_backoff(1.0, 1, 4.0), 2.0)
+        self.assertEqual(_saturating_exponential_backoff(1.0, 2, 4.0), 4.0)
+        self.assertEqual(_saturating_exponential_backoff(1.0, 3, 4.0), 4.0)
+
+    def test_saturating_backoff_caps_huge_exponent_without_overflow(self) -> None:
+        self.assertEqual(_saturating_exponential_backoff(1.0, 1025, 4.0), 4.0)
 
     def test_idle_busy_and_completed_ticks_use_expected_sleep_policy(self) -> None:
         outcomes = [ProcessNextResult("no_work"), ProcessNextResult("busy"), ProcessNextResult("completed", "validation", "T")]
@@ -150,6 +163,46 @@ class SchedulerDaemonTests(unittest.TestCase):
         )
         third.run(max_iterations=1)
         self.assertEqual(third_sleeps, [2.0])
+
+    def test_rehydrated_large_undispatchable_counter_is_capped_without_overflow(self) -> None:
+        self.ledger.upsert_daemon_status(
+            worker_id="daemon",
+            status="authorized_undispatchable",
+            last_status="authorized_undispatchable",
+            last_stage="hermes_dispatch",
+            last_ticket_id=None,
+            reason_category="no_dispatchable_plan",
+            reason="authorized work has no dispatchable plan",
+            consecutive_undispatchable=1025,
+            iterations=1,
+            successful_ticks=1,
+            idle_ticks=0,
+            busy_ticks=0,
+            paused_ticks=0,
+            transient_errors=0,
+            consecutive_errors=0,
+            last_error=None,
+            last_tick_started_at=100.0,
+            last_tick_completed_at=100.0,
+        )
+        sleeps: list[float] = []
+        daemon = SchedulerDaemon(
+            self.ledger,
+            lambda: FakeScheduler(ProcessNextResult("no_work")),
+            external_progress_runner=lambda: {"status": "authorized_undispatchable", "stage": "hermes_dispatch"},
+            worker_id="daemon",
+            undispatchable_backoff_seconds=1.0,
+            max_undispatchable_backoff_seconds=4.0,
+            sleep=sleeps.append,
+            clock=lambda: 101.0,
+        )
+
+        daemon.run_iteration()
+
+        self.assertEqual(sleeps, [4.0])
+        row = self.ledger.operator_status()["daemon_status"][0]
+        self.assertEqual(row["status"], "authorized_undispatchable")
+        self.assertEqual(row["consecutive_undispatchable"], 1026)
 
     def test_authorized_but_undispatchable_is_durable_and_backed_off(self) -> None:
         sleeps: list[float] = []
