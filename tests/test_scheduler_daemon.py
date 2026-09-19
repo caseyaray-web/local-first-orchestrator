@@ -96,6 +96,61 @@ class SchedulerDaemonTests(unittest.TestCase):
         self.assertEqual(health.last_status, "external_progress")
         self.assertEqual(health.last_stage, "hermes_dispatch")
 
+    def test_interrupted_undispatchable_sleep_commits_counter_and_restarts_backoff(self) -> None:
+        def interrupt(_delay: float) -> None:
+            raise SystemExit("interrupt during backoff")
+
+        first = SchedulerDaemon(
+            self.ledger,
+            lambda: FakeScheduler(ProcessNextResult("no_work")),
+            external_progress_runner=lambda: {"status": "authorized_undispatchable", "stage": "hermes_dispatch"},
+            worker_id="daemon",
+            undispatchable_backoff_seconds=1.0,
+            max_undispatchable_backoff_seconds=2.0,
+            sleep=interrupt,
+            clock=lambda: 100.0,
+        )
+        with self.assertRaises(SystemExit):
+            first.run(max_iterations=1)
+
+        self.ledger.close()
+        self.ledger = Ledger(self.database)
+        self.ledger.migrate()
+        row = self.ledger.operator_status()["daemon_status"][0]
+        self.assertEqual(row["status"], "authorized_undispatchable")
+        self.assertEqual(row["consecutive_undispatchable"], 1)
+
+        sleeps: list[float] = []
+        second = SchedulerDaemon(
+            self.ledger,
+            lambda: FakeScheduler(ProcessNextResult("no_work")),
+            external_progress_runner=lambda: {"status": "authorized_undispatchable", "stage": "hermes_dispatch"},
+            worker_id="daemon",
+            undispatchable_backoff_seconds=1.0,
+            max_undispatchable_backoff_seconds=2.0,
+            sleep=sleeps.append,
+            clock=lambda: 101.0,
+        )
+        second.run(max_iterations=1)
+        self.assertEqual(sleeps, [2.0])
+
+        self.ledger.close()
+        self.ledger = Ledger(self.database)
+        self.ledger.migrate()
+        third_sleeps: list[float] = []
+        third = SchedulerDaemon(
+            self.ledger,
+            lambda: FakeScheduler(ProcessNextResult("no_work")),
+            external_progress_runner=lambda: {"status": "authorized_undispatchable", "stage": "hermes_dispatch"},
+            worker_id="daemon",
+            undispatchable_backoff_seconds=1.0,
+            max_undispatchable_backoff_seconds=2.0,
+            sleep=third_sleeps.append,
+            clock=lambda: 102.0,
+        )
+        third.run(max_iterations=1)
+        self.assertEqual(third_sleeps, [2.0])
+
     def test_authorized_but_undispatchable_is_durable_and_backed_off(self) -> None:
         sleeps: list[float] = []
         outcomes = [{"status": "authorized_undispatchable", "stage": "hermes_dispatch", "reason_category": "no_dispatchable_plan"}, {"status": "authorized_undispatchable", "stage": "hermes_dispatch", "reason_category": "no_dispatchable_plan"}, {"status": "no_authorized_work"}]

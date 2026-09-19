@@ -9055,6 +9055,7 @@ class Ledger:
             "ON c.ticket_id=r.ticket_id AND c.retired_attempt_number=r.retired_attempt_number "
             "ORDER BY r.reconciled_at DESC, r.ticket_id LIMIT ?", (active_limit,)
         )]
+        daemon_status = self.daemon_status_rows(limit=active_limit)
         return {
             "paused": bool(paused["paused"]) if paused else False,
             "ready_local": state_counts.get(CanonicalState.READY_LOCAL.value, 0),
@@ -9071,8 +9072,8 @@ class Ledger:
             "pending_state_projections": int(pending_state_projections),
             "superseded_state_projections": int(superseded_state_projections),
             "failed_attempt_reconciliations": reconciliations,
-            "daemon_status": self.daemon_status_rows(limit=active_limit),
-            "daemon_status_truncated": len(self.daemon_status_rows(limit=active_limit)) == active_limit and self.connection.execute("SELECT COUNT(*) FROM daemon_status").fetchone()[0] > active_limit,
+            "daemon_status": daemon_status,
+            "daemon_status_truncated": len(daemon_status) == active_limit and self.connection.execute("SELECT COUNT(*) FROM daemon_status").fetchone()[0] > active_limit,
         }
 
     def plan_projection(self, ticket_id: str, *, evidence: str | None = None, state_payload: dict[str, Any] | None = None) -> dict[str, Any] | None:

@@ -101,8 +101,13 @@ class SchedulerDaemon:
         self._last_tick_completed_at: float | None = None
         # Do not erase a prior worker record during restart.  The previous
         # result/error remains operator-visible until the first new tick.
-        if self.ledger.connection.execute("SELECT 1 FROM daemon_status WHERE worker_id=?", (self.worker_id,)).fetchone() is None:
+        persisted = self.ledger.connection.execute("SELECT * FROM daemon_status WHERE worker_id=?", (self.worker_id,)).fetchone()
+        if persisted is None:
             self._persist_status()
+        else:
+            validated = Ledger._operator_daemon_row(persisted)
+            if validated.get("status") == "authorized_undispatchable":
+                self._consecutive_undispatchable = int(validated["consecutive_undispatchable"])
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -197,13 +202,10 @@ class SchedulerDaemon:
             delay = min(self.max_undispatchable_backoff_seconds, self.undispatchable_backoff_seconds * (2 ** max(0, self._consecutive_undispatchable - 1)))
             self.sleep(delay)
         elif result.status in {"idle", "no_work"}:
-            self._idle_ticks += 1
             self.sleep(self.idle_sleep_seconds)
         elif result.status == "busy":
-            self._busy_ticks += 1
             self.sleep(self.busy_sleep_seconds)
         elif result.status == "paused":
-            self._paused_ticks += 1
             self.sleep(self.idle_sleep_seconds)
 
     def run_iteration(self) -> ProcessNextResult:
@@ -256,8 +258,15 @@ class SchedulerDaemon:
         self._consecutive_errors = 0
         self._state = result.status
         self._last_tick_completed_at = self.clock()
-        self._sleep_after_result(result)
+        if not self.stop_requested:
+            if result.status in {"idle", "no_work"}:
+                self._idle_ticks += 1
+            elif result.status == "busy":
+                self._busy_ticks += 1
+            elif result.status == "paused":
+                self._paused_ticks += 1
         self._persist_status()
+        self._sleep_after_result(result)
         return result
 
     def run(self, *, max_iterations: int | None = None, continue_on_error: bool = True) -> DaemonHealth:
