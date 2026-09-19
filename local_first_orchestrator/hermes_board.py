@@ -449,7 +449,7 @@ class HermesBoardAdapter:
         task = self.get_task(task_id)
         if task.status == "done":
             return task
-        if task.status == "blocked":
+        if task.status in {"blocked", "triage"}:
             snapshot = self.execution_snapshot(task_id)
             if snapshot.runs:
                 latest = max(snapshot.runs, key=lambda run: run.id)

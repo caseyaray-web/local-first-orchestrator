@@ -497,6 +497,48 @@ class ManualAdoptionTests(unittest.TestCase):
         self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.LOCAL_REVIEW.value)
         self.assertEqual(self.ledger.runtime_stage(self.ticket_id, "validation_completed")["attempt_number"], 2)
 
+    def test_runtime_marker_advances_across_automatic_then_manual_retry_lineage(self) -> None:
+        for attempt_number, outcome, fingerprint in (
+            (1, "repair_requested", "a" * 64),
+            (2, "failed_retired", "b" * 64),
+            (3, None, None),
+        ):
+            self.ledger.connection.execute(
+                "INSERT INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,post_diff_hash,outcome,failure_fingerprint,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (self.ticket_id, attempt_number, self.base, f"wt/{self.external_id}", str(self.worktree), "c" * 64, "d" * 64, outcome, fingerprint, attempt_number),
+            )
+        self.ledger.connection.execute(
+            "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,base_sha,created_at) VALUES (?,?,?,?,?,?)",
+            (self.ticket_id, "validation_completed", json.dumps({"passed": False}), 1, self.base, 1),
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,base_sha,created_at) VALUES (?,?,?,?,?,?)",
+            (self.ticket_id, "repair-routing-1", json.dumps({"action": "repair", "attempt_number": 1, "next_attempt_number": 2, "failure_fingerprint": "a" * 64}), 1, self.base, 2),
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO failed_attempt_reconciliations(ticket_id,retired_attempt_number,classification,previous_ticket_state,resulting_ticket_state,operator_id,runtime_identity_json,retry_base_sha,prospective_next_attempt_number,cleanup_required,forensic_artifact_paths_json,reconciled_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (self.ticket_id, 2, "operator_review_repair", CanonicalState.NEEDS_TRIAGE.value, CanonicalState.READY_LOCAL.value, "operator", "{}", self.base, 3, 0, "[]", 3),
+        )
+        self.assertTrue(self.ledger.advance_reconciled_runtime_marker(
+            self.ticket_id,
+            "validation_completed",
+            attempt_number=3,
+            detail=json.dumps({"passed": True}),
+            base_sha=self.base,
+        ))
+        self.assertEqual(self.ledger.runtime_stage(self.ticket_id, "validation_completed")["attempt_number"], 3)
+
+        self.ledger.connection.execute("UPDATE runtime_stages SET attempt_number=1 WHERE ticket_id=? AND stage='validation_completed'", (self.ticket_id,))
+        self.ledger.connection.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage='repair-routing-1'", (self.ticket_id,))
+        with self.assertRaisesRegex(RuntimeError, "authorized retry lineage"):
+            self.ledger.advance_reconciled_runtime_marker(
+                self.ticket_id,
+                "validation_completed",
+                attempt_number=3,
+                detail=json.dumps({"passed": True}),
+                base_sha=self.base,
+            )
+
     def test_manual_validation_reconciliation_requires_completed_scheduler_effect(self) -> None:
         (self.worktree / "app.py").write_text("def run():\n    return 2\n\ndef extra():\n    return 3\n", encoding="utf-8")
         first = self.controller.adopt_existing_implementation(

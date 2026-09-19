@@ -466,6 +466,12 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
             "repo_base_sha": repo_base_sha,
             "repo_snapshot_hash": repo_snapshot_hash,
         }
+    def inspect_landing(identity: dict[str, object]) -> dict[str, object]:
+        return ctl.inspect_tranche_landing_context(identity, repository=registered.canonical_repository)
+
+    def land_tranche(identity: dict[str, object]) -> dict[str, object]:
+        return ctl.execute_tranche_landing(identity, repository=registered.canonical_repository)
+
     return ProcessNextScheduler(
         ledger,
         ctl.board,
@@ -517,6 +523,8 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
         paid_escalation_route=None if registered.paid_escalation is None else (
             registered.paid_escalation.provider, registered.paid_escalation.model, registered.paid_escalation.profile
         ),
+        tranche_landing_context_runner=inspect_landing,
+        tranche_landing_runner=land_tranche,
         ticket_escalation_runner=None if paid_escalation is None or not registered.unresolvable_notification_target else lambda ticket_id: ctl.execute_ticket_paid_escalation(
             ticket_id, adapter=paid_escalation, notification_target=registered.unresolvable_notification_target
         ),

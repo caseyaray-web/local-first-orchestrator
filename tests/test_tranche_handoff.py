@@ -98,6 +98,12 @@ class TrancheHandoffTests(unittest.TestCase):
         add_paid("integration_checkpoint", checkpoint_decision, "call-checkpoint")
         if escalation_decision is not None:
             add_paid("escalation", escalation_decision, "call-escalation")
+        if checkpoint_decision == "approve" or (checkpoint_decision == "escalate" and escalation_decision == "approve"):
+            self.ledger.connection.execute(
+                "INSERT INTO tranche_landing_evidence(tranche_id,feature_id,repository_identity,canonical_branch,pre_landing_sha,final_integration_sha,landing_commit_sha,commit_message,checkpoint_artifact_sha256,checkpoint_completion_hash,scheduler_claim_id,created_at) VALUES ('T1','F',?,'main',?,?,?,'local-first: complete T1',?,?, 'landing-fixture',1)",
+                (str(self.repo), self.base, completion["final_integration_sha"], completion["final_integration_sha"], checkpoint_hash, completion["evidence_hash"]),
+            )
+            self.ledger.connection.execute("UPDATE tranches SET status='completed' WHERE id='T1'")
         return completion
 
     def scheduler_materialize_runner(self, coordinator):
@@ -216,7 +222,7 @@ class TrancheHandoffTests(unittest.TestCase):
         self.assertEqual(json.loads(activation["dependency_graph_hashes_json"]),[{"graph_hash":graph_hash,"ticket_id":"B2"}])
 
     def test_materializes_only_next_tranche_from_completed_head_and_replays(self):
-        self.ledger.record_tranche_completion(completion_evidence(self.ledger, self.repo, "T1"))
+        self.prepare_scheduler_activation_authority()
         s2 = snapshot(self.repo, self.a1, self.feature)
         self.assertEqual(hashlib.sha256((self.repo / "alpha.py").read_bytes()).hexdigest(), next(e.content_hash for e in s2.entries if e.path == "alpha.py"))
         proposal = DecompositionPlan(1, "F", self.feature.contract_hash, "wrong", "wrong", (), {"next": ("B",)}, (Tranche("proposal", 0, "beta", (), ("B",), (self.b,)),))

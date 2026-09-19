@@ -805,6 +805,24 @@ CREATE TRIGGER IF NOT EXISTS paid_checkpoint_evidence_immutable_update
 BEFORE UPDATE ON paid_checkpoint_evidence BEGIN SELECT RAISE(ABORT, 'paid checkpoint evidence is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS paid_checkpoint_evidence_immutable_delete
 BEFORE DELETE ON paid_checkpoint_evidence BEGIN SELECT RAISE(ABORT, 'paid checkpoint evidence is immutable'); END;
+CREATE TABLE IF NOT EXISTS tranche_landing_evidence (
+    tranche_id TEXT PRIMARY KEY REFERENCES tranches(id),
+    feature_id TEXT NOT NULL REFERENCES features(id),
+    repository_identity TEXT NOT NULL,
+    canonical_branch TEXT NOT NULL,
+    pre_landing_sha TEXT NOT NULL,
+    final_integration_sha TEXT NOT NULL,
+    landing_commit_sha TEXT NOT NULL,
+    commit_message TEXT NOT NULL,
+    checkpoint_artifact_sha256 TEXT NOT NULL,
+    checkpoint_completion_hash TEXT NOT NULL,
+    scheduler_claim_id TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS tranche_landing_evidence_immutable_update
+BEFORE UPDATE ON tranche_landing_evidence BEGIN SELECT RAISE(ABORT, 'tranche landing evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS tranche_landing_evidence_immutable_delete
+BEFORE DELETE ON tranche_landing_evidence BEGIN SELECT RAISE(ABORT, 'tranche landing evidence is immutable'); END;
 CREATE TABLE IF NOT EXISTS next_tranche_materializations (
     predecessor_tranche_id TEXT PRIMARY KEY REFERENCES tranches(id),
     successor_tranche_id TEXT NOT NULL REFERENCES tranches(id),
@@ -1614,6 +1632,17 @@ class Ledger:
             # tickets.external_id. The final fallback keeps legacy fake/internal
             # board fixtures working; it is never available to generated tickets.
             return str(ticket["external_id"] or ticket_id)
+        reconciled_terminal = conn.execute(
+            "SELECT json_extract(payload_json,'$.original_external_task_id') AS external_task_id FROM events "
+            "WHERE entity_type='ticket' AND entity_id=? AND event_type='terminal_projection_identity_reconciled' "
+            "AND json_valid(payload_json)=1 AND json_type(payload_json,'$.original_external_task_id')='text' "
+            "ORDER BY id DESC LIMIT 1",
+            (ticket_id,),
+        ).fetchone()
+        if reconciled_terminal is not None and isinstance(reconciled_terminal["external_task_id"], str) and reconciled_terminal["external_task_id"]:
+            if ticket["external_id"] is not None:
+                raise ValueError("external_projection_identity_conflict")
+            return str(reconciled_terminal["external_task_id"])
         repair = conn.execute(
             "SELECT json_extract(detail,'$.external_task_id') AS external_task_id FROM runtime_stages "
             "WHERE ticket_id=? AND stage LIKE 'generated-repair-activation-%' AND json_valid(detail)=1 "
@@ -1762,6 +1791,109 @@ class Ledger:
                 payload={"attempt_number": attempt_number, "event_id": event_id, "operation_id": row["operation_id"]},
             )
             return dict(conn.execute("SELECT * FROM evidence_comment_outbox WHERE operation_id=?", (row["operation_id"],)).fetchone())
+
+    def _verified_hermes_reconciliation_snapshot(self, artifact_path: str, artifact_sha256: str) -> tuple[Path, dict[str, Any]]:
+        if len(artifact_sha256) != 64:
+            raise ValueError("Hermes reconciliation evidence requires sha256")
+        try:
+            path = Path(artifact_path).resolve(strict=True)
+        except OSError as exc:
+            raise ValueError("Hermes reconciliation evidence artifact is missing") from exc
+        if not path.is_file() or path.parent.name != "hermes-reconciliation-evidence":
+            raise ValueError("Hermes reconciliation evidence must be a dedicated snapshot artifact")
+        data = path.read_bytes()
+        if hashlib.sha256(data).hexdigest() != artifact_sha256:
+            raise ValueError("Hermes reconciliation evidence sha256 mismatch")
+        try:
+            document = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Hermes reconciliation evidence is not valid JSON") from exc
+        required = {"task", "latest_summary", "parents", "children", "comments", "events", "runs"}
+        if not isinstance(document, dict) or not required.issubset(document) or not isinstance(document.get("task"), dict) or not isinstance(document.get("parents"), list):
+            raise ValueError("Hermes reconciliation evidence lacks canonical snapshot authority")
+        canonical = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")
+        if canonical != data:
+            raise ValueError("Hermes reconciliation evidence is not canonical JSON")
+        return path, document
+
+    def reconcile_done_projection_to_original_generated_task(
+        self,
+        ticket_id: str,
+        *,
+        stale_event_id: int,
+        original_external_task_id: str,
+        snapshot_artifact_path: str,
+        snapshot_artifact_sha256: str,
+        operator_id: str,
+        reason: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Replace a stale terminal projection to a repair child with observed completion of the original generated task."""
+        if not original_external_task_id or not operator_id.strip() or not reason.strip():
+            raise ValueError("done projection reconciliation requires original task, snapshot evidence, operator, and reason")
+        snapshot_path, snapshot = self._verified_hermes_reconciliation_snapshot(snapshot_artifact_path, snapshot_artifact_sha256)
+        task = snapshot["task"]
+        if str(task.get("id") or "") != original_external_task_id or str(task.get("status") or "") != "done":
+            raise ValueError("done projection reconciliation snapshot does not prove original task completion")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not bool(paused["paused"]):
+                raise PermissionError("done projection reconciliation requires paused controller")
+            ticket = conn.execute("SELECT state FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None: raise KeyError(ticket_id)
+            if str(ticket["state"]) != CanonicalState.DONE.value:
+                raise ValueError("done projection reconciliation requires done ticket")
+            if conn.execute("SELECT 1 FROM accepted_evidence WHERE ticket_id=?", (ticket_id,)).fetchone() is None:
+                raise ValueError("done projection reconciliation requires accepted evidence")
+            original = conn.execute("""
+                SELECT b.external_task_id FROM board_projection_outbox b
+                JOIN events e ON e.id=b.event_id
+                WHERE b.ticket_id=? AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL
+                  AND b.superseded_at IS NULL AND b.external_task_id=?
+                  AND e.entity_type='ticket' AND e.entity_id=?
+                  AND e.event_type IN ('generated_microticket_created','generated_microticket_projection_recovered')
+            """, (ticket_id, original_external_task_id, ticket_id)).fetchall()
+            if len(original) != 1:
+                raise ValueError("done projection reconciliation original generated identity is not authoritative")
+            stale = conn.execute("""
+                SELECT b.*,e.to_state,e.event_type FROM board_projection_outbox b
+                JOIN events e ON e.id=b.event_id
+                WHERE b.ticket_id=? AND b.event_id=?
+            """, (ticket_id, stale_event_id)).fetchone()
+            if stale is None or stale["operation"] != "set_state" or stale["to_state"] != CanonicalState.DONE.value or stale["acknowledged_at"] is not None or stale["superseded_at"] is not None:
+                raise ValueError("done projection reconciliation target is not a current unacknowledged done projection")
+            if str(stale["external_task_id"] or "") == original_external_task_id:
+                raise ValueError("done projection reconciliation target already uses original task")
+            replacement_event_id = self._append_event(
+                conn,
+                entity_type="ticket",
+                entity_id=ticket_id,
+                event_type="state_transition",
+                actor_id=operator_id,
+                from_state=CanonicalState.DONE.value,
+                to_state=CanonicalState.DONE.value,
+                payload={
+                    "mode": "terminal_projection_identity_reconciliation",
+                    "reason": reason,
+                    "superseded_event_id": stale_event_id,
+                    "superseded_external_task_id": str(stale["external_task_id"] or ""),
+                    "original_external_task_id": original_external_task_id,
+                    "snapshot_artifact_path": str(snapshot_path),
+                    "snapshot_artifact_sha256": snapshot_artifact_sha256,
+                },
+            )
+            replacement_key = f"ticket-event:{replacement_event_id}"
+            conn.execute(
+                "INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,operation,external_task_id,acknowledged_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (ticket_id, replacement_event_id, CanonicalState.DONE.value, "{}", replacement_key, now, "set_state", original_external_task_id, now),
+            )
+            conn.execute(
+                "UPDATE board_projection_outbox SET superseded_at=?,superseded_by_event_id=?,supersession_reason=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL WHERE ticket_id=? AND event_id=? AND acknowledged_at IS NULL AND superseded_at IS NULL",
+                (now, replacement_event_id, "terminal_projection_identity_reconciliation", ticket_id, stale_event_id),
+            )
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="terminal_projection_identity_reconciled", actor_id=operator_id, payload={"stale_event_id": stale_event_id, "replacement_event_id": replacement_event_id, "original_external_task_id": original_external_task_id, "snapshot_artifact_path": str(snapshot_path), "snapshot_artifact_sha256": snapshot_artifact_sha256, "reason": reason})
+            return {"ticket_id": ticket_id, "stale_event_id": stale_event_id, "replacement_event_id": replacement_event_id, "external_task_id": original_external_task_id, "status": "acknowledged"}
 
     def projection_reconciliation_report(self) -> list[dict[str, Any]]:
         """Read-only report for legacy events or intents missing their pair."""
@@ -4411,6 +4543,101 @@ class Ledger:
                 results.append(dict(conn.execute("SELECT * FROM native_dependency_graph_revisions WHERE revision_id=?", (revision_id,)).fetchone()))
             return results
 
+    def reconcile_completed_repair_dependency_graph(
+        self,
+        *,
+        downstream_ticket_id: str,
+        cause_ticket_id: str,
+        cause_attempt_number: int,
+        predecessor_external_task_id: str,
+        replacement_external_task_id: str,
+        predecessor_snapshot_artifact_path: str,
+        predecessor_snapshot_artifact_sha256: str,
+        child_snapshot_artifact_path: str,
+        child_snapshot_artifact_sha256: str,
+        operator_id: str,
+        reason: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Append a graph revision after a completed repair child is retired and the original dependency is restored."""
+        if cause_attempt_number < 1:
+            raise ValueError("completed repair dependency reconciliation requires accepted attempt")
+        if not all(isinstance(value, str) and value for value in (downstream_ticket_id, cause_ticket_id, predecessor_external_task_id, replacement_external_task_id, operator_id, reason)):
+            raise ValueError("completed repair dependency reconciliation identity is incomplete")
+        predecessor_snapshot_path, predecessor_snapshot = self._verified_hermes_reconciliation_snapshot(predecessor_snapshot_artifact_path, predecessor_snapshot_artifact_sha256)
+        child_snapshot_path, child_snapshot = self._verified_hermes_reconciliation_snapshot(child_snapshot_artifact_path, child_snapshot_artifact_sha256)
+        predecessor_task = predecessor_snapshot["task"]
+        child_task = child_snapshot["task"]
+        if str(predecessor_task.get("id") or "") != predecessor_external_task_id or str(predecessor_task.get("status") or "") != "archived":
+            raise ValueError("completed repair dependency reconciliation predecessor snapshot is not archived authority")
+        observed_child_external_id = str(child_task.get("id") or "")
+        observed_parent_external_ids = tuple(str(value) for value in child_snapshot.get("parents") or ())
+        if predecessor_external_task_id == replacement_external_task_id:
+            raise ValueError("completed repair dependency reconciliation requires distinct predecessor and replacement")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not bool(paused["paused"]):
+                raise PermissionError("completed repair dependency reconciliation requires paused controller")
+            cause = conn.execute("SELECT state FROM tickets WHERE id=?", (cause_ticket_id,)).fetchone()
+            accepted = conn.execute("SELECT accepted_commit_sha FROM accepted_evidence WHERE ticket_id=?", (cause_ticket_id,)).fetchone()
+            attempt = conn.execute("SELECT accepted_commit_sha FROM attempts WHERE ticket_id=? AND attempt_number=?", (cause_ticket_id, cause_attempt_number)).fetchone()
+            if cause is None or str(cause["state"]) != CanonicalState.DONE.value or accepted is None or attempt is None or not str(attempt["accepted_commit_sha"] or ""):
+                raise ValueError("completed repair dependency reconciliation requires done accepted cause attempt")
+            if str(attempt["accepted_commit_sha"] or "") != str(accepted["accepted_commit_sha"] or ""):
+                raise RuntimeError("completed repair dependency reconciliation accepted commit drift")
+            original = conn.execute("""
+                SELECT b.external_task_id FROM board_projection_outbox b
+                JOIN events e ON e.id=b.event_id
+                WHERE b.ticket_id=? AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL
+                  AND b.superseded_at IS NULL AND b.external_task_id=?
+                  AND e.entity_type='ticket' AND e.entity_id=?
+                  AND e.event_type IN ('generated_microticket_created','generated_microticket_projection_recovered')
+            """, (cause_ticket_id, replacement_external_task_id, cause_ticket_id)).fetchall()
+            if len(original) != 1:
+                raise ValueError("completed repair dependency reconciliation replacement is not original generated identity")
+            existing = conn.execute("SELECT * FROM native_dependency_graph_revisions WHERE ticket_id=? AND cause_ticket_id=? AND cause_attempt_number=?", (downstream_ticket_id, cause_ticket_id, cause_attempt_number)).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["predecessor_external_task_id"]) != predecessor_external_task_id
+                    or str(existing["replacement_external_task_id"]) != replacement_external_task_id
+                    or str(existing["reason"]) != reason
+                    or str(existing["child_external_id"]) != observed_child_external_id
+                    or tuple(sorted(json.loads(str(existing["parent_external_ids_json"])))) != tuple(sorted(observed_parent_external_ids))
+                ):
+                    raise ValueError("completed repair dependency reconciliation replay conflicts")
+                return dict(existing)
+            if conn.execute("SELECT 1 FROM native_dependency_releases WHERE ticket_id=?", (downstream_ticket_id,)).fetchone() is not None:
+                raise ValueError("completed repair dependency reconciliation refuses released downstream ticket")
+            effective = self._effective_native_dependency_graph_in_transaction(conn, downstream_ticket_id)
+            if effective is None:
+                raise ValueError("completed repair dependency reconciliation native graph is missing")
+            if str(effective["child_external_id"]) != observed_child_external_id:
+                raise ValueError("completed repair dependency reconciliation child identity drift")
+            dependency_ids = tuple(json.loads(str(effective["local_dependency_ids_json"])))
+            parent_external_ids = list(json.loads(str(effective["parent_external_ids_json"])))
+            indices = [index for index, dependency_id in enumerate(dependency_ids) if dependency_id == cause_ticket_id]
+            if len(indices) != 1:
+                raise ValueError("completed repair dependency reconciliation cause dependency is missing or ambiguous")
+            index = indices[0]
+            if parent_external_ids[index] != predecessor_external_task_id:
+                raise ValueError("completed repair dependency reconciliation predecessor identity drift")
+            parent_external_ids[index] = replacement_external_task_id
+            parent_tuple = tuple(str(value) for value in parent_external_ids)
+            if tuple(sorted(observed_parent_external_ids)) != tuple(sorted(parent_tuple)):
+                raise ValueError("completed repair dependency reconciliation observed Hermes parents drift")
+            new_hash = self._native_dependency_graph_hash(downstream_ticket_id, observed_child_external_id, dependency_ids, parent_tuple)
+            generation = int(effective["generation"]) + 1
+            revision_id = hashlib.sha256(f"native-completed-repair-graph:{downstream_ticket_id}:{cause_ticket_id}:{cause_attempt_number}:{new_hash}".encode()).hexdigest()[:32]
+            values = (
+                revision_id, downstream_ticket_id, generation, str(effective["graph_hash"]), observed_child_external_id,
+                str(effective["local_dependency_ids_json"]), json.dumps(list(parent_tuple), sort_keys=True, separators=(",", ":")), new_hash,
+                cause_ticket_id, cause_attempt_number, predecessor_external_task_id, replacement_external_task_id, reason, now,
+            )
+            conn.execute("INSERT INTO native_dependency_graph_revisions(revision_id,ticket_id,generation,supersedes_graph_hash,child_external_id,local_dependency_ids_json,parent_external_ids_json,graph_hash,cause_ticket_id,cause_attempt_number,predecessor_external_task_id,replacement_external_task_id,reason,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
+            self._append_event(conn, entity_type="ticket", entity_id=downstream_ticket_id, event_type="native_dependency_graph_reconciled_after_completed_repair", actor_id=operator_id, payload={"revision_id": revision_id, "generation": generation, "supersedes_graph_hash": str(effective["graph_hash"]), "graph_hash": new_hash, "cause_ticket_id": cause_ticket_id, "cause_attempt_number": cause_attempt_number, "predecessor_external_task_id": predecessor_external_task_id, "replacement_external_task_id": replacement_external_task_id, "predecessor_snapshot_artifact_path": str(predecessor_snapshot_path), "predecessor_snapshot_artifact_sha256": predecessor_snapshot_artifact_sha256, "child_snapshot_artifact_path": str(child_snapshot_path), "child_snapshot_artifact_sha256": child_snapshot_artifact_sha256, "reason": reason})
+            return dict(conn.execute("SELECT * FROM native_dependency_graph_revisions WHERE revision_id=?", (revision_id,)).fetchone())
+
     def _native_dependency_graph_identity(self, conn: sqlite3.Connection, ticket_id: str) -> dict[str, Any]:
         ticket = conn.execute("SELECT id,dependencies_json FROM tickets WHERE id=?", (ticket_id,)).fetchone()
         if ticket is None:
@@ -5589,6 +5816,120 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id":claim_id,"stage":"repair_routing","result":result})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
+    def reconcile_stale_repair_routing_after_review(self, ticket_id: str, *, attempt_number: int, operator_id: str, reason: str, now: int | None = None) -> dict[str, Any]:
+        """Reopen a completed repair-routing claim when a newer review supersedes its decision."""
+        if attempt_number < 1 or not operator_id.strip() or not reason.strip():
+            raise ValueError("stale repair-routing reconciliation requires attempt, operator, and reason")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not bool(paused["paused"]):
+                raise PermissionError("stale repair-routing reconciliation requires paused controller")
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None: raise KeyError(ticket_id)
+            if str(ticket["state"]) != CanonicalState.LOCAL_REVIEW.value:
+                raise ValueError("stale repair-routing reconciliation requires local_review ticket")
+            review = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=? AND side_effect_completed_at IS NOT NULL AND result_json IS NOT NULL", (ticket_id, f"review:{attempt_number}")).fetchone()
+            routing = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=? AND side_effect_completed_at IS NOT NULL AND result_json IS NOT NULL", (ticket_id, f"repair_routing:{attempt_number}")).fetchone()
+            if review is None or routing is None:
+                raise ValueError("stale repair-routing reconciliation requires completed review and routing claims")
+            if int(review["side_effect_completed_at"]) <= int(routing["side_effect_completed_at"]):
+                raise ValueError("repair-routing decision is not older than current review")
+            if conn.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number>?", (ticket_id, attempt_number)).fetchone() is not None:
+                raise ValueError("stale repair-routing reconciliation refuses newer attempt history")
+            stage_name = f"repair-routing-{attempt_number}"
+            old_stage = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, stage_name)).fetchone()
+            archive_stage = f"repair-routing-stale-archive-{attempt_number}-{int(review['side_effect_completed_at'])}"
+            archived = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, archive_stage)).fetchone()
+            if old_stage is None and archived is None:
+                raise ValueError("stale repair-routing reconciliation requires durable prior routing decision")
+            if old_stage is not None and archived is None:
+                archive_detail = json.dumps({"reason": reason, "old_stage_detail": str(old_stage["detail"]), "old_claim_result": str(routing["result_json"]), "superseding_review_result": str(review["result_json"])}, sort_keys=True, separators=(",", ":"))
+                conn.execute("INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,base_sha,created_at) VALUES (?,?,?,?,?,?)", (ticket_id, archive_stage, archive_detail, attempt_number, old_stage["base_sha"], now))
+            if old_stage is not None:
+                conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, stage_name))
+            changed = conn.execute("UPDATE scheduler_stage_claims SET status='claimed',lease_owner=NULL,lease_expires_at=?,side_effect_started_at=NULL,side_effect_completed_at=NULL,finalized_at=NULL,result_json=NULL,last_error=NULL,updated_at=? WHERE claim_id=? AND status IN ('completed','claimed')", (now - 1, now, routing["claim_id"]))
+            if changed.rowcount != 1:
+                raise RuntimeError("stale repair-routing reconciliation could not reopen claim")
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="stale_repair_routing_reconciled", actor_id=operator_id, payload={"attempt_number": attempt_number, "reason": reason, "claim_id": str(routing["claim_id"]), "archive_stage": archive_stage})
+            return {"ticket_id": ticket_id, "attempt_number": attempt_number, "claim_id": str(routing["claim_id"]), "archive_stage": archive_stage, "status": "reopened"}
+
+    def reconcile_stale_triage_feedback_after_review(self, ticket_id: str, *, attempt_number: int, operator_id: str, reason: str, now: int | None = None) -> dict[str, Any]:
+        """Archive stale triage feedback after a superseding review reopened repair routing."""
+        if attempt_number < 1 or not operator_id.strip() or not reason.strip():
+            raise ValueError("stale triage feedback reconciliation requires attempt, operator, and reason")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not bool(paused["paused"]):
+                raise PermissionError("stale triage feedback reconciliation requires paused controller")
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None: raise KeyError(ticket_id)
+            if str(ticket["state"]) != CanonicalState.LOCAL_REVIEW.value:
+                raise ValueError("stale triage feedback reconciliation requires local_review ticket")
+            routing = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"repair_routing:{attempt_number}")).fetchone()
+            if routing is None or routing["status"] != "claimed" or routing["side_effect_completed_at"] is not None:
+                raise ValueError("stale triage feedback reconciliation requires reopened unfinished routing claim")
+            review = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=? AND side_effect_completed_at IS NOT NULL", (ticket_id, f"review:{attempt_number}")).fetchone()
+            if review is None:
+                raise ValueError("stale triage feedback reconciliation requires completed superseding review")
+            routing_archive = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage LIKE ? ORDER BY created_at DESC LIMIT 1", (ticket_id, f"repair-routing-stale-archive-{attempt_number}-%")).fetchone()
+            if routing_archive is None:
+                raise PermissionError("stale triage feedback reconciliation requires stale routing authorization")
+            released = conn.execute(
+                "UPDATE scheduler_stage_claims SET lease_owner=NULL,lease_expires_at=?,updated_at=? WHERE claim_id=? AND status='claimed' AND side_effect_completed_at IS NULL",
+                (now - 1, now, routing["claim_id"]),
+            ).rowcount == 1
+            stage_name = f"triage-feedback-{attempt_number}"
+            feedback = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, stage_name)).fetchone()
+            if feedback is None:
+                return {"ticket_id": ticket_id, "attempt_number": attempt_number, "status": "already_clear", "claim_released": released}
+            archive_stage = f"triage-feedback-stale-archive-{attempt_number}-{int(review['side_effect_completed_at'])}"
+            if conn.execute("SELECT 1 FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, archive_stage)).fetchone() is None:
+                archive_detail = json.dumps({"reason": reason, "old_feedback_detail": str(feedback["detail"]), "routing_archive_stage": str(routing_archive["stage"])}, sort_keys=True, separators=(",", ":"))
+                conn.execute("INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,base_sha,created_at) VALUES (?,?,?,?,?,?)", (ticket_id, archive_stage, archive_detail, attempt_number, feedback["base_sha"], now))
+            conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, stage_name))
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="stale_triage_feedback_reconciled", actor_id=operator_id, payload={"attempt_number": attempt_number, "reason": reason, "archive_stage": archive_stage})
+            return {"ticket_id": ticket_id, "attempt_number": attempt_number, "status": "archived", "archive_stage": archive_stage, "claim_released": released}
+
+    def authorize_additional_local_attempt_after_triage(self, ticket_id: str, *, attempt_number: int, operator_id: str, reason: str, now: int | None = None) -> dict[str, Any]:
+        """Authorize exactly one additional local/manual attempt after deterministic triage."""
+        if attempt_number < 1 or not operator_id.strip() or not reason.strip():
+            raise ValueError("local triage repair authorization requires attempt, operator, and reason")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not bool(paused["paused"]):
+                raise PermissionError("local triage repair authorization requires paused controller")
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None: raise KeyError(ticket_id)
+            if str(ticket["state"]) != CanonicalState.NEEDS_TRIAGE.value:
+                raise ValueError("local triage repair authorization requires needs_triage ticket")
+            triage = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"repair-routing-{attempt_number}")).fetchone()
+            if triage is None:
+                raise ValueError("local triage repair authorization requires deterministic triage evidence")
+            detail = json.loads(str(triage["detail"] or "{}"))
+            if detail.get("action") != "triage" or not str(detail.get("failure_fingerprint") or ""):
+                raise ValueError("local triage repair authorization requires triage failure fingerprint")
+            attempt = conn.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            if attempt is None or not attempt["base_sha"] or not attempt["post_diff_hash"]:
+                raise ValueError("local triage repair authorization requires complete candidate provenance")
+            next_attempt = attempt_number + 1
+            if conn.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, next_attempt)).fetchone() is not None:
+                raise ValueError("next local attempt already exists")
+            runtime_identity = json.dumps({"source":"operator_triage_repair","retired_attempt_number":attempt_number,"prospective_next_attempt_number":next_attempt,"failure_fingerprint":str(detail["failure_fingerprint"])}, sort_keys=True, separators=(",", ":"))
+            conn.execute("INSERT INTO failed_attempt_reconciliations(ticket_id,retired_attempt_number,classification,previous_ticket_state,resulting_ticket_state,operator_id,runtime_identity_json,retry_base_sha,prospective_next_attempt_number,cleanup_required,forensic_artifact_paths_json,reconciled_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (ticket_id,attempt_number,"operator_review_repair",CanonicalState.NEEDS_TRIAGE.value,CanonicalState.READY_LOCAL.value,operator_id,runtime_identity,str(attempt["base_sha"]),next_attempt,0,"[]",now))
+            new_max = max(int(ticket["max_attempts"]) + 1, next_attempt)
+            validate_transition(CanonicalState.NEEDS_TRIAGE, CanonicalState.READY_LOCAL)
+            changed = conn.execute("UPDATE tickets SET state=?,max_attempts=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND state=?", (CanonicalState.READY_LOCAL.value,new_max,now,ticket_id,CanonicalState.NEEDS_TRIAGE.value))
+            if changed.rowcount != 1: raise RuntimeError("ticket changed during local triage repair authorization")
+            conn.execute("UPDATE attempts SET outcome='failed_retired',failure_fingerprint=? WHERE ticket_id=? AND attempt_number=?", (str(detail["failure_fingerprint"]),ticket_id,attempt_number))
+            auth = {"mode":"operator_review_repair","reason":reason,"retired_attempt_number":attempt_number,"manual_attempt_number":next_attempt,"prior_max_attempts":int(ticket["max_attempts"]),"new_max_attempts":new_max,"failure_fingerprint":str(detail["failure_fingerprint"])}
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="manual_attempt_slot_authorized", actor_id=operator_id, payload=auth)
+            event_id = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="state_transition", actor_id=operator_id, from_state=CanonicalState.NEEDS_TRIAGE.value, to_state=CanonicalState.READY_LOCAL.value, payload=auth)
+            self._enqueue_projection_bundle_in_transaction(conn, ticket_id=ticket_id, event_id=event_id, evidence=f"operator authorized local repair attempt {next_attempt}", state_payload=auth)
+            return {"ticket_id":ticket_id,"state":CanonicalState.READY_LOCAL.value,"next_attempt_number":next_attempt,"new_max_attempts":new_max,"failure_fingerprint":str(detail["failure_fingerprint"])}
+
     def claim_next_scheduler_implementation(self, owner: str, *, lease_seconds: int, now: int | None = None, ticket_id: str | None = None) -> dict[str, Any] | None:
         """Claim one ready-local implementation stage, including expired replay."""
         if not owner or lease_seconds < 1:
@@ -6378,6 +6719,51 @@ class Ledger:
                 return False
             return True
 
+    def _runtime_marker_lineage_is_authorized(self, conn: sqlite3.Connection, ticket_id: str, *, from_attempt: int, to_attempt: int) -> bool:
+        if from_attempt < 1 or to_attempt <= from_attempt:
+            return False
+        for current in range(from_attempt, to_attempt):
+            attempt = conn.execute(
+                "SELECT outcome,failure_fingerprint FROM attempts WHERE ticket_id=? AND attempt_number=?",
+                (ticket_id, current),
+            ).fetchone()
+            successor = conn.execute(
+                "SELECT base_sha FROM attempts WHERE ticket_id=? AND attempt_number=?",
+                (ticket_id, current + 1),
+            ).fetchone()
+            if attempt is None or successor is None:
+                return False
+            outcome = str(attempt["outcome"] or "")
+            if outcome == "repair_requested":
+                routing = conn.execute(
+                    "SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage=?",
+                    (ticket_id, f"repair-routing-{current}"),
+                ).fetchone()
+                if routing is None:
+                    return False
+                try:
+                    decision = json.loads(str(routing["detail"] or "{}"))
+                except json.JSONDecodeError:
+                    return False
+                if (
+                    decision.get("action") != "repair"
+                    or int(decision.get("attempt_number") or 0) != current
+                    or int(decision.get("next_attempt_number") or 0) != current + 1
+                    or str(decision.get("failure_fingerprint") or "") != str(attempt["failure_fingerprint"] or "")
+                ):
+                    return False
+                continue
+            if outcome == "failed_retired":
+                reconciliation = conn.execute(
+                    "SELECT retry_base_sha FROM failed_attempt_reconciliations WHERE ticket_id=? AND retired_attempt_number=? AND prospective_next_attempt_number=?",
+                    (ticket_id, current, current + 1),
+                ).fetchone()
+                if reconciliation is None or str(reconciliation["retry_base_sha"] or "") != str(successor["base_sha"] or ""):
+                    return False
+                continue
+            return False
+        return True
+
     def _advance_reconciled_runtime_marker_in_transaction(self, conn: sqlite3.Connection, ticket_id: str, stage: str, *, attempt_number: int, detail: str, artifact_path: str | None, artifact_sha256: str | None, base_sha: str | None, now: int) -> bool:
         if stage not in {"implementation_completed", "validation_completed"} or attempt_number < 1:
             raise ValueError("invalid reconciled runtime marker")
@@ -6390,18 +6776,13 @@ class Ledger:
             return True
         if existing["attempt_number"] is None or int(existing["attempt_number"]) == attempt_number:
             return False
-        reconciliation = conn.execute(
-            "SELECT * FROM failed_attempt_reconciliations WHERE ticket_id=? AND retired_attempt_number=? AND prospective_next_attempt_number=?",
-            (ticket_id, int(existing["attempt_number"]), attempt_number),
-        ).fetchone()
-        if reconciliation is None:
-            raise RuntimeError("runtime marker cannot advance without failed-attempt reconciliation")
-        predecessor = conn.execute(
-            "SELECT outcome FROM attempts WHERE ticket_id=? AND attempt_number=?",
-            (ticket_id, int(existing["attempt_number"])),
-        ).fetchone()
-        if predecessor is None or predecessor["outcome"] != "failed_retired":
-            raise RuntimeError("runtime marker predecessor is not retired")
+        if not self._runtime_marker_lineage_is_authorized(
+            conn,
+            ticket_id,
+            from_attempt=int(existing["attempt_number"]),
+            to_attempt=attempt_number,
+        ):
+            raise RuntimeError("runtime marker cannot advance without authorized retry lineage")
         conn.execute(
             "UPDATE runtime_stages SET detail=?,attempt_number=?,artifact_path=?,artifact_sha256=?,base_sha=?,created_at=? WHERE ticket_id=? AND stage=?",
             (detail, attempt_number, artifact_path, artifact_sha256, base_sha, now, ticket_id, stage),
@@ -8497,6 +8878,128 @@ class Ledger:
         row = self.connection.execute("SELECT * FROM paid_checkpoint_evidence WHERE tranche_id=? AND purpose=?", (tranche_id, purpose)).fetchone()
         return dict(row) if row else None
 
+    def tranche_landing(self, tranche_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM tranche_landing_evidence WHERE tranche_id=?", (tranche_id,)).fetchone()
+        return dict(row) if row else None
+
+    def _tranche_landing_identity(self, conn: sqlite3.Connection, tranche_id: str) -> dict[str, Any]:
+        tranche = conn.execute("SELECT * FROM tranches WHERE id=?", (tranche_id,)).fetchone()
+        completion = conn.execute("SELECT * FROM tranche_completion_evidence WHERE tranche_id=?", (tranche_id,)).fetchone()
+        checkpoint = conn.execute("SELECT * FROM tranche_checkpoint_evidence WHERE tranche_id=?", (tranche_id,)).fetchone()
+        if tranche is None or tranche["status"] != "active" or completion is None or checkpoint is None or checkpoint["decision"] != "ready_for_checkpoint":
+            raise RuntimeError("tranche_landing_reconciliation_required: landing authority incomplete")
+        if str(checkpoint["final_integration_sha"]) != str(completion["final_integration_sha"]) or str(checkpoint["completion_evidence_hash"]) != str(completion["evidence_hash"]):
+            raise RuntimeError("tranche_landing_reconciliation_required: checkpoint completion lineage drift")
+        approval = self._effective_paid_approval(conn, tranche_id)
+        return {
+            "tranche_id": tranche_id,
+            "feature_id": str(tranche["feature_id"]),
+            "repository_identity": str(checkpoint["repository_identity"]),
+            "final_integration_sha": str(completion["final_integration_sha"]),
+            "checkpoint_artifact_sha256": str(checkpoint["checkpoint_artifact_sha256"]),
+            "checkpoint_completion_hash": str(checkpoint["completion_evidence_hash"]),
+            "approval_purpose": str(approval["purpose"]),
+            "approval_model_call_id": str(approval["model_call_id"]),
+        }
+
+    def next_scheduler_tranche_landing_identity(self) -> dict[str, Any] | None:
+        for row in self.connection.execute("SELECT id FROM tranches WHERE status='active' AND NOT EXISTS (SELECT 1 FROM tranche_landing_evidence l WHERE l.tranche_id=tranches.id) ORDER BY feature_id,ordinal,id").fetchall():
+            try:
+                return self._tranche_landing_identity(self.connection, str(row["id"]))
+            except RuntimeError:
+                continue
+        return None
+
+    def claim_next_scheduler_tranche_landing(self, owner: str, *, lease_seconds: int, landing_context: dict[str, Any] | None = None, now: int | None = None) -> dict[str, Any] | None:
+        if not owner or lease_seconds < 1:
+            raise ValueError("tranche landing claim requires owner and positive lease")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            replay = conn.execute("SELECT * FROM scheduler_stage_claims WHERE stage='tranche_landing' AND status='claimed' AND lease_expires_at<=? ORDER BY created_at,claim_id LIMIT 1", (now,)).fetchone()
+            if replay is not None:
+                identity = json.loads(str(replay["candidate_identity_json"] or "{}"))
+                tranche_id = str(identity.get("tranche_id") or "")
+                if not identity.get("canonical_branch") or not identity.get("pre_landing_sha"):
+                    raise RuntimeError("tranche_landing_reconciliation_required: claim drift")
+                if replay["side_effect_completed_at"] is None:
+                    base_identity = self._tranche_landing_identity(conn, tranche_id)
+                    if any(identity.get(key) != value for key, value in base_identity.items()):
+                        raise RuntimeError("tranche_landing_reconciliation_required: claim drift")
+                else:
+                    landing = conn.execute("SELECT * FROM tranche_landing_evidence WHERE tranche_id=?", (tranche_id,)).fetchone()
+                    tranche = conn.execute("SELECT status FROM tranches WHERE id=?", (tranche_id,)).fetchone()
+                    try:
+                        result = json.loads(str(replay["result_json"] or "{}"))
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError("tranche_landing_reconciliation_required: persisted landing result malformed") from exc
+                    if landing is None or tranche is None or tranche["status"] != "completed" or result.get("candidate_identity") != identity:
+                        raise RuntimeError("tranche_landing_reconciliation_required: persisted landing effect drift")
+                    evidence_pairs = {
+                        "feature_id": landing["feature_id"], "repository_identity": landing["repository_identity"],
+                        "canonical_branch": landing["canonical_branch"], "pre_landing_sha": landing["pre_landing_sha"],
+                        "final_integration_sha": landing["final_integration_sha"], "checkpoint_artifact_sha256": landing["checkpoint_artifact_sha256"],
+                        "checkpoint_completion_hash": landing["checkpoint_completion_hash"],
+                    }
+                    if any(identity.get(key) != value for key, value in evidence_pairs.items()) or result.get("landing_commit_sha") != landing["landing_commit_sha"] or result.get("commit_message") != landing["commit_message"]:
+                        raise RuntimeError("tranche_landing_reconciliation_required: persisted landing effect drift")
+                if conn.execute("UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?", (owner,now+lease_seconds,now,replay["claim_id"],now)).rowcount != 1:
+                    return None
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
+            rows = conn.execute("SELECT id FROM tranches WHERE status='active' AND NOT EXISTS (SELECT 1 FROM tranche_landing_evidence l WHERE l.tranche_id=tranches.id) AND NOT EXISTS (SELECT 1 FROM scheduler_stage_claims s WHERE s.stage='tranche_landing' AND s.status='claimed' AND json_extract(s.candidate_identity_json,'$.tranche_id')=tranches.id) ORDER BY feature_id,ordinal,id").fetchall()
+            for row in rows:
+                try:
+                    identity = self._tranche_landing_identity(conn, str(row["id"]))
+                except RuntimeError:
+                    continue
+                if landing_context is None or landing_context.get("tranche_id") != identity["tranche_id"]:
+                    continue
+                if landing_context.get("repository_identity") != identity["repository_identity"]:
+                    raise RuntimeError("tranche_landing_reconciliation_required: repository context drift")
+                branch = str(landing_context.get("canonical_branch") or "")
+                head = str(landing_context.get("pre_landing_sha") or "")
+                if not branch or not head:
+                    raise RuntimeError("tranche_landing_reconciliation_required: incomplete landing context")
+                identity = {**identity, "canonical_branch": branch, "pre_landing_sha": head}
+                encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+                claim_id = hashlib.sha256(("tranche_landing:" + encoded).encode()).hexdigest()[:32]
+                ticket = conn.execute("SELECT id FROM tickets WHERE tranche_id=? ORDER BY created_at DESC,id DESC LIMIT 1", (row["id"],)).fetchone()
+                if ticket is None:
+                    continue
+                conn.execute("INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,candidate_identity_json,created_at,updated_at) VALUES (?,?,'tranche_landing','claimed',?,?,1,?,?,?)", (claim_id,ticket["id"],owner,now+lease_seconds,encoded,now,now))
+                return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+            return None
+
+    def apply_scheduler_tranche_landing_effect(self, claim_id: str, owner: str, result: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        now = self._now() if now is None else now
+        encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        with self._transaction() as conn:
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            if claim is None or claim["stage"] != "tranche_landing" or claim["side_effect_started_at"] is None:
+                raise RuntimeError("tranche landing claim is not active")
+            if claim["lease_owner"] != owner or int(claim["lease_expires_at"] or 0) <= now:
+                raise PermissionError("scheduler claim lease is not owned")
+            if claim["side_effect_completed_at"] is not None:
+                if claim["result_json"] != encoded:
+                    raise RuntimeError("tranche landing result conflicts")
+                return dict(claim)
+            identity = json.loads(str(claim["candidate_identity_json"] or "{}"))
+            base_identity = self._tranche_landing_identity(conn, str(identity.get("tranche_id") or ""))
+            if any(identity.get(key) != value for key, value in base_identity.items()) or result.get("candidate_identity") != identity:
+                raise RuntimeError("tranche_landing_reconciliation_required: identity drift")
+            if result.get("canonical_branch") != identity.get("canonical_branch") or result.get("pre_landing_sha") != identity.get("pre_landing_sha"):
+                raise RuntimeError("tranche_landing_reconciliation_required: frozen repository context drift")
+            message = f"local-first: complete {identity['tranche_id']}"
+            if result.get("commit_message") != message:
+                raise RuntimeError("tranche_landing_reconciliation_required: commit message drift")
+            values = (identity["tranche_id"],identity["feature_id"],identity["repository_identity"],identity["canonical_branch"],identity["pre_landing_sha"],identity["final_integration_sha"],str(result.get("landing_commit_sha") or ""),message,identity["checkpoint_artifact_sha256"],identity["checkpoint_completion_hash"],claim_id)
+            if any(not value for value in values):
+                raise RuntimeError("tranche_landing_reconciliation_required: incomplete landing result")
+            conn.execute("INSERT INTO tranche_landing_evidence(tranche_id,feature_id,repository_identity,canonical_branch,pre_landing_sha,final_integration_sha,landing_commit_sha,commit_message,checkpoint_artifact_sha256,checkpoint_completion_hash,scheduler_claim_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (*values,now))
+            if conn.execute("UPDATE tranches SET status='completed' WHERE id=? AND status='active'", (identity["tranche_id"],)).rowcount != 1:
+                raise RuntimeError("tranche_landing_reconciliation_required: tranche completion drift")
+            conn.execute("UPDATE scheduler_stage_claims SET side_effect_completed_at=?,result_json=?,updated_at=? WHERE claim_id=?", (now,encoded,now,claim_id))
+            return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
+
     def next_tranche_materialization(self, predecessor_tranche_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT * FROM next_tranche_materializations WHERE predecessor_tranche_id=?", (predecessor_tranche_id,)).fetchone()
         return dict(row) if row else None
@@ -8529,17 +9032,20 @@ class Ledger:
         predecessor = conn.execute("SELECT * FROM tranches WHERE id=?", (predecessor_tranche_id,)).fetchone()
         checkpoint = conn.execute("SELECT * FROM tranche_checkpoint_evidence WHERE tranche_id=?", (predecessor_tranche_id,)).fetchone()
         completion = conn.execute("SELECT * FROM tranche_completion_evidence WHERE tranche_id=?", (predecessor_tranche_id,)).fetchone()
-        if predecessor is None or checkpoint is None or completion is None or checkpoint["decision"] != "ready_for_checkpoint":
-            raise RuntimeError("next_tranche_activation_reconciliation_required: predecessor checkpoint authority missing")
+        landing = conn.execute("SELECT * FROM tranche_landing_evidence WHERE tranche_id=?", (predecessor_tranche_id,)).fetchone()
+        if predecessor is None or predecessor["status"] != "completed" or checkpoint is None or completion is None or landing is None or checkpoint["decision"] != "ready_for_checkpoint":
+            raise RuntimeError("next_tranche_activation_reconciliation_required: predecessor landing authority missing")
         approval = self._effective_paid_approval(conn, predecessor_tranche_id)
+        if str(landing["final_integration_sha"]) != str(completion["final_integration_sha"]):
+            raise RuntimeError("next_tranche_activation_reconciliation_required: predecessor landing lineage drift")
         successor = conn.execute("SELECT * FROM tranches WHERE feature_id=? AND ordinal=?", (predecessor["feature_id"], int(predecessor["ordinal"]) + 1)).fetchone()
         if successor is None or successor["status"] not in {"planned", "active"}:
             raise RuntimeError("next_tranche_activation_reconciliation_required: successor tranche missing")
         active = [str(row["id"]) for row in conn.execute("SELECT id FROM tranches WHERE feature_id=? AND status='active' ORDER BY ordinal,id", (predecessor["feature_id"],)).fetchall()]
-        if predecessor["status"] == "active":
-            if active != [predecessor_tranche_id]:
-                raise RuntimeError("next_tranche_activation_reconciliation_required: active tranche conflict")
-        elif predecessor["status"] == "completed" and successor["status"] == "active":
+        if successor["status"] == "planned":
+            if active:
+                raise RuntimeError("next_tranche_activation_reconciliation_required: active tranche conflict before successor materialization")
+        elif successor["status"] == "active":
             if active != [str(successor["id"])]:
                 raise RuntimeError("next_tranche_activation_reconciliation_required: recovered active tranche conflict")
         else:
@@ -8572,7 +9078,7 @@ class Ledger:
                 if conn.execute("UPDATE scheduler_stage_claims SET lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE claim_id=? AND status='claimed' AND lease_expires_at<=?", (owner,now+lease_seconds,now,replay["claim_id"],now)).rowcount != 1:
                     return None
                 return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (replay["claim_id"],)).fetchone())
-            rows = conn.execute("SELECT id FROM tranches WHERE status='active' AND NOT EXISTS (SELECT 1 FROM next_tranche_materializations m WHERE m.predecessor_tranche_id=tranches.id) ORDER BY feature_id,ordinal,id").fetchall()
+            rows = conn.execute("SELECT id FROM tranches WHERE status='completed' AND EXISTS (SELECT 1 FROM tranche_landing_evidence l WHERE l.tranche_id=tranches.id) AND NOT EXISTS (SELECT 1 FROM next_tranche_materializations m WHERE m.predecessor_tranche_id=tranches.id) ORDER BY feature_id,ordinal,id").fetchall()
             for row in rows:
                 try:
                     identity = self._next_tranche_materialize_identity(conn, str(row["id"]))
@@ -8898,10 +9404,56 @@ class Ledger:
         tickets = conn.execute("SELECT t.id,t.state,ae.accepted_commit_sha FROM tickets t LEFT JOIN accepted_evidence ae ON ae.ticket_id=t.id WHERE t.tranche_id=? AND t.id NOT LIKE 'tranche:%' ORDER BY t.created_at,t.id", (tranche_id,)).fetchall()
         if not tickets or any(row["state"] != CanonicalState.DONE.value or not row["accepted_commit_sha"] for row in tickets):
             raise RuntimeError("tranche_checkpoint_reconciliation_required: tranche work incomplete")
+        serialized_tickets: list[Any] = []
+        seen_commits: set[str] = set()
+        for row in tickets:
+            ticket_id = str(row["id"]); commit = str(row["accepted_commit_sha"])
+            if commit in seen_commits:
+                nonadvancing = conn.execute(
+                    "SELECT 1 FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='accepted_evidence_recorded' "
+                    "AND json_valid(payload_json)=1 AND json_extract(payload_json,'$.commit_sha')=? "
+                    "AND json_extract(payload_json,'$.integration_advanced')=0 ORDER BY id DESC LIMIT 1",
+                    (ticket_id, commit),
+                ).fetchone()
+                if nonadvancing is None:
+                    raise RuntimeError("tranche_checkpoint_reconciliation_required: ambiguous duplicate accepted commit")
+                continue
+            seen_commits.add(commit); serialized_tickets.append(row)
         commands = json.loads(str(tranche["integration_commands_json"] or "[]"))
         if not isinstance(commands, list) or any(not isinstance(c, list) or not c or not all(isinstance(x,str) and x for x in c) for c in commands):
             raise RuntimeError("tranche_checkpoint_reconciliation_required: integration commands malformed")
-        return {"tranche_id":tranche_id,"feature_id":str(tranche["feature_id"]),"tranche_base_sha":str(tranche["base_sha"]),"repository_identity":str(plan["repository_identity"]),"planning_base_sha":str(plan["repo_base_sha"]),"planning_snapshot_hash":str(plan["repo_snapshot_hash"]),"planning_snapshot_manifest_json":str(plan["repo_snapshot_manifest_json"]),"integration_commands":commands,"ticket_ids":[str(r["id"]) for r in tickets],"accepted_commit_shas":[str(r["accepted_commit_sha"]) for r in tickets]}
+        return {"tranche_id":tranche_id,"feature_id":str(tranche["feature_id"]),"tranche_base_sha":str(tranche["base_sha"]),"repository_identity":str(plan["repository_identity"]),"planning_base_sha":str(plan["repo_base_sha"]),"planning_snapshot_hash":str(plan["repo_snapshot_hash"]),"planning_snapshot_manifest_json":str(plan["repo_snapshot_manifest_json"]),"integration_commands":commands,"ticket_ids":[str(r["id"]) for r in serialized_tickets],"accepted_commit_shas":[str(r["accepted_commit_sha"]) for r in serialized_tickets]}
+
+    def reconcile_stale_tranche_checkpoint_identity(self, tranche_id: str, *, operator_id: str, reason: str, now: int | None = None) -> dict[str, Any]:
+        if not operator_id.strip() or not reason.strip():
+            raise ValueError("tranche checkpoint identity reconciliation requires operator and reason")
+        now = self._now() if now is None else now
+        with self._transaction() as conn:
+            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if paused is None or not bool(paused["paused"]):
+                raise PermissionError("tranche checkpoint identity reconciliation requires paused controller")
+            claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE stage='tranche_checkpoint' AND status='claimed' AND json_extract(candidate_identity_json,'$.tranche_id')=? ORDER BY created_at DESC LIMIT 1", (tranche_id,)).fetchone()
+            if claim is None or claim["side_effect_started_at"] is None or claim["side_effect_completed_at"] is not None:
+                raise ValueError("tranche checkpoint identity reconciliation requires unfinished started claim")
+            old = json.loads(str(claim["candidate_identity_json"] or "{}")); current = self._tranche_checkpoint_identity(conn, tranche_id)
+            old_fixed = dict(old); current_fixed = dict(current)
+            old_ids = old_fixed.pop("ticket_ids", None); old_commits = old_fixed.pop("accepted_commit_shas", None)
+            current_ids = current_fixed.pop("ticket_ids", None); current_commits = current_fixed.pop("accepted_commit_shas", None)
+            if old_fixed != current_fixed or not isinstance(old_ids, list) or not isinstance(old_commits, list) or not isinstance(current_ids, list) or not isinstance(current_commits, list):
+                raise RuntimeError("tranche checkpoint identity reconciliation refuses non-membership drift")
+            cursor = 0
+            for tid, commit in zip(old_ids, old_commits):
+                if cursor < len(current_ids) and tid == current_ids[cursor] and commit == current_commits[cursor]:
+                    cursor += 1; continue
+                nonadvancing = conn.execute("SELECT 1 FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='accepted_evidence_recorded' AND json_valid(payload_json)=1 AND json_extract(payload_json,'$.commit_sha')=? AND json_extract(payload_json,'$.integration_advanced')=0 ORDER BY id DESC LIMIT 1", (tid, commit)).fetchone()
+                if nonadvancing is None:
+                    raise RuntimeError("tranche checkpoint identity reconciliation refuses unproven removed ticket")
+            if cursor != len(current_ids):
+                raise RuntimeError("tranche checkpoint identity reconciliation current chain is not ordered subset")
+            result = json.dumps({"status":"failed","reason":reason,"claim_id":str(claim["claim_id"]),"tranche_id":tranche_id,"replacement_identity":current}, sort_keys=True, separators=(",", ":"))
+            conn.execute("UPDATE scheduler_stage_claims SET status='failed',lease_owner=NULL,lease_expires_at=NULL,last_error=?,result_json=?,finalized_at=?,updated_at=? WHERE claim_id=? AND status='claimed'", (reason,result,now,now,claim["claim_id"]))
+            self._append_event(conn, entity_type="tranche", entity_id=tranche_id, event_type="scheduler_stage_reconciled", actor_id=operator_id, payload={"claim_id":str(claim["claim_id"]),"stage":"tranche_checkpoint","outcome":"failed","reason":reason,"replacement_identity":current})
+            return {"tranche_id":tranche_id,"status":"reconciled","retired_claim_id":str(claim["claim_id"]),"replacement_identity":current}
 
     def _tranche_checkpoint_h1_conflicts(self, conn: sqlite3.Connection, identity: dict[str, Any]) -> bool:
         existing = conn.execute(
@@ -9078,19 +9630,23 @@ class Ledger:
         from .decomposition import generated_card_payload
         now = self._now()
         with self._transaction() as conn:
+            target = conn.execute("SELECT * FROM tranches WHERE feature_id=? AND id=?", (feature.id, tranche.id)).fetchone()
+            if target is None:
+                raise ValueError("next tranche is missing or conflicting")
+            predecessor = conn.execute("SELECT * FROM tranches WHERE feature_id=? AND ordinal=?", (feature.id, int(target["ordinal"]) - 1)).fetchone()
+            if predecessor is None or predecessor["status"] != "completed" or conn.execute("SELECT 1 FROM tranche_landing_evidence WHERE tranche_id=?", (predecessor["id"],)).fetchone() is None:
+                raise ValueError("completed tranche landing handoff conflict")
             active = conn.execute("SELECT * FROM tranches WHERE feature_id=? AND status='active' ORDER BY ordinal", (feature.id,)).fetchall()
-            if len(active) != 1 or int(active[0]["ordinal"]) + 1 != int(conn.execute("SELECT ordinal FROM tranches WHERE id=?", (tranche.id,)).fetchone()[0]):
+            if active and not (len(active) == 1 and active[0]["id"] == target["id"]):
                 raise ValueError("active tranche handoff conflict")
-            existing = conn.execute("SELECT * FROM tranche_completion_evidence WHERE tranche_id=?", (active[0]["id"],)).fetchone()
+            existing = conn.execute("SELECT * FROM tranche_completion_evidence WHERE tranche_id=?", (predecessor["id"],)).fetchone()
             keys = ("tranche_id", "root_planning_sha", "final_integration_sha", "accepted_ticket_ids_json", "accepted_commit_shas_json", "evidence_hash")
-            values = (active[0]["id"], completion["root_planning_sha"], completion["final_integration_sha"], completion["accepted_ticket_ids_json"], completion["accepted_commit_shas_json"], completion["evidence_hash"])
+            values = (predecessor["id"], completion["root_planning_sha"], completion["final_integration_sha"], completion["accepted_ticket_ids_json"], completion["accepted_commit_shas_json"], completion["evidence_hash"])
             if existing:
                 if tuple(existing[k] for k in keys) != values: raise ValueError("conflicting tranche completion evidence")
             else:
                 conn.execute("INSERT INTO tranche_completion_evidence(tranche_id,root_planning_sha,final_integration_sha,accepted_ticket_ids_json,accepted_commit_shas_json,evidence_hash,completed_at) VALUES (?,?,?,?,?,?,?)", (*values, now))
-            conn.execute("UPDATE tranches SET status='completed' WHERE id=?", (active[0]["id"],))
-            target = conn.execute("SELECT * FROM tranches WHERE feature_id=? AND id=?", (feature.id, tranche.id)).fetchone()
-            if target is None or int(target["ordinal"]) != int(active[0]["ordinal"]) + 1 or target["status"] not in {"planned", "active"}: raise ValueError("next tranche is missing or conflicting")
+            if target["status"] not in {"planned", "active"}: raise ValueError("next tranche is missing or conflicting")
             if not all(isinstance(value, str) and value for value in (plan.repository_identity, plan.repo_base_sha, plan.repo_snapshot_hash)):
                 raise ValueError("next tranche repository provenance missing")
             conn.execute("UPDATE tranches SET status='active', base_sha=? WHERE id=?", (plan.repo_base_sha, tranche.id))

@@ -223,10 +223,12 @@ class PlanningCoordinator:
             if feature.id != feature_id or feature.contract_hash != str(row["contract_hash"]):
                 raise ValueError("persisted feature contract identity conflicts")
         stored = json.loads(stored_plan["plan_json"]); coarse_plan = parse(json.dumps(stored["plan"], sort_keys=True, separators=(",", ":")))
-        active_row = self.ledger.connection.execute("SELECT * FROM tranches WHERE feature_id=? AND status='active' ORDER BY ordinal", (feature_id,)).fetchone()
-        if active_row is None: return PlanningOutcome("planner_failed", feature_id, reasons=("active tranche missing",))
-        if int(active_row["ordinal"]) > 0: return PlanningOutcome("already_materialized", feature_id, plan_id=str(stored_plan["id"]))
-        active = next(t for t in coarse_plan.tranches if t.id == active_row["id"])
+        predecessor_row = self.ledger.connection.execute("SELECT * FROM tranches WHERE feature_id=? AND status='completed' AND EXISTS (SELECT 1 FROM tranche_landing_evidence l WHERE l.tranche_id=tranches.id) ORDER BY ordinal DESC LIMIT 1", (feature_id,)).fetchone()
+        if predecessor_row is None:
+            return PlanningOutcome("waiting_not_complete", feature_id, reasons=("predecessor completion authority requires durable tranche landing evidence",))
+        if self.ledger.connection.execute("SELECT 1 FROM tranches WHERE feature_id=? AND status='active' AND ordinal>?", (feature_id, predecessor_row["ordinal"])).fetchone() is not None:
+            return PlanningOutcome("already_materialized", feature_id, plan_id=str(stored_plan["id"]))
+        active = next(t for t in coarse_plan.tranches if t.id == predecessor_row["id"])
         repository = self.config.canonical_repository(self.config.repository)
         from .corrections import CorrectionService
         authority = CorrectionService(self.ledger, repository).completion_authority(active.id)

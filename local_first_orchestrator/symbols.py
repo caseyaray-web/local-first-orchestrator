@@ -45,6 +45,17 @@ def contract_target_scope(ticket: MicroTicket) -> str:
             and language is not None
             and language.name in {"javascript", "typescript"}):
         return "file"
+    # Verification-only tickets may deliberately bind a verifier file plus package
+    # metadata while retaining the production seam as their primary symbol.  In
+    # that shape there is no production source edit whose symbol scope can drift;
+    # the explicit file allowlist is the bounded implementation authority.
+    if ticket.allowed_files and not ticket.create_files and not ticket.new_test_files:
+        source_paths = tuple(path for path in ticket.allowed_files if language_for(path) is not None)
+        metadata_paths = tuple(path for path in ticket.allowed_files if language_for(path) is None)
+        if (len(source_paths) == 1
+                and is_test_path(source_paths[0])
+                and all(path == "package.json" for path in metadata_paths)):
+            return "file"
     return "symbol"
 
 

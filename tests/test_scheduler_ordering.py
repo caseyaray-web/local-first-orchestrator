@@ -109,6 +109,7 @@ class SchedulerOrderingTests(unittest.TestCase):
             "tranche_checkpoint",
             "paid_checkpoint",
             "paid_escalation",
+            "tranche_landing",
             "next_tranche_materialize",
             "next_tranche_activation",
             "dependency_readiness",

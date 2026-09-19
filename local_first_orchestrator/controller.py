@@ -182,6 +182,81 @@ class LocalFirstController:
         if self.fault_injector is not None:
             self.fault_injector(point)
 
+    def _persist_hermes_reconciliation_snapshot(self, ticket_id: str, *, label: str, external_task_id: str) -> tuple[str, str]:
+        snapshot = self.board.execution_snapshot(external_task_id)
+        canonical = canonical_snapshot_json(snapshot_authority(snapshot))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        root = (self.config.artifact_root / ticket_id / "hermes-reconciliation-evidence").resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-") or "snapshot"
+        path = root / f"{safe_label}-{external_task_id}-{digest[:12]}.json"
+        if path.exists():
+            if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                raise RuntimeError("Hermes reconciliation evidence artifact conflict")
+        else:
+            path.write_text(canonical, encoding="utf-8")
+        return str(path), digest
+
+    def reconcile_done_projection_to_original_generated_task(
+        self,
+        ticket_id: str,
+        *,
+        stale_event_id: int,
+        original_external_task_id: str,
+        operator_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        artifact_path, artifact_sha256 = self._persist_hermes_reconciliation_snapshot(
+            ticket_id,
+            label="terminal-projection-original",
+            external_task_id=original_external_task_id,
+        )
+        return self.ledger.reconcile_done_projection_to_original_generated_task(
+            ticket_id,
+            stale_event_id=stale_event_id,
+            original_external_task_id=original_external_task_id,
+            snapshot_artifact_path=artifact_path,
+            snapshot_artifact_sha256=artifact_sha256,
+            operator_id=operator_id,
+            reason=reason,
+        )
+
+    def reconcile_completed_repair_dependency_graph(
+        self,
+        *,
+        downstream_ticket_id: str,
+        cause_ticket_id: str,
+        cause_attempt_number: int,
+        predecessor_external_task_id: str,
+        replacement_external_task_id: str,
+        child_external_task_id: str,
+        operator_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        predecessor_path, predecessor_sha256 = self._persist_hermes_reconciliation_snapshot(
+            cause_ticket_id,
+            label="completed-repair-predecessor",
+            external_task_id=predecessor_external_task_id,
+        )
+        child_path, child_sha256 = self._persist_hermes_reconciliation_snapshot(
+            downstream_ticket_id,
+            label="completed-repair-child",
+            external_task_id=child_external_task_id,
+        )
+        return self.ledger.reconcile_completed_repair_dependency_graph(
+            downstream_ticket_id=downstream_ticket_id,
+            cause_ticket_id=cause_ticket_id,
+            cause_attempt_number=cause_attempt_number,
+            predecessor_external_task_id=predecessor_external_task_id,
+            replacement_external_task_id=replacement_external_task_id,
+            predecessor_snapshot_artifact_path=predecessor_path,
+            predecessor_snapshot_artifact_sha256=predecessor_sha256,
+            child_snapshot_artifact_path=child_path,
+            child_snapshot_artifact_sha256=child_sha256,
+            operator_id=operator_id,
+            reason=reason,
+        )
+
     def _card_contract_payload(self, card: Any) -> dict[str, Any]:
         if card.status != "scheduled": raise ValueError("ineligible card: status must be scheduled")
         if "<!-- local-first-orchestrator -->" not in card.body: raise ValueError("ineligible card: missing local-first ownership marker")
@@ -720,9 +795,21 @@ class LocalFirstController:
             and generated_owned
             and HANDOFF_MARKER in str(snapshot.task.body or "")
         )
+        normalized_terminal_handoff = (
+            require_handoff
+            and snapshot.task.status in {"blocked", "triage"}
+            and generated_owned
+            and not any(run.status == "running" for run in snapshot.runs)
+            and any(
+                run.status == "blocked"
+                and run.outcome == "blocked"
+                and str(run.summary or "") == HANDOFF_SENTINEL
+                for run in snapshot.runs
+            )
+        )
         if snapshot.task.status == "done" and not completed_generated_handoff:
             raise RuntimeError("hermes_completion_authority_bypassed_reconciliation_required")
-        if require_handoff and snapshot.task.status != "blocked" and not completed_generated_handoff:
+        if require_handoff and not normalized_terminal_handoff and not completed_generated_handoff:
             raise RuntimeError("Hermes execution handoff is not blocked for reconciliation")
         activation = self.ledger.connection.execute(
             """SELECT i.*, e.acknowledged_at FROM native_release_activation_intents i
@@ -757,7 +844,7 @@ class LocalFirstController:
                 if require_handoff:
                     raise RuntimeError("Hermes activation continuation is still running")
                 return {"ticket_id": ticket_id, "external_task_id": external_task_id, "status": "externally_running", "run_id": active_run_id}
-            if snapshot.task.status != "blocked" or not require_handoff:
+            if snapshot.task.status not in {"blocked", "triage"} or not require_handoff:
                 require_handoff = True
         if require_handoff:
             if completed_generated_handoff:
@@ -1022,6 +1109,26 @@ class LocalFirstController:
         ticket = ticket_from_ledger(ticket_row)
         external_task_id = self.ledger.resolve_external_task_id(ticket_id)
         reconciliation = None if resolve_terminal else self.ledger.failed_attempt_reconciliation(ticket_id)
+        if reconciliation is not None and str(reconciliation["classification"] or "") == "operator_review_repair":
+            retired_attempt = self.ledger.connection.execute(
+                "SELECT branch,worktree_path,base_sha FROM attempts WHERE ticket_id=? AND attempt_number=?",
+                (ticket_id, int(reconciliation["retired_attempt_number"])),
+            ).fetchone()
+            if retired_attempt is None or not str(retired_attempt["branch"] or "").startswith("wt/") or not retired_attempt["worktree_path"]:
+                raise RuntimeError("operator review repair adoption lacks retired native workspace provenance")
+            retired_external_task_id = str(retired_attempt["branch"])[3:]
+            retired_path, _ = validate_native_workspace_path(
+                canonical_native_workspace_path(repo, retired_external_task_id),
+                repository=repo,
+                external_task_id=retired_external_task_id,
+            )
+            try:
+                recorded_retired_path = Path(str(retired_attempt["worktree_path"])).resolve(strict=True)
+            except OSError as exc:
+                raise RuntimeError("operator review repair adoption retired workspace is missing") from exc
+            if recorded_retired_path != retired_path or str(retired_attempt["base_sha"] or "") != str(reconciliation["retry_base_sha"] or ""):
+                raise RuntimeError("operator review repair adoption retired workspace provenance drift")
+            external_task_id = retired_external_task_id
         latest_attempt = None
         if resolve_terminal:
             if ticket_row["state"] == CanonicalState.BLOCKED.value:
@@ -1195,6 +1302,9 @@ class LocalFirstController:
         path = Path(str(attempt["worktree_path"]))
         lexical = Path(path.absolute())
         external_id = str(ticket.get("external_id") or "")
+        attempt_branch = str(attempt["branch"] or "")
+        if not external_id and attempt_branch.startswith("wt/") and len(attempt_branch) > 3:
+            external_id = attempt_branch[3:]
         native_path = canonical_native_workspace_path(repo, external_id) if external_id else None
         try:
             resolved = path.resolve(strict=True)
@@ -2618,16 +2728,37 @@ class LocalFirstController:
             "SELECT * FROM hermes_execution_reconciliations WHERE ticket_id=? AND attempt_number=?",
             (ticket_id, attempt_number),
         ).fetchone()
+        manual_native_integration = False
         try:
             worktree.relative_to(worktree_root.resolve())
         except ValueError as exc:
-            if (
-                hermes_execution is None
-                or str(hermes_execution["workspace_path"]) != str(worktree)
-                or str(hermes_execution["base_sha"]) != str(identity["base_sha"])
-                or str(hermes_execution["diff_hash"]) != str(identity["candidate_fingerprint"])
-            ):
+            hermes_authorized = (
+                hermes_execution is not None
+                and str(hermes_execution["workspace_path"]) == str(worktree)
+                and str(hermes_execution["base_sha"]) == str(identity["base_sha"])
+                and str(hermes_execution["diff_hash"]) == str(identity["candidate_fingerprint"])
+            )
+            implementation = self.ledger.model_stage(ticket_id, attempt_number, "implementation")
+            manual_authorized = False
+            if implementation is not None and str(implementation["adapter"] or "") == "manual-adoption":
+                expected_branch = str(attempt["branch"] or "")
+                if expected_branch.startswith("wt/") and len(expected_branch) > 3:
+                    native_external_task_id = expected_branch[3:]
+                    expected_native, _ = validate_native_workspace_path(
+                        canonical_native_workspace_path(repo, native_external_task_id),
+                        repository=repo,
+                        external_task_id=native_external_task_id,
+                    )
+                    manual_authorized = (
+                        worktree == expected_native
+                        and str(identity.get("branch") or "") == expected_branch
+                        and str(implementation["worktree_path"] or "") == str(worktree)
+                        and str(implementation["base_sha"] or "") == str(identity["base_sha"])
+                        and str(implementation["diff_hash"] or "") == str(identity["candidate_fingerprint"])
+                    )
+            if not hermes_authorized and not manual_authorized:
                 raise RuntimeError("git_integration_reconciliation_required: worktree outside configured root") from exc
+            manual_native_integration = manual_authorized
         base = str(identity["base_sha"])
         candidate_fingerprint = str(identity["candidate_fingerprint"])
         commit_message = str(identity["commit_message"])
@@ -2651,6 +2782,16 @@ class LocalFirstController:
         live_head = git("rev-parse", "HEAD").stdout.strip()
         if live_root != str(worktree) or live_branch != str(identity["branch"]):
             raise RuntimeError("git_integration_reconciliation_required: worktree root/branch drift")
+        if manual_native_integration:
+            worktree_common_raw = git("rev-parse", "--git-common-dir").stdout.strip()
+            worktree_common = (worktree / worktree_common_raw).resolve() if not Path(worktree_common_raw).is_absolute() else Path(worktree_common_raw).resolve()
+            try:
+                repo_common_raw = subprocess.run(("git", "rev-parse", "--git-common-dir"), cwd=repo, text=True, capture_output=True, check=True, timeout=30).stdout.strip()
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RuntimeError("git_integration_reconciliation_required: native repository common-dir inspection failed") from exc
+            repo_common = (repo / repo_common_raw).resolve() if not Path(repo_common_raw).is_absolute() else Path(repo_common_raw).resolve()
+            if worktree_common != repo_common:
+                raise RuntimeError("git_integration_reconciliation_required: manual native worktree git-common-dir drift")
         ancestor = subprocess.run(
             ("git", "merge-base", "--is-ancestor", str(binding["starting_sha"]), base),
             cwd=repo, text=True, capture_output=True, check=False, timeout=30,
@@ -2729,6 +2870,90 @@ class LocalFirstController:
             "integration_head_before": base,
             "integration_head_after": after,
         }
+
+    def inspect_tranche_landing_context(self, candidate_identity: dict[str, object], *, repository: Path) -> dict[str, object]:
+        repo = Path(repository).resolve(strict=True)
+        configured_repo, _, _ = self.config.validate_execution_roots()
+        if configured_repo != repo or str(candidate_identity.get("repository_identity") or "") != str(repo):
+            raise RuntimeError("tranche_landing_reconciliation_required: repository identity drift")
+        def git(*args: str) -> str:
+            return subprocess.run(safe_git_argv(args), cwd=repo, env=safe_git_env(), text=True, capture_output=True, check=True, timeout=30).stdout.strip()
+        if Path(git("rev-parse", "--show-toplevel")).resolve(strict=True) != repo:
+            raise RuntimeError("tranche_landing_reconciliation_required: canonical repository drift")
+        branch = git("branch", "--show-current")
+        if not branch:
+            raise RuntimeError("tranche_landing_reconciliation_required: canonical repository is detached")
+        if git("status", "--porcelain=v1", "--untracked-files=all"):
+            raise RuntimeError("tranche_landing_reconciliation_required: canonical repository is dirty")
+        return {"tranche_id": str(candidate_identity.get("tranche_id") or ""), "repository_identity": str(repo), "canonical_branch": branch, "pre_landing_sha": git("rev-parse", "HEAD")}
+
+    def execute_tranche_landing(self, candidate_identity: dict[str, object], *, repository: Path) -> dict[str, object]:
+        """Land one paid-approved tranche onto the clean canonical branch."""
+        identity = dict(candidate_identity)
+        tranche_id = str(identity.get("tranche_id") or "")
+        repo = Path(repository).resolve(strict=True)
+        configured_repo, _, _ = self.config.validate_execution_roots()
+        if not tranche_id or configured_repo != repo or str(identity.get("repository_identity") or "") != str(repo):
+            raise RuntimeError("tranche_landing_reconciliation_required: repository identity drift")
+        def git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+            try:
+                return subprocess.run(safe_git_argv(args), cwd=repo, env=safe_git_env(), text=True, capture_output=True, check=check, timeout=30)
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(exc.stderr.strip() or exc.stdout.strip() or "tranche landing Git operation failed") from exc
+        if Path(git("rev-parse", "--show-toplevel").stdout.strip()).resolve(strict=True) != repo:
+            raise RuntimeError("tranche_landing_reconciliation_required: canonical repository drift")
+        branch = git("branch", "--show-current").stdout.strip()
+        if not branch:
+            raise RuntimeError("tranche_landing_reconciliation_required: canonical repository is detached")
+        if git("status", "--porcelain=v1", "--untracked-files=all").stdout.strip():
+            raise RuntimeError("tranche_landing_reconciliation_required: canonical repository is dirty")
+        before = git("rev-parse", "HEAD").stdout.strip()
+        frozen_branch = str(identity.get("canonical_branch") or "")
+        frozen_before = str(identity.get("pre_landing_sha") or "")
+        if not frozen_branch or not frozen_before:
+            raise RuntimeError("tranche_landing_reconciliation_required: frozen repository context missing")
+        if branch != frozen_branch:
+            raise RuntimeError("tranche_landing_reconciliation_required: canonical branch drift")
+        final_sha = str(identity.get("final_integration_sha") or "")
+        if not final_sha or git("cat-file", "-e", f"{final_sha}^{{commit}}", check=False).returncode != 0:
+            raise RuntimeError("tranche_landing_reconciliation_required: approved integration commit missing")
+        message = f"local-first: complete {tranche_id}"
+        if git("merge-base", "--is-ancestor", frozen_before, final_sha, check=False).returncode != 0:
+            raise RuntimeError("tranche_landing_reconciliation_required: canonical head is not an ancestor of approved integration")
+        expected_tree = git("merge-tree", "--write-tree", frozen_before, final_sha, check=False)
+        if expected_tree.returncode != 0:
+            raise RuntimeError("tranche_landing_reconciliation_required: approved integration does not merge cleanly")
+        expected_tree_sha = expected_tree.stdout.strip().splitlines()[0] if expected_tree.stdout.strip() else ""
+        if not expected_tree_sha:
+            raise RuntimeError("tranche_landing_reconciliation_required: deterministic merge tree missing")
+        if before != frozen_before:
+            replay_parents = git("show", "-s", "--format=%P", before).stdout.strip().split()
+            replay_message = git("show", "-s", "--format=%B", before).stdout.strip()
+            replay_tree = git("show", "-s", "--format=%T", before).stdout.strip()
+            previous_head = git("rev-parse", f"{branch}@{{1}}", check=False)
+            replay_previous = previous_head.stdout.strip() if previous_head.returncode == 0 else ""
+            if replay_parents == [frozen_before, final_sha] and replay_message == message and replay_tree == expected_tree_sha and replay_previous == frozen_before:
+                return {"candidate_identity": identity, "canonical_branch": branch, "pre_landing_sha": frozen_before, "landing_commit_sha": before, "commit_message": message}
+            raise RuntimeError("tranche_landing_reconciliation_required: canonical head drift")
+        if before == final_sha:
+            raise RuntimeError("tranche_landing_reconciliation_required: approved integration already canonical without landing merge")
+        try:
+            git("merge", "--no-ff", "--no-edit", "-m", message, final_sha)
+        except RuntimeError as exc:
+            git("merge", "--abort", check=False)
+            restored = git("rev-parse", "HEAD").stdout.strip() == frozen_before and not git("status", "--porcelain=v1", "--untracked-files=all").stdout.strip()
+            if not restored:
+                raise RuntimeError("tranche_landing_reconciliation_required: merge failed and canonical repository was not restored cleanly") from exc
+            raise RuntimeError("tranche_landing_reconciliation_required: merge failed; canonical repository restored") from exc
+        after = git("rev-parse", "HEAD").stdout.strip()
+        parents = git("show", "-s", "--format=%P", after).stdout.strip().split()
+        actual_message = git("show", "-s", "--format=%B", after).stdout.strip()
+        actual_tree = git("show", "-s", "--format=%T", after).stdout.strip()
+        if parents != [before, final_sha] or actual_message != message or actual_tree != expected_tree_sha:
+            raise RuntimeError("tranche_landing_reconciliation_required: landing commit provenance drift")
+        if git("branch", "--show-current").stdout.strip() != branch or git("status", "--porcelain=v1", "--untracked-files=all").stdout.strip():
+            raise RuntimeError("tranche_landing_reconciliation_required: post-landing repository drift")
+        return {"candidate_identity": identity, "canonical_branch": branch, "pre_landing_sha": before, "landing_commit_sha": after, "commit_message": message}
 
     def execute_tranche_checkpoint_only(self, tranche_id: str, *, repository: Path) -> dict[str, object]:
         """Deterministically revalidate and checkpoint one completed tranche without activation or paid calls."""

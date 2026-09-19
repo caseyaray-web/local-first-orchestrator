@@ -66,6 +66,7 @@ SCHEDULER_CRASH_POLICIES: dict[str, SchedulerCrashPolicy] = {
     "tranche_checkpoint": _policy("tranche_checkpoint", ReconciliationAction.REPLAY, "tranche_checkpoint_evidence"),
     "paid_checkpoint": _policy("paid_checkpoint", ReconciliationAction.STOP, "paid_reservations"),
     "paid_escalation": _policy("paid_escalation", ReconciliationAction.STOP, "paid_reservations"),
+    "tranche_landing": _policy("tranche_landing", ReconciliationAction.REPLAY, "tranche_landing_evidence"),
     "next_tranche_materialize": _policy("next_tranche_materialize", ReconciliationAction.REPLAY, "next_tranche_materializations"),
     "next_tranche_activation": _policy("next_tranche_activation", ReconciliationAction.REPLAY, "next_tranche_activation_evidence"),
     "dependency_readiness": _policy("dependency_readiness", ReconciliationAction.REPLAY),

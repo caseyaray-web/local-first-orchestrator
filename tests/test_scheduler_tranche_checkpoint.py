@@ -128,6 +128,25 @@ class SchedulerTrancheCheckpointTests(unittest.TestCase):
         self.assertEqual(self.ledger.connection.execute("SELECT status FROM tranches WHERE id='T'").fetchone()[0], "active")
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM tickets WHERE tranche_id='T'").fetchone()[0], 1)
 
+    def test_completion_ignores_explicit_nonadvancing_duplicate_acceptance(self) -> None:
+        from local_first_orchestrator.tranche_completion import completion_evidence
+        duplicate = self.ledger.create_ticket(title="duplicate", state=CanonicalState.DONE)
+        self.ledger.connection.execute("UPDATE tickets SET feature_id='F',tranche_id='T',created_at=created_at+10 WHERE id=?", (duplicate,))
+        self.ledger.record_accepted_evidence(duplicate, self.commit, "duplicate", "validated")
+        with self.ledger._transaction() as conn:
+            self.ledger._append_event(conn, entity_type="ticket", entity_id=duplicate, event_type="accepted_evidence_recorded", actor_id="controller", payload={"commit_sha": self.commit, "integration_advanced": False})
+        evidence = completion_evidence(self.ledger, self.repo, "T")
+        self.assertEqual(evidence["accepted_ticket_ids"], [self.ticket])
+        self.assertEqual(evidence["accepted_commit_shas"], [self.commit])
+
+    def test_completion_rejects_ambiguous_duplicate_acceptance(self) -> None:
+        from local_first_orchestrator.tranche_completion import TrancheNotComplete, completion_evidence
+        duplicate = self.ledger.create_ticket(title="duplicate", state=CanonicalState.DONE)
+        self.ledger.connection.execute("UPDATE tickets SET feature_id='F',tranche_id='T',created_at=created_at+10 WHERE id=?", (duplicate,))
+        self.ledger.record_accepted_evidence(duplicate, self.commit, "duplicate", "validated")
+        with self.assertRaisesRegex(TrancheNotComplete, "duplicate accepted commit lacks non-advancing acceptance evidence"):
+            completion_evidence(self.ledger, self.repo, "T")
+
     def test_existing_h1_with_later_accepted_correction_is_not_recheckpointed(self) -> None:
         from local_first_orchestrator.tranche_completion import completion_evidence
 

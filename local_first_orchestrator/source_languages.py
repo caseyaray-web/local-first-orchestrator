@@ -52,7 +52,12 @@ def is_supported_repository_file(path: str) -> bool:
 
 def is_test_path(path: str) -> bool:
     language = language_for(path)
-    return language.is_test(path) if language else False
+    if language is None:
+        return False
+    candidate = PurePosixPath(path)
+    if len(candidate.parts) >= 2 and candidate.parts[0] == "scripts" and candidate.name.startswith("verify-"):
+        return True
+    return language.is_test(path)
 
 
 def supported_languages() -> tuple[SourceLanguage, ...]:

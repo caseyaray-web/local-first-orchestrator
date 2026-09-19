@@ -5,7 +5,8 @@ from tempfile import TemporaryDirectory
 
 from local_first_orchestrator.repository_snapshot import RepositoryPlanValidator, snapshot
 from local_first_orchestrator.decomposition import Criterion, DecompositionPlan, FeatureContract, Tranche
-from local_first_orchestrator.symbols import SymbolIndex, symbols_for
+from local_first_orchestrator.symbols import SymbolIndex, contract_target_scope, symbols_for
+from local_first_orchestrator.source_languages import is_test_path
 from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
 from local_first_orchestrator.readiness import validate_ticket
 
@@ -115,6 +116,27 @@ class MultilanguageEvidenceTests(unittest.TestCase):
         bad = MicroTicket(**{**ticket.__dict__, "primary_symbol": "export.js::invented"})
         bad_plan = DecompositionPlan(**{**plan.__dict__, "tranches": (Tranche("tr", 0, "export", (), ("A",), (bad,)),)})
         self.assertEqual(RepositoryPlanValidator().validate(bad_plan, snap).reasons, ("unknown_symbol",))
+
+    def test_verify_javascript_path_is_verification_code(self):
+        self.assertTrue(is_test_path("scripts/verify-meal-planner-isolation.mjs"))
+        self.assertTrue(is_test_path("scripts/verify-household-isolation.js"))
+        self.assertFalse(is_test_path("scripts/run-weekly-reminders.mjs"))
+
+    def test_verifier_plus_package_metadata_contract_is_file_scoped(self):
+        ticket = MicroTicket(
+            "TK-3", "Extend the verifier and package entrypoint.", ("verification-discipline",),
+            "pocketbase/pb_hooks/meal_planner.pb.js::c07Lifecycle",
+            ("scripts/verify-meal-planner-isolation.mjs", "package.json"),
+            ("Do not change production behavior.",), PatchBudget(2, 180),
+            VerificationProfile((("node", "scripts/verify-meal-planner-isolation.mjs"),)),
+            "medium", True, 2, (),
+        )
+        self.assertEqual(contract_target_scope(ticket), "file")
+        production = MicroTicket(**{
+            **ticket.__dict__,
+            "allowed_files": ("scripts/verify-meal-planner-isolation.mjs", "src/lib/runtime.js"),
+        })
+        self.assertEqual(contract_target_scope(production), "symbol")
 
     def test_snapshot_is_deterministic_and_dirty_checkout_is_ignored(self):
         (self.repo / "payment.ts").write_text("export function calculatePayment() { return 1; }\n")

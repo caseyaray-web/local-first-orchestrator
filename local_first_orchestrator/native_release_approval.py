@@ -210,7 +210,7 @@ def validate_activation_continuation_snapshot(activation_post: dict[str, Any], c
         if not isinstance(payload, dict) or set(payload) != {"lock", "expires", "run_id"} or payload.get("run_id") != run_id or not isinstance(payload.get("lock"), str) or not payload["lock"] or type(payload.get("expires")) is not int or payload["expires"] < event["created_at"]:
             raise ValueError("Hermes activation continuation claimed payload is invalid")
         return "running"
-    if task.get("status") == "blocked":
+    if task.get("status") in {"blocked", "triage"}:
         if not isinstance(prior_running_observation, dict):
             raise ValueError("Hermes terminal handoff has no prior running observation")
         if task.get("session_id") is not None:

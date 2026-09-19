@@ -122,6 +122,20 @@ def test_terminal_handoff_uses_observed_running_session_lineage():
     with pytest.raises(ValueError):
         validate_activation_continuation_snapshot(activation_post, terminal, acknowledged_at=20, profile="worker-code-local", workspace_path="/repo/.worktrees/T", branch="wt/T", repository_identity="/repo", base_sha="base", handoff_summary="local-first-awaiting-reconciliation", prior_running_observation=observation)
 
+def test_terminal_handoff_accepts_hermes_triage_normalization_with_same_lineage():
+    from local_first_orchestrator.native_release_approval import canonical_snapshot_json, validate_activation_continuation_snapshot
+    activation_post, _ = _continuation_pair()
+    _, terminal = _continuation_pair("blocked")
+    _, running = _continuation_pair()
+    terminal["task"]["status"] = "triage"
+    observation = {"run_id": 7, "session_id": "session-T", "pid": 1234, "snapshot_json": canonical_snapshot_json(running)}
+    observation["snapshot_hash"] = __import__("hashlib").sha256(observation["snapshot_json"].encode()).hexdigest()
+    observation.update(profile="worker-code-local", workspace_path="/repo/.worktrees/T", branch="wt/T")
+    assert validate_activation_continuation_snapshot(activation_post, terminal, acknowledged_at=20, profile="worker-code-local", workspace_path="/repo/.worktrees/T", branch="wt/T", repository_identity="/repo", base_sha="base", handoff_summary="local-first-awaiting-reconciliation", prior_running_observation=observation) == "terminal"
+    with pytest.raises(ValueError, match="prior running observation"):
+        validate_activation_continuation_snapshot(activation_post, terminal, acknowledged_at=20, profile="worker-code-local", workspace_path="/repo/.worktrees/T", branch="wt/T", repository_identity="/repo", base_sha="base", handoff_summary="local-first-awaiting-reconciliation")
+
+
 
 def test_direct_terminal_handoff_without_observed_running_is_rejected():
     from local_first_orchestrator.native_release_approval import validate_activation_continuation_snapshot
