@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import math
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -51,6 +52,130 @@ class SchedulerDaemonTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.ledger.close()
         self.temp.cleanup()
+
+    def _daemon_status_kwargs(self, worker_id: str = "daemon", **overrides):
+        values = {
+            "worker_id": worker_id,
+            "status": "starting",
+            "last_status": None,
+            "last_stage": None,
+            "last_ticket_id": None,
+            "reason_category": None,
+            "reason": None,
+            "consecutive_undispatchable": 0,
+            "iterations": 0,
+            "successful_ticks": 0,
+            "idle_ticks": 0,
+            "busy_ticks": 0,
+            "paused_ticks": 0,
+            "transient_errors": 0,
+            "consecutive_errors": 0,
+            "last_error": None,
+            "last_tick_started_at": None,
+            "last_tick_completed_at": None,
+        }
+        values.update(overrides)
+        return values
+
+    def _valid_daemon_row(self, **overrides):
+        row = {
+            "worker_id": "daemon",
+            "status": "starting",
+            "last_status": None,
+            "last_stage": None,
+            "last_ticket_id": None,
+            "reason_category": None,
+            "reason": None,
+            "consecutive_undispatchable": 0,
+            "iterations": 0,
+            "successful_ticks": 0,
+            "idle_ticks": 0,
+            "busy_ticks": 0,
+            "paused_ticks": 0,
+            "transient_errors": 0,
+            "consecutive_errors": 0,
+            "last_error": None,
+            "last_tick_started_at": None,
+            "last_tick_completed_at": None,
+            "updated_at": 0,
+        }
+        row.update(overrides)
+        return row
+
+    def test_run_rejects_non_builtin_non_negative_int_before_running_or_loop(self) -> None:
+        calls: list[str] = []
+
+        class IntSubclass(int):
+            pass
+
+        daemon: SchedulerDaemon
+
+        def stop_after_sleep(_delay: float) -> None:
+            daemon.request_stop()
+
+        daemon = SchedulerDaemon(
+            self.ledger,
+            lambda: calls.append("tick") or FakeScheduler(ProcessNextResult("no_work")),
+            worker_id="daemon",
+            sleep=stop_after_sleep,
+        )
+        invalid_values = (True, IntSubclass(1), 1.0, 1.5, math.nan, math.inf, -math.inf, "1", -1)
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    daemon.run(max_iterations=value)  # type: ignore[arg-type]
+                self.assertFalse(daemon.health().running)
+        self.assertEqual(calls, [])
+
+    def test_run_zero_ticks_and_failed_attempts_consume_invocation_local_budget(self) -> None:
+        calls: list[str] = []
+        daemon = SchedulerDaemon(
+            self.ledger,
+            lambda: calls.append("tick") or FakeScheduler(RuntimeError("tick failed")),
+            worker_id="daemon",
+            sleep=lambda _delay: None,
+            clock=lambda: 100.0,
+        )
+
+        daemon.run(max_iterations=0)
+        self.assertEqual(calls, [])
+        daemon.run(max_iterations=3)
+        self.assertEqual(calls, ["tick", "tick", "tick"])
+
+    def test_daemon_timestamp_writes_accept_none_and_finite_reals_and_normalize_to_float(self) -> None:
+        for field in ("last_tick_started_at", "last_tick_completed_at"):
+            for value in (None, 7, 7.5):
+                with self.subTest(field=field, value=value):
+                    worker_id = f"timestamp-{field}-{value}"
+                    row = self.ledger.upsert_daemon_status(**self._daemon_status_kwargs(worker_id, **{field: value}))
+                    self.assertIsNone(row[field]) if value is None else self.assertEqual(row[field], float(value))
+
+    def test_daemon_timestamp_writes_reject_invalid_values_before_sqlite_binding(self) -> None:
+        invalid_values = (True, float("nan"), float("inf"), float("-inf"), "7", object())
+        for field in ("last_tick_started_at", "last_tick_completed_at"):
+            for index, value in enumerate(invalid_values):
+                with self.subTest(field=field, value=value):
+                    worker_id = f"invalid-{field}-{index}"
+                    with self.assertRaises(ValueError):
+                        self.ledger.upsert_daemon_status(**self._daemon_status_kwargs(worker_id, **{field: value}))
+                    self.assertIsNone(self.ledger.connection.execute("SELECT 1 FROM daemon_status WHERE worker_id=?", (worker_id,)).fetchone())
+
+    def test_operator_daemon_reader_rejects_invalid_persisted_timestamps_without_leaking_values(self) -> None:
+        invalid_values = (True, float("nan"), float("inf"), float("-inf"), "7", object())
+        for field in ("last_tick_started_at", "last_tick_completed_at"):
+            for value in invalid_values:
+                with self.subTest(field=field, value=value):
+                    validated = Ledger._operator_daemon_row(self._valid_daemon_row(**{field: value}))
+                    self.assertEqual(validated["status"], "invalid_persisted_state")
+                    self.assertEqual(validated["reason_category"], "malformed_persisted_state")
+                    self.assertNotIn(value, validated.values())
+
+    def test_operator_daemon_reader_normalizes_finite_persisted_timestamps(self) -> None:
+        for field in ("last_tick_started_at", "last_tick_completed_at"):
+            for value in (None, 7, 7.5):
+                with self.subTest(field=field, value=value):
+                    validated = Ledger._operator_daemon_row(self._valid_daemon_row(**{field: value}))
+                    self.assertIsNone(validated[field]) if value is None else self.assertEqual(validated[field], float(value))
 
     def test_saturating_backoff_preserves_zero_base_semantics(self) -> None:
         self.assertEqual(_saturating_exponential_backoff(0.0, 10**9, 4.0), 0.0)

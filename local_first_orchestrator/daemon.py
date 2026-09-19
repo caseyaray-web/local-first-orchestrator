@@ -353,8 +353,8 @@ class SchedulerDaemon:
         return result
 
     def run(self, *, max_iterations: int | None = None, continue_on_error: bool = True) -> DaemonHealth:
-        if max_iterations is not None and max_iterations < 0:
-            raise ValueError("max_iterations must be non-negative")
+        if max_iterations is not None and (type(max_iterations) is not int or max_iterations < 0):
+            raise ValueError("max_iterations must be None or a non-negative built-in int")
         self._running = True
         invocation_iterations = 0
         try:

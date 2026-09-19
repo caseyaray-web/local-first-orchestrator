@@ -4,12 +4,14 @@ import hashlib
 import base64
 import binascii
 import json
+import math
 from cryptography.exceptions import InvalidSignature
 import re
 import sqlite3
 import subprocess
 import time
 import uuid
+from numbers import Real
 from threading import RLock
 from pathlib import Path
 from dataclasses import dataclass
@@ -57,6 +59,21 @@ def validate_sqlite_non_negative_counter(value: int) -> int:
     if type(value) is not int or value < 0 or value > SQLITE_INT_MAX:
         raise ValueError("counter must be a SQLite-range non-negative integer")
     return value
+
+
+def _finite_optional_real(value: object, *, name: str) -> float | None:
+    """Validate and normalize an optional real before SQLite binding or use."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be None or a finite real")
+    try:
+        normalized = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(f"{name} must be None or a finite real") from None
+    if not math.isfinite(normalized):
+        raise ValueError(f"{name} must be None or a finite real")
+    return normalized
 
 
 def _is_json_int(value: object) -> bool:
@@ -8971,6 +8988,8 @@ class Ledger:
         counters = (consecutive_undispatchable, iterations, successful_ticks, idle_ticks, busy_ticks, paused_ticks, transient_errors, consecutive_errors)
         for counter in counters:
             validate_sqlite_non_negative_counter(counter)
+        last_tick_started_at = _finite_optional_real(last_tick_started_at, name="last_tick_started_at")
+        last_tick_completed_at = _finite_optional_real(last_tick_completed_at, name="last_tick_completed_at")
         values = (
             self._bounded_daemon_text(worker_id, limit=128), self._bounded_daemon_text(status, limit=80),
             self._bounded_daemon_text(last_status, limit=80), self._bounded_daemon_text(last_stage, limit=128),
@@ -8992,13 +9011,19 @@ class Ledger:
     def _operator_daemon_row(row: sqlite3.Row) -> dict[str, Any]:
         required_text = ("worker_id", "status")
         counter_fields = ("consecutive_undispatchable", "iterations", "successful_ticks", "idle_ticks", "busy_ticks", "paused_ticks", "transient_errors", "consecutive_errors")
+        timestamp_fields = ("last_tick_started_at", "last_tick_completed_at")
+        timestamps: dict[str, float | None] = {}
         try:
             malformed = any(not isinstance(row[field], str) or not str(row[field]).strip() for field in required_text)
             malformed = malformed or any(
                 type(row[field]) is not int or row[field] < 0 or row[field] > SQLITE_INT_MAX
                 for field in counter_fields
             )
-        except (KeyError, TypeError):
+            timestamps = {
+                field: _finite_optional_real(row[field], name=field)
+                for field in timestamp_fields
+            }
+        except (KeyError, TypeError, ValueError):
             malformed = True
         if malformed:
             return {"worker_id": "<malformed>", "status": "invalid_persisted_state", "reason_category": "malformed_persisted_state", "reason": "daemon status record failed validation"}
@@ -9011,7 +9036,7 @@ class Ledger:
             "reason": Ledger._bounded_daemon_text(row["reason"]),
             **{field: int(row[field]) for field in counter_fields},
             "last_error": Ledger._bounded_daemon_text(row["last_error"]),
-            "last_tick_started_at": row["last_tick_started_at"], "last_tick_completed_at": row["last_tick_completed_at"],
+            **timestamps,
             "updated_at": row["updated_at"],
         }
 
