@@ -8,6 +8,7 @@ import time
 from numbers import Real
 from typing import Any, Callable
 
+from .daemon_text import bounded_daemon_text
 from .ledger import (
     SQLITE_INT_MAX,
     Ledger,
@@ -323,7 +324,7 @@ class SchedulerDaemon:
         except Exception as exc:
             self._transient_errors = saturating_non_negative_counter_increment(self._transient_errors)
             self._consecutive_errors = saturating_non_negative_counter_increment(self._consecutive_errors)
-            self._last_error = f"{type(exc).__name__}: {exc}"
+            self._last_error = bounded_daemon_text(f"{type(exc).__name__}: {exc}")
             self._state = "error"
             self._last_tick_completed_at = self.clock()
             self._persist_status()

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import unittest
+import json
 import math
+from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -567,6 +569,56 @@ class SchedulerDaemonTests(unittest.TestCase):
         status = self.ledger.operator_status()["daemon_status"]
         self.assertEqual(status[0]["status"], "no_work")
         self.assertEqual(status[0]["consecutive_undispatchable"], 0)
+
+    def test_daemon_error_sanitization_is_consistent_across_health_status_persistence_and_cli(self) -> None:
+        supplied_values = (
+            "FAKE_PASSWORD_UNQUOTED",
+            "FAKE_PASSWORD_QUOTED",
+            "FAKE_TOKEN_UNQUOTED",
+            "FAKE_TOKEN_QUOTED",
+            "FAKE_API_KEY_UNQUOTED",
+            "FAKE_API_KEY_QUOTED",
+            "FAKE_PRIVATE_KEY_UNQUOTED",
+            "FAKE_PRIVATE_KEY_QUOTED",
+        )
+        message = (
+            "\x00  scheduler\tfailed\n"
+            "password=FAKE_PASSWORD_UNQUOTED password: \"FAKE_PASSWORD_QUOTED\" "
+            "token:FAKE_TOKEN_UNQUOTED token = 'FAKE_TOKEN_QUOTED' "
+            "api_key=FAKE_API_KEY_UNQUOTED api_key : \"FAKE_API_KEY_QUOTED\" "
+            "private_key:FAKE_PRIVATE_KEY_UNQUOTED private_key = 'FAKE_PRIVATE_KEY_QUOTED' "
+            + ("safe-context " * 100)
+        )
+        daemon = SchedulerDaemon(
+            self.ledger,
+            lambda: FakeScheduler(RuntimeError(message)),
+            worker_id="daemon",
+            sleep=lambda _delay: None,
+            clock=lambda: 100.0,
+        )
+
+        with self.assertRaises(RuntimeError):
+            daemon.run_iteration()
+
+        health = daemon.health()
+        status = daemon.status()
+        persisted = self.ledger.operator_status()["daemon_status"][0]
+        cli_serialized = json.dumps({"health": asdict(health)}, sort_keys=True)
+        cli_health_error = json.loads(cli_serialized)["health"]["last_error"]
+        observed = (health.last_error, status["health"]["last_error"], persisted["last_error"], cli_health_error)
+        for value in observed:
+            self.assertIsNotNone(value)
+            self.assertLessEqual(len(value), 500)
+            self.assertTrue(value.startswith("RuntimeError: scheduler failed"))
+            for supplied in supplied_values:
+                self.assertNotIn(supplied, value)
+        for supplied in supplied_values:
+            self.assertNotIn(supplied, cli_serialized)
+        self.assertNotIn("\x00", health.last_error or "")
+        self.assertNotIn("\t", health.last_error or "")
+        self.assertNotIn("\n", health.last_error or "")
+        self.assertEqual(health.last_error, status["health"]["last_error"])
+        self.assertEqual(health.last_error, persisted["last_error"])
 
     def test_persisted_daemon_error_survives_new_ledger_and_is_bounded(self) -> None:
         daemon = SchedulerDaemon(

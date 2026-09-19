@@ -25,6 +25,7 @@ from .historical_revalidation import authorization_hash, authorization_identity,
 from .ticket import MicroTicket
 from .revalidation_boundary import validate_and_consume_revalidation_capability
 from .native_release_approval import snapshot_authority
+from .daemon_text import bounded_daemon_text
 
 class _LegacyRevalidationCompatibility(Exception):
     pass
@@ -8952,12 +8953,7 @@ class Ledger:
 
     @staticmethod
     def _bounded_daemon_text(value: object, *, limit: int = 500) -> str | None:
-        if value is None:
-            return None
-        text = str(value).replace("\x00", "")
-        text = " ".join(text.split())
-        text = re.sub(r"(?i)\b(?:password|token|secret|api[_-]?key|private[_-]?key)(?:\s*[:=]|[-_])\S+", "[REDACTED]", text)
-        return text[:limit]
+        return bounded_daemon_text(value, limit=limit)
 
     def upsert_daemon_status(
         self,
