@@ -1,18 +1,8 @@
 # Native Hermes integration
 
-## Current project status — 2026-09-12
+## Current project status
 
-Native plugin discovery, registered operator configuration, real Hermes board reads/writes, retry-safe state/comment projection, comment-marker reconciliation, native dependency links/readiness semantics, the restartable scheduler, observability, and the daemon are implemented. Milestone 20 drove a representative real Local First-owned feature through implementation, deterministic validation, independent review, acceptance, Git commit, Local First completion, and Hermes `done`; it also proved one live ambiguous external-effect restart without duplicate comment delivery.
-
-The major native-integration acceptance items are now complete for representative configured paths:
-
-1. **Hermes-dispatched execution reconciliation — complete for representative dispatcher-owned execution:** generated Local First cards are Hermes-owned for implementation, automatically polled for blocked handoff runs, excluded from the Local First implementation launcher, reconciled into deterministic Local First attempts, and kept non-final until Local First acceptance/integration projects `done`. The real dispatcher proof completed with zero Local First implementation model calls; see `docs/hermes-dispatch-execution-acceptance.md`.
-2. **Full scheduler-generated tranche graph proof — complete:** a real generated two-ticket tranche with exact Hermes-native dependency readiness was executed ticket-by-ticket by dispatcher workers, reconciled and integrated through a rolling Local First integration head, checkpointed, and followed by real standard-model successor materialization plus exact `next_tranche_activation`. Successor runtime binding/worktree preparation at the predecessor final integration SHA was separately re-verified after the final provenance fix. See `docs/multi-ticket-native-tranche-acceptance.md`.
-3. **Representative live operational crash proof — complete:** a real Hermes ambiguous write, real local implementation ambiguity/replay, real fresh-review replay, actual Git commit/ref recovery, checkpoint artifact/integration-command replay, and live paid-provider replay/unknown-outcome stop behavior are now acceptance-proven. See `docs/live-external-boundary-crash-acceptance.md` and `docs/live-paid-provider-acceptance.md`.
-
-The historical installation/dashboard notes below remain valid where they describe Hermes plugin mechanics; `docs/design-v2.md` is authoritative for current full-project status.
-
-
+Native plugin discovery, registered operator configuration, Hermes board reads/writes, retry-safe projection, native dependency links/readiness, the restartable scheduler, observability, and the daemon are implemented. Generated Local First cards can be executed by Hermes workers and reconciled back into Local First while Local First retains validation, review, integration, checkpoint, and finality authority.
 
 ### Hermes execution reconciliation — completed dispatcher-owned path
 
@@ -25,10 +15,6 @@ hermes local-first-orchestrator ... reconcile-hermes-execution --task-id <Hermes
 remains available as an explicit read-only reconciliation surface, but registered `process-next`/daemon execution now performs the normal generated-ticket handoff automatically. Local First-generated/triage cards carry `<!-- local-first-execution-handoff:v1 -->`, use Hermes `worktree` workspace mode, and are permanently excluded from Local First implementation claims. `ready_local`/`repairing` release to Hermes through `unblock`. Workers hand completed implementation back by blocking with reason exactly `local-first-awaiting-reconciliation`; Local First keeps the task blocked through validation/review/integration and alone performs final `done`.
 
 Automatic reconciliation accepts only an unreconciled blocked sentinel run. It verifies exact generated-card identity, common Git repository, authoritative tranche base, worker `HEAD`, and base-relative binary diff; persists immutable execution evidence; creates/reuses exactly one attempt per Hermes run; and creates `adapter=hermes-dispatch` implementation-stage evidence without any Local First implementation model invocation. Subsequent blocked repair runs can become later Local First attempts.
-
-The real proof dispatched Hermes task `t_6ddb14ba` to `worker-code-local`, reconciled run `1`, passed deterministic validation and independent review, committed `59b1b6c0da7bc7402d4c12758ccf2b268e0e5688`, finalized Local First, then projected Hermes `done`. Checkpointing also recovered correctly after Hermes removed its worker worktree by reconstructing from the immutable final commit. See `docs/hermes-dispatch-execution-acceptance.md`.
-
-
 
 ### Multi-ticket native tranche graph — completed live path
 

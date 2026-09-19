@@ -744,5 +744,3 @@ Do not repeat it manually. Unknown outcomes are intentionally fail-closed and re
 - `docs/command-reference.md` — complete CLI command reference.
 - `docs/operator-lifecycle-recovery.md` — recovery workflows.
 - `docs/native-hermes-integration.md` — plugin and Hermes integration details.
-- `docs/design-v2.md` — detailed design and invariants.
-- `docs/traceability.md` — implementation/acceptance status.

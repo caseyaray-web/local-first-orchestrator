@@ -105,8 +105,6 @@ The design-v2 implementation roadmap is complete for the current bounded policy.
 - operator lifecycle/recovery UX;
 - runtime metrics and bounded adaptive decomposition sizing.
 
-See [docs/traceability.md](docs/traceability.md) for the reconciled implementation matrix.
-
 ## Core design principles
 
 ### 1. Hermes schedules; Local First decides completion
@@ -212,7 +210,7 @@ There is no separate architecture model role in the operator configuration; arch
 ```text
 local_first_orchestrator/   Python package and orchestration implementation
 dashboard/                  Hermes dashboard plugin UI + API
-docs/                       design, operations, acceptance, and traceability docs
+docs/                       operator guides and CLI/integration references
 tests/                      unit/integration/acceptance regression suite
 plugin.yaml                 Hermes plugin manifest
 __init__.py                 Hermes native plugin registration
@@ -433,8 +431,6 @@ Metrics include attempts, acceptance outcome, deterministic context-size estimat
 
 After a minimum sample count, outcome history can adjust only decomposition planning hints within hard bounds. It cannot alter validation or finality.
 
-See [docs/runtime-metrics-adaptive-sizing-acceptance.md](docs/runtime-metrics-adaptive-sizing-acceptance.md).
-
 ## Configuration summary
 
 Production configuration has four layers:
@@ -497,8 +493,6 @@ python -m compileall -q local_first_orchestrator dashboard tests
 node --check dashboard/dist/index.js
 ```
 
-The repository also contains focused live/acceptance documentation for crash recovery, paid providers, Hermes dispatch, and multi-ticket native graphs.
-
 ## Documentation map
 
 Start here, then use the focused references as needed:
@@ -507,14 +501,7 @@ Start here, then use the focused references as needed:
 - [Command reference](docs/command-reference.md) — all CLI commands grouped by purpose.
 - [Operator lifecycle and recovery](docs/operator-lifecycle-recovery.md) — pause/resume, diagnosis, recovery workflows, daemon operation.
 - [Native Hermes integration](docs/native-hermes-integration.md) — plugin discovery, board/dispatcher integration, native graph behavior.
-- [Design v2](docs/design-v2.md) — detailed architecture and invariants.
-- [Traceability](docs/traceability.md) — current implementation/acceptance matrix.
-- [Scheduler plan](docs/scheduler-plan.md) — scheduler milestone history and current completion status.
-- [Runtime metrics acceptance](docs/runtime-metrics-adaptive-sizing-acceptance.md) — metrics/adaptive-sizing behavior.
-- [Live external-boundary crash acceptance](docs/live-external-boundary-crash-acceptance.md) — representative crash/restart proofs.
-- [Live paid-provider acceptance](docs/live-paid-provider-acceptance.md) — paid checkpoint/escalation and ambiguity handling.
-- [Hermes dispatch acceptance](docs/hermes-dispatch-execution-acceptance.md) — dispatcher-owned implementation reconciliation.
-- [Multi-ticket native tranche acceptance](docs/multi-ticket-native-tranche-acceptance.md) — dependency graph and successor-tranche proof.
+- [Detached native-release approval](docs/native-release-detached-approval.md) — operator-controlled signing boundary for native release revalidation.
 
 ## Development status and scope
 

@@ -607,4 +607,3 @@ Avoid using narrow recovery commands as a substitute for normal scheduler flow.
 - `docs/configuration.md`
 - `docs/operator-lifecycle-recovery.md`
 - `docs/native-hermes-integration.md`
-- `docs/design-v2.md`
