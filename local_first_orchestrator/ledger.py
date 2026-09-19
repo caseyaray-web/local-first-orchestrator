@@ -37,6 +37,28 @@ def _stable_scheduler_failure_fingerprint(ticket_id: str, stage: str, evidence: 
     return hashlib.sha256("\x1f".join((ticket_id, stage, normalized)).encode()).hexdigest()
 
 
+SQLITE_INT_MAX = 2**63 - 1
+
+
+def saturating_non_negative_counter(value: int) -> int:
+    """Normalize an internal non-negative counter to SQLite's signed range."""
+    if type(value) is not int or value < 0:
+        raise ValueError("counter must be a non-negative integer")
+    return min(value, SQLITE_INT_MAX)
+
+
+def saturating_non_negative_counter_increment(value: int) -> int:
+    """Increment a counter without crossing SQLite's signed integer maximum."""
+    return min(saturating_non_negative_counter(value) + 1, SQLITE_INT_MAX)
+
+
+def validate_sqlite_non_negative_counter(value: int) -> int:
+    """Validate a caller-provided counter before binding it to SQLite."""
+    if type(value) is not int or value < 0 or value > SQLITE_INT_MAX:
+        raise ValueError("counter must be a SQLite-range non-negative integer")
+    return value
+
+
 def _is_json_int(value: object) -> bool:
     return type(value) is int
 
@@ -8947,8 +8969,8 @@ class Ledger:
         if not isinstance(status, str) or not status.strip():
             raise ValueError("daemon status is required")
         counters = (consecutive_undispatchable, iterations, successful_ticks, idle_ticks, busy_ticks, paused_ticks, transient_errors, consecutive_errors)
-        if any(type(value) is not int or value < 0 for value in counters):
-            raise ValueError("daemon counters must be non-negative integers")
+        for counter in counters:
+            validate_sqlite_non_negative_counter(counter)
         values = (
             self._bounded_daemon_text(worker_id, limit=128), self._bounded_daemon_text(status, limit=80),
             self._bounded_daemon_text(last_status, limit=80), self._bounded_daemon_text(last_stage, limit=128),
@@ -8970,8 +8992,14 @@ class Ledger:
     def _operator_daemon_row(row: sqlite3.Row) -> dict[str, Any]:
         required_text = ("worker_id", "status")
         counter_fields = ("consecutive_undispatchable", "iterations", "successful_ticks", "idle_ticks", "busy_ticks", "paused_ticks", "transient_errors", "consecutive_errors")
-        malformed = any(not isinstance(row[field], str) or not str(row[field]).strip() for field in required_text)
-        malformed = malformed or any(type(row[field]) is not int or row[field] < 0 for field in counter_fields)
+        try:
+            malformed = any(not isinstance(row[field], str) or not str(row[field]).strip() for field in required_text)
+            malformed = malformed or any(
+                type(row[field]) is not int or row[field] < 0 or row[field] > SQLITE_INT_MAX
+                for field in counter_fields
+            )
+        except (KeyError, TypeError):
+            malformed = True
         if malformed:
             return {"worker_id": "<malformed>", "status": "invalid_persisted_state", "reason_category": "malformed_persisted_state", "reason": "daemon status record failed validation"}
         return {

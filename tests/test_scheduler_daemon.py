@@ -4,8 +4,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from local_first_orchestrator.daemon import SchedulerDaemon, _saturating_exponential_backoff
-from local_first_orchestrator.ledger import Ledger
+from local_first_orchestrator.daemon import SQLITE_INT_MAX, SchedulerDaemon, _saturating_exponential_backoff
+from local_first_orchestrator.ledger import Ledger, saturating_non_negative_counter, saturating_non_negative_counter_increment
 from local_first_orchestrator.scheduler import ProcessNextResult, ProcessNextScheduler
 from local_first_orchestrator.states import CanonicalState
 
@@ -64,6 +64,7 @@ class SchedulerDaemonTests(unittest.TestCase):
 
     def test_saturating_backoff_caps_huge_exponent_without_overflow(self) -> None:
         self.assertEqual(_saturating_exponential_backoff(1.0, 1025, 4.0), 4.0)
+        self.assertEqual(_saturating_exponential_backoff(1.0, 10**9, 4.0), 4.0)
 
     def test_idle_busy_and_completed_ticks_use_expected_sleep_policy(self) -> None:
         outcomes = [ProcessNextResult("no_work"), ProcessNextResult("busy"), ProcessNextResult("completed", "validation", "T")]
@@ -144,7 +145,7 @@ class SchedulerDaemonTests(unittest.TestCase):
             sleep=sleeps.append,
             clock=lambda: 101.0,
         )
-        second.run(max_iterations=1)
+        second.run(max_iterations=2)
         self.assertEqual(sleeps, [2.0])
 
         self.ledger.close()
@@ -161,8 +162,185 @@ class SchedulerDaemonTests(unittest.TestCase):
             sleep=third_sleeps.append,
             clock=lambda: 102.0,
         )
-        third.run(max_iterations=1)
+        third.run(max_iterations=3)
         self.assertEqual(third_sleeps, [2.0])
+
+    def test_sqlite_signed_max_undispatchable_counter_saturates_before_persist_and_sleep(self) -> None:
+        sqlite_int_max = SQLITE_INT_MAX
+        self.ledger.upsert_daemon_status(
+            worker_id="daemon",
+            status="authorized_undispatchable",
+            last_status="authorized_undispatchable",
+            last_stage="hermes_dispatch",
+            last_ticket_id=None,
+            reason_category="no_dispatchable_plan",
+            reason="authorized work has no dispatchable plan",
+            consecutive_undispatchable=sqlite_int_max,
+            iterations=sqlite_int_max,
+            successful_ticks=sqlite_int_max,
+            idle_ticks=sqlite_int_max,
+            busy_ticks=sqlite_int_max,
+            paused_ticks=sqlite_int_max,
+            transient_errors=sqlite_int_max,
+            consecutive_errors=sqlite_int_max,
+            last_error=None,
+            last_tick_started_at=100.0,
+            last_tick_completed_at=100.0,
+        )
+        sleeps: list[float] = []
+        daemon = SchedulerDaemon(
+            self.ledger,
+            lambda: FakeScheduler(ProcessNextResult("no_work")),
+            external_progress_runner=lambda: {"status": "authorized_undispatchable", "stage": "hermes_dispatch"},
+            worker_id="daemon",
+            undispatchable_backoff_seconds=1.0,
+            max_undispatchable_backoff_seconds=4.0,
+            sleep=sleeps.append,
+            clock=lambda: 101.0,
+        )
+
+        self.assertEqual(daemon.health().iterations, sqlite_int_max)
+        self.assertEqual(daemon.health().consecutive_undispatchable, sqlite_int_max)
+        daemon.run_iteration()
+
+        self.assertEqual(sleeps, [4.0])
+        row = self.ledger.operator_status()["daemon_status"][0]
+        for field in ("consecutive_undispatchable", "iterations", "successful_ticks", "idle_ticks", "busy_ticks", "paused_ticks", "transient_errors"):
+            self.assertEqual(row[field], sqlite_int_max)
+        self.assertEqual(row["consecutive_errors"], 0)
+
+    def test_sqlite_signed_max_error_counters_rehydrate_and_backoff_without_overflow(self) -> None:
+        sqlite_int_max = SQLITE_INT_MAX
+        self.ledger.upsert_daemon_status(
+            worker_id="daemon",
+            status="error",
+            last_status=None,
+            last_stage=None,
+            last_ticket_id=None,
+            reason_category=None,
+            reason=None,
+            consecutive_undispatchable=sqlite_int_max,
+            iterations=sqlite_int_max,
+            successful_ticks=sqlite_int_max,
+            idle_ticks=sqlite_int_max,
+            busy_ticks=sqlite_int_max,
+            paused_ticks=sqlite_int_max,
+            transient_errors=sqlite_int_max,
+            consecutive_errors=sqlite_int_max,
+            last_error="persisted error",
+            last_tick_started_at=100.0,
+            last_tick_completed_at=100.0,
+        )
+        sleeps: list[float] = []
+        daemon = SchedulerDaemon(
+            self.ledger,
+            lambda: FakeScheduler(RuntimeError("next error")),
+            worker_id="daemon",
+            error_backoff_seconds=1.0,
+            max_error_backoff_seconds=4.0,
+            sleep=sleeps.append,
+            clock=lambda: 101.0,
+        )
+
+        health = daemon.health()
+        self.assertEqual(health.iterations, sqlite_int_max)
+        self.assertEqual(health.transient_errors, sqlite_int_max)
+        self.assertEqual(health.consecutive_errors, sqlite_int_max)
+        with self.assertRaises(RuntimeError):
+            daemon.run_iteration()
+
+        self.assertEqual(sleeps, [4.0])
+        row = self.ledger.operator_status()["daemon_status"][0]
+        self.assertEqual(row["transient_errors"], sqlite_int_max)
+        self.assertEqual(row["consecutive_errors"], sqlite_int_max)
+        self.assertEqual(row["iterations"], sqlite_int_max)
+
+    def test_daemon_upsert_rejects_sqlite_out_of_range_counters(self) -> None:
+        values = {field: 0 for field in ("consecutive_undispatchable", "iterations", "successful_ticks", "idle_ticks", "busy_ticks", "paused_ticks", "transient_errors", "consecutive_errors")}
+        for field in values:
+            values[field] = 2**63
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    self.ledger.upsert_daemon_status(
+                        worker_id="out-of-range-" + field,
+                        status="starting",
+                        last_status=None,
+                        last_stage=None,
+                        last_ticket_id=None,
+                        reason_category=None,
+                        reason=None,
+                        last_error=None,
+                        last_tick_started_at=None,
+                        last_tick_completed_at=None,
+                        **values,
+                    )
+            values[field] = 0
+
+    def test_out_of_range_persisted_counter_is_not_authority(self) -> None:
+        row = {
+            "worker_id": "malformed",
+            "status": "error",
+            "consecutive_undispatchable": SQLITE_INT_MAX + 1,
+            "iterations": 0,
+            "successful_ticks": 0,
+            "idle_ticks": 0,
+            "busy_ticks": 0,
+            "paused_ticks": 0,
+            "transient_errors": 0,
+            "consecutive_errors": 0,
+        }
+        validated = Ledger._operator_daemon_row(row)  # type: ignore[arg-type]
+        self.assertEqual(validated["status"], "invalid_persisted_state")
+        self.assertEqual(validated["reason_category"], "malformed_persisted_state")
+
+    def test_saturating_counter_helpers_clamp_at_sqlite_signed_max(self) -> None:
+        self.assertEqual(saturating_non_negative_counter(SQLITE_INT_MAX + 1), SQLITE_INT_MAX)
+        self.assertEqual(saturating_non_negative_counter_increment(SQLITE_INT_MAX), SQLITE_INT_MAX)
+
+        invalid_values = (float("nan"), float("inf"), float("-inf"), -1.0, True)
+        for value in invalid_values:
+            with self.subTest(base=value):
+                with self.assertRaises(ValueError):
+                    _saturating_exponential_backoff(value, 0, 1.0)
+            with self.subTest(maximum=value):
+                with self.assertRaises(ValueError):
+                    _saturating_exponential_backoff(1.0, 0, value)
+        for exponent in (-1, True, 1.0):
+            with self.subTest(exponent=exponent):
+                with self.assertRaises(ValueError):
+                    _saturating_exponential_backoff(1.0, exponent, 4.0)
+
+    def test_constructor_validates_all_sleep_and_backoff_inputs_before_order_checks(self) -> None:
+        fields = (
+            "idle_sleep_seconds",
+            "busy_sleep_seconds",
+            "error_backoff_seconds",
+            "max_error_backoff_seconds",
+            "undispatchable_backoff_seconds",
+            "max_undispatchable_backoff_seconds",
+        )
+        for field in fields:
+            for value in (float("nan"), float("inf"), float("-inf"), -1.0, True):
+                with self.subTest(field=field, value=value):
+                    kwargs = {field: value}
+                    with self.assertRaises(ValueError):
+                        SchedulerDaemon(self.ledger, lambda: FakeScheduler(ProcessNextResult("no_work")), worker_id="daemon", **kwargs)
+
+    def test_negative_zero_is_normalized_to_zero_for_backoff_and_constructor(self) -> None:
+        self.assertEqual(_saturating_exponential_backoff(-0.0, 10**9, 4.0), 0.0)
+        daemon = SchedulerDaemon(
+            self.ledger,
+            lambda: FakeScheduler(ProcessNextResult("no_work")),
+            worker_id="daemon",
+            idle_sleep_seconds=-0.0,
+            busy_sleep_seconds=-0.0,
+            error_backoff_seconds=-0.0,
+            max_error_backoff_seconds=0.0,
+            undispatchable_backoff_seconds=-0.0,
+            max_undispatchable_backoff_seconds=0.0,
+        )
+        self.assertEqual(daemon.idle_sleep_seconds, 0.0)
+        self.assertEqual(daemon.error_backoff_seconds, 0.0)
 
     def test_rehydrated_large_undispatchable_counter_is_capped_without_overflow(self) -> None:
         self.ledger.upsert_daemon_status(
