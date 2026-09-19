@@ -385,10 +385,11 @@ class HermesBoardAdapter:
                 return
             raise RuntimeError(f"Hermes execution handoff release has incompatible state: {current}")
         elif handoff:
-            if current == "blocked":
+            if current in {"blocked", "review", "done"}:
+                # Review is the preferred implementation handoff. Done is tolerated
+                # as a recoverable premature worker finality signal; Local First
+                # remains authoritative for validation/review/integration/finality.
                 return
-            if current == "done":
-                raise RuntimeError("Hermes execution handoff became final before Local First completion")
             if current in {"running", "ready", "todo", "scheduled"}:
                 raise RuntimeError(f"Hermes execution handoff is not parked for Local First trust stage: {current}")
             return
@@ -463,7 +464,7 @@ class HermesBoardAdapter:
         *,
         title: str,
         body: str,
-        workspace_path: str,
+        workspace_path: str | None,
         downstream_child_ids: tuple[str, ...],
         idempotency_key: str,
         reason: str,
@@ -476,8 +477,8 @@ class HermesBoardAdapter:
         """
         if not self.allow_writes:
             raise PermissionError("real board writes require --allow-board-writes")
-        if not predecessor_task_id or not workspace_path or not idempotency_key or not reason:
-            raise ValueError("repair task creation requires predecessor, workspace, key, and reason")
+        if not predecessor_task_id or not idempotency_key or not reason:
+            raise ValueError("repair task creation requires predecessor, key, and reason")
         predecessor = self.repair_predecessor_task(predecessor_task_id)
         expected_children = tuple(sorted(set(downstream_child_ids)))
         if predecessor_task_id in expected_children:
@@ -486,7 +487,7 @@ class HermesBoardAdapter:
             "create", title,
             "--body", attach_execution_handoff(body),
             "--parent", predecessor_task_id,
-            "--workspace", f"dir:{workspace_path}",
+            "--workspace", (f"dir:{workspace_path}" if workspace_path else (f"worktree:{self.canonical_repository}" if self.canonical_repository is not None else "worktree")),
             "--idempotency-key", idempotency_key,
             "--initial-status", "blocked",
         ]
@@ -533,12 +534,44 @@ class HermesBoardAdapter:
         repair = self.get_task(repair_task_id)
         if tuple(sorted(set(repair.children))) != expected_children:
             raise RuntimeError("Hermes repair task downstream graph did not converge")
-        if repair.status == "blocked":
+        if workspace_path is not None and repair.status == "blocked":
             self._run("unblock", repair_task_id, "--reason", reason)
             repair = self.get_task(repair_task_id)
         if repair.status not in {"todo", "ready", "scheduled", "running", "blocked", "done"}:
             raise RuntimeError(f"Hermes repair task entered an unsupported status: {repair.status}")
         return repair
+
+    def activate_repair_task(self, task_id: str, *, reason: str) -> ExternalTicket:
+        if not self.allow_writes:
+            raise PermissionError("real board writes require --allow-board-writes")
+        if not task_id or not reason:
+            raise ValueError("repair task activation requires task and reason")
+        task = self.get_task(task_id)
+        if task.status in {"ready", "running", "review", "done"}:
+            return task
+        if task.status != "blocked":
+            raise RuntimeError(f"Hermes repair task activation requires blocked state: {task.status}")
+        self._run("unblock", task_id, "--reason", reason)
+        updated = self.get_task(task_id)
+        if updated.status not in {"ready", "todo", "running"}:
+            raise RuntimeError(f"Hermes repair task activation did not release task: {updated.status}")
+        return updated
+
+    def reopen_review_handoff(self, task_id: str, *, reason: str) -> ExternalTicket:
+        if not self.allow_writes:
+            raise PermissionError("real board writes require --allow-board-writes")
+        if not task_id or not reason:
+            raise ValueError("review handoff recovery requires task and reason")
+        task = self.get_task(task_id)
+        if task.status == "ready":
+            return task
+        if task.status != "review":
+            raise RuntimeError(f"Hermes review handoff recovery requires review state: {task.status}")
+        self._run("reopen-review", task_id, "--reason", reason)
+        updated = self.get_task(task_id)
+        if updated.status not in {"ready", "todo"}:
+            raise RuntimeError(f"Hermes review handoff did not return to implementation: {updated.status}")
+        return updated
 
     def create_microticket(self, title: str, body: str, *, idempotency_key: str) -> str:
         if not self.allow_writes:

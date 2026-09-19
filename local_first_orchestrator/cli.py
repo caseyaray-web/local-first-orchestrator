@@ -277,6 +277,7 @@ def _registered_process_next_scheduler(ledger: Ledger, args: argparse.Namespace)
                 message = str(exc)
                 if message in {
                     "Hermes execution handoff is not blocked for reconciliation",
+                    "Hermes execution handoff is not in review or a recoverable terminal handoff state",
                     "no completed Hermes worker run available for reconciliation",
                     "no unreconciled Hermes worker run available for reconciliation",
                 }:

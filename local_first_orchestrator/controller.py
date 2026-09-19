@@ -784,16 +784,44 @@ class LocalFirstController:
             (ticket_id, external_task_id, ticket_id),
         ).fetchall()
         repair_projection = self.ledger.connection.execute(
-            "SELECT 1 FROM runtime_stages WHERE ticket_id=? AND stage LIKE 'generated-repair-activation-%' "
-            "AND json_valid(detail)=1 AND json_extract(detail,'$.external_task_id')=? LIMIT 1",
+            "SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage LIKE 'generated-repair-activation-%' "
+            "AND json_valid(detail)=1 AND json_extract(detail,'$.external_task_id')=? ORDER BY created_at DESC LIMIT 1",
             (ticket_id, external_task_id),
         ).fetchone()
         generated_owned = ticket_row["external_id"] is None and (len(generated_projection) == 1 or repair_projection is not None)
+        handoff_marked = generated_owned and HANDOFF_MARKER in str(snapshot.task.body or "")
+        if require_handoff and snapshot.task.status == "blocked" and repair_projection is not None and not snapshot.runs:
+            try:
+                repair_detail = json.loads(str(repair_projection["detail"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                repair_detail = {}
+            if repair_detail.get("recovery_kind") == "premature_done_no_diff":
+                activator = getattr(self.board, "activate_repair_task", None)
+                if activator is None:
+                    raise RuntimeError("prepared premature-Done retry cannot be activated")
+                reason = str(repair_detail.get("reason") or "Local First retry workspace prepared")
+                activated_retry = activator(external_task_id, reason=reason)
+                return {
+                    "ticket_id": ticket_id,
+                    "external_task_id": external_task_id,
+                    "status": "replacement_activated",
+                    "hermes_status": activated_retry.status,
+                }
         completed_generated_handoff = (
             require_handoff
             and snapshot.task.status == "done"
-            and generated_owned
-            and HANDOFF_MARKER in str(snapshot.task.body or "")
+            and handoff_marked
+        )
+        review_generated_handoff = (
+            require_handoff
+            and snapshot.task.status == "review"
+            and handoff_marked
+            and not any(run.status == "running" for run in snapshot.runs)
+            and any(
+                run.status == "review"
+                and run.outcome == "review_requested"
+                for run in snapshot.runs
+            )
         )
         normalized_terminal_handoff = (
             require_handoff
@@ -809,8 +837,8 @@ class LocalFirstController:
         )
         if snapshot.task.status == "done" and not completed_generated_handoff:
             raise RuntimeError("hermes_completion_authority_bypassed_reconciliation_required")
-        if require_handoff and not normalized_terminal_handoff and not completed_generated_handoff:
-            raise RuntimeError("Hermes execution handoff is not blocked for reconciliation")
+        if require_handoff and not normalized_terminal_handoff and not completed_generated_handoff and not review_generated_handoff:
+            raise RuntimeError("Hermes execution handoff is not in review or a recoverable terminal handoff state")
         activation = self.ledger.connection.execute(
             """SELECT i.*, e.acknowledged_at FROM native_release_activation_intents i
                JOIN native_release_activation_evidence e ON e.request_key=i.request_key
@@ -847,7 +875,14 @@ class LocalFirstController:
             if snapshot.task.status not in {"blocked", "triage"} or not require_handoff:
                 require_handoff = True
         if require_handoff:
-            if completed_generated_handoff:
+            if review_generated_handoff:
+                candidates = [
+                    run for run in snapshot.runs
+                    if run.status == "review"
+                    and run.outcome == "review_requested"
+                    and not str(run.summary or "").startswith("local-first projection ")
+                ]
+            elif completed_generated_handoff:
                 candidates = [
                     run for run in snapshot.runs
                     if run.status in {"done", "completed"}
@@ -918,6 +953,70 @@ class LocalFirstController:
         diff = git("diff", "--binary", "--no-ext-diff", base_sha, "--").stdout
         diff_hash = hashlib.sha256(diff.encode()).hexdigest()
         if not diff.strip():
+            if review_generated_handoff:
+                reopener = getattr(self.board, "reopen_review_handoff", None)
+                if reopener is None:
+                    raise RuntimeError("Hermes review handoff produced no candidate diff and cannot be reopened")
+                reason = "Local First found no candidate diff; implementation is not complete"
+                reopened = reopener(external_task_id, reason=reason)
+                return {
+                    "ticket_id": ticket_id,
+                    "external_task_id": external_task_id,
+                    "status": "implementation_reopened",
+                    "hermes_status": reopened.status,
+                }
+            if completed_generated_handoff:
+                if self.ledger.attempt_count(ticket_id) != 0:
+                    raise RuntimeError("premature Hermes Done with no diff conflicts with existing Local First attempt authority")
+                lifecycle_tables = (
+                    "model_stage_artifacts", "hermes_execution_reconciliations", "review_candidates",
+                    "accepted_candidates", "accepted_evidence", "git_commit_intents", "git_commit_evidence",
+                )
+                if any(self.ledger.connection.execute(f"SELECT 1 FROM {table} WHERE ticket_id=? LIMIT 1", (ticket_id,)).fetchone() is not None for table in lifecycle_tables):
+                    raise RuntimeError("premature Hermes Done with no diff conflicts with existing Local First lifecycle authority")
+                creator = getattr(self.board, "create_repair_task", None)
+                if creator is None:
+                    raise RuntimeError("premature Hermes Done with no diff requires replacement task support")
+                retry_key = f"premature-done-retry:{ticket_id}:{external_task_id}:{run.id}"
+                reason = "Local First found no candidate diff after premature Hermes Done; retry implementation"
+                replacement = creator(
+                    external_task_id,
+                    title=f"{snapshot.task.title} retry",
+                    body=f"{snapshot.task.body}\n\n## Local First retry\n{reason}",
+                    workspace_path=None,
+                    downstream_child_ids=tuple(snapshot.task.children),
+                    idempotency_key=retry_key,
+                    reason=reason,
+                )
+                prepared = self.prepare_premature_done_retry_worktree(replacement.id, base_sha)
+                detail = json.dumps({
+                    "ticket_id": ticket_id,
+                    "attempt_number": 1,
+                    "external_task_id": replacement.id,
+                    "predecessor_external_task_id": external_task_id,
+                    "reason": reason,
+                    "hermes_status": replacement.status,
+                    "recovery_kind": "premature_done_no_diff",
+                    "idempotency_key": retry_key,
+                    "base_sha": base_sha,
+                    "workspace_path": prepared["workspace_path"],
+                    "branch_name": prepared["branch_name"],
+                }, sort_keys=True, separators=(",", ":"))
+                if not self.ledger.record_runtime_stage(ticket_id, "generated-repair-activation-1", detail, attempt_number=1, base_sha=base_sha):
+                    existing_stage = self.ledger.connection.execute("SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage='generated-repair-activation-1'", (ticket_id,)).fetchone()
+                    if existing_stage is None or str(existing_stage["detail"]) != detail:
+                        raise RuntimeError("premature Hermes Done replacement reconciliation required")
+                activator = getattr(self.board, "activate_repair_task", None)
+                if activator is None:
+                    raise RuntimeError("premature Hermes Done replacement cannot be activated")
+                activated = activator(replacement.id, reason=reason)
+                return {
+                    "ticket_id": ticket_id,
+                    "external_task_id": replacement.id,
+                    "predecessor_external_task_id": external_task_id,
+                    "status": "replacement_activated",
+                    "hermes_status": activated.status,
+                }
             raise RuntimeError("Hermes execution produced no candidate diff")
 
         pending_repair_attempt = self.ledger.pending_repair_attempt_number(ticket_id)
@@ -963,6 +1062,61 @@ class LocalFirstController:
             snapshot_hash=snapshot_hash,
         )
         return {**row, "status": "reconciled"}
+
+    def prepare_premature_done_retry_worktree(self, external_task_id: str, base_sha: str) -> dict[str, str]:
+        """Materialize one replacement Hermes worktree at the exact frozen execution base."""
+        repository, _, _ = self.config.validate_execution_roots()
+        target, _ = validate_native_workspace_path(
+            canonical_native_workspace_path(repository, external_task_id),
+            repository=repository,
+            external_task_id=external_task_id,
+            require_existing=False,
+        )
+        branch = f"wt/{external_task_id}"
+        with PinnedNativeWorkspace.open(repository, target) as pin:
+            resolved_base = pin.git("rev-parse", "--verify", f"{base_sha}^{{commit}}").stdout.strip()
+            if resolved_base != base_sha:
+                raise RuntimeError("premature_done_retry_reconciliation_required: base identity drift")
+            if target.exists():
+                pin.pin_existing_target(already_created=True)
+                target_git_fd = pin.target_git_fd()
+                target_root = Path(pin.git("rev-parse", "--show-toplevel", target=True, git_fd_override=target_git_fd).stdout.strip()).resolve(strict=True)
+                common_raw = pin.git("rev-parse", "--git-common-dir", target=True, git_fd_override=target_git_fd).stdout.strip()
+                target_common = (target / common_raw).resolve(strict=True) if not Path(common_raw).is_absolute() else Path(common_raw).resolve(strict=True)
+                repo_common_raw = pin.git("rev-parse", "--git-common-dir").stdout.strip()
+                repo_common = (repository / repo_common_raw).resolve(strict=True) if not Path(repo_common_raw).is_absolute() else Path(repo_common_raw).resolve(strict=True)
+                head = pin.git("rev-parse", "HEAD", target=True, git_fd_override=target_git_fd).stdout.strip()
+                actual_branch = pin.git("branch", "--show-current", target=True, git_fd_override=target_git_fd).stdout.strip()
+                status = pin.git("status", "--porcelain=v1", target=True, git_fd_override=target_git_fd).stdout.strip()
+                if target_root != target or target_common != repo_common or head != base_sha or actual_branch != branch or status:
+                    raise RuntimeError("premature_done_retry_reconciliation_required: existing worktree drift")
+                validate_native_workspace_path(target, repository=repository, external_task_id=external_task_id)
+                pin.final_revalidate()
+                return {"workspace_path": str(target), "branch_name": branch, "base_sha": base_sha}
+
+            pin.revalidate(target_must_exist=False)
+            pin.require_expected_metadata_absent(external_task_id)
+            branch_check = pin.git("rev-parse", "--verify", f"refs/heads/{branch}", check=False)
+            if branch_check.returncode == 0 and branch_check.stdout.strip() != base_sha:
+                raise RuntimeError("premature_done_retry_reconciliation_required: existing branch drift")
+            if branch_check.returncode == 0:
+                pin.git("worktree", "add", "-q", external_task_id, branch, creates_target=True, cwd_fd_override=pin.worktree_parent_fd)
+            else:
+                pin.git("worktree", "add", "-q", "-b", branch, external_task_id, base_sha, creates_target=True, cwd_fd_override=pin.worktree_parent_fd)
+            pin.pin_existing_target(already_created=True)
+            target_git_fd = pin.target_git_fd()
+            target_root = Path(pin.git("rev-parse", "--show-toplevel", target=True, git_fd_override=target_git_fd).stdout.strip()).resolve(strict=True)
+            common_raw = pin.git("rev-parse", "--git-common-dir", target=True, git_fd_override=target_git_fd).stdout.strip()
+            target_common = (target / common_raw).resolve(strict=True) if not Path(common_raw).is_absolute() else Path(common_raw).resolve(strict=True)
+            repo_common_raw = pin.git("rev-parse", "--git-common-dir").stdout.strip()
+            repo_common = (repository / repo_common_raw).resolve(strict=True) if not Path(repo_common_raw).is_absolute() else Path(repo_common_raw).resolve(strict=True)
+            head = pin.git("rev-parse", "HEAD", target=True, git_fd_override=target_git_fd).stdout.strip()
+            actual_branch = pin.git("branch", "--show-current", target=True, git_fd_override=target_git_fd).stdout.strip()
+            if target_root != target or target_common != repo_common or head != base_sha or actual_branch != branch:
+                raise RuntimeError("premature_done_retry_reconciliation_required: created worktree drift")
+            validate_native_workspace_path(target, repository=repository, external_task_id=external_task_id)
+            pin.final_revalidate()
+            return {"workspace_path": str(target), "branch_name": branch, "base_sha": base_sha}
 
     def prepare_hermes_dispatch_worktree(self, ticket_id: str, external_task_id: str) -> dict[str, str]:
         """Prepare Hermes' canonical task worktree inside pinned Git objects."""

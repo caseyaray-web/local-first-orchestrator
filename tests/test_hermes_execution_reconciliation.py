@@ -35,6 +35,26 @@ class ExecutionBoard:
     def set_state(self, *args, **kwargs): return None
     def get_task(self, task_id: str): return self.snapshot.task
 
+    def reopen_review_handoff(self, task_id: str, *, reason: str):
+        self.reopened = (task_id, reason)
+        return ExternalTicket(task_id, "external", HANDOFF_MARKER, "ready", str(Path(self.snapshot.task.workspace_path or ".")))
+
+    def create_repair_task(self, predecessor_task_id: str, *, title: str, body: str, workspace_path, downstream_child_ids, idempotency_key: str, reason: str):
+        self.repair_created = {
+            "predecessor_task_id": predecessor_task_id,
+            "title": title,
+            "body": body,
+            "workspace_path": workspace_path,
+            "downstream_child_ids": downstream_child_ids,
+            "idempotency_key": idempotency_key,
+            "reason": reason,
+        }
+        return ExternalTicket("H-retry", title, body, "blocked", str(Path(self.snapshot.task.workspace_path or ".")), parents=(predecessor_task_id,))
+
+    def activate_repair_task(self, task_id: str, *, reason: str):
+        self.repair_activated = (task_id, reason)
+        return ExternalTicket(task_id, "retry", HANDOFF_MARKER, "ready", None)
+
 
 class HermesExecutionReconciliationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -141,6 +161,76 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
             self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7)
         self.assertEqual(self.ledger.attempt_count(self.ticket_id), 0)
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM hermes_execution_reconciliations").fetchone()[0], 0)
+
+    def test_generated_owned_review_with_no_diff_reopens_same_card_without_local_attempt(self) -> None:
+        self._make_generated_owned()
+        subprocess.run(("git", "checkout", "--", "app.py"), cwd=self.repo, check=True)
+        self.board.snapshot = ExternalExecutionSnapshot(
+            task=ExternalTicket("H-1", "external", HANDOFF_MARKER, "review", str(self.repo)),
+            session_id=self.snapshot.session_id,
+            branch_name=self.snapshot.branch_name,
+            started_at=self.snapshot.started_at,
+            completed_at=self.snapshot.completed_at,
+            runs=(ExternalExecutionRun(7, "review", "review_requested", 10, 20, "ready", "worker-code", None, {"source": "dispatcher"}),),
+        )
+
+        result = self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7, require_handoff=True)
+
+        self.assertEqual(result["status"], "implementation_reopened")
+        self.assertEqual(result["external_task_id"], "H-1")
+        self.assertEqual(self.ledger.attempt_count(self.ticket_id), 0)
+        self.assertEqual(self.board.reopened[0], "H-1")
+
+    def test_generated_owned_done_with_no_diff_activates_replacement_without_local_attempt(self) -> None:
+        self._make_generated_owned()
+        subprocess.run(("git", "checkout", "--", "app.py"), cwd=self.repo, check=True)
+        self.board.snapshot = ExternalExecutionSnapshot(
+            task=ExternalTicket("H-1", "external", HANDOFF_MARKER, "done", str(self.repo)),
+            session_id=self.snapshot.session_id,
+            branch_name=self.snapshot.branch_name,
+            started_at=self.snapshot.started_at,
+            completed_at=self.snapshot.completed_at,
+            runs=(ExternalExecutionRun(7, "done", "completed", 10, 20, "worker completed", "worker-code", None, {"source": "dispatcher"}),),
+        )
+
+        result = self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7, require_handoff=True)
+
+        self.assertEqual(result["status"], "replacement_activated")
+        self.assertEqual(result["external_task_id"], "H-retry")
+        self.assertEqual(self.ledger.attempt_count(self.ticket_id), 0)
+        self.assertEqual(self.ledger.resolve_external_task_id(self.ticket_id), "H-retry")
+        self.assertIsNone(self.board.repair_created["workspace_path"])
+        self.assertEqual(self.board.repair_activated[0], "H-retry")
+        retry_worktree = self.repo / ".worktrees" / "H-retry"
+        self.assertTrue(retry_worktree.is_dir())
+        retry_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=retry_worktree, text=True, capture_output=True, check=True).stdout.strip()
+        self.assertEqual(retry_head, self.base)
+        stage = self.ledger.connection.execute("SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage='generated-repair-activation-1'", (self.ticket_id,)).fetchone()
+        self.assertIsNotNone(stage)
+        stage_detail = json.loads(stage["detail"])
+        self.assertEqual(stage_detail["recovery_kind"], "premature_done_no_diff")
+        self.assertEqual(stage_detail["base_sha"], self.base)
+        self.assertEqual(stage_detail["workspace_path"], str(retry_worktree.resolve()))
+
+    def test_generated_owned_review_handoff_reconciles_for_local_validation(self) -> None:
+        self._make_generated_owned()
+        self.board.snapshot = ExternalExecutionSnapshot(
+            task=ExternalTicket("H-1", "external", HANDOFF_MARKER, "review", str(self.repo)),
+            session_id=self.snapshot.session_id,
+            branch_name=self.snapshot.branch_name,
+            started_at=self.snapshot.started_at,
+            completed_at=self.snapshot.completed_at,
+            runs=(ExternalExecutionRun(7, "review", "review_requested", 10, 20, "implementation ready for Local First validation", "worker-code", None, {"source": "dispatcher"}),),
+        )
+
+        result = self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7, require_handoff=True)
+
+        self.assertEqual(result["status"], "reconciled")
+        self.assertEqual(result["attempt_number"], 1)
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.IMPLEMENTING.value)
+        claim = self.ledger.claim_next_scheduler_validation("validator", lease_seconds=30, now=100)
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim["ticket_id"], self.ticket_id)
 
     def test_generated_owned_done_with_handoff_marker_reconciles_for_local_validation(self) -> None:
         self._make_generated_owned()

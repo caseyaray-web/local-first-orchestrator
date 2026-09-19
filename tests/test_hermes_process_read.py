@@ -163,6 +163,26 @@ class ProcessReadTests(unittest.TestCase):
   a=HermesBoardAdapter(executable=str(self.exe),board='board',allow_writes=True,runner=runner)
   a.set_state('1',CanonicalState.LOCAL_REVIEW,idempotency_key='K')
   self.assertEqual(calls,[[str(self.exe),'kanban','--board','board','show','1','--json']])
+ def test_handoff_review_is_left_for_local_first_reconciliation(self):
+  calls=[]
+  def runner(argv,**kwargs):
+   calls.append(list(argv))
+   if argv[-1]=='--json':
+    return subprocess.CompletedProcess(argv,0,json.dumps({'task':{'id':'1','title':'x','body':'<!-- local-first-execution-handoff:v1 -->','status':'review','workspace_path':None},'parents':[],'children':[],'comments':[]}), '')
+   return subprocess.CompletedProcess(argv,0,'','')
+  a=HermesBoardAdapter(executable=str(self.exe),board='board',allow_writes=True,runner=runner)
+  a.set_state('1',CanonicalState.LOCAL_REVIEW,idempotency_key='K')
+  self.assertEqual(calls,[[str(self.exe),'kanban','--board','board','show','1','--json']])
+ def test_premature_handoff_done_is_left_for_local_first_reconciliation(self):
+  calls=[]
+  def runner(argv,**kwargs):
+   calls.append(list(argv))
+   if argv[-1]=='--json':
+    return subprocess.CompletedProcess(argv,0,json.dumps({'task':{'id':'1','title':'x','body':'<!-- local-first-execution-handoff:v1 -->','status':'done','workspace_path':None},'parents':[],'children':[],'comments':[]}), '')
+   return subprocess.CompletedProcess(argv,0,'','')
+  a=HermesBoardAdapter(executable=str(self.exe),board='board',allow_writes=True,runner=runner)
+  a.set_state('1',CanonicalState.LOCAL_REVIEW,idempotency_key='K')
+  self.assertEqual(calls,[[str(self.exe),'kanban','--board','board','show','1','--json']])
  def test_done_projection_promotes_scheduled_task_before_complete(self):
   calls=[]
   def runner(argv,**kwargs):

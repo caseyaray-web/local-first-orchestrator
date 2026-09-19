@@ -6,9 +6,10 @@ HANDOFF_BLOCK_KIND = "needs_input"
 
 HANDOFF_INSTRUCTIONS = f"""{HANDOFF_MARKER}
 Local First owns validation, review, integration, and final completion for this task.
-Implement and test the contract in the assigned workspace, but DO NOT mark this Hermes task done/complete.
-When implementation is ready for Local First validation, block this task with kind `{HANDOFF_BLOCK_KIND}` and reason exactly `{HANDOFF_SENTINEL}`.
-Do not unblock or complete the task yourself after that handoff.
+Implement and test the contract in the assigned workspace. When implementation is ready for Local First validation, move this Hermes task to Review with `hermes kanban request-review`.
+Review is an implementation handoff only: do not claim that Local First validation, independent review, integration, or final completion has passed.
+If the task is accidentally marked Done instead, Local First will treat that only as a recoverable implementation handoff and will still run its own validation and review gates.
+Legacy recovery marker: `{HANDOFF_SENTINEL}`.
 """
 
 
