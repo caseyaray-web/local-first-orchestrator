@@ -7903,12 +7903,28 @@ class Ledger:
             "SELECT * FROM validation_recovery_archives WHERE ticket_id=? AND attempt_number=? AND terminal_generation=? ORDER BY archive_kind",
             (ticket_id, attempt_number, terminal_generation),
         ).fetchall()
+        triage_claim = conn.execute(
+            "SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?",
+            (ticket_id, f"triage:{attempt_number}"),
+        ).fetchone()
+        feedback = conn.execute(
+            "SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?",
+            (ticket_id, f"triage-feedback-{attempt_number}"),
+        ).fetchone()
         if route_stage is None and route_claim is None:
+            if triage_claim is not None or feedback is not None:
+                raise ValueError("validation controller-defect recovery downstream routing lineage is incomplete")
             if not archive_rows:
                 return []
             return [str(row["archive_id"]) for row in archive_rows]
         if route_stage is None or route_claim is None:
             raise ValueError("validation controller-defect recovery downstream routing lineage is incomplete")
+        try:
+            route_attempt = int(route_stage["attempt_number"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("validation controller-defect recovery downstream routing lineage conflicts") from exc
+        if route_attempt != attempt_number:
+            raise ValueError("validation controller-defect recovery downstream routing lineage conflicts")
         if (
             str(route_claim["status"]) != "completed"
             or route_claim["side_effect_started_at"] is None
@@ -7924,42 +7940,46 @@ class Ledger:
             route_result = json.loads(str(route_claim["result_json"]))
         except (TypeError, json.JSONDecodeError) as exc:
             raise ValueError("validation controller-defect recovery downstream routing is malformed") from exc
-        compact_evidence = str(validation_record.get("compact_evidence") or "")
+        compact_evidence = validation_record.get("compact_evidence")
+        if not isinstance(compact_evidence, str) or not compact_evidence:
+            raise ValueError("validation controller-defect recovery terminal validation evidence is malformed")
         expected_fingerprint = _stable_scheduler_failure_fingerprint(ticket_id, "validation", compact_evidence)
         if str(terminal_failure_fingerprint) != expected_fingerprint:
             raise ValueError("validation controller-defect recovery terminal failure lineage conflicts")
         if (
-            route_detail != route_result
+            not isinstance(route_detail, dict)
+            or not isinstance(route_result, dict)
+            or route_detail != route_result
             or route_detail.get("ticket_id") != ticket_id
             or int(route_detail.get("attempt_number") or 0) != attempt_number
             or route_detail.get("source") != "validation"
             or route_detail.get("action") != "triage"
             or route_detail.get("failure_fingerprint") != expected_fingerprint
+            or route_detail.get("failure_evidence") != compact_evidence
             or not str(route_detail.get("failure_evidence") or "").strip()
         ):
             raise ValueError("validation controller-defect recovery downstream routing lineage conflicts")
 
-        feedback = conn.execute(
-            "SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?",
-            (ticket_id, f"triage-feedback-{attempt_number}"),
-        ).fetchone()
+
         if feedback is not None:
             try:
                 feedback_detail = json.loads(str(feedback["detail"]))
             except (TypeError, json.JSONDecodeError) as exc:
                 raise ValueError("validation controller-defect recovery triage feedback is malformed") from exc
+            try:
+                feedback_attempt = int(feedback["attempt_number"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("validation controller-defect recovery triage feedback lineage conflicts") from exc
             if (
-                feedback_detail.get("ticket_id") != ticket_id
+                feedback_attempt != attempt_number
+                or not isinstance(feedback_detail, dict)
+                or feedback_detail.get("ticket_id") != ticket_id
                 or int(feedback_detail.get("attempt_number") or 0) != attempt_number
                 or feedback_detail.get("failure_fingerprint") != expected_fingerprint
                 or not str(feedback_detail.get("feedback") or "").strip()
             ):
                 raise ValueError("validation controller-defect recovery triage feedback lineage conflicts")
 
-        triage_claim = conn.execute(
-            "SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?",
-            (ticket_id, f"triage:{attempt_number}"),
-        ).fetchone()
         if triage_claim is not None:
             if (
                 str(triage_claim["status"]) != "completed"
@@ -7977,10 +7997,25 @@ class Ledger:
                 triage_result = json.loads(str(triage_claim["result_json"]))
             except (TypeError, json.JSONDecodeError) as exc:
                 raise ValueError("validation controller-defect recovery downstream triage is malformed") from exc
+            if not isinstance(triage_identity, dict) or not isinstance(triage_result, dict):
+                raise ValueError("validation controller-defect recovery downstream triage is malformed")
+            policy_hash = triage_identity.get("triage_execution_policy_hash")
+            if not isinstance(policy_hash, str) or not policy_hash:
+                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None:
+                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
+            expected_triage_identity = self._triage_claim_identity(
+                ticket,
+                attempt_number=attempt_number,
+                failure_evidence=compact_evidence,
+                triage_execution_policy_hash=policy_hash,
+            )
             if (
-                triage_identity.get("ticket_id") != ticket_id
-                or int(triage_identity.get("attempt_number") or 0) != attempt_number
-                or triage_result.get("candidate_identity") != triage_identity
+                triage_identity != expected_triage_identity
+                or triage_result.get("candidate_identity") != expected_triage_identity
+                or triage_result.get("ticket_id") != ticket_id
+                or int(triage_result.get("attempt_number") or 0) != attempt_number
             ):
                 raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
 
@@ -8034,6 +8069,7 @@ class Ledger:
                 )
             archive_ids.append(archive_id)
 
+        self._inject_failure("after_validation_recovery_downstream_archive")
         conn.execute("DELETE FROM scheduler_stage_claims WHERE claim_id=?", (route_claim["claim_id"],))
         conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, route_stage_name))
         if triage_claim is not None:

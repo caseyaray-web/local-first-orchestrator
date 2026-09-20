@@ -77,6 +77,22 @@ class RecoveryReviewModel:
         return type("ReviewResult", (), {"payload": payload, "artifact_path": self.artifact_path})()
 
 
+class RecoveryFailingReviewModel(RecoveryReviewModel):
+    def __init__(self, verdict: str) -> None:
+        self.verdict = verdict
+
+    def invoke(self, purpose: str, packet: str, *, artifact_dir: Path, workdir: Path | None = None) -> object:
+        self.artifact_path = artifact_dir / f"{purpose}-result.json"
+        payload = {
+            "verdict": self.verdict,
+            "criterion_results": [{"criterion_id": "AC-1", "status": "fail", "evidence": "review found a bounded defect"}],
+            "findings": [{"severity": "blocking", "criterion_id": "AC-1", "file": "app.py", "symbol": "value", "evidence": "review found a bounded defect", "minimal_repair": "fix value", "verification": "run configured test", "fingerprint_input": f"recovered review {self.verdict}"}],
+            "suggestions": [],
+        }
+        self.artifact_path.write_text(json.dumps({"provider": self.provider, "model": self.model, "payload": payload}, sort_keys=True), encoding="utf-8")
+        return type("ReviewResult", (), {"payload": payload, "artifact_path": self.artifact_path})()
+
+
 class HermesExecutionReconciliationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = TemporaryDirectory()
@@ -632,6 +648,48 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
         self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.ACCEPTED.value)
         self.assertEqual(reconciled["diff_hash"], identity["implementation_diff_hash"])
 
+        def integrate(ticket_id: str) -> dict[str, object]:
+            claim = self.ledger.connection.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage LIKE 'git_integration:%' AND status='claimed'", (ticket_id,)).fetchone()
+            assert claim is not None
+            candidate_identity = json.loads(str(claim["candidate_identity_json"]))
+            self.ledger.start_git_commit_intent(ticket_id, candidate_identity, now=201)
+            subprocess.run(("git", "add", "app.py"), cwd=self.repo, check=True)
+            subprocess.run(("git", "commit", "-qm", str(candidate_identity["commit_message"])), cwd=self.repo, check=True)
+            commit_sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=self.repo, text=True, capture_output=True, check=True).stdout.strip()
+            return {"candidate_identity": candidate_identity, "commit_sha": commit_sha, "integration_head_before": str(candidate_identity["base_sha"]), "integration_head_after": commit_sha}
+
+        integration_scheduler = ProcessNextScheduler(
+            self.ledger,
+            self.board,
+            worker_id="integrator",
+            target_ticket_id=self.ticket_id,
+            lease_seconds=60,
+            clock=lambda: 201,
+            git_integration_runner=integrate,
+        )
+        integrated = None
+        for _ in range(5):
+            candidate = integration_scheduler.process_next()
+            if candidate.stage == "git_integration":
+                integrated = candidate
+                break
+            self.assertIn(candidate.stage, {"state_projection", "evidence_comment"})
+        self.assertIsNotNone(integrated)
+        assert integrated is not None
+        self.assertEqual((integrated.status, integrated.stage, integrated.ticket_id), ("completed", "git_integration", self.ticket_id))
+        completed = None
+        for _ in range(5):
+            candidate = integration_scheduler.process_next()
+            if candidate.stage == "completion":
+                completed = candidate
+                break
+            self.assertIn(candidate.stage, {"state_projection", "evidence_comment"})
+        self.assertIsNotNone(completed)
+        assert completed is not None
+        self.assertEqual((completed.status, completed.stage, completed.ticket_id), ("completed", "completion", self.ticket_id))
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.DONE.value)
+        self.assertIsNotNone(self.ledger.connection.execute("SELECT 1 FROM git_commit_evidence WHERE ticket_id=?", (self.ticket_id,)).fetchone())
+
     def test_validation_recovery_archive_schema_migrates_idempotently_and_is_immutable(self) -> None:
         self.ledger.migrate()
         self.ledger.connection.execute(
@@ -643,6 +701,279 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
             self.ledger.connection.execute("UPDATE validation_recovery_archives SET reason='changed' WHERE archive_id='schema-archive'")
         with self.assertRaises(sqlite3.IntegrityError):
             self.ledger.connection.execute("DELETE FROM validation_recovery_archives WHERE archive_id='schema-archive'")
+
+    def _prepare_stale_validation_recovery(self, *, with_triage_claim: bool = False) -> dict[str, object]:
+        """Build one temporary, production-shaped stale-routing recovery case."""
+        self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7)
+        validation_claim = self.ledger.claim_next_scheduler_validation("validator", lease_seconds=60, now=100, ticket_id=self.ticket_id)
+        self.assertIsNotNone(validation_claim)
+        assert validation_claim is not None
+        validation_claim_id = str(validation_claim["claim_id"])
+        self.ledger.begin_scheduler_claim_effect(validation_claim_id, "validator", now=100)
+        identity = json.loads(str(validation_claim["candidate_identity_json"]))
+        false_artifact = self.root / "matrix-false-validation.json"
+        false_artifact.write_text(json.dumps({"errors": ["obsolete validator false positive"]}, sort_keys=True), encoding="utf-8")
+        false_sha = hashlib.sha256(false_artifact.read_bytes()).hexdigest()
+        false_result = {
+            "candidate_identity": identity,
+            "passed": False,
+            "compact_evidence": "obsolete validator false positive",
+            "validation_artifact": str(false_artifact),
+            "validation_artifact_sha256": false_sha,
+            "review_diff": str(_isolated_candidate_diff(self.repo, self.base)["diff"]),
+            "review_selected_files": {"app.py": str(_isolated_candidate_diff(self.repo, self.base)["diff"])},
+        }
+        self.ledger.record_runtime_stage(self.ticket_id, "validation-1", json.dumps(false_result, sort_keys=True), attempt_number=1, artifact_path=str(false_artifact), artifact_sha256=false_sha, base_sha=self.base)
+        self.ledger.record_runtime_stage(self.ticket_id, "validation_completed", json.dumps(false_result, sort_keys=True), attempt_number=1, artifact_path=str(false_artifact), artifact_sha256=false_sha, base_sha=self.base)
+        validation_claim_result = {
+            "ticket_id": self.ticket_id,
+            "candidate_identity": identity,
+            "passed": False,
+            "compact_evidence": false_result["compact_evidence"],
+            "validation_artifact": str(false_artifact),
+            "validation_artifact_sha256": false_sha,
+            "replayed": False,
+        }
+        self.ledger.complete_scheduler_validation_effect(validation_claim_id, "validator", validation_claim_result, now=101)
+        self.ledger.complete_scheduler_claim(validation_claim_id, "validator", validation_claim_result, now=101)
+        self.ledger.connection.execute("UPDATE tickets SET max_attempts=1 WHERE id=?", (self.ticket_id,))
+        routing_claim = self.ledger.claim_next_scheduler_repair_routing("router", lease_seconds=60, now=110, ticket_id=self.ticket_id)
+        self.assertIsNotNone(routing_claim)
+        assert routing_claim is not None
+        routing_claim_id = str(routing_claim["claim_id"])
+        proposed = self.ledger.plan_scheduler_repair_routing_effect(routing_claim_id, "router", now=110)
+        self.ledger.begin_scheduler_claim_effect(routing_claim_id, "router", now=110)
+        routed = self.ledger.apply_scheduler_repair_routing_effect(routing_claim_id, "router", now=111)
+        routing_result = json.loads(str(routed["result_json"]))
+        self.ledger.complete_scheduler_claim(routing_claim_id, "router", routing_result, now=111)
+        self.ledger.record_terminal_unresolvable(
+            self.ticket_id,
+            attempt_number=1,
+            failure_fingerprint=str(proposed["failure_fingerprint"]),
+            reason="attempt limit reached after deterministic validation failure",
+            summary={"deterministic_failure": {"source": "validation", "attempt_number": 1, "failure_evidence": false_result["compact_evidence"]}},
+            notification_target="mattermost:ops",
+        )
+        if with_triage_claim:
+            policy_hash = "triage-policy-for-matrix"
+            ticket = self.ledger.get_ticket(self.ticket_id)
+            triage_identity = self.ledger._triage_claim_identity(ticket, attempt_number=1, failure_evidence=str(routing_result["failure_evidence"]), triage_execution_policy_hash=policy_hash)
+            encoded_identity = json.dumps(triage_identity, sort_keys=True, separators=(",", ":"))
+            triage_result = {"ticket_id": self.ticket_id, "attempt_number": 1, "candidate_identity": triage_identity}
+            now = 112
+            self.ledger.connection.execute(
+                "INSERT INTO scheduler_stage_claims(claim_id,ticket_id,stage,status,lease_owner,lease_expires_at,attempt_count,result_json,side_effect_started_at,side_effect_completed_at,finalized_at,candidate_identity_json,created_at,updated_at) VALUES (?,?,?,'completed',NULL,NULL,1,?,?,?,?,?,?,?)",
+                ("matrix-triage-claim", self.ticket_id, "triage:1", json.dumps(triage_result, sort_keys=True, separators=(",", ":")), now, now, now, encoded_identity, now, now),
+            )
+        self.ledger.pause("operator", reason="matrix recovery")
+        return {"routing_result": routing_result, "routing_claim_id": routing_claim_id, "triage_policy_hash": "triage-policy-for-matrix"}
+
+    def _recovery_state_snapshot(self) -> dict[str, object]:
+        tables = {
+            "ticket": "SELECT * FROM tickets WHERE id=?",
+            "claims": "SELECT * FROM scheduler_stage_claims WHERE ticket_id=? ORDER BY claim_id",
+            "stages": "SELECT * FROM runtime_stages WHERE ticket_id=? ORDER BY stage",
+            "archives": "SELECT * FROM validation_recovery_archives WHERE ticket_id=? ORDER BY archive_id",
+            "events": "SELECT * FROM events WHERE entity_type='ticket' AND entity_id=? ORDER BY id",
+            "terminal": "SELECT * FROM terminal_ticket_failures WHERE ticket_id=?",
+        }
+        snapshot: dict[str, object] = {}
+        for name, query in tables.items():
+            rows = self.ledger.connection.execute(query, (self.ticket_id,)).fetchall()
+            snapshot[name] = [tuple(row) for row in rows]
+        return snapshot
+
+    def _attempt_matrix_recovery(self) -> dict[str, object]:
+        return self.controller.recover_terminal_validation_controller_defect(
+            self.ticket_id,
+            1,
+            repository=self.repo,
+            operator_id="operator",
+            reason="matrix validator correction",
+        )
+
+    def test_recovery_rejects_runtime_route_attempt_mismatch_without_mutation(self) -> None:
+        self._prepare_stale_validation_recovery()
+        self.ledger.connection.execute("UPDATE runtime_stages SET attempt_number=2 WHERE ticket_id=? AND stage='repair-routing-1'", (self.ticket_id,))
+        before = self._recovery_state_snapshot()
+        with self.assertRaisesRegex(ValueError, "routing lineage"):
+            self._attempt_matrix_recovery()
+        self.assertEqual(before, self._recovery_state_snapshot())
+
+    def test_recovery_rejects_triage_canonical_identity_mismatch_without_mutation(self) -> None:
+        self._prepare_stale_validation_recovery(with_triage_claim=True)
+        self.ledger.connection.execute("UPDATE scheduler_stage_claims SET candidate_identity_json=? WHERE claim_id='matrix-triage-claim'", (json.dumps({"ticket_id": self.ticket_id, "attempt_number": 1, "parent_depth": 999, "unresolved_criteria": [], "failure_evidence_hash": "x", "ticket_policy_hash": "x", "triage_execution_policy_hash": "triage-policy-for-matrix"}, sort_keys=True, separators=(",", ":")),))
+        before = self._recovery_state_snapshot()
+        with self.assertRaisesRegex(ValueError, "triage lineage"):
+            self._attempt_matrix_recovery()
+        self.assertEqual(before, self._recovery_state_snapshot())
+
+    def test_recovery_rejects_triage_failure_evidence_hash_mismatch_without_mutation(self) -> None:
+        self._prepare_stale_validation_recovery(with_triage_claim=True)
+        claim = self.ledger.connection.execute("SELECT candidate_identity_json FROM scheduler_stage_claims WHERE claim_id='matrix-triage-claim'").fetchone()
+        identity = json.loads(str(claim["candidate_identity_json"]))
+        identity["failure_evidence_hash"] = "0" * 64
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        self.ledger.connection.execute("UPDATE scheduler_stage_claims SET candidate_identity_json=?,result_json=? WHERE claim_id='matrix-triage-claim'", (encoded, json.dumps({"candidate_identity": identity}, sort_keys=True, separators=(",", ":"))))
+        before = self._recovery_state_snapshot()
+        with self.assertRaisesRegex(ValueError, "triage lineage"):
+            self._attempt_matrix_recovery()
+        self.assertEqual(before, self._recovery_state_snapshot())
+
+    def test_recovery_rejects_cross_ticket_route_evidence_without_mutation(self) -> None:
+        self._prepare_stale_validation_recovery()
+        route = self.ledger.connection.execute("SELECT detail FROM runtime_stages WHERE ticket_id=? AND stage='repair-routing-1'", (self.ticket_id,)).fetchone()
+        detail = json.loads(str(route["detail"]))
+        detail["ticket_id"] = "other-ticket"
+        self.ledger.connection.execute("UPDATE runtime_stages SET detail=? WHERE ticket_id=? AND stage='repair-routing-1'", (json.dumps(detail, sort_keys=True, separators=(",", ":")), self.ticket_id))
+        before = self._recovery_state_snapshot()
+        with self.assertRaisesRegex(ValueError, "routing lineage"):
+            self._attempt_matrix_recovery()
+        self.assertEqual(before, self._recovery_state_snapshot())
+
+    def test_recovery_rejects_leased_triage_claim_without_mutation(self) -> None:
+        self._prepare_stale_validation_recovery(with_triage_claim=True)
+        self.ledger.connection.execute("UPDATE scheduler_stage_claims SET lease_owner='leased',lease_expires_at=999 WHERE claim_id='matrix-triage-claim'")
+        before = self._recovery_state_snapshot()
+        with self.assertRaisesRegex(ValueError, "active or incomplete downstream triage"):
+            self._attempt_matrix_recovery()
+        self.assertEqual(before, self._recovery_state_snapshot())
+
+    def test_recovery_rejects_malformed_route_json_without_mutation(self) -> None:
+        self._prepare_stale_validation_recovery()
+        self.ledger.connection.execute("UPDATE runtime_stages SET detail='{bad json' WHERE ticket_id=? AND stage='repair-routing-1'", (self.ticket_id,))
+        before = self._recovery_state_snapshot()
+        with self.assertRaisesRegex(ValueError, "routing is malformed"):
+            self._attempt_matrix_recovery()
+        self.assertEqual(before, self._recovery_state_snapshot())
+
+    def test_recovery_rejects_partial_route_claim_and_stage_without_mutation(self) -> None:
+        self._prepare_stale_validation_recovery()
+        self.ledger.connection.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage='repair-routing-1'", (self.ticket_id,))
+        before = self._recovery_state_snapshot()
+        with self.assertRaisesRegex(ValueError, "lineage is incomplete"):
+            self._attempt_matrix_recovery()
+        self.assertEqual(before, self._recovery_state_snapshot())
+
+    def test_recovery_archive_insertion_rolls_back_before_release(self) -> None:
+        self._prepare_stale_validation_recovery(with_triage_claim=True)
+        before = self._recovery_state_snapshot()
+        self.ledger.failure_injector = lambda point: (_ for _ in ()).throw(RuntimeError("injected archive failure")) if point == "after_validation_recovery_downstream_archive" else None
+        with self.assertRaisesRegex(RuntimeError, "injected archive failure"):
+            self._attempt_matrix_recovery()
+        self.assertEqual(before, self._recovery_state_snapshot())
+
+    def test_completed_dependent_triage_claim_is_archived_with_canonical_identity(self) -> None:
+        self._prepare_stale_validation_recovery(with_triage_claim=True)
+        recovered = self._attempt_matrix_recovery()
+        self.assertEqual(recovered["archived_downstream_identities"], [str(row[0]) for row in self.ledger.connection.execute("SELECT archive_id FROM validation_recovery_archives WHERE ticket_id=? ORDER BY archive_kind", (self.ticket_id,)).fetchall()])
+        kinds = [row[0] for row in self.ledger.connection.execute("SELECT archive_kind FROM validation_recovery_archives WHERE ticket_id=? ORDER BY archive_kind", (self.ticket_id,)).fetchall()]
+        self.assertEqual(kinds, ["repair_routing_claim", "repair_routing_stage", "triage_claim"])
+        self.assertIsNone(self.ledger.connection.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND stage='triage:1'", (self.ticket_id,)).fetchone())
+        archived = self.ledger.connection.execute("SELECT source_claim_result_json,source_claim_snapshot_json FROM validation_recovery_archives WHERE ticket_id=? AND archive_kind='triage_claim'", (self.ticket_id,)).fetchone()
+        self.assertIsNotNone(archived)
+        assert archived is not None
+        result_identity = json.loads(str(archived["source_claim_result_json"]))["candidate_identity"]
+        snapshot_identity = json.loads(str(json.loads(str(archived["source_claim_snapshot_json"]))["candidate_identity_json"]))
+        self.assertEqual(result_identity, snapshot_identity)
+
+    def test_exact_recovery_replay_keeps_downstream_archives_byte_identical(self) -> None:
+        self._prepare_stale_validation_recovery(with_triage_claim=True)
+        self._attempt_matrix_recovery()
+        before = [tuple(row) for row in self.ledger.connection.execute("SELECT * FROM validation_recovery_archives WHERE ticket_id=? ORDER BY archive_id", (self.ticket_id,)).fetchall()]
+        replayed = self.controller.recover_terminal_validation_controller_defect(self.ticket_id, 1, repository=self.repo, operator_id="operator", reason="matrix validator correction")
+        after = [tuple(row) for row in self.ledger.connection.execute("SELECT * FROM validation_recovery_archives WHERE ticket_id=? ORDER BY archive_id", (self.ticket_id,)).fetchall()]
+        self.assertTrue(replayed["replayed"])
+        self.assertEqual(before, after)
+
+    def _run_recovered_review_variant(self, *, verdict: str, max_attempts: int) -> dict[str, object]:
+        self._prepare_stale_validation_recovery()
+        self._attempt_matrix_recovery()
+        self.ledger.connection.execute("UPDATE tickets SET max_attempts=? WHERE id=?", (max_attempts, self.ticket_id))
+        self.ledger.resume("operator", reason="run recovered review variant")
+        review_model = RecoveryFailingReviewModel(verdict)
+        review_controller = LocalFirstController(self.ledger, self.board, self.controller.config, local_model=review_model)  # type: ignore[arg-type]
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            self.board,
+            worker_id="recovered-reviewer",
+            target_ticket_id=self.ticket_id,
+            lease_seconds=60,
+            clock=lambda: 200,
+            review_runner=lambda ticket_id: review_controller.execute_fresh_review_only(ticket_id, repository=self.repo),
+            review_execution_policy_hash=review_controller.review_execution_policy_hash(),
+        )
+        for _ in range(4):
+            if preview_next(self.ledger, now=200).next_stage == "review":
+                break
+            projection = scheduler.process_next()
+            self.assertIn(projection.stage, {"state_projection", "evidence_comment"})
+        review_preview = preview_next(self.ledger, now=200)
+        self.assertEqual((review_preview.next_stage, review_preview.ticket_id), ("review", self.ticket_id))
+        review_result = scheduler.process_next()
+        self.assertEqual((review_result.status, review_result.stage), ("completed", "review"))
+        routing_preview = preview_next(self.ledger, now=200)
+        self.assertEqual((routing_preview.next_stage, routing_preview.ticket_id), ("repair_routing", self.ticket_id))
+        routing_result = scheduler.process_next()
+        self.assertEqual((routing_result.status, routing_result.stage), ("completed", "repair_routing"))
+        route = self.ledger.runtime_stage(self.ticket_id, "repair-routing-1")
+        self.assertIsNotNone(route)
+        assert route is not None
+        return json.loads(str(route["detail"]))
+
+    def test_recovered_failing_review_routes_repair_without_archived_identity_collision(self) -> None:
+        decision = self._run_recovered_review_variant(verdict="repair", max_attempts=2)
+        self.assertEqual((decision["source"], decision["action"]), ("review", "repair"))
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.REPAIRING.value)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM validation_recovery_archives WHERE ticket_id=?", (self.ticket_id,)).fetchone()[0], 2)
+
+    def test_recovered_failing_review_routes_triage_without_archived_identity_collision(self) -> None:
+        decision = self._run_recovered_review_variant(verdict="escalate", max_attempts=1)
+        self.assertEqual((decision["source"], decision["action"]), ("review", "triage"))
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.NEEDS_TRIAGE.value)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM validation_recovery_archives WHERE ticket_id=?", (self.ticket_id,)).fetchone()[0], 2)
+
+    def test_recovery_rejects_route_claim_result_disagreement_without_mutation(self) -> None:
+        self._prepare_stale_validation_recovery()
+        claim = self.ledger.connection.execute("SELECT result_json FROM scheduler_stage_claims WHERE ticket_id=? AND stage='repair_routing:1'", (self.ticket_id,)).fetchone()
+        result = json.loads(str(claim["result_json"]))
+        result["failure_evidence"] = "different routing evidence"
+        self.ledger.connection.execute("UPDATE scheduler_stage_claims SET result_json=? WHERE ticket_id=? AND stage='repair_routing:1'", (json.dumps(result, sort_keys=True, separators=(",", ":")), self.ticket_id))
+        before = self._recovery_state_snapshot()
+        with self.assertRaisesRegex(ValueError, "downstream routing"):
+            self._attempt_matrix_recovery()
+        self.assertEqual(before, self._recovery_state_snapshot())
+
+    def test_recovery_rejects_active_route_claim_without_mutation(self) -> None:
+        self._prepare_stale_validation_recovery()
+        self.ledger.connection.execute("UPDATE scheduler_stage_claims SET lease_owner='leased',lease_expires_at=999 WHERE ticket_id=? AND stage='repair_routing:1'", (self.ticket_id,))
+        before = self._recovery_state_snapshot()
+        with self.assertRaisesRegex(ValueError, "active or incomplete downstream routing"):
+            self._attempt_matrix_recovery()
+        self.assertEqual(before, self._recovery_state_snapshot())
+
+    def test_recovery_rejects_malformed_triage_claim_json_without_mutation(self) -> None:
+        self._prepare_stale_validation_recovery(with_triage_claim=True)
+        self.ledger.connection.execute("UPDATE scheduler_stage_claims SET candidate_identity_json='{bad json' WHERE claim_id='matrix-triage-claim'")
+        before = self._recovery_state_snapshot()
+        with self.assertRaisesRegex(ValueError, "downstream triage is malformed"):
+            self._attempt_matrix_recovery()
+        self.assertEqual(before, self._recovery_state_snapshot())
+
+    def test_recovery_migrates_actual_legacy_ledger_without_rewriting_rows(self) -> None:
+        legacy_path = self.root / "legacy-pre-recovery.db"
+        legacy = Ledger(legacy_path)
+        legacy.migrate()
+        legacy.connection.execute("INSERT INTO tickets(id,title,state,created_at,updated_at) VALUES ('legacy-ticket','legacy','draft',1,1)")
+        legacy.connection.execute("DROP TRIGGER validation_recovery_archives_immutable_update")
+        legacy.connection.execute("DROP TRIGGER validation_recovery_archives_immutable_delete")
+        legacy.connection.execute("DROP TABLE validation_recovery_archives")
+        legacy.close()
+        migrated = Ledger(legacy_path)
+        migrated.migrate()
+        self.assertEqual(migrated.connection.execute("SELECT title FROM tickets WHERE id='legacy-ticket'").fetchone()[0], "legacy")
+        self.assertIsNotNone(migrated.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='validation_recovery_archives'").fetchone())
+        migrated.close()
 
     def test_terminal_retry_reuses_preallocated_attempt_without_fresh_repair_route(self) -> None:
         self._seed_generated_repair_attempt_two()
