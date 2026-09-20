@@ -415,8 +415,17 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
             artifact_sha256=false_sha,
             base_sha=self.base,
         ))
-        self.ledger.complete_scheduler_validation_effect(str(claim["claim_id"]), "validator", false_result, now=101)
-        self.ledger.complete_scheduler_claim(str(claim["claim_id"]), "validator", false_result, now=101)
+        claim_result = {
+            "ticket_id": self.ticket_id,
+            "candidate_identity": identity,
+            "passed": False,
+            "compact_evidence": false_result["compact_evidence"],
+            "validation_artifact": str(false_artifact),
+            "validation_artifact_sha256": false_sha,
+            "replayed": False,
+        }
+        self.ledger.complete_scheduler_validation_effect(str(claim["claim_id"]), "validator", claim_result, now=101)
+        self.ledger.complete_scheduler_claim(str(claim["claim_id"]), "validator", claim_result, now=101)
         self.ledger.record_terminal_unresolvable(
             self.ticket_id,
             attempt_number=1,

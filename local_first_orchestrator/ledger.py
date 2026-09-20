@@ -7938,7 +7938,16 @@ class Ledger:
                     completed_claim_result = json.loads(str(claim["result_json"]))
                 except (TypeError, json.JSONDecodeError) as exc:
                     raise ValueError("validation controller-defect recovery completed claim result is malformed") from exc
-                if completed_claim_result != validation_record:
+                expected_completed_result = {
+                    "ticket_id": ticket_id,
+                    "candidate_identity": validation_record.get("candidate_identity"),
+                    "passed": validation_record.get("passed"),
+                    "compact_evidence": validation_record.get("compact_evidence"),
+                    "validation_artifact": validation_record.get("validation_artifact"),
+                    "validation_artifact_sha256": validation_record.get("validation_artifact_sha256"),
+                    "replayed": False,
+                }
+                if completed_claim_result != expected_completed_result:
                     raise ValueError("validation controller-defect recovery completed claim conflicts with failed validation")
             if conn.execute("SELECT 1 FROM review_candidates WHERE ticket_id=? AND attempt_number=? UNION SELECT 1 FROM review_results WHERE ticket_id=? AND attempt_number=? UNION SELECT 1 FROM accepted_evidence WHERE ticket_id=?", (ticket_id, attempt_number, ticket_id, attempt_number, ticket_id)).fetchone() is not None:
                 raise ValueError("validation controller-defect recovery refuses review or acceptance activity")

@@ -2026,7 +2026,16 @@ class LocalFirstController:
                 completed_result = json.loads(str(claim["result_json"]))
             except (TypeError, json.JSONDecodeError) as exc:
                 raise ValueError("validation controller-defect recovery completed claim result is malformed") from exc
-            if completed_result != old_record:
+            expected_completed_result = {
+                "ticket_id": ticket_id,
+                "candidate_identity": old_record.get("candidate_identity"),
+                "passed": old_record.get("passed"),
+                "compact_evidence": old_record.get("compact_evidence"),
+                "validation_artifact": old_record.get("validation_artifact"),
+                "validation_artifact_sha256": old_record.get("validation_artifact_sha256"),
+                "replayed": False,
+            }
+            if completed_result != expected_completed_result:
                 raise ValueError("validation controller-defect recovery completed claim conflicts with failed validation")
         generation = int(terminal["generation"] or 1)
         archive_dir = artifact_root / ticket_id / str(attempt_number) / "controller-defect-archive"
