@@ -1332,6 +1332,10 @@ class LocalFirstController:
                 latest_attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? ORDER BY attempt_number DESC LIMIT 1", (ticket_id,)).fetchone()
                 if latest_attempt is None or not latest_attempt["base_sha"] or not latest_attempt["post_diff_hash"]:
                     raise RuntimeError("terminal manual adoption requires complete prior attempt provenance")
+                latest_branch = str(latest_attempt["branch"] or "")
+                if not latest_branch.startswith("wt/") or not latest_branch[3:]:
+                    raise RuntimeError("terminal manual adoption requires native workspace provenance")
+                external_task_id = latest_branch[3:]
                 attempt_number = int(latest_attempt["attempt_number"]) + 1
             else:
                 prior_adoption = self.ledger.connection.execute(

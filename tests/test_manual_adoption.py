@@ -191,6 +191,44 @@ class ManualAdoptionTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(validation_marker["attempt_number"], 2)
 
+    def test_terminal_manual_adoption_uses_latest_attempt_workspace_after_repair_projection(self) -> None:
+        self.ledger.connection.execute(
+            "INSERT INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,post_diff_hash,outcome,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (self.ticket_id, 1, self.base, f"wt/{self.external_id}", str(self.worktree), hashlib.sha256(b"").hexdigest(), "d" * 64, "failed", 1),
+        )
+        self.ledger.connection.execute(
+            "INSERT INTO runtime_stages(ticket_id,stage,attempt_number,detail,base_sha,created_at) VALUES (?,?,?,?,?,?)",
+            (self.ticket_id, "validation_completed", 1, json.dumps({"passed": False}), self.base, 1),
+        )
+        self.ledger.record_terminal_unresolvable(
+            self.ticket_id,
+            attempt_number=1,
+            failure_fingerprint="e" * 64,
+            reason="automatic recovery exhausted",
+            summary={"local_feedback": "manual intervention required"},
+            notification_target="mattermost:ops",
+        )
+        self.ledger.connection.execute(
+            "UPDATE tickets SET external_id=? WHERE id=?",
+            ("repair-projection", self.ticket_id),
+        )
+
+        adopted = self.controller.adopt_existing_implementation(
+            self.ticket_id,
+            repository=self.repo,
+            operator_id="operator",
+            reason="reuse unchanged candidate after validator repair",
+            resolve_terminal=True,
+        )
+
+        self.assertEqual(adopted["attempt_number"], 2)
+        self.assertEqual(adopted["changed_paths"], ["app.py", "test_app.py"])
+        attempt = self.ledger.connection.execute(
+            "SELECT branch,worktree_path FROM attempts WHERE ticket_id=? AND attempt_number=2",
+            (self.ticket_id,),
+        ).fetchone()
+        self.assertEqual((attempt["branch"], attempt["worktree_path"]), (f"wt/{self.external_id}", str(self.worktree)))
+
     def test_terminal_validation_controller_defect_replays_same_manual_candidate(self) -> None:
         self.ledger.connection.execute(
             "INSERT INTO attempts(ticket_id,attempt_number,base_sha,branch,worktree_path,pre_diff_hash,post_diff_hash,outcome,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
