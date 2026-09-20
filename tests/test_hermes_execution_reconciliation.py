@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import sqlite3
 import subprocess
 import unittest
 from pathlib import Path
@@ -13,7 +14,7 @@ from local_first_orchestrator.controller import LocalFirstController, RuntimeCon
 from local_first_orchestrator.execution_handoff import HANDOFF_MARKER, HANDOFF_SENTINEL
 from local_first_orchestrator.hermes_board import ExternalExecutionRun, ExternalExecutionSnapshot, ExternalTicket
 from local_first_orchestrator.ledger import Ledger
-from local_first_orchestrator.scheduler import ProcessNextScheduler
+from local_first_orchestrator.scheduler import ProcessNextScheduler, preview_next
 from local_first_orchestrator.states import CanonicalState
 
 
@@ -55,6 +56,25 @@ class ExecutionBoard:
     def activate_repair_task(self, task_id: str, *, reason: str):
         self.repair_activated = (task_id, reason)
         return ExternalTicket(task_id, "retry", HANDOFF_MARKER, "ready", None)
+
+
+class RecoveryReviewModel:
+    provider = "fixture-provider"
+    model = "fixture-review-model"
+
+    def invoke(self, purpose: str, packet: str, *, artifact_dir: Path, workdir: Path | None = None) -> object:
+        self.artifact_path = artifact_dir / f"{purpose}-result.json"
+        payload = {
+            "verdict": "pass",
+            "criterion_results": [{"criterion_id": "AC-1", "status": "pass", "evidence": "corrected validator"}],
+            "findings": [],
+            "suggestions": [],
+        }
+        self.artifact_path.write_text(
+            json.dumps({"provider": self.provider, "model": self.model, "payload": payload}, sort_keys=True),
+            encoding="utf-8",
+        )
+        return type("ReviewResult", (), {"payload": payload, "artifact_path": self.artifact_path})()
 
 
 class HermesExecutionReconciliationTests(unittest.TestCase):
@@ -469,6 +489,160 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
         self.assertTrue(replayed["replayed"])
         self.assertEqual(self.ledger.attempt_count(self.ticket_id), 1)
         self.assertEqual(reconciled["diff_hash"], identity["implementation_diff_hash"])
+
+    def test_recovered_validation_replays_fresh_review_routing_after_stale_triage(self) -> None:
+        reconciled = self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7)
+        claim = self.ledger.claim_next_scheduler_validation("validator", lease_seconds=60, now=100, ticket_id=self.ticket_id)
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        self.ledger.begin_scheduler_claim_effect(str(claim["claim_id"]), "validator", now=100)
+        identity = json.loads(str(claim["candidate_identity_json"]))
+        false_artifact = self.root / "false-validation-recovery.json"
+        false_artifact.write_text(json.dumps({"errors": ["obsolete validator false positive"]}, sort_keys=True), encoding="utf-8")
+        false_sha = hashlib.sha256(false_artifact.read_bytes()).hexdigest()
+        candidate_diff = str(_isolated_candidate_diff(self.repo, self.base)["diff"])
+        false_result = {
+            "candidate_identity": identity,
+            "passed": False,
+            "compact_evidence": "obsolete validator false positive",
+            "validation_artifact": str(false_artifact),
+            "validation_artifact_sha256": false_sha,
+            "review_diff": candidate_diff,
+            "review_selected_files": {"app.py": candidate_diff},
+        }
+        self.ledger.record_runtime_stage(
+            self.ticket_id,
+            "validation-1",
+            json.dumps(false_result, sort_keys=True),
+            attempt_number=1,
+            artifact_path=str(false_artifact),
+            artifact_sha256=false_sha,
+            base_sha=self.base,
+        )
+        self.ledger.record_runtime_stage(
+            self.ticket_id,
+            "validation_completed",
+            json.dumps(false_result, sort_keys=True),
+            attempt_number=1,
+            artifact_path=str(false_artifact),
+            artifact_sha256=false_sha,
+            base_sha=self.base,
+        )
+        claim_result = {
+            "ticket_id": self.ticket_id,
+            "candidate_identity": identity,
+            "passed": False,
+            "compact_evidence": false_result["compact_evidence"],
+            "validation_artifact": str(false_artifact),
+            "validation_artifact_sha256": false_sha,
+            "replayed": False,
+        }
+        self.ledger.complete_scheduler_validation_effect(str(claim["claim_id"]), "validator", claim_result, now=101)
+        self.ledger.complete_scheduler_claim(str(claim["claim_id"]), "validator", claim_result, now=101)
+        self.ledger.connection.execute("UPDATE tickets SET max_attempts=1 WHERE id=?", (self.ticket_id,))
+        routing_claim = self.ledger.claim_next_scheduler_repair_routing("router", lease_seconds=60, now=110, ticket_id=self.ticket_id)
+        self.assertIsNotNone(routing_claim)
+        assert routing_claim is not None
+        routing_id = str(routing_claim["claim_id"])
+        proposed = self.ledger.plan_scheduler_repair_routing_effect(routing_id, "router", now=110)
+        self.ledger.record_runtime_stage(
+            self.ticket_id,
+            "triage-feedback-1",
+            json.dumps({
+                "ticket_id": self.ticket_id,
+                "attempt_number": 1,
+                "failure_fingerprint": proposed["failure_fingerprint"],
+                "failure_evidence": proposed["failure_evidence"],
+                "feedback": "obsolete validator false positive was escalated",
+            }, sort_keys=True, separators=(",", ":")),
+            attempt_number=1,
+        )
+        self.ledger.begin_scheduler_claim_effect(routing_id, "router", now=110)
+        routed = self.ledger.apply_scheduler_repair_routing_effect(routing_id, "router", now=111)
+        self.ledger.complete_scheduler_claim(routing_id, "router", json.loads(str(routed["result_json"])), now=111)
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.NEEDS_TRIAGE.value)
+        self.assertEqual(json.loads(str(self.ledger.runtime_stage(self.ticket_id, "repair-routing-1")["detail"]))["action"], "triage")
+        self.ledger.record_terminal_unresolvable(
+            self.ticket_id,
+            attempt_number=1,
+            failure_fingerprint=str(proposed["failure_fingerprint"]),
+            reason="attempt limit reached after deterministic validation failure",
+            summary={"deterministic_failure": {"source": "validation", "attempt_number": 1, "failure_evidence": "obsolete validator false positive"}},
+            notification_target="mattermost:ops",
+        )
+        self.ledger.pause("operator", reason="recover corrected validator")
+        recovered = self.controller.recover_terminal_validation_controller_defect(
+            self.ticket_id,
+            1,
+            repository=self.repo,
+            operator_id="operator",
+            reason="validator false positive corrected",
+        )
+        self.assertEqual(recovered["state"], CanonicalState.LOCAL_REVIEW.value)
+        archive_rows = self.ledger.connection.execute(
+            "SELECT archive_kind,source_claim_id,source_runtime_stage FROM validation_recovery_archives WHERE ticket_id=? AND attempt_number=1 ORDER BY archive_kind",
+            (self.ticket_id,),
+        ).fetchall()
+        self.assertEqual([row["archive_kind"] for row in archive_rows], ["repair_routing_claim", "repair_routing_stage", "triage_feedback_stage"])
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM scheduler_stage_claims WHERE ticket_id=? AND stage='repair_routing:1'", (self.ticket_id,)).fetchone()[0], 0)
+        self.assertIsNone(self.ledger.runtime_stage(self.ticket_id, "repair-routing-1"))
+        self.assertIsNone(self.ledger.runtime_stage(self.ticket_id, "triage-feedback-1"))
+        self.ledger.resume("operator", reason="run temporary recovery regression")
+
+        review_model = RecoveryReviewModel()
+        review_controller = LocalFirstController(self.ledger, self.board, self.controller.config, local_model=review_model)
+        scheduler = ProcessNextScheduler(
+            self.ledger,
+            self.board,
+            worker_id="reviewer",
+            target_ticket_id=self.ticket_id,
+            lease_seconds=60,
+            clock=lambda: 200,
+            review_runner=lambda ticket_id: review_controller.execute_fresh_review_only(ticket_id, repository=self.repo),
+            review_execution_policy_hash=review_controller.review_execution_policy_hash(),
+            acceptance_runner=lambda ticket_id: review_controller.inspect_acceptance_candidate_only(ticket_id, repository=self.repo),
+        )
+        for _ in range(4):
+            if preview_next(self.ledger, now=200).next_stage == "review":
+                break
+            projection_result = scheduler.process_next()
+            self.assertIn(projection_result.stage, {"state_projection", "evidence_comment"})
+        else:
+            self.fail("temporary recovery did not reach fresh review")
+        self.assertEqual(preview_next(self.ledger, now=200).next_stage, "review")
+
+        review_result = scheduler.process_next()
+        self.assertEqual((review_result.status, review_result.stage, review_result.ticket_id), ("completed", "review", self.ticket_id))
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM review_results WHERE ticket_id=? AND attempt_number=1", (self.ticket_id,)).fetchone()[0], 0)
+        self.assertEqual(preview_next(self.ledger, now=200).next_stage, "repair_routing")
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM scheduler_stage_claims WHERE ticket_id=? AND stage='repair_routing:1'", (self.ticket_id,)).fetchone()[0], 0)
+        routed_review = scheduler.process_next()
+        self.assertEqual((routed_review.status, routed_review.stage, routed_review.ticket_id), ("completed", "repair_routing", self.ticket_id))
+        review_row = self.ledger.connection.execute("SELECT verdict FROM review_results WHERE ticket_id=? AND attempt_number=1", (self.ticket_id,)).fetchone()
+        self.assertEqual(review_row["verdict"], "pass")
+        routing_detail = json.loads(str(self.ledger.runtime_stage(self.ticket_id, "repair-routing-1")["detail"]))
+        self.assertEqual((routing_detail["source"], routing_detail["action"]), ("review", "pass"))
+        self.assertEqual(preview_next(self.ledger, now=200).next_stage, "acceptance")
+        acceptance_result = scheduler.process_next()
+        self.assertEqual((acceptance_result.status, acceptance_result.stage, acceptance_result.ticket_id), ("completed", "acceptance", self.ticket_id))
+        accepted = self.ledger.accepted_candidate(self.ticket_id)
+        self.assertIsNotNone(accepted)
+        assert accepted is not None
+        self.assertEqual(accepted["candidate_fingerprint"], identity["implementation_diff_hash"])
+        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.ACCEPTED.value)
+        self.assertEqual(reconciled["diff_hash"], identity["implementation_diff_hash"])
+
+    def test_validation_recovery_archive_schema_migrates_idempotently_and_is_immutable(self) -> None:
+        self.ledger.migrate()
+        self.ledger.connection.execute(
+            "INSERT INTO validation_recovery_archives(archive_id,ticket_id,attempt_number,terminal_generation,archive_kind,operator_id,reason,created_at) VALUES (?,?,?,?,?,?,?,?)",
+            ("schema-archive", self.ticket_id, 1, 1, "repair_routing_claim", "operator", "schema test", 1),
+        )
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM validation_recovery_archives WHERE archive_id='schema-archive'").fetchone()[0], 1)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.ledger.connection.execute("UPDATE validation_recovery_archives SET reason='changed' WHERE archive_id='schema-archive'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.ledger.connection.execute("DELETE FROM validation_recovery_archives WHERE archive_id='schema-archive'")
 
     def test_terminal_retry_reuses_preallocated_attempt_without_fresh_repair_route(self) -> None:
         self._seed_generated_repair_attempt_two()

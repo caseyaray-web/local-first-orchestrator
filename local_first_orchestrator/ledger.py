@@ -182,6 +182,31 @@ CREATE TABLE IF NOT EXISTS scheduler_stage_claims (
     updated_at INTEGER NOT NULL,
     UNIQUE(ticket_id, stage)
 );
+CREATE TABLE IF NOT EXISTS validation_recovery_archives (
+    archive_id TEXT PRIMARY KEY,
+    ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    attempt_number INTEGER NOT NULL,
+    terminal_generation INTEGER NOT NULL,
+    archive_kind TEXT NOT NULL CHECK(archive_kind IN ('repair_routing_claim', 'repair_routing_stage', 'triage_claim', 'triage_feedback_stage')),
+    source_claim_id TEXT,
+    source_claim_stage TEXT,
+    source_claim_status TEXT,
+    source_claim_snapshot_json TEXT,
+    source_claim_result_json TEXT,
+    source_runtime_stage TEXT,
+    source_runtime_detail TEXT,
+    source_runtime_artifact_path TEXT,
+    source_runtime_artifact_sha256 TEXT,
+    source_runtime_base_sha TEXT,
+    operator_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(ticket_id, attempt_number, terminal_generation, archive_kind)
+);
+CREATE TRIGGER IF NOT EXISTS validation_recovery_archives_immutable_update
+BEFORE UPDATE ON validation_recovery_archives BEGIN SELECT RAISE(ABORT, 'validation recovery archives are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS validation_recovery_archives_immutable_delete
+BEFORE DELETE ON validation_recovery_archives BEGIN SELECT RAISE(ABORT, 'validation recovery archives are append-only'); END;
 CREATE TABLE IF NOT EXISTS features (
     id TEXT PRIMARY KEY,
     external_id TEXT UNIQUE,
@@ -7850,6 +7875,173 @@ class Ledger:
             )
             return {"ticket_id": ticket_id, "state": CanonicalState.REPAIRING.value, **resolution_payload}
 
+    def _archive_validation_recovery_downstream_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        ticket_id: str,
+        attempt_number: int,
+        terminal_generation: int,
+        terminal_failure_fingerprint: str,
+        validation_record: dict[str, Any],
+        operator_id: str,
+        reason: str,
+        now: int,
+    ) -> list[str]:
+        """Retire stale validation routing only after proving its complete lineage."""
+        route_stage_name = f"repair-routing-{attempt_number}"
+        route_claim_stage = f"repair_routing:{attempt_number}"
+        route_stage = conn.execute(
+            "SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?",
+            (ticket_id, route_stage_name),
+        ).fetchone()
+        route_claim = conn.execute(
+            "SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?",
+            (ticket_id, route_claim_stage),
+        ).fetchone()
+        archive_rows = conn.execute(
+            "SELECT * FROM validation_recovery_archives WHERE ticket_id=? AND attempt_number=? AND terminal_generation=? ORDER BY archive_kind",
+            (ticket_id, attempt_number, terminal_generation),
+        ).fetchall()
+        if route_stage is None and route_claim is None:
+            if not archive_rows:
+                return []
+            return [str(row["archive_id"]) for row in archive_rows]
+        if route_stage is None or route_claim is None:
+            raise ValueError("validation controller-defect recovery downstream routing lineage is incomplete")
+        if (
+            str(route_claim["status"]) != "completed"
+            or route_claim["side_effect_started_at"] is None
+            or route_claim["side_effect_completed_at"] is None
+            or route_claim["finalized_at"] is None
+            or route_claim["lease_owner"] is not None
+            or route_claim["lease_expires_at"] is not None
+            or not route_claim["result_json"]
+        ):
+            raise ValueError("validation controller-defect recovery refuses active or incomplete downstream routing")
+        try:
+            route_detail = json.loads(str(route_stage["detail"]))
+            route_result = json.loads(str(route_claim["result_json"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("validation controller-defect recovery downstream routing is malformed") from exc
+        compact_evidence = str(validation_record.get("compact_evidence") or "")
+        expected_fingerprint = _stable_scheduler_failure_fingerprint(ticket_id, "validation", compact_evidence)
+        if str(terminal_failure_fingerprint) != expected_fingerprint:
+            raise ValueError("validation controller-defect recovery terminal failure lineage conflicts")
+        if (
+            route_detail != route_result
+            or route_detail.get("ticket_id") != ticket_id
+            or int(route_detail.get("attempt_number") or 0) != attempt_number
+            or route_detail.get("source") != "validation"
+            or route_detail.get("action") != "triage"
+            or route_detail.get("failure_fingerprint") != expected_fingerprint
+            or not str(route_detail.get("failure_evidence") or "").strip()
+        ):
+            raise ValueError("validation controller-defect recovery downstream routing lineage conflicts")
+
+        feedback = conn.execute(
+            "SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?",
+            (ticket_id, f"triage-feedback-{attempt_number}"),
+        ).fetchone()
+        if feedback is not None:
+            try:
+                feedback_detail = json.loads(str(feedback["detail"]))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("validation controller-defect recovery triage feedback is malformed") from exc
+            if (
+                feedback_detail.get("ticket_id") != ticket_id
+                or int(feedback_detail.get("attempt_number") or 0) != attempt_number
+                or feedback_detail.get("failure_fingerprint") != expected_fingerprint
+                or not str(feedback_detail.get("feedback") or "").strip()
+            ):
+                raise ValueError("validation controller-defect recovery triage feedback lineage conflicts")
+
+        triage_claim = conn.execute(
+            "SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?",
+            (ticket_id, f"triage:{attempt_number}"),
+        ).fetchone()
+        if triage_claim is not None:
+            if (
+                str(triage_claim["status"]) != "completed"
+                or triage_claim["side_effect_started_at"] is None
+                or triage_claim["side_effect_completed_at"] is None
+                or triage_claim["finalized_at"] is None
+                or triage_claim["lease_owner"] is not None
+                or triage_claim["lease_expires_at"] is not None
+                or not triage_claim["candidate_identity_json"]
+                or not triage_claim["result_json"]
+            ):
+                raise ValueError("validation controller-defect recovery refuses active or incomplete downstream triage")
+            try:
+                triage_identity = json.loads(str(triage_claim["candidate_identity_json"]))
+                triage_result = json.loads(str(triage_claim["result_json"]))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("validation controller-defect recovery downstream triage is malformed") from exc
+            if (
+                triage_identity.get("ticket_id") != ticket_id
+                or int(triage_identity.get("attempt_number") or 0) != attempt_number
+                or triage_result.get("candidate_identity") != triage_identity
+            ):
+                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
+
+        sources: list[tuple[str, sqlite3.Row | None, sqlite3.Row | None]] = [
+            ("repair_routing_claim", route_claim, None),
+            ("repair_routing_stage", None, route_stage),
+        ]
+        if triage_claim is not None:
+            sources.append(("triage_claim", triage_claim, None))
+        if feedback is not None:
+            sources.append(("triage_feedback_stage", None, feedback))
+
+        archive_ids: list[str] = []
+        for kind, source_claim, source_stage in sources:
+            archive_id = f"validation-recovery:{ticket_id}:{attempt_number}:g{terminal_generation}:{kind}"
+            claim_snapshot = None
+            claim_result = None
+            if source_claim is not None:
+                claim_snapshot = json.dumps(dict(source_claim), sort_keys=True, separators=(",", ":"))
+                claim_result = None if source_claim["result_json"] is None else str(source_claim["result_json"])
+            values = {
+                "archive_id": archive_id,
+                "ticket_id": ticket_id,
+                "attempt_number": attempt_number,
+                "terminal_generation": terminal_generation,
+                "archive_kind": kind,
+                "source_claim_id": None if source_claim is None else str(source_claim["claim_id"]),
+                "source_claim_stage": None if source_claim is None else str(source_claim["stage"]),
+                "source_claim_status": None if source_claim is None else str(source_claim["status"]),
+                "source_claim_snapshot_json": claim_snapshot,
+                "source_claim_result_json": claim_result,
+                "source_runtime_stage": None if source_stage is None else str(source_stage["stage"]),
+                "source_runtime_detail": None if source_stage is None else str(source_stage["detail"]),
+                "source_runtime_artifact_path": None if source_stage is None else source_stage["artifact_path"],
+                "source_runtime_artifact_sha256": None if source_stage is None else source_stage["artifact_sha256"],
+                "source_runtime_base_sha": None if source_stage is None else source_stage["base_sha"],
+                "operator_id": operator_id,
+                "reason": reason,
+            }
+            existing = conn.execute("SELECT * FROM validation_recovery_archives WHERE archive_id=?", (archive_id,)).fetchone()
+            if existing is not None:
+                for key, expected in values.items():
+                    if key == "archive_id":
+                        continue
+                    if existing[key] != expected:
+                        raise ValueError("validation controller-defect recovery archive conflicts with prior evidence")
+            else:
+                conn.execute(
+                    "INSERT INTO validation_recovery_archives(archive_id,ticket_id,attempt_number,terminal_generation,archive_kind,source_claim_id,source_claim_stage,source_claim_status,source_claim_snapshot_json,source_claim_result_json,source_runtime_stage,source_runtime_detail,source_runtime_artifact_path,source_runtime_artifact_sha256,source_runtime_base_sha,operator_id,reason,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (*values.values(), now),
+                )
+            archive_ids.append(archive_id)
+
+        conn.execute("DELETE FROM scheduler_stage_claims WHERE claim_id=?", (route_claim["claim_id"],))
+        conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, route_stage_name))
+        if triage_claim is not None:
+            conn.execute("DELETE FROM scheduler_stage_claims WHERE claim_id=?", (triage_claim["claim_id"],))
+        if feedback is not None:
+            conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"triage-feedback-{attempt_number}"))
+        return archive_ids
+
     def recover_terminal_validation_controller_defect(
         self,
         ticket_id: str,
@@ -7965,6 +8157,17 @@ class Ledger:
             if conn.execute("SELECT 1 FROM review_candidates WHERE ticket_id=? AND attempt_number=? UNION SELECT 1 FROM review_results WHERE ticket_id=? AND attempt_number=? UNION SELECT 1 FROM accepted_evidence WHERE ticket_id=?", (ticket_id, attempt_number, ticket_id, attempt_number, ticket_id)).fetchone() is not None:
                 raise ValueError("validation controller-defect recovery refuses review or acceptance activity")
             generation = int(terminal["generation"] or 1)
+            downstream_archive_ids = self._archive_validation_recovery_downstream_in_transaction(
+                conn,
+                ticket_id=ticket_id,
+                attempt_number=attempt_number,
+                terminal_generation=generation,
+                terminal_failure_fingerprint=str(terminal["failure_fingerprint"]),
+                validation_record=validation_record,
+                operator_id=operator_id,
+                reason=reason,
+                now=now,
+            )
             archive_stage = f"validation-controller-defect-archive-{attempt_number}-{generation}"
             if not authorized_replay and conn.execute("SELECT 1 FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, archive_stage)).fetchone() is not None:
                 raise ValueError("validation controller-defect recovery archive already exists")
@@ -8057,9 +8260,9 @@ class Ledger:
             )
             if claim_changed.rowcount != 1:
                 raise RuntimeError("validation controller-defect recovery claim changed during replay authorization")
-            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="terminal_unresolvable_resolved", actor_id=operator_id, payload={"mode": "validation_controller_defect", "reason": reason, "attempt_number": attempt_number, "terminal_generation": generation, "archived_validation_stage": archive_stage, "archived_validation_completed_stage": completed_archive_stage, "superseded_notification_operation_ids": superseded})
-            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="validation_controller_defect_recovery_authorized", actor_id=operator_id, payload={"attempt_number": attempt_number, "terminal_generation": generation, "claim_id": str(claim["claim_id"]), "prior_claim_status": str(claim["status"]), "archived_validation_stage": archive_stage, "reason": reason})
-            return {"ticket_id": ticket_id, "attempt_number": attempt_number, "state": CanonicalState.LOCAL_REVIEW.value, "claim_id": str(claim["claim_id"]), "terminal_generation": generation, "archived_validation_stage": archive_stage, "superseded_notification_operation_ids": superseded}
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="terminal_unresolvable_resolved", actor_id=operator_id, payload={"mode": "validation_controller_defect", "reason": reason, "attempt_number": attempt_number, "terminal_generation": generation, "archived_validation_stage": archive_stage, "archived_validation_completed_stage": completed_archive_stage, "archived_downstream_identities": downstream_archive_ids, "superseded_notification_operation_ids": superseded})
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="validation_controller_defect_recovery_authorized", actor_id=operator_id, payload={"attempt_number": attempt_number, "terminal_generation": generation, "claim_id": str(claim["claim_id"]), "prior_claim_status": str(claim["status"]), "archived_validation_stage": archive_stage, "archived_downstream_identities": downstream_archive_ids, "reason": reason})
+            return {"ticket_id": ticket_id, "attempt_number": attempt_number, "state": CanonicalState.LOCAL_REVIEW.value, "claim_id": str(claim["claim_id"]), "terminal_generation": generation, "archived_validation_stage": archive_stage, "archived_downstream_identities": downstream_archive_ids, "superseded_notification_operation_ids": superseded}
 
     def reconcile_validation_controller_defect_completion_marker(
         self,
