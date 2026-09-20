@@ -378,6 +378,35 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
         self.assertIsNotNone(attempt["post_diff_hash"])
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM attempts WHERE ticket_id=? AND attempt_number=3", (self.ticket_id,)).fetchone()[0], 0)
 
+    def test_terminal_retry_reuses_preallocated_attempt_without_fresh_repair_route(self) -> None:
+        self._seed_generated_repair_attempt_two()
+        self.ledger.connection.execute(
+            "UPDATE runtime_stages SET detail=? WHERE ticket_id=? AND stage='repair-routing-1'",
+            (json.dumps({"action": "triage", "attempt_number": 1}, sort_keys=True, separators=(",", ":")), self.ticket_id),
+        )
+        self.ledger.record_runtime_stage(
+            self.ticket_id,
+            "generated-repair-activation-2",
+            json.dumps({"ticket_id": self.ticket_id, "attempt_number": 2, "external_task_id": "H-2", "predecessor_external_task_id": "H-1"}, sort_keys=True, separators=(",", ":")),
+            attempt_number=2,
+            base_sha=self.base,
+        )
+        (self.repo / "app.py").write_text('def value():\n    return "repaired after terminal retry"\n')
+        self.board.snapshot = ExternalExecutionSnapshot(
+            task=ExternalTicket("H-2", "external repair", HANDOFF_MARKER, "blocked", str(self.repo), parents=("H-1",)),
+            session_id="session-2",
+            branch_name="worker-branch",
+            started_at=30,
+            completed_at=40,
+            runs=(ExternalExecutionRun(8, "blocked", "blocked", 30, 40, HANDOFF_SENTINEL, "worker-code", 456, {"source": "dispatcher"}),),
+        )
+
+        result = self.controller.reconcile_hermes_execution("H-2", hermes_run_id=8, require_handoff=True)
+
+        self.assertEqual(result["attempt_number"], 2)
+        self.assertEqual(self.ledger.attempt_count(self.ticket_id), 2)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM attempts WHERE ticket_id=? AND attempt_number=3", (self.ticket_id,)).fetchone()[0], 0)
+
     def test_prepare_stops_when_git_directory_is_replaced(self) -> None:
         original_git = self.repo / ".git-original"
         swapped = False

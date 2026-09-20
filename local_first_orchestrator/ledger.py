@@ -2108,7 +2108,23 @@ class Ledger:
                LIMIT 1""",
             (ticket_id,),
         ).fetchone()
-        return int(row["attempt_number"]) if row is not None else None
+        if row is not None:
+            return int(row["attempt_number"])
+        rows = self.connection.execute(
+            """SELECT a.attempt_number
+               FROM tickets t JOIN attempts a ON a.ticket_id=t.id
+               WHERE t.id=? AND t.state='repairing'
+                 AND a.attempt_number=(SELECT MAX(aa.attempt_number) FROM attempts aa WHERE aa.ticket_id=t.id)
+                 AND a.base_sha IS NOT NULL AND a.worktree_path IS NOT NULL
+                 AND a.post_diff_hash IS NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM model_stage_artifacts m
+                   WHERE m.ticket_id=a.ticket_id AND m.attempt_number=a.attempt_number AND m.stage='implementation'
+                 )
+               LIMIT 2""",
+            (ticket_id,),
+        ).fetchall()
+        return int(rows[0]["attempt_number"]) if len(rows) == 1 else None
 
     def hermes_execution_reconciliation(self, external_task_id: str, hermes_run_id: int) -> dict[str, Any] | None:
         row = self.connection.execute(
