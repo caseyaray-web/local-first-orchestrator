@@ -692,6 +692,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     implementation.add_argument("--task-id",required=True)
     revalidate=commands.add_parser("revalidate-implementation", help="revalidate an existing implementation; never retry implementation or review")
     revalidate.add_argument("--task-id", required=True); revalidate.add_argument("--attempt-number", required=True, type=int); revalidate.add_argument("--operator-id", default="local-first-cli")
+    recover_validation=commands.add_parser("recover-validation-controller-defect", help="paused operator-only: replay one exact failed validation after current-validator preflight passes")
+    recover_validation.add_argument("--task-id", required=True); recover_validation.add_argument("--attempt-number", required=True, type=int); recover_validation.add_argument("--reason", required=True); recover_validation.add_argument("--operator-id", default="local-first-cli")
     authorize_revalidate=commands.add_parser("authorize-historical-revalidation", help="authorize one exact historical implementation for a future integrity gate; does not revalidate")
     authorize_revalidate.add_argument("--task-id",required=True); authorize_revalidate.add_argument("--attempt-number",required=True, type=int); authorize_revalidate.add_argument("--operator-id", default="local-first-cli"); authorize_revalidate.add_argument("--reason", default="operator authorization for historical revalidation")
     attest_revalidate=commands.add_parser("attest-historical-revalidation", help="attest one preserved historical implementation; does not validate or recover")
@@ -972,6 +974,10 @@ def run_command(args: argparse.Namespace) -> int:
             if args.ad_hoc_runtime: raise ValueError("implementation revalidation requires registered operator runtime")
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
             print(json.dumps(ctl.revalidate_historical_implementation(args.task_id,args.attempt_number,repository=registered.canonical_repository,operator_id=args.operator_id),sort_keys=True))
+        elif args.command=="recover-validation-controller-defect":
+            if args.ad_hoc_runtime: raise ValueError("validation controller-defect recovery requires registered operator runtime")
+            ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)
+            print(json.dumps(ctl.recover_terminal_validation_controller_defect(args.task_id,args.attempt_number,repository=registered.canonical_repository,operator_id=args.operator_id,reason=args.reason),sort_keys=True))
         elif args.command=="authorize-historical-revalidation":
             if args.ad_hoc_runtime: raise ValueError("historical revalidation authorization requires registered operator runtime")
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)

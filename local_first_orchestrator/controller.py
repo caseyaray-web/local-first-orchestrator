@@ -1943,7 +1943,7 @@ class LocalFirstController:
         operator_id: str,
         reason: str,
     ) -> dict[str, object]:
-        """Prove a frozen manual candidate passes the current validator before replaying its failed validation claim."""
+        """Prove a frozen candidate passes the current validator before replaying its failed validation claim."""
         paused = self.ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
         if paused is None or not bool(paused["paused"]):
             raise PermissionError("validation controller-defect recovery requires Local First paused")
@@ -1957,13 +1957,29 @@ class LocalFirstController:
             raise ValueError("repository mismatch with imported binding")
         implementation = self.ledger.model_stage(ticket_id, attempt_number, "implementation")
         attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
-        manual_adoption = self.ledger.runtime_stage(ticket_id, f"manual-adoption-{attempt_number}")
         claim = self.ledger.connection.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"validation:{attempt_number}")).fetchone()
         terminal = self.ledger.connection.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=? AND resolved_at IS NULL", (ticket_id,)).fetchone()
-        if implementation is None or attempt is None or manual_adoption is None or str(implementation["adapter"]) != "manual-adoption":
-            raise ValueError("validation controller-defect recovery requires manual-adoption provenance")
-        if claim is None or claim["status"] != "claimed" or claim["side_effect_started_at"] is None or claim["side_effect_completed_at"] is not None or not claim["candidate_identity_json"]:
-            raise ValueError("validation controller-defect recovery requires unfinished frozen validation claim")
+        if implementation is None or attempt is None or str(implementation["adapter"]) not in {"manual-adoption", "hermes-dispatch"}:
+            raise ValueError("validation controller-defect recovery requires frozen implementation provenance")
+        claim_incomplete = (
+            claim is not None
+            and claim["status"] == "claimed"
+            and claim["side_effect_started_at"] is not None
+            and claim["side_effect_completed_at"] is None
+            and bool(claim["candidate_identity_json"])
+        )
+        claim_completed = (
+            claim is not None
+            and claim["status"] == "completed"
+            and claim["side_effect_started_at"] is not None
+            and claim["side_effect_completed_at"] is not None
+            and claim["finalized_at"] is not None
+            and bool(claim["result_json"])
+            and bool(claim["candidate_identity_json"])
+        )
+        if not claim_incomplete and not claim_completed:
+            raise ValueError("validation controller-defect recovery requires frozen failed validation claim")
+        assert claim is not None
         if terminal is None or int(terminal["attempt_number"]) != attempt_number:
             raise ValueError("validation controller-defect recovery requires current terminal attempt")
         implementation_artifact = Path(str(implementation["response_artifact"]))
@@ -2005,6 +2021,13 @@ class LocalFirstController:
             raise ValueError("validation controller-defect recovery failed validation detail is malformed") from exc
         if old_record.get("passed") is not False or old_record.get("candidate_identity") != identity:
             raise ValueError("validation controller-defect recovery requires failed validation for frozen candidate")
+        if claim_completed:
+            try:
+                completed_result = json.loads(str(claim["result_json"]))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("validation controller-defect recovery completed claim result is malformed") from exc
+            if completed_result != old_record:
+                raise ValueError("validation controller-defect recovery completed claim conflicts with failed validation")
         generation = int(terminal["generation"] or 1)
         archive_dir = artifact_root / ticket_id / str(attempt_number) / "controller-defect-archive"
         archive_dir.mkdir(parents=True, exist_ok=True)

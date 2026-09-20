@@ -378,6 +378,76 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
         self.assertIsNotNone(attempt["post_diff_hash"])
         self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM attempts WHERE ticket_id=? AND attempt_number=3", (self.ticket_id,)).fetchone()[0], 0)
 
+    def test_completed_dispatch_validation_can_replay_after_proven_validator_defect(self) -> None:
+        reconciled = self.controller.reconcile_hermes_execution("H-1", hermes_run_id=7)
+        claim = self.ledger.claim_next_scheduler_validation("validator", lease_seconds=60, now=100, ticket_id=self.ticket_id)
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        self.ledger.begin_scheduler_claim_effect(str(claim["claim_id"]), "validator", now=100)
+        identity = json.loads(str(claim["candidate_identity_json"]))
+        false_artifact = self.root / "false-validation.json"
+        false_artifact.write_text(json.dumps({"errors": ["obsolete validator false positive"]}, sort_keys=True), encoding="utf-8")
+        false_sha = hashlib.sha256(false_artifact.read_bytes()).hexdigest()
+        false_result = {
+            "candidate_identity": identity,
+            "passed": False,
+            "compact_evidence": "obsolete validator false positive",
+            "validation_artifact": str(false_artifact),
+            "validation_artifact_sha256": false_sha,
+            "review_diff": "unused",
+            "review_selected_files": {},
+        }
+        self.assertTrue(self.ledger.record_runtime_stage(
+            self.ticket_id,
+            "validation-1",
+            json.dumps(false_result, sort_keys=True),
+            attempt_number=1,
+            artifact_path=str(false_artifact),
+            artifact_sha256=false_sha,
+            base_sha=self.base,
+        ))
+        self.assertTrue(self.ledger.record_runtime_stage(
+            self.ticket_id,
+            "validation_completed",
+            json.dumps(false_result, sort_keys=True),
+            attempt_number=1,
+            artifact_path=str(false_artifact),
+            artifact_sha256=false_sha,
+            base_sha=self.base,
+        ))
+        self.ledger.complete_scheduler_validation_effect(str(claim["claim_id"]), "validator", false_result, now=101)
+        self.ledger.complete_scheduler_claim(str(claim["claim_id"]), "validator", false_result, now=101)
+        self.ledger.record_terminal_unresolvable(
+            self.ticket_id,
+            attempt_number=1,
+            failure_fingerprint="f" * 64,
+            reason="attempt limit reached after deterministic validation failure",
+            summary={"deterministic_failure": {"source": "validation", "attempt_number": 1, "failure_evidence": "obsolete validator false positive"}},
+            notification_target="mattermost:ops",
+        )
+        self.ledger.pause("operator", reason="recover corrected validator")
+
+        recovered = self.controller.recover_terminal_validation_controller_defect(
+            self.ticket_id,
+            1,
+            repository=self.repo,
+            operator_id="operator",
+            reason="validator false positive corrected",
+        )
+
+        self.assertEqual(recovered["state"], CanonicalState.VERIFYING.value)
+        self.assertIn("validation passed", str(recovered["preflight_compact_evidence"]))
+        replay_claim = self.ledger.scheduler_claim(str(claim["claim_id"]))
+        self.assertEqual(replay_claim["status"], "claimed")
+        self.assertIsNone(replay_claim["side_effect_completed_at"])
+        self.assertIsNone(replay_claim["finalized_at"])
+        self.assertIsNone(replay_claim["result_json"])
+        archive = self.ledger.runtime_stage(self.ticket_id, "validation-controller-defect-archive-1-1")
+        self.assertIsNotNone(archive)
+        assert archive is not None
+        self.assertEqual(self.ledger.attempt_count(self.ticket_id), 1)
+        self.assertEqual(reconciled["diff_hash"], identity["implementation_diff_hash"])
+
     def test_terminal_retry_reuses_preallocated_attempt_without_fresh_repair_route(self) -> None:
         self._seed_generated_repair_attempt_two()
         self.ledger.connection.execute(
