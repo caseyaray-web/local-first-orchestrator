@@ -1948,7 +1948,9 @@ class LocalFirstController:
         if paused is None or not bool(paused["paused"]):
             raise PermissionError("validation controller-defect recovery requires Local First paused")
         ticket_row = self.ledger.get_ticket(ticket_id)
-        if ticket_row["state"] != CanonicalState.BLOCKED.value:
+        already_recovered = ticket_row["state"] == CanonicalState.LOCAL_REVIEW.value
+        authorized_replay = ticket_row["state"] == CanonicalState.VERIFYING.value
+        if ticket_row["state"] not in {CanonicalState.BLOCKED.value, CanonicalState.VERIFYING.value, CanonicalState.LOCAL_REVIEW.value}:
             raise ValueError("validation controller-defect recovery requires blocked ticket")
         binding = self.ledger.runtime_binding(ticket_id)
         raw_repository = Path(repository).resolve(strict=True)
@@ -1958,7 +1960,7 @@ class LocalFirstController:
         implementation = self.ledger.model_stage(ticket_id, attempt_number, "implementation")
         attempt = self.ledger.connection.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
         claim = self.ledger.connection.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"validation:{attempt_number}")).fetchone()
-        terminal = self.ledger.connection.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=? AND resolved_at IS NULL", (ticket_id,)).fetchone()
+        terminal = self.ledger.connection.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=? ORDER BY generation DESC", (ticket_id,)).fetchone()
         if implementation is None or attempt is None or str(implementation["adapter"]) not in {"manual-adoption", "hermes-dispatch"}:
             raise ValueError("validation controller-defect recovery requires frozen implementation provenance")
         claim_incomplete = (
@@ -1980,7 +1982,7 @@ class LocalFirstController:
         if not claim_incomplete and not claim_completed:
             raise ValueError("validation controller-defect recovery requires frozen failed validation claim")
         assert claim is not None
-        if terminal is None or int(terminal["attempt_number"]) != attempt_number:
+        if not already_recovered and (terminal is None or int(terminal["attempt_number"]) != attempt_number):
             raise ValueError("validation controller-defect recovery requires current terminal attempt")
         implementation_artifact = Path(str(implementation["response_artifact"]))
         if not implementation_artifact.is_file():
@@ -2008,7 +2010,25 @@ class LocalFirstController:
         live_diff_hash = str(_isolated_candidate_diff(worktree, expected["base_sha"], allowed_new_paths=manual_new_paths)["diff_hash"])
         if live_root != str(worktree) or live_head != expected["base_sha"] or live_diff_hash != expected["implementation_diff_hash"]:
             raise RuntimeError("validation controller-defect recovery live candidate identity drift")
+        if already_recovered:
+            current = self.ledger.runtime_stage(ticket_id, f"validation-{attempt_number}")
+            if current is None:
+                raise RuntimeError("validation controller-defect recovery idempotent evidence is incomplete")
+            try:
+                current_record = json.loads(str(current["detail"] or "{}"))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("validation controller-defect recovery idempotent evidence is malformed") from exc
+            if current_record.get("passed") is not True or current_record.get("candidate_identity") != identity:
+                raise RuntimeError("validation controller-defect recovery idempotent candidate identity drift")
+            if claim["status"] != "completed" or claim["side_effect_completed_at"] is None or claim["finalized_at"] is None:
+                raise RuntimeError("validation controller-defect recovery idempotent claim is incomplete")
+            result = json.loads(str(claim["result_json"] or "{}"))
+            if result.get("candidate_identity") != identity or result.get("passed") is not True:
+                raise RuntimeError("validation controller-defect recovery idempotent claim identity drift")
+            return {"ticket_id": ticket_id, "attempt_number": attempt_number, "state": CanonicalState.LOCAL_REVIEW.value, "claim_id": str(claim["claim_id"]), "terminal_generation": None, "archived_validation_stage": None, "superseded_notification_operation_ids": [], "preflight_validation_artifact": str(current_record["validation_artifact"]), "preflight_compact_evidence": str(current_record["compact_evidence"]), "replayed": True}
         old_validation = self.ledger.runtime_stage(ticket_id, f"validation-{attempt_number}")
+        if old_validation is None and authorized_replay:
+            old_validation = self.ledger.runtime_stage(ticket_id, f"validation-controller-defect-archive-{attempt_number}-{int(terminal['generation'] or 1)}")
         if old_validation is None or not old_validation["artifact_path"] or not old_validation["artifact_sha256"]:
             raise ValueError("validation controller-defect recovery requires failed validation artifact")
         old_artifact = Path(str(old_validation["artifact_path"])).resolve(strict=True)
@@ -2019,6 +2039,8 @@ class LocalFirstController:
             old_record = json.loads(str(old_validation["detail"] or "{}"))
         except json.JSONDecodeError as exc:
             raise ValueError("validation controller-defect recovery failed validation detail is malformed") from exc
+        if authorized_replay and isinstance(old_record.get("record"), dict):
+            old_record = old_record["record"]
         if old_record.get("passed") is not False or old_record.get("candidate_identity") != identity:
             raise ValueError("validation controller-defect recovery requires failed validation for frozen candidate")
         if claim_completed:
@@ -2057,6 +2079,9 @@ class LocalFirstController:
             reason=reason,
             archived_validation_artifact_path=str(archive_artifact),
             archived_validation_artifact_sha256=old_sha,
+            replay_validation_artifact_path=str(fresh.full_evidence_path),
+            replay_validation_artifact_sha256=hashlib.sha256(Path(fresh.full_evidence_path).read_bytes()).hexdigest(),
+            replay_compact_evidence=fresh.compact_evidence,
         )
         return {**recovered, "preflight_validation_artifact": str(fresh.full_evidence_path), "preflight_compact_evidence": fresh.compact_evidence}
 

@@ -316,29 +316,24 @@ class ManualAdoptionTests(unittest.TestCase):
             operator_id="operator",
             reason="validator double-counted staged declared new files",
         )
-        self.assertEqual(recovered["state"], CanonicalState.VERIFYING.value)
+        self.assertEqual(recovered["state"], CanonicalState.LOCAL_REVIEW.value)
         self.assertIn("validation passed", str(recovered["preflight_compact_evidence"]))
         archive = self.ledger.runtime_stage(self.ticket_id, "validation-controller-defect-archive-2-2")
         self.assertIsNotNone(archive)
         self.assertEqual(Path(str(archive["artifact_path"])).read_bytes(), false_artifact.read_bytes())
-        self.assertIsNone(self.ledger.runtime_stage(self.ticket_id, "validation-2"))
+        current_validation = self.ledger.runtime_stage(self.ticket_id, "validation-2")
+        self.assertIsNotNone(current_validation)
+        self.assertTrue(json.loads(str(current_validation["detail"]))["passed"])
         terminal_row = self.ledger.connection.execute("SELECT resolved_at,resolution_reason FROM terminal_ticket_failures WHERE ticket_id=?", (self.ticket_id,)).fetchone()
         self.assertIsNotNone(terminal_row["resolved_at"])
         self.assertEqual(terminal_row["resolution_reason"], "validator double-counted staged declared new files")
         notice = self.ledger.connection.execute("SELECT status FROM gateway_notification_outbox WHERE operation_id=?", (terminal["operation_id"],)).fetchone()
         self.assertEqual(notice["status"], "superseded")
         claim_row = self.ledger.scheduler_claim(str(claim["claim_id"]))
-        self.assertEqual(claim_row["status"], "claimed")
-        self.assertLess(int(claim_row["lease_expires_at"]), int(self.ledger._now()))
-
-        self.ledger.resume("operator", reason="replay corrected validation")
-        replay = self.ledger.claim_next_scheduler_validation("validator-2", lease_seconds=60, ticket_id=self.ticket_id)
-        self.assertIsNotNone(replay)
-        self.assertEqual(replay["claim_id"], claim["claim_id"])
-        result = self.controller.execute_deterministic_validation_only(self.ticket_id, repository=self.repo)
-        self.ledger.complete_scheduler_validation_effect(str(replay["claim_id"]), "validator-2", result)
-        self.assertTrue(result["passed"], result)
-        self.assertEqual(self.ledger.get_ticket(self.ticket_id)["state"], CanonicalState.LOCAL_REVIEW.value)
+        self.assertEqual(claim_row["status"], "completed")
+        self.assertIsNotNone(claim_row["side_effect_completed_at"])
+        self.assertIsNotNone(claim_row["finalized_at"])
+        self.assertTrue(json.loads(str(claim_row["result_json"]))["passed"])
 
         # A partially recovered process may discover an even older active completion marker
         # after the fresh passing validation has already been persisted. Reconcile it without

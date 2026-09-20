@@ -7859,6 +7859,9 @@ class Ledger:
         reason: str,
         archived_validation_artifact_path: str,
         archived_validation_artifact_sha256: str,
+        replay_validation_artifact_path: str = "",
+        replay_validation_artifact_sha256: str = "",
+        replay_compact_evidence: str = "",
         now: int | None = None,
     ) -> dict[str, Any]:
         """Reopen the same candidate after a proven deterministic-validation controller defect."""
@@ -7872,9 +7875,10 @@ class Ledger:
             ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
             if ticket is None:
                 raise KeyError(ticket_id)
-            if str(ticket["state"]) != CanonicalState.BLOCKED.value:
+            authorized_replay = str(ticket["state"]) == CanonicalState.VERIFYING.value
+            if str(ticket["state"]) not in {CanonicalState.BLOCKED.value, CanonicalState.VERIFYING.value}:
                 raise ValueError("validation controller-defect recovery requires blocked ticket")
-            terminal = conn.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=? AND resolved_at IS NULL", (ticket_id,)).fetchone()
+            terminal = conn.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=? ORDER BY generation DESC", (ticket_id,)).fetchone()
             if terminal is None or int(terminal["attempt_number"]) != attempt_number:
                 raise ValueError("validation controller-defect recovery requires current unresolved terminal attempt")
             try:
@@ -7905,6 +7909,8 @@ class Ledger:
                 raise ValueError("validation controller-defect recovery requires frozen failed validation claim")
             assert claim is not None
             validation_stage = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"validation-{attempt_number}")).fetchone()
+            if validation_stage is None and authorized_replay:
+                validation_stage = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"validation-controller-defect-archive-{attempt_number}-{int(terminal['generation'] or 1)}")).fetchone()
             if validation_stage is None or not validation_stage["artifact_path"] or not validation_stage["artifact_sha256"]:
                 raise ValueError("validation controller-defect recovery requires persisted failed validation evidence")
             try:
@@ -7914,16 +7920,20 @@ class Ledger:
                 raise ValueError("validation controller-defect recovery archive does not match failed validation evidence") from exc
             if (
                 not archived_artifact.is_file()
-                or archived_artifact == original_artifact
+                or (not authorized_replay and archived_artifact == original_artifact)
                 or archived_artifact.parent.name != "controller-defect-archive"
                 or hashlib.sha256(archived_artifact.read_bytes()).hexdigest() != archived_validation_artifact_sha256
                 or archived_validation_artifact_sha256 != str(validation_stage["artifact_sha256"])
             ):
                 raise ValueError("validation controller-defect recovery requires a distinct dedicated archive matching failed validation evidence")
+            if not replay_validation_artifact_path or not replay_validation_artifact_sha256 or not replay_compact_evidence.strip():
+                raise ValueError("validation controller-defect recovery requires passing replay validation evidence")
             try:
                 validation_record = json.loads(str(validation_stage["detail"] or "{}"))
             except json.JSONDecodeError as exc:
                 raise ValueError("validation controller-defect recovery validation detail is malformed") from exc
+            if authorized_replay and isinstance(validation_record.get("record"), dict):
+                validation_record = validation_record["record"]
             if validation_record.get("passed") is not False:
                 raise ValueError("validation controller-defect recovery requires failed validation evidence")
             try:
@@ -7932,6 +7942,9 @@ class Ledger:
                 raise ValueError("validation controller-defect recovery claim identity is malformed") from exc
             if validation_record.get("candidate_identity") != claim_identity:
                 raise ValueError("validation controller-defect recovery validation identity conflicts with frozen claim")
+            replay_artifact = Path(replay_validation_artifact_path).resolve(strict=True)
+            if not replay_artifact.is_file() or hashlib.sha256(replay_artifact.read_bytes()).hexdigest() != replay_validation_artifact_sha256:
+                raise ValueError("validation controller-defect recovery replay validation artifact is not intact")
             completed_claim_result = None
             if claim_completed:
                 try:
@@ -7953,7 +7966,7 @@ class Ledger:
                 raise ValueError("validation controller-defect recovery refuses review or acceptance activity")
             generation = int(terminal["generation"] or 1)
             archive_stage = f"validation-controller-defect-archive-{attempt_number}-{generation}"
-            if conn.execute("SELECT 1 FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, archive_stage)).fetchone() is not None:
+            if not authorized_replay and conn.execute("SELECT 1 FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, archive_stage)).fetchone() is not None:
                 raise ValueError("validation controller-defect recovery archive already exists")
             archive_detail = json.dumps({
                 "original_stage": f"validation-{attempt_number}",
@@ -7963,13 +7976,14 @@ class Ledger:
                 "claim_status": str(claim["status"]),
                 "claim_result": completed_claim_result,
             }, sort_keys=True, separators=(",", ":"))
-            conn.execute(
-                "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                (ticket_id, archive_stage, archive_detail, attempt_number, str(archived_artifact), archived_validation_artifact_sha256, validation_stage["base_sha"], now),
-            )
+            if not authorized_replay:
+                conn.execute(
+                    "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (ticket_id, archive_stage, archive_detail, attempt_number, str(archived_artifact), archived_validation_artifact_sha256, validation_stage["base_sha"], now),
+                )
             completed = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage='validation_completed'", (ticket_id,)).fetchone()
             completed_archive_stage = None
-            if completed is not None:
+            if completed is not None and not authorized_replay:
                 completed_archive_stage = f"validation-completed-controller-defect-archive-{attempt_number}-{generation}"
                 completed_archive_detail = json.dumps({
                     "original_stage": "validation_completed",
@@ -7984,6 +7998,23 @@ class Ledger:
                 )
                 conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage='validation_completed'", (ticket_id,))
             conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"validation-{attempt_number}"))
+            replay_record = {
+                "candidate_identity": claim_identity,
+                "passed": True,
+                "compact_evidence": replay_compact_evidence,
+                "validation_artifact": str(replay_artifact),
+                "validation_artifact_sha256": replay_validation_artifact_sha256,
+                "review_diff": validation_record.get("review_diff", ""),
+                "review_selected_files": validation_record.get("review_selected_files", {}),
+            }
+            conn.execute(
+                "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (ticket_id, f"validation-{attempt_number}", json.dumps(replay_record, sort_keys=True, separators=(",", ":")), attempt_number, str(replay_artifact), replay_validation_artifact_sha256, validation_stage["base_sha"], now),
+            )
+            conn.execute(
+                "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (ticket_id, "validation_completed", json.dumps(replay_record, sort_keys=True, separators=(",", ":")), attempt_number, str(replay_artifact), replay_validation_artifact_sha256, validation_stage["base_sha"], now),
+            )
             notices = conn.execute(
                 "SELECT operation_id,status FROM gateway_notification_outbox WHERE ticket_id=? AND failure_fingerprint=? AND terminal_generation=?",
                 (ticket_id, str(terminal["failure_fingerprint"]), generation),
@@ -7998,8 +8029,10 @@ class Ledger:
                     (now, now, *superseded),
                 )
             conn.execute("UPDATE terminal_ticket_failures SET resolved_at=?,resolved_by=?,resolution_reason=? WHERE ticket_id=? AND resolved_at IS NULL", (now, operator_id, reason[:2000], ticket_id))
-            states = (CanonicalState.READY_LOCAL, CanonicalState.IMPLEMENTING, CanonicalState.VERIFYING)
+            states = (CanonicalState.READY_LOCAL, CanonicalState.IMPLEMENTING, CanonicalState.VERIFYING, CanonicalState.LOCAL_REVIEW) if not authorized_replay else (CanonicalState.LOCAL_REVIEW,)
             current = CanonicalState.BLOCKED
+            if authorized_replay:
+                current = CanonicalState.VERIFYING
             final_event = None
             for target in states:
                 validate_transition(current, target)
@@ -8008,21 +8041,25 @@ class Ledger:
                     raise RuntimeError("ticket changed during validation controller-defect recovery")
                 final_event = self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="state_transition", actor_id=operator_id, from_state=current.value, to_state=target.value, payload={"reason": "validation_controller_defect_recovery", "attempt_number": attempt_number, "terminal_generation": generation})
                 current = target
-            if claim_completed:
-                claim_changed = conn.execute(
-                    "UPDATE scheduler_stage_claims SET status='claimed',lease_owner=NULL,lease_expires_at=?,side_effect_completed_at=NULL,finalized_at=NULL,result_json=NULL,last_error=NULL,updated_at=? WHERE claim_id=? AND status='completed' AND side_effect_started_at IS NOT NULL AND side_effect_completed_at IS NOT NULL AND finalized_at IS NOT NULL",
-                    (now - 1, now, claim["claim_id"]),
-                )
-            else:
-                claim_changed = conn.execute(
-                    "UPDATE scheduler_stage_claims SET lease_owner=NULL,lease_expires_at=?,updated_at=? WHERE claim_id=? AND status='claimed' AND side_effect_started_at IS NOT NULL AND side_effect_completed_at IS NULL",
-                    (now - 1, now, claim["claim_id"]),
-                )
+            replay_result = {
+                "ticket_id": ticket_id,
+                "candidate_identity": claim_identity,
+                "passed": True,
+                "compact_evidence": replay_compact_evidence,
+                "validation_artifact": str(replay_artifact),
+                "validation_artifact_sha256": replay_validation_artifact_sha256,
+                "replayed": True,
+            }
+            encoded_replay_result = json.dumps(replay_result, sort_keys=True, separators=(",", ":"))
+            claim_changed = conn.execute(
+                "UPDATE scheduler_stage_claims SET status='completed',lease_owner=NULL,lease_expires_at=NULL,side_effect_completed_at=?,finalized_at=?,result_json=?,last_error=NULL,updated_at=? WHERE claim_id=? AND status IN ('claimed','completed') AND side_effect_started_at IS NOT NULL",
+                (now, now, encoded_replay_result, now, claim["claim_id"]),
+            )
             if claim_changed.rowcount != 1:
                 raise RuntimeError("validation controller-defect recovery claim changed during replay authorization")
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="terminal_unresolvable_resolved", actor_id=operator_id, payload={"mode": "validation_controller_defect", "reason": reason, "attempt_number": attempt_number, "terminal_generation": generation, "archived_validation_stage": archive_stage, "archived_validation_completed_stage": completed_archive_stage, "superseded_notification_operation_ids": superseded})
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="validation_controller_defect_recovery_authorized", actor_id=operator_id, payload={"attempt_number": attempt_number, "terminal_generation": generation, "claim_id": str(claim["claim_id"]), "prior_claim_status": str(claim["status"]), "archived_validation_stage": archive_stage, "reason": reason})
-            return {"ticket_id": ticket_id, "attempt_number": attempt_number, "state": CanonicalState.VERIFYING.value, "claim_id": str(claim["claim_id"]), "terminal_generation": generation, "archived_validation_stage": archive_stage, "superseded_notification_operation_ids": superseded}
+            return {"ticket_id": ticket_id, "attempt_number": attempt_number, "state": CanonicalState.LOCAL_REVIEW.value, "claim_id": str(claim["claim_id"]), "terminal_generation": generation, "archived_validation_stage": archive_stage, "superseded_notification_operation_ids": superseded}
 
     def reconcile_validation_controller_defect_completion_marker(
         self,
@@ -8069,7 +8106,7 @@ class Ledger:
             if record.get("passed") is not True or not artifact.is_file() or hashlib.sha256(artifact.read_bytes()).hexdigest() != str(stage["artifact_sha256"]):
                 raise ValueError("validation marker reconciliation requires passing intact validation evidence")
             claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"validation:{attempt_number}")).fetchone()
-            if claim is None or claim["status"] != "claimed" or not claim["candidate_identity_json"] or record.get("candidate_identity") != json.loads(str(claim["candidate_identity_json"])):
+            if claim is None or claim["status"] not in {"claimed", "completed"} or not claim["candidate_identity_json"] or record.get("candidate_identity") != json.loads(str(claim["candidate_identity_json"])):
                 raise ValueError("validation marker reconciliation requires matching frozen validation claim")
             existing = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage='validation_completed'", (ticket_id,)).fetchone()
             archive_stage = None

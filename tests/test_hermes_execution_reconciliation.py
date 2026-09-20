@@ -444,16 +444,29 @@ class HermesExecutionReconciliationTests(unittest.TestCase):
             reason="validator false positive corrected",
         )
 
-        self.assertEqual(recovered["state"], CanonicalState.VERIFYING.value)
+        self.assertEqual(recovered["state"], CanonicalState.LOCAL_REVIEW.value)
         self.assertIn("validation passed", str(recovered["preflight_compact_evidence"]))
         replay_claim = self.ledger.scheduler_claim(str(claim["claim_id"]))
-        self.assertEqual(replay_claim["status"], "claimed")
-        self.assertIsNone(replay_claim["side_effect_completed_at"])
-        self.assertIsNone(replay_claim["finalized_at"])
-        self.assertIsNone(replay_claim["result_json"])
-        archive = self.ledger.runtime_stage(self.ticket_id, "validation-controller-defect-archive-1-1")
-        self.assertIsNotNone(archive)
-        assert archive is not None
+        self.assertEqual(replay_claim["status"], "completed")
+        self.assertIsNotNone(replay_claim["side_effect_completed_at"])
+        self.assertIsNotNone(replay_claim["finalized_at"])
+        self.assertEqual(json.loads(str(replay_claim["result_json"]))["passed"], True)
+        self.assertIsNotNone(self.ledger.runtime_stage(self.ticket_id, "validation-controller-defect-archive-1-1"))
+        self.assertIsNotNone(self.ledger.runtime_stage(self.ticket_id, "validation-completed-controller-defect-archive-1-1"))
+        current_validation = self.ledger.runtime_stage(self.ticket_id, "validation-1")
+        self.assertIsNotNone(current_validation)
+        self.assertEqual(json.loads(str(current_validation["detail"]))["passed"], True)
+        terminal = self.ledger.connection.execute("SELECT resolved_at FROM terminal_ticket_failures WHERE ticket_id=?", (self.ticket_id,)).fetchone()
+        self.assertIsNotNone(terminal["resolved_at"])
+        self.assertEqual(self.ledger.attempt_count(self.ticket_id), 1)
+        replayed = self.controller.recover_terminal_validation_controller_defect(
+            self.ticket_id,
+            1,
+            repository=self.repo,
+            operator_id="operator",
+            reason="validator false positive corrected",
+        )
+        self.assertTrue(replayed["replayed"])
         self.assertEqual(self.ledger.attempt_count(self.ticket_id), 1)
         self.assertEqual(reconciled["diff_hash"], identity["implementation_diff_hash"])
 
