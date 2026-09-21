@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 APPROVAL_DOMAIN = "native-release-revalidation"
 ACTIVATION_DOMAIN = "native-release-activation"
+VALIDATION_RECOVERY_DOMAIN = "validation-controller-defect-recovery"
 APPROVAL_VERSION = 1
 _REQUIRED = {"domain", "version", "operation", "request_id", "nonce", "operator_id", "reason", "authority"}
 
@@ -49,12 +50,14 @@ def linux_process_identity(pid: int) -> dict[str, Any]:
         st = os.stat(proc, follow_symlinks=False)
         if not os.path.isdir(proc) or st.st_uid != os.getuid():
             raise ValueError("worker process identity is not owned by the controller")
-        fields = open(f"{proc}/stat", "rb", buffering=0).read().split()
+        with open(f"{proc}/stat", "rb", buffering=0) as stat_handle:
+            fields = stat_handle.read().split()
         if len(fields) < 22:
             raise ValueError("worker process stat is incomplete")
         start_ticks = int(fields[21])
         exe = os.readlink(f"{proc}/exe")
-        cmdline = open(f"{proc}/cmdline", "rb", buffering=0).read()
+        with open(f"{proc}/cmdline", "rb", buffering=0) as cmdline_handle:
+            cmdline = cmdline_handle.read()
         if not exe or not cmdline:
             raise ValueError("worker process identity is incomplete")
     except (OSError, ValueError, IndexError) as exc:
@@ -98,6 +101,10 @@ def canonical_activation_bytes(document: dict[str, Any]) -> bytes:
     return _canonical_bytes(document, domain=ACTIVATION_DOMAIN, operation="activate-native-release")
 
 
+def canonical_validation_recovery_bytes(document: dict[str, Any]) -> bytes:
+    return _canonical_bytes(document, domain=VALIDATION_RECOVERY_DOMAIN, operation="recover-validation-controller-defect")
+
+
 def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -119,6 +126,8 @@ def parse_approval_document(raw: bytes | str) -> dict[str, Any]:
         raise ValueError("approval document is not canonical JSON")
     if document.get("domain") == ACTIVATION_DOMAIN and document.get("operation") == "activate-native-release":
         canonical = canonical_activation_bytes(document)
+    elif document.get("domain") == VALIDATION_RECOVERY_DOMAIN and document.get("operation") == "recover-validation-controller-defect":
+        canonical = canonical_validation_recovery_bytes(document)
     else:
         canonical = canonical_approval_bytes(document)
     if canonical != data:

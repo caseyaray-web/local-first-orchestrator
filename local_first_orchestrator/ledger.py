@@ -24,6 +24,7 @@ from .evidence_hash import canonical_sha256
 from .historical_revalidation import authorization_hash, authorization_identity, authorization_hash_from_row, attestation_hash, attestation_identity, attestation_hash_from_row, historical_validation_hash, historical_validation_identity, historical_validation_result_hash
 from .ticket import MicroTicket
 from .revalidation_boundary import validate_and_consume_revalidation_capability
+from .validation_recovery_boundary import validate_and_consume_validation_recovery_capability, revalidate_consumed_validation_recovery_capability
 from .native_release_approval import snapshot_authority
 from .daemon_text import bounded_daemon_text, validate_daemon_status_label, validate_daemon_worker_id
 
@@ -59,6 +60,12 @@ def validate_sqlite_non_negative_counter(value: int) -> int:
     """Validate a caller-provided counter before binding it to SQLite."""
     if type(value) is not int or value < 0 or value > SQLITE_INT_MAX:
         raise ValueError("counter must be a SQLite-range non-negative integer")
+    return value
+
+
+def _strict_positive_identity_int(value: object, *, name: str) -> int:
+    if type(value) is not int or value < 1 or value > SQLITE_INT_MAX:
+        raise ValueError(f"{name} must be a positive SQLite-range integer")
     return value
 
 
@@ -324,6 +331,25 @@ CREATE TABLE IF NOT EXISTS events (
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity_type, entity_id, id);
+CREATE TABLE IF NOT EXISTS validation_recovery_authorities (
+    authority_id TEXT PRIMARY KEY,
+    ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    attempt_number INTEGER NOT NULL,
+    terminal_generation INTEGER NOT NULL,
+    operator_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    signer_fingerprint TEXT NOT NULL,
+    document_json TEXT NOT NULL,
+    document_hash TEXT NOT NULL,
+    detached_signature BLOB NOT NULL,
+    expected_archive_ids_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(ticket_id, attempt_number, terminal_generation)
+);
+CREATE TRIGGER IF NOT EXISTS validation_recovery_authorities_immutable_update
+BEFORE UPDATE ON validation_recovery_authorities BEGIN SELECT RAISE(ABORT, 'validation recovery authorities are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS validation_recovery_authorities_immutable_delete
+BEFORE DELETE ON validation_recovery_authorities BEGIN SELECT RAISE(ABORT, 'validation recovery authorities are append-only'); END;
 CREATE TABLE IF NOT EXISTS board_projections (
     ticket_id TEXT NOT NULL REFERENCES tickets(id),
     event_id INTEGER NOT NULL REFERENCES events(id),
@@ -1150,6 +1176,8 @@ class Ledger:
         self.connection.execute("PRAGMA busy_timeout = 5000")
         self._lock = RLock()
         self.failure_injector = failure_injector
+        self._active_transaction_token: object | None = None
+        self._active_transaction_commit_guard: Callable[[], None] | None = None
 
     def close(self) -> None:
         self.connection.close()
@@ -1625,12 +1653,31 @@ class Ledger:
                 self.conn = conn
             def __enter__(self) -> sqlite3.Connection:
                 self.owner._lock.acquire()
+                if self.owner._active_transaction_token is not None:
+                    self.owner._lock.release()
+                    raise RuntimeError("nested trusted ledger transaction is not supported")
                 self.conn.execute("BEGIN IMMEDIATE")
+                self.owner._active_transaction_token = object()
                 return self.conn
             def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
                 try:
-                    self.conn.execute("ROLLBACK" if exc_type else "COMMIT")
+                    if exc_type:
+                        self.conn.execute("ROLLBACK")
+                    else:
+                        guard = self.owner._active_transaction_commit_guard
+                        if guard is not None:
+                            self.owner._inject_failure("before_validation_recovery_commit_guard")
+                            guard()
+                            self.owner._inject_failure("after_validation_recovery_commit_guard_before_sqlite_commit")
+                            guard()
+                        self.conn.execute("COMMIT")
+                except BaseException:
+                    if self.conn.in_transaction:
+                        self.conn.execute("ROLLBACK")
+                    raise
                 finally:
+                    self.owner._active_transaction_commit_guard = None
+                    self.owner._active_transaction_token = None
                     self.owner._lock.release()
                 return False
         return Transaction(self, self.connection)  # type: ignore[return-value]
@@ -7875,6 +7922,145 @@ class Ledger:
             )
             return {"ticket_id": ticket_id, "state": CanonicalState.REPAIRING.value, **resolution_payload}
 
+    def _validation_recovery_authority_projection_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        ticket_id: str,
+        attempt_number: int,
+    ) -> dict[str, Any]:
+        attempt_number = _strict_positive_identity_int(attempt_number, name="attempt_number")
+        binding = conn.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
+        if binding is None:
+            raise ValueError("validation controller-defect recovery runtime binding is missing")
+        signer_fingerprint = binding["operator_signer_fingerprint"]
+        authority_hash = binding["operator_authority_hash"]
+        if not isinstance(signer_fingerprint, str) or not signer_fingerprint or not isinstance(authority_hash, str) or not authority_hash:
+            raise PermissionError("validation controller-defect recovery requires bound operator signer authority")
+        terminal = conn.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=? ORDER BY generation DESC", (ticket_id,)).fetchone()
+        if terminal is None:
+            raise ValueError("validation controller-defect recovery requires terminal failure evidence")
+        terminal_attempt = _strict_positive_identity_int(terminal["attempt_number"], name="terminal attempt_number")
+        terminal_generation = _strict_positive_identity_int(terminal["generation"], name="terminal generation")
+        terminal_evidence = {
+            "ticket_id": str(terminal["ticket_id"]),
+            "attempt_number": terminal_attempt,
+            "failure_fingerprint": str(terminal["failure_fingerprint"]),
+            "reason": str(terminal["reason"]),
+            "summary_json": str(terminal["summary_json"]),
+            "created_at": int(terminal["created_at"]),
+            "generation": terminal_generation,
+            "resolved_at": terminal["resolved_at"],
+            "resolved_by": terminal["resolved_by"],
+            "resolution_reason": terminal["resolution_reason"],
+        }
+        if terminal_attempt != attempt_number:
+            raise ValueError("validation controller-defect recovery terminal attempt conflicts")
+        claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"validation:{attempt_number}")).fetchone()
+        if claim is None or not claim["candidate_identity_json"]:
+            raise ValueError("validation controller-defect recovery requires frozen validation claim identity")
+        try:
+            claim_identity = json.loads(str(claim["candidate_identity_json"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("validation controller-defect recovery claim identity is malformed") from exc
+        if not isinstance(claim_identity, dict):
+            raise ValueError("validation controller-defect recovery claim identity is malformed")
+        if _strict_positive_identity_int(claim_identity.get("attempt_number"), name="validation candidate attempt_number") != attempt_number:
+            raise ValueError("validation controller-defect recovery claim identity attempt conflicts")
+        route_stage = conn.execute("SELECT 1 FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"repair-routing-{attempt_number}")).fetchone()
+        route_claim = conn.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"repair_routing:{attempt_number}")).fetchone()
+        triage_claim = conn.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"triage:{attempt_number}")).fetchone()
+        triage_applied = conn.execute("SELECT 1 FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"triage-applied-{attempt_number}")).fetchone()
+        feedback = conn.execute("SELECT 1 FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"triage-feedback-{attempt_number}")).fetchone()
+        if (route_stage is None) != (route_claim is None):
+            raise ValueError("validation controller-defect recovery downstream routing lineage is incomplete")
+        if route_stage is None and (triage_claim is not None or triage_applied is not None or feedback is not None):
+            raise ValueError("validation controller-defect recovery downstream routing lineage is incomplete")
+        if (triage_claim is None) != (triage_applied is None):
+            raise ValueError("validation controller-defect recovery downstream triage lineage is incomplete")
+        kinds: list[str] = []
+        if route_stage is not None:
+            kinds.extend(("repair_routing_claim", "repair_routing_stage"))
+            if triage_claim is not None:
+                kinds.append("triage_claim")
+            if feedback is not None:
+                kinds.append("triage_feedback_stage")
+        else:
+            archived_kinds = {
+                str(row["archive_kind"])
+                for row in conn.execute(
+                    "SELECT archive_kind FROM validation_recovery_archives WHERE ticket_id=? AND attempt_number=? AND terminal_generation=?",
+                    (ticket_id, attempt_number, terminal_generation),
+                ).fetchall()
+            }
+            allowed_order = ("repair_routing_claim", "repair_routing_stage", "triage_claim", "triage_feedback_stage")
+            if archived_kinds and not archived_kinds.issubset(set(allowed_order)):
+                raise ValueError("validation recovery archive set contains unrelated evidence")
+            kinds.extend(kind for kind in allowed_order if kind in archived_kinds)
+        expected_archive_ids = [f"validation-recovery:{ticket_id}:{attempt_number}:g{terminal_generation}:{kind}" for kind in kinds]
+        return {
+            "ledger_identity": str(self.database.resolve()),
+            "ticket_id": ticket_id,
+            "attempt_number": attempt_number,
+            "terminal_generation": terminal_generation,
+            "terminal_failure_fingerprint": str(terminal["failure_fingerprint"]),
+            "terminal_evidence_hash": canonical_sha256(terminal_evidence),
+            "claim_id": str(claim["claim_id"]),
+            "candidate_identity_hash": canonical_sha256(claim_identity),
+            "runtime_authority_hash": authority_hash,
+            "signer_fingerprint": signer_fingerprint,
+            "expected_archive_ids": expected_archive_ids,
+        }
+
+    def validation_recovery_authority_projection(self, ticket_id: str, attempt_number: int) -> dict[str, Any]:
+        attempt_number = _strict_positive_identity_int(attempt_number, name="attempt_number")
+        current = self._validation_recovery_authority_projection_in_transaction(self.connection, ticket_id=ticket_id, attempt_number=attempt_number)
+        authority = self.connection.execute(
+            "SELECT document_json FROM validation_recovery_authorities WHERE ticket_id=? AND attempt_number=? AND terminal_generation=?",
+            (ticket_id, attempt_number, current["terminal_generation"]),
+        ).fetchone()
+        if authority is None:
+            archived = self.connection.execute(
+                "SELECT 1 FROM validation_recovery_archives WHERE ticket_id=? AND attempt_number=? AND terminal_generation=? LIMIT 1",
+                (ticket_id, attempt_number, current["terminal_generation"]),
+            ).fetchone()
+            if archived is not None:
+                raise PermissionError("validation recovery archived replay lacks signed recovery authority")
+            return current
+        try:
+            document = json.loads(str(authority["document_json"]))
+        except json.JSONDecodeError as exc:
+            raise ValueError("validation recovery authority document is malformed") from exc
+        stored = document.get("authority") if isinstance(document, dict) else None
+        if not isinstance(stored, dict):
+            raise ValueError("validation recovery authority document is malformed")
+        if stored != current:
+            ticket = self.connection.execute("SELECT state FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            terminal = self.connection.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=? AND generation=?", (ticket_id, current["terminal_generation"])).fetchone()
+            replay_ok = False
+            if ticket is not None and str(ticket["state"]) in {CanonicalState.LOCAL_REVIEW.value, CanonicalState.VERIFYING.value} and terminal is not None and terminal["resolved_at"] is not None:
+                normalized_terminal = {
+                    "ticket_id": str(terminal["ticket_id"]),
+                    "attempt_number": _strict_positive_identity_int(terminal["attempt_number"], name="terminal attempt_number"),
+                    "failure_fingerprint": str(terminal["failure_fingerprint"]),
+                    "reason": str(terminal["reason"]),
+                    "summary_json": str(terminal["summary_json"]),
+                    "created_at": int(terminal["created_at"]),
+                    "generation": _strict_positive_identity_int(terminal["generation"], name="terminal generation"),
+                    "resolved_at": None,
+                    "resolved_by": None,
+                    "resolution_reason": None,
+                }
+                current_without_terminal_hash = {key: value for key, value in current.items() if key != "terminal_evidence_hash"}
+                stored_without_terminal_hash = {key: value for key, value in stored.items() if key != "terminal_evidence_hash"}
+                replay_ok = (
+                    current_without_terminal_hash == stored_without_terminal_hash
+                    and stored.get("terminal_evidence_hash") == canonical_sha256(normalized_terminal)
+                )
+            if not replay_ok:
+                raise ValueError("validation recovery stored authority conflicts with current terminal projection archive set")
+        return dict(stored)
+
     def _archive_validation_recovery_downstream_in_transaction(
         self,
         conn: sqlite3.Connection,
@@ -7889,6 +8075,8 @@ class Ledger:
         now: int,
     ) -> list[str]:
         """Retire stale validation routing only after proving its complete lineage."""
+        attempt_number = _strict_positive_identity_int(attempt_number, name="attempt_number")
+        terminal_generation = _strict_positive_identity_int(terminal_generation, name="terminal_generation")
         route_stage_name = f"repair-routing-{attempt_number}"
         route_claim_stage = f"repair_routing:{attempt_number}"
         route_stage = conn.execute(
@@ -7911,16 +8099,204 @@ class Ledger:
             "SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?",
             (ticket_id, f"triage-feedback-{attempt_number}"),
         ).fetchone()
+        triage_applied = conn.execute(
+            "SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?",
+            (ticket_id, f"triage-applied-{attempt_number}"),
+        ).fetchone()
+
+        if route_stage is None and route_claim is None and triage_claim is None and feedback is None and triage_applied is None and not archive_rows:
+            return []
+
+        compact_evidence = validation_record.get("compact_evidence")
+        if not isinstance(compact_evidence, str) or not compact_evidence:
+            raise ValueError("validation controller-defect recovery terminal validation evidence is malformed")
+        expected_fingerprint = _stable_scheduler_failure_fingerprint(ticket_id, "validation", compact_evidence)
+        if str(terminal_failure_fingerprint) != expected_fingerprint:
+            raise ValueError("validation controller-defect recovery terminal failure lineage conflicts")
+
+        def validate_route_payload(route_detail: object, route_result: object) -> None:
+            if (
+                not isinstance(route_detail, dict)
+                or not isinstance(route_result, dict)
+                or canonical_sha256(route_detail) != canonical_sha256(route_result)
+                or route_detail.get("ticket_id") != ticket_id
+                or _strict_positive_identity_int(route_detail.get("attempt_number"), name="routing detail attempt_number") != attempt_number
+                or _strict_positive_identity_int(route_result.get("attempt_number"), name="routing result attempt_number") != attempt_number
+                or route_detail.get("source") != "validation"
+                or route_detail.get("action") != "triage"
+                or route_detail.get("failure_fingerprint") != expected_fingerprint
+                or route_detail.get("failure_evidence") != compact_evidence
+                or not str(route_detail.get("failure_evidence") or "").strip()
+            ):
+                raise ValueError("validation controller-defect recovery downstream routing lineage conflicts")
+
+        def validate_triage_payload(triage_identity: object, triage_result: object, applied_detail: object) -> None:
+            if not isinstance(triage_identity, dict) or not isinstance(triage_result, dict) or not isinstance(applied_detail, dict):
+                raise ValueError("validation controller-defect recovery downstream triage is malformed")
+            policy_hash = triage_identity.get("triage_execution_policy_hash")
+            if _strict_positive_identity_int(triage_identity.get("attempt_number"), name="triage identity attempt_number") != attempt_number:
+                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
+            candidate_identity = triage_result.get("candidate_identity")
+            if not isinstance(candidate_identity, dict) or _strict_positive_identity_int(candidate_identity.get("attempt_number"), name="triage result candidate attempt_number") != attempt_number:
+                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
+            if not isinstance(policy_hash, str) or not policy_hash:
+                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None:
+                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
+            expected_triage_identity = self._triage_claim_identity(
+                ticket,
+                attempt_number=attempt_number,
+                failure_evidence=compact_evidence,
+                triage_execution_policy_hash=policy_hash,
+            )
+            if validate_sqlite_non_negative_counter(triage_identity.get("parent_depth")) != validate_sqlite_non_negative_counter(expected_triage_identity.get("parent_depth")):
+                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
+            if validate_sqlite_non_negative_counter(candidate_identity.get("parent_depth")) != validate_sqlite_non_negative_counter(expected_triage_identity.get("parent_depth")):
+                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
+            if _strict_positive_identity_int(applied_detail.get("attempt_number"), name="triage applied attempt_number") != attempt_number:
+                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
+            if (
+                canonical_sha256(triage_identity) != canonical_sha256(expected_triage_identity)
+                or canonical_sha256(candidate_identity) != canonical_sha256(expected_triage_identity)
+                or triage_result.get("ticket_id") != ticket_id
+                or _strict_positive_identity_int(triage_result.get("attempt_number"), name="triage result attempt_number") != attempt_number
+                or canonical_sha256(applied_detail) != canonical_sha256(triage_result)
+            ):
+                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
+            model_stage = conn.execute(
+                "SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='triage'",
+                (ticket_id, attempt_number),
+            ).fetchone()
+            if model_stage is None:
+                raise ValueError("validation controller-defect recovery downstream triage lineage is incomplete")
+            identity_hash = hashlib.sha256(json.dumps(expected_triage_identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            if str(model_stage["diff_hash"]) != identity_hash:
+                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
+            artifact = Path(str(model_stage["response_artifact"] or ""))
+            if not artifact.is_file() or str(triage_result.get("triage_artifact") or "") != str(artifact):
+                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
+            try:
+                envelope = json.loads(artifact.read_text(encoding="utf-8"))
+                raw_payload = envelope["payload"]
+            except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("validation controller-defect recovery downstream triage artifact is malformed") from exc
+            proposal_hash = hashlib.sha256(json.dumps(raw_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            if proposal_hash != str(triage_result.get("proposal_hash") or ""):
+                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
+
         if route_stage is None and route_claim is None:
-            if triage_claim is not None or feedback is not None:
+            if triage_claim is not None or feedback is not None or triage_applied is not None:
                 raise ValueError("validation controller-defect recovery downstream routing lineage is incomplete")
             if not archive_rows:
                 return []
-            return [str(row["archive_id"]) for row in archive_rows]
+            authority_row = conn.execute(
+                "SELECT * FROM validation_recovery_authorities WHERE ticket_id=? AND attempt_number=? AND terminal_generation=?",
+                (ticket_id, attempt_number, terminal_generation),
+            ).fetchone()
+            if authority_row is None:
+                raise ValueError("validation controller-defect recovery archive lacks signed recovery authority")
+            try:
+                authority_document = json.loads(str(authority_row["document_json"]))
+                expected_archive_ids = json.loads(str(authority_row["expected_archive_ids_json"]))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("validation controller-defect recovery signed authority is malformed") from exc
+            authority = authority_document.get("authority") if isinstance(authority_document, dict) else None
+            if not isinstance(authority, dict):
+                raise ValueError("validation controller-defect recovery signed authority is malformed")
+            if (
+                _strict_positive_identity_int(authority.get("attempt_number"), name="signed authority attempt_number") != attempt_number
+                or _strict_positive_identity_int(authority.get("terminal_generation"), name="signed authority terminal_generation") != terminal_generation
+                or str(authority.get("ticket_id") or "") != ticket_id
+                or str(authority_row["operator_id"]) != operator_id
+                or str(authority_row["reason"]) != reason
+            ):
+                raise ValueError("validation controller-defect recovery signed authority conflicts")
+            if not isinstance(expected_archive_ids, list) or not all(isinstance(value, str) and value for value in expected_archive_ids):
+                raise ValueError("validation controller-defect recovery signed authority is malformed")
+            actual_archive_ids = [str(row["archive_id"]) for row in archive_rows]
+            if sorted(actual_archive_ids) != sorted(expected_archive_ids) or len(actual_archive_ids) != len(set(actual_archive_ids)):
+                raise ValueError("validation controller-defect recovery archive set is incomplete or unrelated")
+            by_kind = {str(row["archive_kind"]): row for row in archive_rows}
+            if len(by_kind) != len(archive_rows) or not {"repair_routing_claim", "repair_routing_stage"}.issubset(by_kind):
+                raise ValueError("validation controller-defect recovery archive set is incomplete")
+            allowed_kinds = {"repair_routing_claim", "repair_routing_stage", "triage_claim", "triage_feedback_stage"}
+            if not set(by_kind).issubset(allowed_kinds):
+                raise ValueError("validation controller-defect recovery archive contains unrelated evidence")
+            for kind, row in by_kind.items():
+                canonical_id = f"validation-recovery:{ticket_id}:{attempt_number}:g{terminal_generation}:{kind}"
+                if (
+                    str(row["archive_id"]) != canonical_id
+                    or str(row["ticket_id"]) != ticket_id
+                    or _strict_positive_identity_int(row["attempt_number"], name="archive attempt_number") != attempt_number
+                    or _strict_positive_identity_int(row["terminal_generation"], name="archive terminal_generation") != terminal_generation
+                    or str(row["operator_id"]) != operator_id
+                    or str(row["reason"]) != reason
+                ):
+                    raise ValueError("validation controller-defect recovery archive source identity conflicts")
+            route_claim_archive = by_kind["repair_routing_claim"]
+            route_stage_archive = by_kind["repair_routing_stage"]
+            try:
+                route_claim_snapshot = json.loads(str(route_claim_archive["source_claim_snapshot_json"] or ""))
+                archived_route_result = json.loads(str(route_claim_archive["source_claim_result_json"] or ""))
+                archived_route_detail = json.loads(str(route_stage_archive["source_runtime_detail"] or ""))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("validation controller-defect recovery archive routing evidence is malformed") from exc
+            if (
+                not isinstance(route_claim_snapshot, dict)
+                or str(route_claim_snapshot.get("claim_id") or "") != str(route_claim_archive["source_claim_id"] or "")
+                or str(route_claim_snapshot.get("ticket_id") or "") != ticket_id
+                or str(route_claim_snapshot.get("stage") or "") != route_claim_stage
+                or str(route_claim_snapshot.get("status") or "") != "completed"
+                or str(route_claim_snapshot.get("result_json") or "") != str(route_claim_archive["source_claim_result_json"] or "")
+                or str(route_claim_archive["source_claim_stage"] or "") != route_claim_stage
+                or str(route_claim_archive["source_claim_status"] or "") != "completed"
+                or str(route_stage_archive["source_runtime_stage"] or "") != route_stage_name
+            ):
+                raise ValueError("validation controller-defect recovery archive routing source identity conflicts")
+            validate_route_payload(archived_route_detail, archived_route_result)
+            if "triage_feedback_stage" in by_kind:
+                feedback_archive = by_kind["triage_feedback_stage"]
+                if str(feedback_archive["source_runtime_stage"] or "") != f"triage-feedback-{attempt_number}":
+                    raise ValueError("validation controller-defect recovery archive triage feedback identity conflicts")
+                try:
+                    feedback_detail = json.loads(str(feedback_archive["source_runtime_detail"] or ""))
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError("validation controller-defect recovery archive triage feedback is malformed") from exc
+                if (
+                    not isinstance(feedback_detail, dict)
+                    or feedback_detail.get("ticket_id") != ticket_id
+                    or _strict_positive_identity_int(feedback_detail.get("attempt_number"), name="archived triage feedback attempt_number") != attempt_number
+                    or feedback_detail.get("failure_fingerprint") != expected_fingerprint
+                    or not str(feedback_detail.get("feedback") or "").strip()
+                ):
+                    raise ValueError("validation controller-defect recovery archive triage feedback lineage conflicts")
+            if "triage_claim" in by_kind:
+                triage_claim_archive = by_kind["triage_claim"]
+                try:
+                    triage_claim_snapshot = json.loads(str(triage_claim_archive["source_claim_snapshot_json"] or ""))
+                    triage_identity = json.loads(str(triage_claim_snapshot.get("candidate_identity_json") or ""))
+                    archived_triage_result = json.loads(str(triage_claim_archive["source_claim_result_json"] or ""))
+                    archived_triage_applied = json.loads(str(triage_claim_archive["source_runtime_detail"] or ""))
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError("validation controller-defect recovery archive triage evidence is malformed") from exc
+                if (
+                    str(triage_claim_snapshot.get("claim_id") or "") != str(triage_claim_archive["source_claim_id"] or "")
+                    or str(triage_claim_snapshot.get("ticket_id") or "") != ticket_id
+                    or str(triage_claim_snapshot.get("stage") or "") != f"triage:{attempt_number}"
+                    or str(triage_claim_snapshot.get("status") or "") != "completed"
+                    or str(triage_claim_snapshot.get("result_json") or "") != str(triage_claim_archive["source_claim_result_json"] or "")
+                    or str(triage_claim_archive["source_claim_stage"] or "") != f"triage:{attempt_number}"
+                    or str(triage_claim_archive["source_claim_status"] or "") != "completed"
+                    or str(triage_claim_archive["source_runtime_stage"] or "") != f"triage-applied-{attempt_number}"
+                ):
+                    raise ValueError("validation controller-defect recovery archive triage source identity conflicts")
+                validate_triage_payload(triage_identity, archived_triage_result, archived_triage_applied)
+            return actual_archive_ids
         if route_stage is None or route_claim is None:
             raise ValueError("validation controller-defect recovery downstream routing lineage is incomplete")
         try:
-            route_attempt = int(route_stage["attempt_number"])
+            route_attempt = _strict_positive_identity_int(route_stage["attempt_number"], name="routing stage attempt_number")
         except (TypeError, ValueError) as exc:
             raise ValueError("validation controller-defect recovery downstream routing lineage conflicts") from exc
         if route_attempt != attempt_number:
@@ -7940,25 +8316,7 @@ class Ledger:
             route_result = json.loads(str(route_claim["result_json"]))
         except (TypeError, json.JSONDecodeError) as exc:
             raise ValueError("validation controller-defect recovery downstream routing is malformed") from exc
-        compact_evidence = validation_record.get("compact_evidence")
-        if not isinstance(compact_evidence, str) or not compact_evidence:
-            raise ValueError("validation controller-defect recovery terminal validation evidence is malformed")
-        expected_fingerprint = _stable_scheduler_failure_fingerprint(ticket_id, "validation", compact_evidence)
-        if str(terminal_failure_fingerprint) != expected_fingerprint:
-            raise ValueError("validation controller-defect recovery terminal failure lineage conflicts")
-        if (
-            not isinstance(route_detail, dict)
-            or not isinstance(route_result, dict)
-            or route_detail != route_result
-            or route_detail.get("ticket_id") != ticket_id
-            or int(route_detail.get("attempt_number") or 0) != attempt_number
-            or route_detail.get("source") != "validation"
-            or route_detail.get("action") != "triage"
-            or route_detail.get("failure_fingerprint") != expected_fingerprint
-            or route_detail.get("failure_evidence") != compact_evidence
-            or not str(route_detail.get("failure_evidence") or "").strip()
-        ):
-            raise ValueError("validation controller-defect recovery downstream routing lineage conflicts")
+        validate_route_payload(route_detail, route_result)
 
 
         if feedback is not None:
@@ -7967,14 +8325,14 @@ class Ledger:
             except (TypeError, json.JSONDecodeError) as exc:
                 raise ValueError("validation controller-defect recovery triage feedback is malformed") from exc
             try:
-                feedback_attempt = int(feedback["attempt_number"])
+                feedback_attempt = _strict_positive_identity_int(feedback["attempt_number"], name="triage feedback stage attempt_number")
             except (TypeError, ValueError) as exc:
                 raise ValueError("validation controller-defect recovery triage feedback lineage conflicts") from exc
             if (
                 feedback_attempt != attempt_number
                 or not isinstance(feedback_detail, dict)
                 or feedback_detail.get("ticket_id") != ticket_id
-                or int(feedback_detail.get("attempt_number") or 0) != attempt_number
+                or _strict_positive_identity_int(feedback_detail.get("attempt_number"), name="triage feedback attempt_number") != attempt_number
                 or feedback_detail.get("failure_fingerprint") != expected_fingerprint
                 or not str(feedback_detail.get("feedback") or "").strip()
             ):
@@ -7992,41 +8350,39 @@ class Ledger:
                 or not triage_claim["result_json"]
             ):
                 raise ValueError("validation controller-defect recovery refuses active or incomplete downstream triage")
+            if triage_applied is None:
+                raise ValueError("validation controller-defect recovery downstream triage lineage is incomplete")
             try:
                 triage_identity = json.loads(str(triage_claim["candidate_identity_json"]))
                 triage_result = json.loads(str(triage_claim["result_json"]))
+                triage_applied_detail = json.loads(str(triage_applied["detail"]))
             except (TypeError, json.JSONDecodeError) as exc:
                 raise ValueError("validation controller-defect recovery downstream triage is malformed") from exc
-            if not isinstance(triage_identity, dict) or not isinstance(triage_result, dict):
-                raise ValueError("validation controller-defect recovery downstream triage is malformed")
-            policy_hash = triage_identity.get("triage_execution_policy_hash")
-            if not isinstance(policy_hash, str) or not policy_hash:
-                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
-            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
-            if ticket is None:
-                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
-            expected_triage_identity = self._triage_claim_identity(
-                ticket,
-                attempt_number=attempt_number,
-                failure_evidence=compact_evidence,
-                triage_execution_policy_hash=policy_hash,
-            )
-            if (
-                triage_identity != expected_triage_identity
-                or triage_result.get("candidate_identity") != expected_triage_identity
-                or triage_result.get("ticket_id") != ticket_id
-                or int(triage_result.get("attempt_number") or 0) != attempt_number
-            ):
-                raise ValueError("validation controller-defect recovery downstream triage lineage conflicts")
+            validate_triage_payload(triage_identity, triage_result, triage_applied_detail)
+        elif triage_applied is not None:
+            raise ValueError("validation controller-defect recovery downstream triage lineage is incomplete")
 
         sources: list[tuple[str, sqlite3.Row | None, sqlite3.Row | None]] = [
             ("repair_routing_claim", route_claim, None),
             ("repair_routing_stage", None, route_stage),
         ]
         if triage_claim is not None:
-            sources.append(("triage_claim", triage_claim, None))
+            sources.append(("triage_claim", triage_claim, triage_applied))
         if feedback is not None:
             sources.append(("triage_feedback_stage", None, feedback))
+        authority_row = conn.execute(
+            "SELECT expected_archive_ids_json FROM validation_recovery_authorities WHERE ticket_id=? AND attempt_number=? AND terminal_generation=?",
+            (ticket_id, attempt_number, terminal_generation),
+        ).fetchone()
+        if authority_row is None:
+            raise ValueError("validation controller-defect recovery lacks signed recovery authority")
+        try:
+            authorized_archive_ids = json.loads(str(authority_row["expected_archive_ids_json"]))
+        except json.JSONDecodeError as exc:
+            raise ValueError("validation controller-defect recovery signed archive identity set is malformed") from exc
+        planned_archive_ids = [f"validation-recovery:{ticket_id}:{attempt_number}:g{terminal_generation}:{kind}" for kind, _, _ in sources]
+        if not isinstance(authorized_archive_ids, list) or planned_archive_ids != authorized_archive_ids:
+            raise ValueError("validation controller-defect recovery archive plan conflicts with signed authority")
 
         archive_ids: list[str] = []
         for kind, source_claim, source_stage in sources:
@@ -8074,6 +8430,7 @@ class Ledger:
         conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, route_stage_name))
         if triage_claim is not None:
             conn.execute("DELETE FROM scheduler_stage_claims WHERE claim_id=?", (triage_claim["claim_id"],))
+            conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"triage-applied-{attempt_number}"))
         if feedback is not None:
             conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"triage-feedback-{attempt_number}"))
         return archive_ids
@@ -8090,11 +8447,18 @@ class Ledger:
         replay_validation_artifact_path: str = "",
         replay_validation_artifact_sha256: str = "",
         replay_compact_evidence: str = "",
+        recovery_authority_capability: object | None = None,
+        recovery_operation_id: str = "",
         now: int | None = None,
     ) -> dict[str, Any]:
         """Reopen the same candidate after a proven deterministic-validation controller defect."""
-        if attempt_number < 1 or not operator_id.strip() or not reason.strip() or not archived_validation_artifact_path or not archived_validation_artifact_sha256:
+        attempt_number = _strict_positive_identity_int(attempt_number, name="attempt_number")
+        if not operator_id.strip() or not reason.strip() or not archived_validation_artifact_path or not archived_validation_artifact_sha256:
             raise ValueError("validation controller-defect recovery requires attempt, operator, reason, and archived validation artifact")
+        if recovery_authority_capability is None:
+            raise PermissionError("validation controller-defect recovery requires controller-owned authority capability")
+        if not recovery_operation_id:
+            raise PermissionError("validation controller-defect recovery requires immutable controller operation identity")
         now = self._now() if now is None else now
         with self._transaction() as conn:
             controller = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
@@ -8107,14 +8471,20 @@ class Ledger:
             if str(ticket["state"]) not in {CanonicalState.BLOCKED.value, CanonicalState.VERIFYING.value}:
                 raise ValueError("validation controller-defect recovery requires blocked ticket")
             terminal = conn.execute("SELECT * FROM terminal_ticket_failures WHERE ticket_id=? ORDER BY generation DESC", (ticket_id,)).fetchone()
-            if terminal is None or int(terminal["attempt_number"]) != attempt_number:
+            if terminal is None:
+                raise ValueError("validation controller-defect recovery requires current unresolved terminal attempt")
+            terminal_attempt = _strict_positive_identity_int(terminal["attempt_number"], name="terminal attempt_number")
+            generation = _strict_positive_identity_int(terminal["generation"], name="terminal generation")
+            if terminal_attempt != attempt_number:
                 raise ValueError("validation controller-defect recovery requires current unresolved terminal attempt")
             try:
                 terminal_summary = json.loads(str(terminal["summary_json"] or "{}"))
             except json.JSONDecodeError as exc:
                 raise ValueError("validation controller-defect recovery terminal summary is malformed") from exc
             deterministic_failure = terminal_summary.get("deterministic_failure") if isinstance(terminal_summary, dict) else None
-            if not isinstance(deterministic_failure, dict) or deterministic_failure.get("source") != "validation" or int(deterministic_failure.get("attempt_number") or 0) != attempt_number:
+            if not isinstance(deterministic_failure, dict) or deterministic_failure.get("source") != "validation":
+                raise ValueError("validation controller-defect recovery requires validation terminal evidence")
+            if _strict_positive_identity_int(deterministic_failure.get("attempt_number"), name="terminal summary attempt_number") != attempt_number:
                 raise ValueError("validation controller-defect recovery requires validation terminal evidence")
             claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"validation:{attempt_number}")).fetchone()
             claim_incomplete = (
@@ -8136,9 +8506,102 @@ class Ledger:
             if not claim_incomplete and not claim_completed:
                 raise ValueError("validation controller-defect recovery requires frozen failed validation claim")
             assert claim is not None
+            binding = conn.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if binding is None:
+                raise PermissionError("validation controller-defect recovery runtime binding is missing")
+            existing_authority = conn.execute(
+                "SELECT * FROM validation_recovery_authorities WHERE ticket_id=? AND attempt_number=? AND terminal_generation=?",
+                (ticket_id, attempt_number, generation),
+            ).fetchone()
+            if existing_authority is None:
+                expected_authority = self._validation_recovery_authority_projection_in_transaction(conn, ticket_id=ticket_id, attempt_number=attempt_number)
+            else:
+                try:
+                    stored_document = json.loads(str(existing_authority["document_json"]))
+                except json.JSONDecodeError as exc:
+                    raise ValueError("validation recovery authority document is malformed") from exc
+                if not isinstance(stored_document, dict) or not isinstance(stored_document.get("authority"), dict):
+                    raise ValueError("validation recovery authority document is malformed")
+                expected_authority = dict(stored_document["authority"])
+            expected_archive_ids = expected_authority.get("expected_archive_ids")
+            if not isinstance(expected_archive_ids, list) or not all(isinstance(value, str) and value for value in expected_archive_ids):
+                raise ValueError("validation controller-defect recovery signed archive identity set is malformed")
+            verified_authority = validate_and_consume_validation_recovery_capability(
+                recovery_authority_capability,
+                operation_id=recovery_operation_id,
+                operation_kind="recover",
+                operation_reason=reason,
+                transaction_token=self._active_transaction_token,
+                ledger_path=self.database,
+                repository=Path(str(binding["repository_path"])),
+                runtime_binding=binding,
+                ticket_id=ticket_id,
+                attempt_number=attempt_number,
+                terminal_generation=generation,
+                operator_id=operator_id,
+                expected_archive_ids=tuple(expected_archive_ids),
+                ledger_connection=conn,
+                replay_validation_artifact_path=replay_validation_artifact_path,
+                replay_validation_artifact_sha256=replay_validation_artifact_sha256,
+                replay_compact_evidence=replay_compact_evidence,
+                validation_policy_hash=self._validation_policy_hash(ticket),
+            )
+            signed_document = json.loads(str(verified_authority["document_json"]))
+            signed_authority = signed_document.get("authority") if isinstance(signed_document, dict) else None
+            current_authority = self._validation_recovery_authority_projection_in_transaction(
+                conn, ticket_id=ticket_id, attempt_number=attempt_number
+            )
+            authority_matches = isinstance(signed_authority, dict) and signed_authority == current_authority
+            if not authority_matches and authorized_replay and isinstance(signed_authority, dict):
+                replay_terminal = conn.execute(
+                    "SELECT * FROM terminal_ticket_failures WHERE ticket_id=? AND generation=?",
+                    (ticket_id, generation),
+                ).fetchone()
+                if replay_terminal is not None and replay_terminal["resolved_at"] is not None:
+                    normalized_terminal = {
+                        "ticket_id": str(replay_terminal["ticket_id"]),
+                        "attempt_number": _strict_positive_identity_int(replay_terminal["attempt_number"], name="terminal attempt_number"),
+                        "failure_fingerprint": str(replay_terminal["failure_fingerprint"]),
+                        "reason": str(replay_terminal["reason"]),
+                        "summary_json": str(replay_terminal["summary_json"]),
+                        "created_at": int(replay_terminal["created_at"]),
+                        "generation": _strict_positive_identity_int(replay_terminal["generation"], name="terminal generation"),
+                        "resolved_at": None,
+                        "resolved_by": None,
+                        "resolution_reason": None,
+                    }
+                    replay_current = dict(current_authority)
+                    replay_current["terminal_evidence_hash"] = canonical_sha256(normalized_terminal)
+                    authority_matches = signed_authority == replay_current
+            if not authority_matches:
+                raise PermissionError("signed validation recovery authority is stale or differs from current terminal/candidate authority")
+            canonical_document_json = str(verified_authority["document_json"])
+            document_hash = str(verified_authority["document_hash"])
+            detached_signature = bytes(verified_authority["detached_signature"])
+            signer_fingerprint = str(verified_authority["signer_fingerprint"])
+            authority_id = f"validation-recovery-authority:{ticket_id}:{attempt_number}:g{generation}"
+            if existing_authority is None:
+                conn.execute(
+                    "INSERT INTO validation_recovery_authorities(authority_id,ticket_id,attempt_number,terminal_generation,operator_id,reason,signer_fingerprint,document_json,document_hash,detached_signature,expected_archive_ids_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (authority_id, ticket_id, attempt_number, generation, operator_id, reason, signer_fingerprint, canonical_document_json, document_hash, detached_signature, json.dumps(expected_archive_ids, sort_keys=True, separators=(",", ":")), now),
+                )
+            else:
+                if (
+                    str(existing_authority["authority_id"]) != authority_id
+                    or _strict_positive_identity_int(existing_authority["attempt_number"], name="stored recovery authority attempt_number") != attempt_number
+                    or _strict_positive_identity_int(existing_authority["terminal_generation"], name="stored recovery authority terminal_generation") != generation
+                    or str(existing_authority["operator_id"]) != operator_id
+                    or str(existing_authority["reason"]) != reason
+                    or str(existing_authority["signer_fingerprint"]) != signer_fingerprint
+                    or str(existing_authority["document_json"]) != canonical_document_json
+                    or str(existing_authority["document_hash"]) != document_hash
+                    or bytes(existing_authority["detached_signature"]) != detached_signature
+                    or json.loads(str(existing_authority["expected_archive_ids_json"])) != expected_archive_ids
+                ):
+                    raise ValueError("validation controller-defect recovery signed authority conflicts with prior evidence")
             validation_stage = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"validation-{attempt_number}")).fetchone()
             if validation_stage is None and authorized_replay:
-                validation_stage = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"validation-controller-defect-archive-{attempt_number}-{int(terminal['generation'] or 1)}")).fetchone()
+                validation_stage = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"validation-controller-defect-archive-{attempt_number}-{generation}")).fetchone()
             if validation_stage is None or not validation_stage["artifact_path"] or not validation_stage["artifact_sha256"]:
                 raise ValueError("validation controller-defect recovery requires persisted failed validation evidence")
             try:
@@ -8168,7 +8631,12 @@ class Ledger:
                 claim_identity = json.loads(str(claim["candidate_identity_json"]))
             except (TypeError, json.JSONDecodeError) as exc:
                 raise ValueError("validation controller-defect recovery claim identity is malformed") from exc
-            if validation_record.get("candidate_identity") != claim_identity:
+            validation_candidate_identity = validation_record.get("candidate_identity")
+            if not isinstance(validation_candidate_identity, dict):
+                raise ValueError("validation controller-defect recovery validation identity is malformed")
+            if _strict_positive_identity_int(validation_candidate_identity.get("attempt_number"), name="validation record attempt_number") != attempt_number:
+                raise ValueError("validation controller-defect recovery validation identity conflicts with frozen claim")
+            if canonical_sha256(validation_candidate_identity) != canonical_sha256(claim_identity):
                 raise ValueError("validation controller-defect recovery validation identity conflicts with frozen claim")
             replay_artifact = Path(replay_validation_artifact_path).resolve(strict=True)
             if not replay_artifact.is_file() or hashlib.sha256(replay_artifact.read_bytes()).hexdigest() != replay_validation_artifact_sha256:
@@ -8192,7 +8660,6 @@ class Ledger:
                     raise ValueError("validation controller-defect recovery completed claim conflicts with failed validation")
             if conn.execute("SELECT 1 FROM review_candidates WHERE ticket_id=? AND attempt_number=? UNION SELECT 1 FROM review_results WHERE ticket_id=? AND attempt_number=? UNION SELECT 1 FROM accepted_evidence WHERE ticket_id=?", (ticket_id, attempt_number, ticket_id, attempt_number, ticket_id)).fetchone() is not None:
                 raise ValueError("validation controller-defect recovery refuses review or acceptance activity")
-            generation = int(terminal["generation"] or 1)
             downstream_archive_ids = self._archive_validation_recovery_downstream_in_transaction(
                 conn,
                 ticket_id=ticket_id,
@@ -8226,7 +8693,7 @@ class Ledger:
                 completed_archive_stage = f"validation-completed-controller-defect-archive-{attempt_number}-{generation}"
                 completed_archive_detail = json.dumps({
                     "original_stage": "validation_completed",
-                    "original_attempt_number": int(completed["attempt_number"] or 0),
+                    "original_attempt_number": _strict_positive_identity_int(completed["attempt_number"], name="validation completed attempt_number"),
                     "terminal_generation": generation,
                     "reason": reason,
                     "detail": str(completed["detail"]),
@@ -8267,7 +8734,14 @@ class Ledger:
                     f"UPDATE gateway_notification_outbox SET status='superseded',superseded_at=?,lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,updated_at=? WHERE operation_id IN ({placeholders}) AND status IN ('pending','retryable')",
                     (now, now, *superseded),
                 )
-            conn.execute("UPDATE terminal_ticket_failures SET resolved_at=?,resolved_by=?,resolution_reason=? WHERE ticket_id=? AND resolved_at IS NULL", (now, operator_id, reason[:2000], ticket_id))
+            if authorized_replay:
+                replay_terminal = conn.execute("SELECT resolved_at FROM terminal_ticket_failures WHERE ticket_id=?", (ticket_id,)).fetchone()
+                if replay_terminal is None or replay_terminal["resolved_at"] is None:
+                    raise RuntimeError("authorized validation recovery replay requires already-resolved terminal failure")
+            else:
+                resolved_terminal = conn.execute("UPDATE terminal_ticket_failures SET resolved_at=?,resolved_by=?,resolution_reason=? WHERE ticket_id=? AND resolved_at IS NULL", (now, operator_id, reason[:2000], ticket_id))
+                if resolved_terminal.rowcount != 1:
+                    raise RuntimeError("terminal failure changed while authorizing validation recovery")
             states = (CanonicalState.READY_LOCAL, CanonicalState.IMPLEMENTING, CanonicalState.VERIFYING, CanonicalState.LOCAL_REVIEW) if not authorized_replay else (CanonicalState.LOCAL_REVIEW,)
             current = CanonicalState.BLOCKED
             if authorized_replay:
@@ -8298,6 +8772,17 @@ class Ledger:
                 raise RuntimeError("validation controller-defect recovery claim changed during replay authorization")
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="terminal_unresolvable_resolved", actor_id=operator_id, payload={"mode": "validation_controller_defect", "reason": reason, "attempt_number": attempt_number, "terminal_generation": generation, "archived_validation_stage": archive_stage, "archived_validation_completed_stage": completed_archive_stage, "archived_downstream_identities": downstream_archive_ids, "superseded_notification_operation_ids": superseded})
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="validation_controller_defect_recovery_authorized", actor_id=operator_id, payload={"attempt_number": attempt_number, "terminal_generation": generation, "claim_id": str(claim["claim_id"]), "prior_claim_status": str(claim["status"]), "archived_validation_stage": archive_stage, "archived_downstream_identities": downstream_archive_ids, "reason": reason})
+            commit_policy_hash = self._validation_policy_hash(conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone())
+            transaction_token = self._active_transaction_token
+            self._active_transaction_commit_guard = lambda: revalidate_consumed_validation_recovery_capability(
+                recovery_authority_capability,
+                operation_id=recovery_operation_id,
+                transaction_token=transaction_token,
+                ledger_path=self.database,
+                repository=Path(str(binding["repository_path"])),
+                ledger_connection=conn,
+                validation_policy_hash=commit_policy_hash,
+            )
             return {"ticket_id": ticket_id, "attempt_number": attempt_number, "state": CanonicalState.LOCAL_REVIEW.value, "claim_id": str(claim["claim_id"]), "terminal_generation": generation, "archived_validation_stage": archive_stage, "archived_downstream_identities": downstream_archive_ids, "superseded_notification_operation_ids": superseded}
 
     def reconcile_validation_controller_defect_completion_marker(
@@ -8307,11 +8792,16 @@ class Ledger:
         attempt_number: int,
         operator_id: str,
         reason: str,
+        recovery_authority_capability: object,
         now: int | None = None,
+        recovery_operation_id: str = "",
     ) -> dict[str, Any]:
         """Repair a stale validation_completed marker after an authorized controller-defect recovery."""
-        if attempt_number < 1 or not operator_id.strip() or not reason.strip():
+        attempt_number = _strict_positive_identity_int(attempt_number, name="attempt_number")
+        if not operator_id.strip() or not reason.strip():
             raise ValueError("validation marker reconciliation requires attempt, operator, and reason")
+        if not recovery_operation_id:
+            raise PermissionError("validation marker reconciliation requires immutable controller operation identity")
         now = self._now() if now is None else now
         with self._transaction() as conn:
             paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
@@ -8322,18 +8812,89 @@ class Ledger:
                 raise KeyError(ticket_id)
             if str(ticket["state"]) not in {CanonicalState.VERIFYING.value, CanonicalState.LOCAL_REVIEW.value}:
                 raise ValueError("validation marker reconciliation requires recovered validating ticket")
-            authorization = None
-            rows = conn.execute("SELECT payload_json FROM events WHERE entity_type='ticket' AND entity_id=? AND event_type='validation_controller_defect_recovery_authorized' ORDER BY id DESC", (ticket_id,)).fetchall()
-            for row in rows:
-                try:
-                    payload = json.loads(str(row["payload_json"] or "{}"))
-                except json.JSONDecodeError:
-                    continue
-                if int(payload.get("attempt_number") or 0) == attempt_number:
-                    authorization = payload
-                    break
-            if authorization is None:
-                raise PermissionError("validation marker reconciliation lacks controller-defect recovery authorization")
+            authority_row = conn.execute(
+                "SELECT * FROM validation_recovery_authorities WHERE ticket_id=? AND attempt_number=? ORDER BY terminal_generation DESC LIMIT 1",
+                (ticket_id, attempt_number),
+            ).fetchone()
+            if authority_row is None:
+                raise PermissionError("validation marker reconciliation lacks signed controller-defect recovery authority")
+            binding = conn.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if binding is None:
+                raise PermissionError("validation marker reconciliation lacks runtime signer authority")
+            bound_fingerprint = binding["operator_signer_fingerprint"]
+            bound_authority_hash = binding["operator_authority_hash"]
+            if not isinstance(bound_fingerprint, str) or not bound_fingerprint or not isinstance(bound_authority_hash, str) or not bound_authority_hash:
+                raise PermissionError("validation marker reconciliation lacks runtime signer authority")
+            if str(authority_row["signer_fingerprint"]) != bound_fingerprint:
+                raise ValueError("validation marker reconciliation signed authority signer conflicts")
+            try:
+                authorization_document = json.loads(str(authority_row["document_json"]))
+            except json.JSONDecodeError as exc:
+                raise ValueError("validation marker reconciliation signed authority is malformed") from exc
+            authorization = authorization_document.get("authority") if isinstance(authorization_document, dict) else None
+            if not isinstance(authorization, dict):
+                raise ValueError("validation marker reconciliation signed authority is malformed")
+            canonical_document_json = str(authority_row["document_json"])
+            document_hash = hashlib.sha256(canonical_document_json.encode("utf-8")).hexdigest()
+            if str(authority_row["document_hash"]) != document_hash:
+                raise ValueError("validation marker reconciliation signed authority document hash conflicts")
+            if authorization_document.get("operator_id") != operator_id:
+                raise ValueError("validation marker reconciliation operator conflicts with signed authority")
+            if str(authorization.get("ticket_id") or "") != ticket_id:
+                raise ValueError("validation marker reconciliation signed authority ticket conflicts")
+            if str(authorization.get("signer_fingerprint") or "") != bound_fingerprint:
+                raise ValueError("validation marker reconciliation signed authority signer conflicts")
+            if str(authorization.get("runtime_authority_hash") or "") != bound_authority_hash:
+                raise ValueError("validation marker reconciliation runtime authority conflicts")
+            try:
+                expected_archive_ids = json.loads(str(authority_row["expected_archive_ids_json"]))
+            except json.JSONDecodeError as exc:
+                raise ValueError("validation marker reconciliation signed archive identity set is malformed") from exc
+            approved_archive_ids = authorization.get("expected_archive_ids")
+            if (
+                not isinstance(expected_archive_ids, list)
+                or not all(isinstance(value, str) and value for value in expected_archive_ids)
+                or approved_archive_ids != expected_archive_ids
+            ):
+                raise ValueError("validation marker reconciliation signed archive identity set conflicts")
+            actual_archive_ids = [
+                str(row["archive_id"])
+                for row in conn.execute(
+                    "SELECT archive_id FROM validation_recovery_archives WHERE ticket_id=? AND attempt_number=? AND terminal_generation=? ORDER BY archive_id",
+                    (ticket_id, attempt_number, authority_row["terminal_generation"]),
+                ).fetchall()
+            ]
+            if sorted(actual_archive_ids) != sorted(expected_archive_ids) or len(actual_archive_ids) != len(set(actual_archive_ids)):
+                raise ValueError("validation marker reconciliation archived recovery identity set conflicts")
+            verified_authority = validate_and_consume_validation_recovery_capability(
+                recovery_authority_capability,
+                operation_id=recovery_operation_id,
+                operation_kind="marker_reconcile",
+                operation_reason=reason,
+                transaction_token=self._active_transaction_token,
+                ledger_path=self.database,
+                repository=Path(str(binding["repository_path"])),
+                runtime_binding=binding,
+                ticket_id=ticket_id,
+                attempt_number=attempt_number,
+                terminal_generation=_strict_positive_identity_int(authority_row["terminal_generation"], name="stored recovery authority terminal_generation"),
+                operator_id=operator_id,
+                expected_archive_ids=tuple(expected_archive_ids),
+                ledger_connection=conn,
+            )
+            if (
+                str(verified_authority["document_json"]) != canonical_document_json
+                or str(verified_authority["document_hash"]) != str(authority_row["document_hash"])
+                or bytes(verified_authority["detached_signature"]) != bytes(authority_row["detached_signature"])
+                or str(verified_authority["signer_fingerprint"]) != str(authority_row["signer_fingerprint"])
+            ):
+                raise ValueError("validation marker reconciliation signed authority conflicts with verified external authority")
+            if (
+                _strict_positive_identity_int(authority_row["attempt_number"], name="stored recovery authority attempt_number") != attempt_number
+                or _strict_positive_identity_int(authority_row["terminal_generation"], name="stored recovery authority terminal_generation") != _strict_positive_identity_int(authorization.get("terminal_generation"), name="signed recovery terminal_generation")
+                or _strict_positive_identity_int(authorization.get("attempt_number"), name="signed recovery attempt_number") != attempt_number
+            ):
+                raise ValueError("validation marker reconciliation signed authority conflicts")
             stage = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"validation-{attempt_number}")).fetchone()
             if stage is None or not stage["artifact_path"] or not stage["artifact_sha256"]:
                 raise ValueError("validation marker reconciliation requires current validation evidence")
@@ -8349,11 +8910,11 @@ class Ledger:
                 raise ValueError("validation marker reconciliation requires matching frozen validation claim")
             existing = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage='validation_completed'", (ticket_id,)).fetchone()
             archive_stage = None
-            if existing is not None and int(existing["attempt_number"] or 0) != attempt_number:
-                generation = int(authorization.get("terminal_generation") or 0)
+            if existing is not None and _strict_positive_identity_int(existing["attempt_number"], name="existing validation completed attempt_number") != attempt_number:
+                generation = _strict_positive_identity_int(authorization.get("terminal_generation"), name="signed recovery terminal_generation")
                 archive_stage = f"validation-completed-controller-defect-late-archive-{attempt_number}-{generation}"
                 if conn.execute("SELECT 1 FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, archive_stage)).fetchone() is None:
-                    archive_detail = json.dumps({"original_attempt_number": int(existing["attempt_number"] or 0), "reason": reason, "detail": str(existing["detail"])}, sort_keys=True, separators=(",", ":"))
+                    archive_detail = json.dumps({"original_attempt_number": _strict_positive_identity_int(existing["attempt_number"], name="existing validation completed attempt_number"), "reason": reason, "detail": str(existing["detail"])}, sort_keys=True, separators=(",", ":"))
                     conn.execute(
                         "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
                         (ticket_id, archive_stage, archive_detail, existing["attempt_number"], existing["artifact_path"], existing["artifact_sha256"], existing["base_sha"], now),
@@ -8365,7 +8926,7 @@ class Ledger:
                     "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
                     (ticket_id, "validation_completed", str(stage["detail"]), attempt_number, stage["artifact_path"], stage["artifact_sha256"], stage["base_sha"], now),
                 )
-            elif int(existing["attempt_number"] or 0) != attempt_number:
+            elif _strict_positive_identity_int(existing["attempt_number"], name="validation completed attempt_number") != attempt_number:
                 raise RuntimeError("validation marker reconciliation could not replace stale marker")
             claim_released = False
             if claim["side_effect_completed_at"] is None:
@@ -8375,6 +8936,15 @@ class Ledger:
                 )
                 claim_released = changed.rowcount == 1
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="validation_controller_defect_marker_reconciled", actor_id=operator_id, payload={"attempt_number": attempt_number, "reason": reason, "archived_stage": archive_stage})
+            transaction_token = self._active_transaction_token
+            self._active_transaction_commit_guard = lambda: revalidate_consumed_validation_recovery_capability(
+                recovery_authority_capability,
+                operation_id=recovery_operation_id,
+                transaction_token=transaction_token,
+                ledger_path=self.database,
+                repository=Path(str(binding["repository_path"])),
+                ledger_connection=conn,
+            )
             return {"ticket_id": ticket_id, "attempt_number": attempt_number, "status": "reconciled", "archived_stage": archive_stage, "claim_released": claim_released}
 
     def reopen_terminal_ticket_after_paid_budget(

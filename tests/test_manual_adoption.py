@@ -2,14 +2,24 @@ from __future__ import annotations
 
 import subprocess
 import hashlib
+import base64
 import json
+import copy
+import os
+import shutil
+import threading
 import unittest
 from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.exceptions import InvalidSignature
 
 from local_first_orchestrator.controller import LocalFirstController, RuntimeConfig
 from local_first_orchestrator.ledger import Ledger
+from local_first_orchestrator.native_release_approval import APPROVAL_VERSION, VALIDATION_RECOVERY_DOMAIN, canonical_validation_recovery_bytes, fingerprint_public_key
+from local_first_orchestrator.operator_config import ModelRegistration, OperatorConfig, load_operator_config, save_operator_config
+import local_first_orchestrator.validation_recovery_boundary as recovery_boundary
 from local_first_orchestrator.states import CanonicalState
 from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
 
@@ -48,8 +58,27 @@ class ManualAdoptionTests(unittest.TestCase):
         self.ticket_id = self.ledger.create_ticket(
             title="manual adoption", external_id=self.external_id, state=CanonicalState.READY_LOCAL, contract=ticket.contract()
         )
-        self.ledger.bind_runtime(self.ticket_id, str(self.repo), self.base)
-        self.config = RuntimeConfig(self.repo, self.root / "attempt-worktrees", self.root / "artifacts", repository_allowlist=(self.repo,))
+        self.signing_key = Ed25519PrivateKey.generate()
+        self.signer_public_key = self.signing_key.public_key().public_bytes_raw()
+        self.signer_fingerprint = fingerprint_public_key(self.signer_public_key)
+        self.signer_authority_hash = hashlib.sha256(self.signer_fingerprint.encode("ascii")).hexdigest()
+        self.operator_config_path = self.root / "operator-config.json"
+        self.operator_config = OperatorConfig(
+            ledger_path=self.ledger.database,
+            canonical_repository=self.repo,
+            repository_allowlist=(self.repo,),
+            implementation=ModelRegistration("implementation", "fixture", "fixture"),
+            review=ModelRegistration("review", "fixture", "fixture"),
+            worktree_root=self.root / "attempt-worktrees",
+            artifact_root=self.root / "artifacts",
+            implementation_timeout_seconds=300,
+            review_timeout_seconds=300,
+            operator_signing_public_key=base64.b64encode(self.signer_public_key).decode("ascii"),
+            operator_signing_key_fingerprint=self.signer_fingerprint,
+        )
+        save_operator_config(self.operator_config, self.operator_config_path)
+        self.ledger.bind_runtime(self.ticket_id, str(self.repo), self.base, operator_signer_fingerprint=self.signer_fingerprint, operator_authority_hash=self.signer_authority_hash)
+        self.config = load_operator_config(self.operator_config_path).runtime_config()
         self.controller = LocalFirstController(self.ledger, _Board(), self.config)
         self.ledger.pause("operator", reason="manual adoption test")
         self.initial_status = subprocess.run(("git", "status", "--porcelain=v1", "--untracked-files=all"), cwd=self.worktree, text=True, capture_output=True, check=True).stdout
@@ -57,6 +86,24 @@ class ManualAdoptionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.ledger.close()
         self.temp.cleanup()
+
+    def _recovery_material(self, attempt_number: int, reason: str) -> tuple[dict[str, object], bytes]:
+        prepared = self.controller.prepare_validation_controller_defect_recovery(self.ticket_id, attempt_number, operator_id="operator", reason=reason)
+        document = prepared["document"]
+        assert isinstance(document, dict)
+        return document, self.signing_key.sign(canonical_validation_recovery_bytes(document))
+
+    def _recover(self, attempt_number: int, reason: str) -> dict[str, object]:
+        document, signature = self._recovery_material(attempt_number, reason)
+        return self.controller.recover_terminal_validation_controller_defect(
+            self.ticket_id,
+            attempt_number,
+            repository=self.repo,
+            operator_id="operator",
+            reason=reason,
+            approval_document=document,
+            detached_signature=signature,
+        )
 
     def test_adoption_records_truthful_provenance_and_enters_normal_validation(self) -> None:
         adopted = self.controller.adopt_existing_implementation(
@@ -294,12 +341,13 @@ class ManualAdoptionTests(unittest.TestCase):
             notification_target="mattermost:ops",
         )
         self.ledger.pause("operator", reason="recover validator defect")
-        with self.assertRaisesRegex(ValueError, "distinct dedicated archive"):
+        unsafe_reason = "unsafe direct-ledger archive alias"
+        with self.assertRaisesRegex(PermissionError, "controller-owned authority capability"):
             self.ledger.recover_terminal_validation_controller_defect(
                 self.ticket_id,
                 attempt_number=2,
                 operator_id="operator",
-                reason="unsafe direct-ledger archive alias",
+                reason=unsafe_reason,
                 archived_validation_artifact_path=str(false_artifact),
                 archived_validation_artifact_sha256=false_sha,
             )
@@ -309,13 +357,7 @@ class ManualAdoptionTests(unittest.TestCase):
             (self.ticket_id,),
         ).fetchone()
         self.assertIsNone(unresolved["resolved_at"])
-        recovered = self.controller.recover_terminal_validation_controller_defect(
-            self.ticket_id,
-            2,
-            repository=self.repo,
-            operator_id="operator",
-            reason="validator double-counted staged declared new files",
-        )
+        recovered = self._recover(2, "validator double-counted staged declared new files")
         self.assertEqual(recovered["state"], CanonicalState.LOCAL_REVIEW.value)
         self.assertIn("validation passed", str(recovered["preflight_compact_evidence"]))
         archive = self.ledger.runtime_stage(self.ticket_id, "validation-controller-defect-archive-2-2")
@@ -346,11 +388,36 @@ class ManualAdoptionTests(unittest.TestCase):
             "INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,base_sha,created_at) VALUES (?,?,?,?,?,?,?,?)",
             (self.ticket_id, "validation_completed", json.dumps({"passed": True, "historical_attempt": 1}), 1, str(false_artifact), false_sha, self.base, 1),
         )
-        reconciled = self.ledger.reconcile_validation_controller_defect_completion_marker(
+        genuine_authority = self.ledger.connection.execute("SELECT * FROM validation_recovery_authorities WHERE ticket_id=? AND attempt_number=2", (self.ticket_id,)).fetchone()
+        self.assertIsNotNone(genuine_authority)
+        self.ledger.connection.execute("DROP TRIGGER validation_recovery_authorities_immutable_delete")
+        self.ledger.connection.execute("DELETE FROM validation_recovery_authorities WHERE ticket_id=? AND attempt_number=2", (self.ticket_id,))
+        authority_columns = [desc[0] for desc in self.ledger.connection.execute("SELECT * FROM validation_recovery_authorities LIMIT 0").description]
+        forged_values = [genuine_authority[column] for column in authority_columns]
+        forged_values[authority_columns.index("detached_signature")] = b"x" * 64
+        self.ledger.connection.execute(
+            f"INSERT INTO validation_recovery_authorities({','.join(authority_columns)}) VALUES ({','.join('?' for _ in authority_columns)})",
+            forged_values,
+        )
+        before_forged_reconcile = self.ledger.connection.serialize()
+        with self.assertRaises((InvalidSignature, ValueError, PermissionError)):
+            self.controller.reconcile_validation_controller_defect_completion_marker(
+                self.ticket_id,
+                2,
+                operator_id="operator",
+                reason="stale historical completion marker discovered after recovery",
+            )
+        self.assertEqual(before_forged_reconcile, self.ledger.connection.serialize())
+        self.ledger.connection.execute("DELETE FROM validation_recovery_authorities WHERE ticket_id=? AND attempt_number=2", (self.ticket_id,))
+        self.ledger.connection.execute(
+            f"INSERT INTO validation_recovery_authorities({','.join(authority_columns)}) VALUES ({','.join('?' for _ in authority_columns)})",
+            [genuine_authority[column] for column in authority_columns],
+        )
+        reconciled = self.controller.reconcile_validation_controller_defect_completion_marker(
             self.ticket_id,
-            attempt_number=2,
+            2,
             operator_id="operator",
-            reason="stale historical completion marker discovered after recovery",
+            reason="validator double-counted staged declared new files",
         )
         self.assertEqual(reconciled["status"], "reconciled")
         self.assertEqual(self.ledger.runtime_stage(self.ticket_id, "validation_completed")["attempt_number"], 2)
@@ -683,6 +750,7 @@ class ManualAdoptionTests(unittest.TestCase):
             self.controller.adopt_existing_implementation(
                 self.ticket_id, repository=self.repo, operator_id="operator", reason="conflicting orphan"
             )
+
 
 
 if __name__ == "__main__":

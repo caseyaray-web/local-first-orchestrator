@@ -125,6 +125,22 @@ Examples include:
 - checkpoint artifacts and integration commands;
 - paid provider calls.
 
+### Recovery-boundary threat model
+
+Validation-recovery capabilities are an in-process misuse boundary, not a sandbox. They reject stale or replayed authority, alternate SQLite connections, wrong threads/processes, mismatched transaction provenance, and drift detected at the recovery commit fence. They do **not** authenticate arbitrary code that already has unrestricted execution inside the Local First Python interpreter.
+
+| Actor | Boundary / treatment |
+| --- | --- |
+| Raw-SQL writer using a different connection/process | Untrusted. Signed recovery authority is reconstructed and compared inside the trusted transaction; exact `Ledger.connection` and SQLite inode identity are required. |
+| Ordinary API/plugin caller without arbitrary interpreter execution | Untrusted. Must pass the controller-owned recovery path, signed authority, immutable operation identity, thread/PID checks, and transaction provenance. |
+| Cross-thread caller | Untrusted and rejected by capability ownership checks. |
+| Cross-process caller | Untrusted and rejected by PID ownership and SQLite/process identity checks. |
+| External operator-config writer | In scope only through the supported config writer, which honors the operator-config lock. Recovery holds that writer lock through SQLite commit and revalidates exact bytes/inode/authority. A non-cooperating writer that bypasses the lock is outside this in-process boundary. |
+| External repository/worktree writer | In scope only if it honors the repository recovery lock. Recovery holds that lock through commit and binds the complete post-validation lexical tree, untracked set, candidate contents, replay artifact, and Git administrative manifest. A non-cooperating arbitrary filesystem writer that ignores the lock is outside this boundary; defending against it requires an isolated/privileged filesystem authority. |
+| Arbitrary code already executing inside the controller interpreter | Trusted / out of scope. Python sentinels, registries, frame inspection, and object identity are not security isolation. Defending against malicious same-process code requires a separately privileged process with authenticated IPC. |
+
+The repository recovery lock is therefore a **cooperative writer exclusion contract**, not an OS sandbox. Recovery fails closed when its required identity/lock/config/SQLite proofs cannot be established; it does not claim atomicity against a writer that deliberately bypasses the documented lock contract.
+
 ### 3. Validation and finality are deterministic authority
 
 Model output can propose implementation, review judgments, decomposition, triage, or checkpoint decisions. It does not bypass deterministic validation or rewrite completion authority.
