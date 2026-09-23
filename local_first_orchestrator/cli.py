@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import uuid
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,7 @@ from .local_qwen import LOCAL_QWEN_MODEL, LOCAL_QWEN_PROVIDER, LocalQwenAdapter
 from .operator_config import ModelRegistration, OperatorConfig, default_execution_roots, load_operator_config, save_operator_config
 from .signer_enrollment import enroll_operator_signer
 from .runtime_metrics import RuntimeMetricsStore
-from .native_release_approval import parse_approval_document
+from .native_release_approval import parse_approval_document, canonical_stale_routing_recovery_bytes
 from .paid_model import HermesPaidModelAdapter
 from .scheduler import ProcessNextScheduler, preview_database, preview_ticket_database, scheduler_observability
 from .states import CanonicalState
@@ -698,6 +699,10 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     recover_validation.add_argument("--task-id", required=True); recover_validation.add_argument("--attempt-number", required=True, type=int); recover_validation.add_argument("--reason", required=True); recover_validation.add_argument("--operator-id", default="local-first-cli"); recover_validation.add_argument("--approval-file", required=True); recover_validation.add_argument("--signature-file", required=True)
     reconcile_validation_marker=commands.add_parser("reconcile-validation-controller-defect-marker", help="paused operator-only: reconcile one stale validation completion marker under signed recovery authority")
     reconcile_validation_marker.add_argument("--task-id", required=True); reconcile_validation_marker.add_argument("--attempt-number", required=True, type=int); reconcile_validation_marker.add_argument("--reason", required=True); reconcile_validation_marker.add_argument("--operator-id", default="local-first-cli")
+    prepare_stale=commands.add_parser("prepare-stale-routing-recovery", help="read-only: emit exact paused stale-routing supersession approval bytes")
+    prepare_stale.add_argument("--task-id", required=True); prepare_stale.add_argument("--attempt-number", required=True, type=int); prepare_stale.add_argument("--operator-id", required=True); prepare_stale.add_argument("--reason", required=True); prepare_stale.add_argument("--request-id", required=True); prepare_stale.add_argument("--output-file")
+    recover_stale=commands.add_parser("recover-stale-routing", help="paused, signed ledger-only supersession; no review application or board writes")
+    recover_stale.add_argument("--task-id", required=True); recover_stale.add_argument("--attempt-number", required=True, type=int); recover_stale.add_argument("--operator-id", required=True); recover_stale.add_argument("--reason", required=True); recover_stale.add_argument("--request-id", required=True); recover_stale.add_argument("--approval-file", required=True); recover_stale.add_argument("--signature-file", required=True)
     authorize_revalidate=commands.add_parser("authorize-historical-revalidation", help="authorize one exact historical implementation for a future integrity gate; does not revalidate")
     authorize_revalidate.add_argument("--task-id",required=True); authorize_revalidate.add_argument("--attempt-number",required=True, type=int); authorize_revalidate.add_argument("--operator-id", default="local-first-cli"); authorize_revalidate.add_argument("--reason", default="operator authorization for historical revalidation")
     attest_revalidate=commands.add_parser("attest-historical-revalidation", help="attest one preserved historical implementation; does not validate or recover")
@@ -999,6 +1004,29 @@ def run_command(args: argparse.Namespace) -> int:
             if args.ad_hoc_runtime: raise ValueError("validation marker reconciliation requires registered operator runtime")
             ctl, _ = _registered_controller(ledger,args,allow_board_writes=False)
             print(json.dumps(ctl.reconcile_validation_controller_defect_completion_marker(args.task_id,args.attempt_number,operator_id=args.operator_id,reason=args.reason),sort_keys=True))
+        elif args.command in {"prepare-stale-routing-recovery", "recover-stale-routing"}:
+            if args.ad_hoc_runtime or args.allow_repository or args.worktree_root or args.artifact_root or args.implementation_timeout_seconds is not None or args.review_timeout_seconds is not None or args.hermes_executable or args.board:
+                raise ValueError("stale routing recovery forbids ad-hoc, runtime, and board overrides")
+            registered=load_operator_config(Path(args.operator_config_path) if args.operator_config_path else None)
+            if ledger.database.resolve() != registered.ledger_path.resolve() or (args.repository != "." and Path(args.repository).resolve() != registered.canonical_repository):
+                raise ValueError("stale routing recovery requires the registered ledger and repository")
+            if not registered.signer_public_key_bytes or not registered.operator_signing_key_fingerprint:
+                raise PermissionError("stale routing recovery requires registered operator signer")
+            if args.command=="prepare-stale-routing-recovery":
+                authority=ledger.stale_routing_recovery_projection(args.task_id,args.attempt_number,operator_config_path=registered.config_path)
+                if authority["signer_fingerprint"] != registered.operator_signing_key_fingerprint:
+                    raise PermissionError("stale routing recovery signer is not bound to ticket")
+                document={"domain":"stale-review-routing-recovery","version":1,"operation":"supersede-stale-routing","request_id":args.request_id,"nonce":uuid.uuid4().hex,"operator_id":args.operator_id,"reason":args.reason,"authority":authority}
+                raw=canonical_stale_routing_recovery_bytes(document)
+                if args.output_file:
+                    Path(args.output_file).write_bytes(raw)
+                    print(json.dumps({"request_id":args.request_id,"approval_hash":__import__("hashlib").sha256(raw).hexdigest(),"output_file":args.output_file},sort_keys=True))
+                else: sys.stdout.write(raw.decode("utf-8"))
+            else:
+                document=parse_approval_document(Path(args.approval_file).read_bytes())
+                if any(document[key] != value for key,value in (("operator_id",args.operator_id),("reason",args.reason),("request_id",args.request_id))):
+                    raise ValueError("stale routing recovery CLI arguments conflict with signed approval")
+                print(json.dumps(ledger.supersede_stale_routing_after_review(args.task_id,attempt_number=args.attempt_number,operator_id=args.operator_id,reason=args.reason,approval_document=document,detached_signature=Path(args.signature_file).read_bytes(),operator_config_path=registered.config_path),sort_keys=True))
         elif args.command=="authorize-historical-revalidation":
             if args.ad_hoc_runtime: raise ValueError("historical revalidation authorization requires registered operator runtime")
             ctl, registered = _registered_controller(ledger,args,allow_board_writes=False)

@@ -16,6 +16,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 APPROVAL_DOMAIN = "native-release-revalidation"
 ACTIVATION_DOMAIN = "native-release-activation"
 VALIDATION_RECOVERY_DOMAIN = "validation-controller-defect-recovery"
+STALE_ROUTING_RECOVERY_DOMAIN = "stale-review-routing-recovery"
 APPROVAL_VERSION = 1
 _REQUIRED = {"domain", "version", "operation", "request_id", "nonce", "operator_id", "reason", "authority"}
 
@@ -104,6 +105,9 @@ def canonical_activation_bytes(document: dict[str, Any]) -> bytes:
 def canonical_validation_recovery_bytes(document: dict[str, Any]) -> bytes:
     return _canonical_bytes(document, domain=VALIDATION_RECOVERY_DOMAIN, operation="recover-validation-controller-defect")
 
+def canonical_stale_routing_recovery_bytes(document: dict[str, Any]) -> bytes:
+    return _canonical_bytes(document, domain=STALE_ROUTING_RECOVERY_DOMAIN, operation="supersede-stale-routing")
+
 
 def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
@@ -128,6 +132,8 @@ def parse_approval_document(raw: bytes | str) -> dict[str, Any]:
         canonical = canonical_activation_bytes(document)
     elif document.get("domain") == VALIDATION_RECOVERY_DOMAIN and document.get("operation") == "recover-validation-controller-defect":
         canonical = canonical_validation_recovery_bytes(document)
+    elif document.get("domain") == STALE_ROUTING_RECOVERY_DOMAIN and document.get("operation") == "supersede-stale-routing":
+        canonical = canonical_stale_routing_recovery_bytes(document)
     else:
         canonical = canonical_approval_bytes(document)
     if canonical != data:

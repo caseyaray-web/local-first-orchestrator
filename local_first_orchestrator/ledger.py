@@ -214,6 +214,30 @@ CREATE TRIGGER IF NOT EXISTS validation_recovery_archives_immutable_update
 BEFORE UPDATE ON validation_recovery_archives BEGIN SELECT RAISE(ABORT, 'validation recovery archives are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS validation_recovery_archives_immutable_delete
 BEFORE DELETE ON validation_recovery_archives BEGIN SELECT RAISE(ABORT, 'validation recovery archives are append-only'); END;
+CREATE TABLE IF NOT EXISTS stale_routing_recovery_archives (
+    request_id TEXT PRIMARY KEY,
+    ticket_id TEXT NOT NULL REFERENCES tickets(id),
+    attempt_number INTEGER NOT NULL,
+    authority_json TEXT NOT NULL,
+    document_json TEXT NOT NULL,
+    detached_signature BLOB NOT NULL,
+    routing_claim_json TEXT NOT NULL,
+    routing_stage_json TEXT NOT NULL,
+    feedback_stage_json TEXT NOT NULL,
+    triage_claim_json TEXT,
+    validation_claim_json TEXT,
+    validation_stage_json TEXT,
+    triage_applied_json TEXT,
+    triage_model_json TEXT,
+    operator_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(ticket_id, attempt_number)
+);
+CREATE TRIGGER IF NOT EXISTS stale_routing_recovery_archives_immutable_update
+BEFORE UPDATE ON stale_routing_recovery_archives BEGIN SELECT RAISE(ABORT, 'stale routing recovery archives are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS stale_routing_recovery_archives_immutable_delete
+BEFORE DELETE ON stale_routing_recovery_archives BEGIN SELECT RAISE(ABORT, 'stale routing recovery archives are append-only'); END;
 CREATE TABLE IF NOT EXISTS features (
     id TEXT PRIMARY KEY,
     external_id TEXT UNIQUE,
@@ -6257,81 +6281,321 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id":claim_id,"stage":"repair_routing","result":result})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
-    def reconcile_stale_repair_routing_after_review(self, ticket_id: str, *, attempt_number: int, operator_id: str, reason: str, now: int | None = None) -> dict[str, Any]:
-        """Reopen a completed repair-routing claim when a newer review supersedes its decision."""
-        if attempt_number < 1 or not operator_id.strip() or not reason.strip():
-            raise ValueError("stale repair-routing reconciliation requires attempt, operator, and reason")
-        now = self._now() if now is None else now
-        with self._transaction() as conn:
+    def _stale_routing_recovery_evidence(self, conn: sqlite3.Connection, ticket_id: str, attempt_number: int, now: int) -> tuple[dict[str, Any], dict[str, sqlite3.Row | None]]:
+        """One read-only authority calculation, shared by approval and the write transaction."""
+        attempt_number = _strict_positive_identity_int(attempt_number, name="attempt_number")
+        paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+        if paused is None or paused["paused"] != 1:
+            raise PermissionError("stale routing recovery requires a paused controller")
+        tick = conn.execute("SELECT lease_expires_at FROM scheduler_tick_lease WHERE id=1").fetchone()
+        if tick is not None and int(tick["lease_expires_at"]) > now:
+            raise PermissionError("stale routing recovery refuses an active scheduler tick")
+        ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+        if ticket is None:
+            raise KeyError(ticket_id)
+        if ticket["state"] != CanonicalState.LOCAL_REVIEW.value or (ticket["lease_owner"] is not None or ticket["lease_expires_at"] is not None):
+            raise ValueError("stale routing recovery requires an unleased local_review ticket")
+        binding = conn.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
+        if binding is None or not binding["operator_signer_fingerprint"] or not binding["operator_authority_hash"]:
+            raise PermissionError("stale routing recovery requires bound operator signer")
+        from .operator_config import operator_authority_hash_from_fingerprint
+        if binding["operator_authority_hash"] != operator_authority_hash_from_fingerprint(binding["operator_signer_fingerprint"]):
+            raise PermissionError("stale routing recovery operator authority is invalid")
+        attempt = conn.execute("SELECT * FROM attempts WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        if attempt is None or conn.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number>?", (ticket_id, attempt_number)).fetchone():
+            raise ValueError("stale routing recovery requires the current frozen attempt")
+        if conn.execute("SELECT 1 FROM review_results WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone():
+            raise ValueError("stale routing recovery refuses an already applied review")
+        if conn.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND status='claimed'", (ticket_id,)).fetchone():
+            raise ValueError("stale routing recovery refuses active claims")
+        candidate = conn.execute("SELECT * FROM review_candidates WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+        review = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"review:{attempt_number}")).fetchone()
+        model = conn.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='review'", (ticket_id, attempt_number)).fetchone()
+        routing = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"repair_routing:{attempt_number}")).fetchone()
+        route_stage = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"repair-routing-{attempt_number}")).fetchone()
+        feedback = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"triage-feedback-{attempt_number}")).fetchone()
+        triage = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"triage:{attempt_number}")).fetchone()
+        validation_claim = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"validation:{attempt_number}")).fetchone()
+        validation_stage = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"validation-{attempt_number}")).fetchone()
+        implementation = conn.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='implementation'", (ticket_id, attempt_number)).fetchone()
+        triage_applied = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, f"triage-applied-{attempt_number}")).fetchone()
+        triage_model = conn.execute("SELECT * FROM model_stage_artifacts WHERE ticket_id=? AND attempt_number=? AND stage='triage'", (ticket_id, attempt_number)).fetchone()
+        if any(row is None for row in (candidate, review, model, routing, route_stage, feedback, validation_claim, validation_stage, implementation)):
+            raise ValueError("stale routing recovery evidence is incomplete")
+        assert candidate is not None and review is not None and model is not None and routing is not None and route_stage is not None and feedback is not None
+        for claim in (review, routing, triage, validation_claim):
+            if claim is not None and (claim["status"] != "completed" or claim["side_effect_started_at"] is None or claim["side_effect_completed_at"] is None or claim["finalized_at"] is None or claim["lease_owner"] is not None or claim["lease_expires_at"] is not None or not claim["result_json"]):
+                raise ValueError("stale routing recovery refuses incomplete or leased claims")
+        if review["side_effect_completed_at"] <= routing["side_effect_completed_at"] or candidate["status"] != "review_pending" or model["status"] != "completed":
+            raise ValueError("stale routing recovery requires a newer unapplied completed review")
+        if route_stage["attempt_number"] != attempt_number or feedback["attempt_number"] != attempt_number or model["diff_hash"] != candidate["candidate_fingerprint"]:
+            raise ValueError("stale routing recovery attempt identity conflicts")
+        try:
+            from .native_release_approval import _no_duplicates
+            def strict_json(value: str) -> Any:
+                return json.loads(value, object_pairs_hook=_no_duplicates, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite JSON number")))
+            identity = strict_json(review["candidate_identity_json"])
+            result = strict_json(review["result_json"])
+            candidate_identity = strict_json(candidate["runtime_identity_json"])
+            route = strict_json(routing["result_json"])
+            stage = strict_json(route_stage["detail"])
+            triage_feedback = strict_json(feedback["detail"])
+            triage_result = strict_json(triage["result_json"]) if triage is not None else None
+            validation_identity = strict_json(validation_claim["candidate_identity_json"])
+            validation_result = strict_json(validation_claim["result_json"])
+            validation_detail = strict_json(validation_stage["detail"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("stale routing recovery evidence is malformed") from exc
+        validation_path = validation_stage["artifact_path"]
+        try:
+            validation_bytes = Path(str(validation_path)).read_bytes() if validation_path else b""
+        except OSError as exc:
+            raise ValueError("stale routing recovery validation artifact is missing") from exc
+        assert implementation is not None
+        implementation_path = implementation["response_artifact"]
+        try:
+            implementation_bytes = Path(str(implementation_path)).read_bytes() if implementation_path else b""
+        except OSError as exc:
+            raise ValueError("stale routing recovery implementation artifact is missing") from exc
+        canonical_validation_identity = {
+            "ticket_id": ticket_id, "attempt_number": attempt_number,
+            "implementation_artifact": implementation_path,
+            "implementation_artifact_sha256": hashlib.sha256(implementation_bytes).hexdigest(),
+            "worktree_path": implementation["worktree_path"], "base_sha": implementation["base_sha"],
+            "implementation_diff_hash": implementation["diff_hash"],
+            "validation_policy_hash": self._validation_policy_hash(ticket),
+        }
+        if (implementation["status"] != "completed" or not implementation_path or not implementation_bytes
+            or implementation["base_sha"] != attempt["base_sha"]
+            or implementation["diff_hash"] != candidate["candidate_fingerprint"]
+            or not isinstance(implementation["worktree_path"], str) or not implementation["worktree_path"]):
+            raise ValueError("stale routing recovery implementation provenance conflicts")
+        if (validation_identity != canonical_validation_identity
+            or not isinstance(validation_result, dict) or not isinstance(validation_detail, dict)
+            or validation_result.get("candidate_identity") != canonical_validation_identity
+            or validation_detail.get("candidate_identity") != canonical_validation_identity
+            or validation_result.get("passed") is not False or validation_detail.get("passed") is not False
+            or validation_result.get("compact_evidence") != validation_detail.get("compact_evidence")
+            or validation_stage["attempt_number"] != attempt_number
+            or not validation_path or validation_result.get("validation_artifact") != validation_path
+            or validation_detail.get("validation_artifact") != validation_path
+            or validation_result.get("validation_artifact_sha256") != validation_stage["artifact_sha256"]
+            or validation_detail.get("validation_artifact_sha256") != validation_stage["artifact_sha256"]
+            or hashlib.sha256(validation_bytes).hexdigest() != validation_stage["artifact_sha256"]
+            or validation_claim["side_effect_completed_at"] > routing["side_effect_completed_at"]):
+            raise ValueError("stale routing recovery failed validation lineage conflicts")
+        if (not isinstance(identity, dict) or not isinstance(result, dict) or identity.get("ticket_id") != ticket_id or identity.get("attempt_number") != attempt_number
+            or identity.get("implementation_diff_hash") != candidate["candidate_fingerprint"] or result.get("candidate_identity") != identity
+            or candidate_identity != identity or result.get("review_verdict") != "pass"
+            or result.get("ticket_id") != ticket_id or result.get("attempt_number") != attempt_number
+            or result.get("review_artifact") != model["response_artifact"]
+            or result.get("findings") != [] or not isinstance(result.get("criterion_results"), list)
+            or not isinstance(result.get("review_raw"), dict) or not isinstance(result.get("suggestions"), list)):
+            raise ValueError("stale routing recovery review candidate/result conflicts")
+        from .controller import ticket_from_ledger
+        from .review import normalize_review
+        try:
+            artifact_bytes = Path(str(model["response_artifact"])).read_bytes()
+            envelope = strict_json(artifact_bytes.decode("utf-8"))
+            if not isinstance(envelope, dict) or set(envelope) != {"provider", "model", "payload"}:
+                raise ValueError("review artifact envelope is malformed")
+            normalized = normalize_review(envelope["payload"], ticket_from_ledger(dict(ticket)))
+        except (OSError, TypeError, KeyError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("stale routing recovery review artifact is invalid") from exc
+        if (normalized.verdict != "pass" or list(normalized.criterion_results) != result["criterion_results"]
+            or [item.__dict__ for item in normalized.findings] != result["findings"]
+            or list(normalized.suggestions) != result["suggestions"] or normalized.raw != result["review_raw"]):
+            raise ValueError("stale routing recovery review artifact conflicts with completed claim")
+        if (not isinstance(route, dict) or stage != route or route.get("ticket_id") != ticket_id
+            or route.get("attempt_number") != attempt_number or route.get("source") != "validation"
+            or route.get("action") != "triage" or not isinstance(route.get("failure_evidence"), str)
+            or not route["failure_evidence"].strip() or not isinstance(route.get("failure_fingerprint"), str)
+            or not route["failure_fingerprint"].strip()):
+            raise ValueError("stale routing recovery old routing evidence conflicts")
+        compact = validation_result.get("compact_evidence")
+        if (not isinstance(compact, str) or not compact.strip() or compact != route["failure_evidence"]
+            or _stable_scheduler_failure_fingerprint(ticket_id, "validation", compact) != route["failure_fingerprint"]
+            or candidate["validation_evidence"] != compact):
+            raise ValueError("stale routing recovery validation fingerprint conflicts")
+        if (not isinstance(triage_feedback, dict) or triage_feedback.get("ticket_id") != ticket_id
+            or triage_feedback.get("attempt_number") != attempt_number
+            or triage_feedback.get("failure_fingerprint") != route["failure_fingerprint"]
+            or triage_feedback.get("failure_evidence") != route["failure_evidence"]
+            or not isinstance(triage_feedback.get("feedback"), str) or not triage_feedback["feedback"].strip()):
+            raise ValueError("stale routing recovery triage feedback conflicts")
+        feedback_path = feedback["artifact_path"]
+        feedback_digest = None
+        if feedback_path:
+            try:
+                feedback_digest = hashlib.sha256(Path(str(feedback_path)).read_bytes()).hexdigest()
+            except OSError as exc:
+                raise ValueError("stale routing recovery feedback artifact is missing") from exc
+            if (feedback_digest != feedback["artifact_sha256"]
+                or (triage_feedback.get("artifact_path") is not None and triage_feedback["artifact_path"] != feedback_path)
+                or (triage_feedback.get("artifact_sha256") is not None and triage_feedback["artifact_sha256"] != feedback_digest)):
+                raise ValueError("stale routing recovery feedback artifact conflicts")
+        elif feedback["artifact_sha256"] is not None:
+            raise ValueError("stale routing recovery feedback artifact is incomplete")
+        triage_bytes = None
+        if triage is not None:
+            try:
+                triage_identity = strict_json(triage["candidate_identity_json"])
+                applied = strict_json(triage_applied["detail"]) if triage_applied is not None else None
+                policy_hash = triage_identity["triage_execution_policy_hash"]
+                expected = self._triage_claim_identity(ticket, attempt_number=attempt_number, failure_evidence=compact, triage_execution_policy_hash=policy_hash)
+                if (triage_identity != expected or not isinstance(triage_result, dict)
+                    or triage_result.get("candidate_identity") != expected or triage_result.get("ticket_id") != ticket_id
+                    or triage_result.get("attempt_number") != attempt_number or applied != triage_result
+                    or triage_applied["attempt_number"] != attempt_number or triage_model is None
+                    or triage_model["status"] != "completed" or triage_model["purpose"] != "triage"
+                    or not all(isinstance(triage_model[key], str) and triage_model[key] for key in ("adapter", "request_hash", "response_artifact", "worktree_path", "base_sha"))
+                    or triage_model["base_sha"] != attempt["base_sha"]
+                    or triage_model["worktree_path"] != implementation["worktree_path"]
+                    or triage_model["diff_hash"] != canonical_sha256(expected)
+                    or triage_result.get("triage_artifact") != triage_model["response_artifact"]):
+                    raise ValueError("stale routing recovery triage claim conflicts")
+                triage_bytes = Path(str(triage_model["response_artifact"])).read_bytes()
+                proposal = strict_json(triage_bytes.decode("utf-8"))["payload"]
+                if triage_result.get("proposal_hash") != canonical_sha256(proposal):
+                    raise ValueError("stale routing recovery triage proposal conflicts")
+            except (OSError, TypeError, KeyError, ValueError, AttributeError) as exc:
+                raise ValueError("stale routing recovery triage evidence is malformed") from exc
+        elif triage_applied is not None or triage_model is not None:
+            raise ValueError("stale routing recovery orphaned triage evidence")
+        rows = {"routing": routing, "route_stage": route_stage, "feedback": feedback, "triage": triage, "validation_claim": validation_claim, "validation_stage": validation_stage, "triage_applied": triage_applied, "triage_model": triage_model}
+        authority = {
+            "ledger_identity": str(self.database.resolve()), "ticket_id": ticket_id, "attempt_number": attempt_number,
+            "signer_fingerprint": binding["operator_signer_fingerprint"], "operator_authority_hash": binding["operator_authority_hash"],
+            "runtime_binding_hash": canonical_sha256(dict(binding)),
+            "ticket_hash": canonical_sha256(dict(ticket)), "attempt_hash": canonical_sha256(dict(attempt)),
+            "candidate_hash": canonical_sha256(dict(candidate)), "review_claim_id": review["claim_id"],
+            "review_hash": canonical_sha256(dict(review)), "model_hash": canonical_sha256(dict(model)),
+            "review_artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            "routing_claim_id": routing["claim_id"], "routing_hash": canonical_sha256(dict(routing)),
+            "routing_stage_hash": canonical_sha256(dict(route_stage)), "feedback_hash": canonical_sha256(dict(feedback)),
+            "feedback_artifact_sha256": feedback_digest,
+            "triage_hash": None if triage is None else canonical_sha256(dict(triage)),
+            "validation_claim_hash": canonical_sha256(dict(validation_claim)), "validation_stage_hash": canonical_sha256(dict(validation_stage)),
+            "validation_artifact_sha256": hashlib.sha256(validation_bytes).hexdigest(),
+            "triage_applied_hash": None if triage_applied is None else canonical_sha256(dict(triage_applied)),
+            "triage_model_hash": None if triage_model is None else canonical_sha256(dict(triage_model)),
+            "triage_artifact_sha256": hashlib.sha256(triage_bytes).hexdigest() if triage_bytes is not None else None,
+        }
+        return authority, rows
+
+    def stale_routing_recovery_projection(self, ticket_id: str, attempt_number: int, *, operator_config_path: Path | None = None) -> dict[str, Any]:
+        from .operator_config import _locked_config, _parse_operator_config_bytes, _read_verified_fd, default_config_path
+        config_path = operator_config_path or default_config_path()
+        with _locked_config(config_path, write=False) as (fd, identity):
+            raw = _read_verified_fd(fd, identity)
+            registered = _parse_operator_config_bytes(raw, config_path)
+            authority, _ = self._stale_routing_recovery_evidence(self.connection, ticket_id, attempt_number, self._now())
+            if (registered.ledger_path != self.database.resolve() or registered.canonical_repository != Path(str(self.connection.execute("SELECT repository_path FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()[0])).resolve()
+                or registered.operator_signing_key_fingerprint != authority["signer_fingerprint"]):
+                raise PermissionError("stale routing recovery registration conflicts with ledger")
+            authority["operator_config_sha256"] = hashlib.sha256(raw).hexdigest()
+            authority["operator_config_identity"] = identity
+            from .operator_config import _config_identity
+            if _config_identity(config_path) != identity or _read_verified_fd(fd, identity) != raw:
+                raise PermissionError("stale routing recovery registration changed during preview")
+            return authority
+
+    def supersede_stale_routing_after_review(self, ticket_id: str, *, attempt_number: int, operator_id: str, reason: str, approval_document: dict[str, Any], detached_signature: bytes, operator_config_path: Path | None = None) -> dict[str, Any]:
+        """Atomically archive obsolete evidence and reopen only its exact routing claim."""
+        from .native_release_approval import canonical_stale_routing_recovery_bytes, verify_detached_signature, _no_duplicates
+        from .operator_config import _locked_config, _parse_operator_config_bytes, _read_verified_fd, _config_identity, default_config_path
+        attempt_number = _strict_positive_identity_int(attempt_number, name="attempt_number")
+        if not isinstance(operator_id, str) or not operator_id.strip() or not isinstance(reason, str) or not reason.strip():
+            raise ValueError("stale routing recovery requires operator and reason")
+        raw = canonical_stale_routing_recovery_bytes(approval_document)
+        if approval_document["operator_id"] != operator_id or approval_document["reason"] != reason:
+            raise ValueError("stale routing recovery signed operator/reason mismatch")
+        config_path = operator_config_path or default_config_path()
+        with _locked_config(config_path, write=False) as (fd, config_identity):
+          config_bytes = _read_verified_fd(fd, config_identity)
+          registered = _parse_operator_config_bytes(config_bytes, config_path)
+          signer_public_key = registered.signer_public_key_bytes
+          signer_fingerprint = registered.operator_signing_key_fingerprint
+          if registered.ledger_path != self.database.resolve():
+              raise PermissionError("stale routing recovery registration ledger conflicts")
+          verify_detached_signature(raw, detached_signature, signer_public_key, signer_fingerprint)
+          with self._transaction() as conn:
+            def verify_config_at_commit() -> None:
+                if _config_identity(config_path) != config_identity or _read_verified_fd(fd, config_identity) != config_bytes:
+                    raise PermissionError("stale routing recovery registration changed before SQLite commit")
+            self._active_transaction_commit_guard = verify_config_at_commit
+            now = self._now()
             paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
-            if paused is None or not bool(paused["paused"]):
-                raise PermissionError("stale repair-routing reconciliation requires paused controller")
-            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
-            if ticket is None: raise KeyError(ticket_id)
-            if str(ticket["state"]) != CanonicalState.LOCAL_REVIEW.value:
-                raise ValueError("stale repair-routing reconciliation requires local_review ticket")
-            review = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=? AND side_effect_completed_at IS NOT NULL AND result_json IS NOT NULL", (ticket_id, f"review:{attempt_number}")).fetchone()
-            routing = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=? AND side_effect_completed_at IS NOT NULL AND result_json IS NOT NULL", (ticket_id, f"repair_routing:{attempt_number}")).fetchone()
-            if review is None or routing is None:
-                raise ValueError("stale repair-routing reconciliation requires completed review and routing claims")
-            if int(review["side_effect_completed_at"]) <= int(routing["side_effect_completed_at"]):
-                raise ValueError("repair-routing decision is not older than current review")
-            if conn.execute("SELECT 1 FROM attempts WHERE ticket_id=? AND attempt_number>?", (ticket_id, attempt_number)).fetchone() is not None:
-                raise ValueError("stale repair-routing reconciliation refuses newer attempt history")
-            stage_name = f"repair-routing-{attempt_number}"
-            old_stage = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, stage_name)).fetchone()
-            archive_stage = f"repair-routing-stale-archive-{attempt_number}-{int(review['side_effect_completed_at'])}"
-            archived = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, archive_stage)).fetchone()
-            if old_stage is None and archived is None:
-                raise ValueError("stale repair-routing reconciliation requires durable prior routing decision")
-            if old_stage is not None and archived is None:
-                archive_detail = json.dumps({"reason": reason, "old_stage_detail": str(old_stage["detail"]), "old_claim_result": str(routing["result_json"]), "superseding_review_result": str(review["result_json"])}, sort_keys=True, separators=(",", ":"))
-                conn.execute("INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,base_sha,created_at) VALUES (?,?,?,?,?,?)", (ticket_id, archive_stage, archive_detail, attempt_number, old_stage["base_sha"], now))
-            if old_stage is not None:
-                conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, stage_name))
-            changed = conn.execute("UPDATE scheduler_stage_claims SET status='claimed',lease_owner=NULL,lease_expires_at=?,side_effect_started_at=NULL,side_effect_completed_at=NULL,finalized_at=NULL,result_json=NULL,last_error=NULL,updated_at=? WHERE claim_id=? AND status IN ('completed','claimed')", (now - 1, now, routing["claim_id"]))
+            if paused is None or paused["paused"] != 1:
+                raise PermissionError("stale routing recovery requires paused controller")
+            tick = conn.execute("SELECT lease_expires_at FROM scheduler_tick_lease WHERE id=1").fetchone()
+            if tick is not None and int(tick["lease_expires_at"]) > now:
+                raise PermissionError("stale routing recovery refuses an active scheduler tick")
+            binding = conn.execute("SELECT operator_signer_fingerprint,operator_authority_hash FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
+            from .operator_config import operator_authority_hash_from_fingerprint
+            if binding is None or binding["operator_signer_fingerprint"] != signer_fingerprint or binding["operator_authority_hash"] != operator_authority_hash_from_fingerprint(signer_fingerprint):
+                raise PermissionError("stale routing recovery signer is not bound to ticket")
+            previous = conn.execute("SELECT * FROM stale_routing_recovery_archives WHERE ticket_id=? AND attempt_number=?", (ticket_id, attempt_number)).fetchone()
+            request_id = approval_document["request_id"]
+            if previous is not None:
+                try:
+                    archived_authority = json.loads(previous["authority_json"], object_pairs_hook=_no_duplicates)
+                    archived_document = json.loads(previous["document_json"], object_pairs_hook=_no_duplicates)
+                    archived_rows = {key: json.loads(previous[column], object_pairs_hook=_no_duplicates) if previous[column] is not None else None for key, column in (
+                        ("routing_hash", "routing_claim_json"), ("routing_stage_hash", "routing_stage_json"),
+                        ("feedback_hash", "feedback_stage_json"), ("triage_hash", "triage_claim_json"),
+                        ("validation_claim_hash", "validation_claim_json"), ("validation_stage_hash", "validation_stage_json"),
+                        ("triage_applied_hash", "triage_applied_json"), ("triage_model_hash", "triage_model_json"))}
+                    if (archived_document != approval_document or archived_authority != approval_document["authority"]
+                        or archived_authority.get("operator_config_identity") != config_identity
+                        or archived_authority.get("operator_config_sha256") != hashlib.sha256(config_bytes).hexdigest()
+                        or any((canonical_sha256(value) if value is not None else None) != archived_authority[key] for key, value in archived_rows.items())):
+                        raise ValueError("stale routing recovery archive authority conflicts")
+                except (TypeError, KeyError, ValueError) as exc:
+                    raise ValueError("stale routing recovery archive evidence is malformed") from exc
+                ticket = conn.execute("SELECT state,lease_owner,lease_expires_at FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+                route = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"repair_routing:{attempt_number}")).fetchone()
+                if (previous["request_id"] != request_id or previous["document_json"] != raw.decode() or bytes(previous["detached_signature"]) != detached_signature
+                    or ticket is None or ticket["state"] != CanonicalState.LOCAL_REVIEW.value or ticket["lease_owner"] is not None or ticket["lease_expires_at"] is not None
+                    or route is None or route["claim_id"] != archived_rows["routing_hash"]["claim_id"]
+                    or route["status"] != "claimed" or route["lease_owner"] is not None or route["side_effect_completed_at"] is not None
+                    or conn.execute("SELECT 1 FROM runtime_stages WHERE ticket_id=? AND stage IN (?,?,?)", (ticket_id, f"repair-routing-{attempt_number}", f"triage-feedback-{attempt_number}", f"triage-applied-{attempt_number}")).fetchone()
+                    or (previous["triage_claim_json"] is not None and not conn.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND stage=? AND status='failed' AND last_error=?", (ticket_id, f"triage:{attempt_number}", f"superseded by stale routing recovery {request_id}")).fetchone())):
+                    raise ValueError("stale routing recovery already superseded or replay state changed")
+                if _config_identity(config_path) != config_identity or _read_verified_fd(fd, config_identity) != config_bytes:
+                    raise PermissionError("stale routing recovery registration changed during replay")
+                return {"ticket_id": ticket_id, "attempt_number": attempt_number, "request_id": request_id, "status": "already_superseded"}
+            if conn.execute("SELECT 1 FROM stale_routing_recovery_archives WHERE request_id=?", (request_id,)).fetchone():
+                raise ValueError("stale routing recovery request identity already used")
+            authority, rows = self._stale_routing_recovery_evidence(conn, ticket_id, attempt_number, now)
+            authority["operator_config_sha256"] = hashlib.sha256(config_bytes).hexdigest()
+            authority["operator_config_identity"] = config_identity
+            if (approval_document["authority"] != authority or authority["signer_fingerprint"] != signer_fingerprint
+                or registered.canonical_repository != Path(str(conn.execute("SELECT repository_path FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()[0])).resolve()):
+                raise ValueError("stale routing recovery signed authority conflicts with current ledger")
+            if _config_identity(config_path) != config_identity or _read_verified_fd(fd, config_identity) != config_bytes:
+                raise PermissionError("stale routing recovery registration changed before commit")
+            snapshots = {key: None if row is None else json.dumps(dict(row), sort_keys=True, separators=(",", ":")) for key, row in rows.items()}
+            conn.execute("INSERT INTO stale_routing_recovery_archives(request_id,ticket_id,attempt_number,authority_json,document_json,detached_signature,routing_claim_json,routing_stage_json,feedback_stage_json,triage_claim_json,validation_claim_json,validation_stage_json,triage_applied_json,triage_model_json,operator_id,reason,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (request_id,ticket_id,attempt_number,json.dumps(authority,sort_keys=True,separators=(",", ":")),raw.decode(),detached_signature,snapshots["routing"],snapshots["route_stage"],snapshots["feedback"],snapshots["triage"],snapshots["validation_claim"],snapshots["validation_stage"],snapshots["triage_applied"],snapshots["triage_model"],operator_id,reason,now))
+            conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage IN (?,?,?)", (ticket_id, f"repair-routing-{attempt_number}", f"triage-feedback-{attempt_number}", f"triage-applied-{attempt_number}"))
+            if rows["triage"] is not None:
+                if conn.execute("UPDATE scheduler_stage_claims SET status='failed',last_error=?,updated_at=? WHERE claim_id=? AND status='completed'", (f"superseded by stale routing recovery {request_id}", now, rows["triage"]["claim_id"])).rowcount != 1:
+                    raise RuntimeError("stale routing recovery triage authority changed")
+            changed = conn.execute("UPDATE scheduler_stage_claims SET status='claimed',lease_owner=NULL,lease_expires_at=?,side_effect_started_at=NULL,side_effect_completed_at=NULL,finalized_at=NULL,result_json=NULL,last_error=NULL,updated_at=? WHERE claim_id=? AND status='completed'", (now - 1, now, authority["routing_claim_id"]))
             if changed.rowcount != 1:
-                raise RuntimeError("stale repair-routing reconciliation could not reopen claim")
-            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="stale_repair_routing_reconciled", actor_id=operator_id, payload={"attempt_number": attempt_number, "reason": reason, "claim_id": str(routing["claim_id"]), "archive_stage": archive_stage})
-            return {"ticket_id": ticket_id, "attempt_number": attempt_number, "claim_id": str(routing["claim_id"]), "archive_stage": archive_stage, "status": "reopened"}
+                raise RuntimeError("stale routing recovery claim changed")
+            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="stale_routing_review_supersession", actor_id=operator_id, payload={"request_id":request_id,"attempt_number":attempt_number,"reason":reason,"authority_hash":canonical_sha256(authority),"routing_claim_id":authority["routing_claim_id"]})
+            if _config_identity(config_path) != config_identity or _read_verified_fd(fd, config_identity) != config_bytes:
+                raise PermissionError("stale routing recovery registration changed before commit")
+            return {"ticket_id":ticket_id,"attempt_number":attempt_number,"request_id":request_id,"status":"superseded"}
+
+    def reconcile_stale_repair_routing_after_review(self, ticket_id: str, *, attempt_number: int, operator_id: str, reason: str, now: int | None = None) -> dict[str, Any]:
+        """Retired unsigned entry point; use signed stale-routing supersession."""
+        raise PermissionError("stale routing recovery requires signed registered authority")
 
     def reconcile_stale_triage_feedback_after_review(self, ticket_id: str, *, attempt_number: int, operator_id: str, reason: str, now: int | None = None) -> dict[str, Any]:
-        """Archive stale triage feedback after a superseding review reopened repair routing."""
-        if attempt_number < 1 or not operator_id.strip() or not reason.strip():
-            raise ValueError("stale triage feedback reconciliation requires attempt, operator, and reason")
-        now = self._now() if now is None else now
-        with self._transaction() as conn:
-            paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
-            if paused is None or not bool(paused["paused"]):
-                raise PermissionError("stale triage feedback reconciliation requires paused controller")
-            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
-            if ticket is None: raise KeyError(ticket_id)
-            if str(ticket["state"]) != CanonicalState.LOCAL_REVIEW.value:
-                raise ValueError("stale triage feedback reconciliation requires local_review ticket")
-            routing = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=?", (ticket_id, f"repair_routing:{attempt_number}")).fetchone()
-            if routing is None or routing["status"] != "claimed" or routing["side_effect_completed_at"] is not None:
-                raise ValueError("stale triage feedback reconciliation requires reopened unfinished routing claim")
-            review = conn.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage=? AND side_effect_completed_at IS NOT NULL", (ticket_id, f"review:{attempt_number}")).fetchone()
-            if review is None:
-                raise ValueError("stale triage feedback reconciliation requires completed superseding review")
-            routing_archive = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage LIKE ? ORDER BY created_at DESC LIMIT 1", (ticket_id, f"repair-routing-stale-archive-{attempt_number}-%")).fetchone()
-            if routing_archive is None:
-                raise PermissionError("stale triage feedback reconciliation requires stale routing authorization")
-            released = conn.execute(
-                "UPDATE scheduler_stage_claims SET lease_owner=NULL,lease_expires_at=?,updated_at=? WHERE claim_id=? AND status='claimed' AND side_effect_completed_at IS NULL",
-                (now - 1, now, routing["claim_id"]),
-            ).rowcount == 1
-            stage_name = f"triage-feedback-{attempt_number}"
-            feedback = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, stage_name)).fetchone()
-            if feedback is None:
-                return {"ticket_id": ticket_id, "attempt_number": attempt_number, "status": "already_clear", "claim_released": released}
-            archive_stage = f"triage-feedback-stale-archive-{attempt_number}-{int(review['side_effect_completed_at'])}"
-            if conn.execute("SELECT 1 FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, archive_stage)).fetchone() is None:
-                archive_detail = json.dumps({"reason": reason, "old_feedback_detail": str(feedback["detail"]), "routing_archive_stage": str(routing_archive["stage"])}, sort_keys=True, separators=(",", ":"))
-                conn.execute("INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,base_sha,created_at) VALUES (?,?,?,?,?,?)", (ticket_id, archive_stage, archive_detail, attempt_number, feedback["base_sha"], now))
-            conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage=?", (ticket_id, stage_name))
-            self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="stale_triage_feedback_reconciled", actor_id=operator_id, payload={"attempt_number": attempt_number, "reason": reason, "archive_stage": archive_stage})
-            return {"ticket_id": ticket_id, "attempt_number": attempt_number, "status": "archived", "archive_stage": archive_stage, "claim_released": released}
+        """Retired unsigned entry point; use signed stale-routing supersession."""
+        raise PermissionError("stale routing recovery requires signed registered authority")
 
     def authorize_additional_local_attempt_after_triage(self, ticket_id: str, *, attempt_number: int, operator_id: str, reason: str, now: int | None = None) -> dict[str, Any]:
         """Authorize exactly one additional local/manual attempt after deterministic triage."""
