@@ -1,0 +1,52 @@
+#!/bin/sh
+# Rendered only by c12r1-tk-3-root-install.sh. Do not invoke this template.
+set -eu
+PATH=/usr/bin:/bin
+export PATH
+SOURCE_ROOT='@SOURCE_ROOT@'
+SOURCE_MANIFEST='@SOURCE_MANIFEST@'
+SOURCE_MANIFEST_SHA256='@SOURCE_MANIFEST_SHA256@'
+RUNTIME_MANIFEST='@RUNTIME_MANIFEST@'
+RUNTIME_MANIFEST_SHA256='@RUNTIME_MANIFEST_SHA256@'
+PYTHON_BIN='@PYTHON_BIN@'
+PYTHON_SHA256='@PYTHON_SHA256@'
+PYTHON_MODE='@PYTHON_MODE@'
+ID_BIN='@ID_BIN@'
+STAT_BIN='@STAT_BIN@'
+SHA256SUM_BIN='@SHA256SUM_BIN@'
+GREP_BIN='@GREP_BIN@'
+fail() { printf '%s\n' "$1" >&2; exit 1; }
+[ "$#" -eq 0 ] || fail 'expected no launcher arguments'
+[ "$("$ID_BIN" -u)" = 0 ] || fail 'launcher requires effective root'
+meta() { "$STAT_BIN" -c '%u:%a:%F' -- "$1" 2>/dev/null || fail "missing protected path: $1"; }
+check_meta() { [ "$(meta "$1")" = "0:$2:$3" ] || fail "owner/mode/type mismatch: $1"; }
+check_chain() {
+    case "$1" in /*) ;; *) fail 'protected path is not absolute' ;; esac
+    current=/
+    oldifs=$IFS; IFS=/; set -- $1; IFS=$oldifs
+    for component in "$@"; do
+        [ -n "$component" ] || continue
+        current=$current/$component
+        check_meta "$current" 555 directory
+    done
+}
+check_chain "$SOURCE_ROOT"
+check_meta "$SOURCE_MANIFEST" 444 'regular file'
+check_meta "$RUNTIME_MANIFEST" 600 'regular file'
+check_meta "$PYTHON_BIN" "$PYTHON_MODE" 'regular file'
+actual_python_hash=$("$SHA256SUM_BIN" "$PYTHON_BIN" | "$GREP_BIN" -Eo '^[0-9a-f]{64}')
+[ "$actual_python_hash" = "$PYTHON_SHA256" ] || fail 'python interpreter digest mismatch'
+actual_runtime_hash=$("$SHA256SUM_BIN" "$RUNTIME_MANIFEST" | "$GREP_BIN" -Eo '^[0-9a-f]{64}')
+[ "$actual_runtime_hash" = "$RUNTIME_MANIFEST_SHA256" ] || fail 'runtime manifest digest mismatch'
+actual_source_manifest_hash=$("$SHA256SUM_BIN" "$SOURCE_MANIFEST" | "$GREP_BIN" -Eo '^[0-9a-f]{64}')
+[ "$actual_source_manifest_hash" = "$SOURCE_MANIFEST_SHA256" ] || fail 'source manifest digest mismatch'
+while IFS='  ' read -r digest relative; do
+    [ -n "$digest" ] || continue
+    printf '%s  %s\n' "$digest" "$relative" | "$GREP_BIN" -Eq '^[0-9a-f]{64}  [A-Za-z0-9_./-]+\.py$' || fail 'malformed source manifest entry'
+    case "$relative" in /*|*'..'*|*'//'*) fail 'unsafe source manifest path' ;; esac
+    check_meta "$SOURCE_ROOT/$relative" 444 'regular file'
+    actual=$("$SHA256SUM_BIN" "$SOURCE_ROOT/$relative" | "$GREP_BIN" -Eo '^[0-9a-f]{64}')
+    [ "$actual" = "$digest" ] || fail 'source file digest mismatch'
+done < "$SOURCE_MANIFEST"
+# This is the first Python execution. -I excludes user site/path customizations.
+exec "$PYTHON_BIN" -I -c "import sys;sys.path.insert(0, '$SOURCE_ROOT');from local_first_orchestrator.keyless_human_recovery import main;raise SystemExit(main())"
