@@ -225,7 +225,7 @@ def _bound_commit(repository: Path, value: Any, field: str) -> str:
     return value
 
 
-def _eligible(ledger: Any, ticket_ids: tuple[str, ...], repository: Path) -> dict[str, dict[str, Any]]:
+def _eligible(ledger: Any, ticket_ids: tuple[str, ...], repository: Path, *, implementation_profile: str | None = None) -> dict[str, dict[str, Any]]:
     if not ticket_ids or len(set(ticket_ids)) != len(ticket_ids): raise ValueError("explicit ticket IDs must be non-empty and unique")
     out = {}
     registered_identity = _repository_identity(repository)
@@ -235,9 +235,27 @@ def _eligible(ledger: Any, ticket_ids: tuple[str, ...], repository: Path) -> dic
         binding = ledger.connection.execute("SELECT * FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()
         release = ledger.connection.execute("SELECT * FROM native_dependency_releases WHERE ticket_id=?", (ticket_id,)).fetchone()
         if ticket is None or binding is None or release is None: raise ValueError(f"ticket {ticket_id} is not eligible for signer enrollment")
-        try: authority = json.loads(str(release["routing_authority_json"] or "{}"))
-        except json.JSONDecodeError as exc: raise ValueError("legacy release authority is malformed") from exc
-        if authority != {} or binding["operator_signer_fingerprint"] is not None or binding["operator_authority_hash"] is not None: raise ValueError(f"ticket {ticket_id} is not an unbound legacy release")
+        try: authority = json.loads(str(release["routing_authority_json"] or "{}"), object_pairs_hook=_pairs)
+        except (json.JSONDecodeError, ValueError) as exc: raise ValueError("release routing authority is malformed") from exc
+        if binding["operator_signer_fingerprint"] is not None or binding["operator_authority_hash"] is not None:
+            raise ValueError(f"ticket {ticket_id} already has signer authority")
+        legacy = authority == {}
+        modern = (type(authority) is dict and set(authority) == {"profile", "canonical_repository"}
+                  and type(implementation_profile) is str and bool(implementation_profile)
+                  and authority == {"profile": implementation_profile, "canonical_repository": str(registered_repository)}
+                  and ticket["state"] == "local_review" and ticket["lease_owner"] is None
+                  and ticket["lease_expires_at"] is None)
+        if not legacy and not modern:
+            raise ValueError(f"ticket {ticket_id} is not an eligible legacy or routed local_review release")
+        if modern:
+            pause = ledger.connection.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
+            if pause is None or pause["paused"] != 1:
+                raise PermissionError("modern signer enrollment requires a paused controller")
+            tick = ledger.connection.execute("SELECT lease_expires_at FROM scheduler_tick_lease WHERE id=1").fetchone()
+            if tick is not None and (type(tick["lease_expires_at"]) is not int or tick["lease_expires_at"] > ledger._now()):
+                raise PermissionError("modern signer enrollment refuses an active scheduler tick")
+            if ledger.connection.execute("SELECT 1 FROM scheduler_stage_claims WHERE ticket_id=? AND status='claimed'", (ticket_id,)).fetchone():
+                raise ValueError("modern signer enrollment refuses active claims")
         bound_text = str(binding["repository_path"])
         if not os.path.isabs(bound_text) or os.path.normpath(bound_text) != bound_text or bound_text != str(registered_repository):
             raise ValueError(f"ticket {ticket_id} runtime binding repository is not the exact registered path")
@@ -249,7 +267,7 @@ def _eligible(ledger: Any, ticket_ids: tuple[str, ...], repository: Path) -> dic
         if _repository_identity(registered_repository) != registered_identity:
             raise ValueError("canonical repository identity changed during commit validation")
         projection = ledger.connection.execute("""SELECT b.*,e.event_type,e.entity_type,e.entity_id FROM board_projection_outbox b JOIN events e ON e.id=b.event_id WHERE b.ticket_id=? AND b.operation='create_microticket' AND b.acknowledged_at IS NOT NULL AND b.superseded_at IS NULL AND b.external_task_id IS NOT NULL""", (ticket_id,)).fetchall()
-        if str(ticket["state"]) not in {"draft", "ready_local"} or len(projection) != 1 or projection[0]["entity_type"] != "ticket" or projection[0]["entity_id"] != ticket_id or projection[0]["event_type"] not in {"generated_microticket_created", "generated_microticket_projection_recovered"}: raise ValueError(f"ticket {ticket_id} has ambiguous projection")
+        if (legacy and str(ticket["state"]) not in {"draft", "ready_local"}) or (not legacy and not modern) or len(projection) != 1 or projection[0]["entity_type"] != "ticket" or projection[0]["entity_id"] != ticket_id or projection[0]["event_type"] not in {"generated_microticket_created", "generated_microticket_projection_recovered"}: raise ValueError(f"ticket {ticket_id} has ambiguous projection")
         p = dict(projection[0])
         out[ticket_id] = {"binding": {k: binding[k] for k in ("ticket_id", "repository_path", "starting_sha", "canonical_sha", "ownership_verified")} | {"repository_identity": registered_identity}, "projection": {"event_id": int(p["event_id"]), "idempotency_key": str(p["idempotency_key"]), "external_task_id": str(p["external_task_id"])}, "release": {k: release[k] for k in ("ticket_id", "graph_hash", "child_external_id", "parent_completion_hash", "routing_authority_json", "hermes_status")}}
     return out
@@ -261,7 +279,7 @@ def prepare_operator_signer_enrollment(ledger: Any, *, config_path: Path, operat
     if not nonce: nonce = secrets.token_hex(16)
     raw, obj, identity = _raw_config(Path(config_path).expanduser())
     config = load_operator_config(Path(config_path).expanduser())
-    selected = _eligible(ledger, tuple(ticket_ids), config.canonical_repository)
+    selected = _eligible(ledger, tuple(ticket_ids), config.canonical_repository, implementation_profile=config.implementation.profile)
     new_raw = _with_signer_bytes(raw, public_key_b64, fingerprint)
     document = {"domain": ENROLLMENT_DOMAIN, "version": ENROLLMENT_VERSION, "operation": "enroll-operator-signer", "ledger_identity": str(Path(ledger.database).resolve()), "old_config_identity": identity, "old_config_hash": hashlib.sha256(raw).hexdigest(), "new_config_hash": hashlib.sha256(new_raw).hexdigest(), "new_config_bytes": base64.b64encode(new_raw).decode(), "new_public_key": public_key_b64, "new_fingerprint": fingerprint, "ticket_ids": list(ticket_ids), "binding_projection_release_identities": selected, "operator_id": operator_id, "reason": reason, "nonce": nonce}
     data = _canonical_document(document)
@@ -315,7 +333,7 @@ def enroll_operator_signer(ledger: Any, *, config_path: Path, document: dict[str
             raise RuntimeError("external operator config differs from signed enrollment document")
         config = _parse_operator_config_bytes(expected_new_raw if resume_write else raw, config_path)
         if str(Path(ledger.database).resolve()) != document_obj["ledger_identity"]: raise ValueError("ledger identity conflicts with signed enrollment document")
-        selected_bindings = _eligible(ledger, selected, config.canonical_repository)
+        selected_bindings = _eligible(ledger, selected, config.canonical_repository, implementation_profile=config.implementation.profile)
         if selected_bindings != document_obj["binding_projection_release_identities"]: raise RuntimeError("ticket, projection, or release evidence drifted")
         old_hash = document_obj["old_config_hash"]
         new_raw = expected_new_raw

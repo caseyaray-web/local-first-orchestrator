@@ -22,7 +22,7 @@ from local_first_orchestrator.states import CanonicalState
 
 
 class OperatorSignerEnrollmentRedTests(unittest.TestCase):
-    def _enrollment_fixture(self):
+    def _enrollment_fixture(self, *, modern: bool = False, modern_routing: str | None = None):
         tmp = TemporaryDirectory(); root = Path(tmp.name); repo = root / "repo"; repo.mkdir()
         subprocess.run(("git", "init", "-q"), cwd=repo, check=True)
         (repo / "README").write_text("fixture\n")
@@ -35,19 +35,20 @@ class OperatorSignerEnrollmentRedTests(unittest.TestCase):
         commit_b = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
         (repo / "dirty.txt").write_text("canonical remains dirty\n")
         ledger = Ledger(root / "ledger.db"); ledger.migrate()
-        ticket = ledger.create_ticket(title="legacy", state=CanonicalState.READY_LOCAL, external_id="external-legacy", contract={"objective":"x","criterion_ids":["AC-1"],"primary_symbol":"x","allowed_files":["README"],"forbidden_changes":[],"patch_budget":{"max_files":1,"max_changed_lines":1},"verification":{"commands":[]},"risk":"low","review_required":True,"max_attempts":1,"dependencies":[]})
+        ticket = ledger.create_ticket(title="legacy", state=CanonicalState.LOCAL_REVIEW if modern else CanonicalState.READY_LOCAL, external_id="external-legacy", contract={"objective":"x","criterion_ids":["AC-1"],"primary_symbol":"x","allowed_files":["README"],"forbidden_changes":[],"patch_budget":{"max_files":1,"max_changed_lines":1},"verification":{"commands":[]},"risk":"low","review_required":True,"max_attempts":1,"dependencies":[]})
         ledger.bind_runtime(ticket, str(repo), commit_a)
         with ledger._transaction() as conn:
             event = ledger._append_event(conn, entity_type="ticket", entity_id=ticket, event_type="generated_microticket_created", actor_id="test", to_state="draft", payload={"ticket_id":ticket})
             conn.execute("INSERT INTO board_projection_outbox(ticket_id,event_id,state,payload_json,idempotency_key,queued_at,acknowledged_at,external_task_id,operation) VALUES (?,?,?,'{}',?,1,1,?,'create_microticket')", (ticket,event,"draft","legacy-create","external-legacy"))
             conn.execute("INSERT INTO native_dependency_graphs(ticket_id,child_external_id,local_dependency_ids_json,parent_external_ids_json,graph_hash,verified_at) VALUES (?,?,?,?,?,1)", (ticket,"external-legacy","[]","[]","graph-hash"))
-            conn.execute("INSERT INTO native_dependency_releases(ticket_id,graph_hash,child_external_id,parent_completion_hash,routing_authority_json,hermes_status,observed_at) VALUES (?,?,?,?,?,?,1)", (ticket,"graph-hash","external-legacy","parent","{}","ready"))
+            routing = modern_routing if modern_routing is not None else (json.dumps({"canonical_repository": str(repo), "profile": "i"}, sort_keys=True, separators=(",", ":")) if modern else "{}")
+            conn.execute("INSERT INTO native_dependency_releases(ticket_id,graph_hash,child_external_id,parent_completion_hash,routing_authority_json,hermes_status,observed_at) VALUES (?,?,?,?,?,?,1)", (ticket,"graph-hash","external-legacy","parent",routing,"ready"))
         config_path = root / "operator.json"
         config_path.write_text(json.dumps({"ledger_path":str(root / "ledger.db"),"canonical_repository":str(repo),"repository_allowlist":[str(repo)],"implementation":{"profile":"i","provider":"p","model":"m"},"review":{"profile":"r","provider":"p","model":"m"},"worktree_root":str(root / "w"),"artifact_root":str(root / "a"),"implementation_timeout_seconds":30,"review_timeout_seconds":30}, indent=2) + "\n")
         ledger.pause("operator", reason="maintenance")
         private = Ed25519PrivateKey.generate(); public = private.public_key().public_bytes_raw(); public_b64 = base64.b64encode(public).decode(); fingerprint = hashlib.sha256(public).hexdigest()
-        prepared = prepare_operator_signer_enrollment(ledger, config_path=config_path, operator_id="operator", reason="migration", ticket_ids=(ticket,), public_key_b64=public_b64, fingerprint=fingerprint, nonce="fixed")
-        signature = private.sign(prepared["document_bytes"])
+        prepared = {} if modern else prepare_operator_signer_enrollment(ledger, config_path=config_path, operator_id="operator", reason="migration", ticket_ids=(ticket,), public_key_b64=public_b64, fingerprint=fingerprint, nonce="fixed")
+        signature = b"" if modern else private.sign(prepared["document_bytes"])
         return tmp, root, ledger, config_path, prepared, signature, public_b64, fingerprint, ticket
 
     def test_historical_binding_enrolls_without_touching_dirty_canonical_checkout(self) -> None:
