@@ -6374,16 +6374,48 @@ class Ledger:
             or not isinstance(validation_result, dict) or not isinstance(validation_detail, dict)
             or validation_result.get("candidate_identity") != canonical_validation_identity
             or validation_detail.get("candidate_identity") != canonical_validation_identity
-            or validation_result.get("passed") is not False or validation_detail.get("passed") is not False
+            or type(validation_result.get("passed")) is not bool
+            or validation_detail.get("passed") is not validation_result["passed"]
             or validation_result.get("compact_evidence") != validation_detail.get("compact_evidence")
             or validation_stage["attempt_number"] != attempt_number
             or not validation_path or validation_result.get("validation_artifact") != validation_path
             or validation_detail.get("validation_artifact") != validation_path
             or validation_result.get("validation_artifact_sha256") != validation_stage["artifact_sha256"]
             or validation_detail.get("validation_artifact_sha256") != validation_stage["artifact_sha256"]
-            or hashlib.sha256(validation_bytes).hexdigest() != validation_stage["artifact_sha256"]
-            or validation_claim["side_effect_completed_at"] > routing["side_effect_completed_at"]):
-            raise ValueError("stale routing recovery failed validation lineage conflicts")
+            or hashlib.sha256(validation_bytes).hexdigest() != validation_stage["artifact_sha256"]):
+            raise ValueError("stale routing recovery validation lineage conflicts")
+        archived_validation = None
+        archived_validation_bytes = None
+        if validation_result["passed"]:
+            archives = conn.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage LIKE ? ORDER BY stage", (ticket_id, f"validation-controller-defect-archive-{attempt_number}-%")).fetchall()
+            if len(archives) != 1:
+                raise ValueError("stale routing recovery requires one prior failed validation archive")
+            archived_validation = archives[0]
+            try:
+                archived_detail = strict_json(archived_validation["detail"])
+                archived_validation_bytes = Path(str(archived_validation["artifact_path"])).read_bytes()
+            except (TypeError, ValueError, OSError) as exc:
+                raise ValueError("stale routing recovery failed validation archive is malformed") from exc
+            old_record = archived_detail.get("record") if isinstance(archived_detail, dict) else None
+            old_result = archived_detail.get("claim_result") if isinstance(archived_detail, dict) else None
+            expected_old_result = ({**{key: old_record.get(key) for key in ("candidate_identity", "passed", "compact_evidence", "validation_artifact", "validation_artifact_sha256")}, "ticket_id": ticket_id, "replayed": False} if isinstance(old_record, dict) else None)
+            if (not isinstance(archived_detail, dict)
+                or archived_detail.get("original_stage") != f"validation-{attempt_number}"
+                or archived_detail.get("claim_status") != "completed"
+                or archived_validation["attempt_number"] != attempt_number
+                or not isinstance(old_record, dict) or old_record.get("passed") is not False
+                or old_record.get("candidate_identity") != canonical_validation_identity
+                or old_result != expected_old_result
+                or old_record.get("validation_artifact_sha256") != archived_validation["artifact_sha256"]
+                or hashlib.sha256(archived_validation_bytes).hexdigest() != archived_validation["artifact_sha256"]
+                or not archived_validation["created_at"] or archived_validation["created_at"] > validation_claim["side_effect_completed_at"]
+                or validation_claim["side_effect_completed_at"] <= routing["side_effect_completed_at"]):
+                raise ValueError("stale routing recovery failed validation archive conflicts")
+            failure_compact = old_record.get("compact_evidence")
+        else:
+            if validation_claim["side_effect_completed_at"] > routing["side_effect_completed_at"]:
+                raise ValueError("stale routing recovery failed validation was newer than old routing")
+            failure_compact = validation_result.get("compact_evidence")
         if (not isinstance(identity, dict) or not isinstance(result, dict) or identity.get("ticket_id") != ticket_id or identity.get("attempt_number") != attempt_number
             or identity.get("implementation_diff_hash") != candidate["candidate_fingerprint"] or result.get("candidate_identity") != identity
             or candidate_identity != identity or result.get("review_verdict") != "pass"
@@ -6412,10 +6444,11 @@ class Ledger:
             or not route["failure_evidence"].strip() or not isinstance(route.get("failure_fingerprint"), str)
             or not route["failure_fingerprint"].strip()):
             raise ValueError("stale routing recovery old routing evidence conflicts")
-        compact = validation_result.get("compact_evidence")
-        if (not isinstance(compact, str) or not compact.strip() or compact != route["failure_evidence"]
-            or _stable_scheduler_failure_fingerprint(ticket_id, "validation", compact) != route["failure_fingerprint"]
-            or candidate["validation_evidence"] != compact):
+        current_compact = validation_result.get("compact_evidence")
+        if (not isinstance(failure_compact, str) or not failure_compact.strip() or failure_compact != route["failure_evidence"]
+            or _stable_scheduler_failure_fingerprint(ticket_id, "validation", failure_compact) != route["failure_fingerprint"]
+            or not isinstance(current_compact, str) or not current_compact.strip()
+            or candidate["validation_evidence"] != current_compact):
             raise ValueError("stale routing recovery validation fingerprint conflicts")
         if (not isinstance(triage_feedback, dict) or triage_feedback.get("ticket_id") != ticket_id
             or triage_feedback.get("attempt_number") != attempt_number
@@ -6442,7 +6475,7 @@ class Ledger:
                 triage_identity = strict_json(triage["candidate_identity_json"])
                 applied = strict_json(triage_applied["detail"]) if triage_applied is not None else None
                 policy_hash = triage_identity["triage_execution_policy_hash"]
-                expected = self._triage_claim_identity(ticket, attempt_number=attempt_number, failure_evidence=compact, triage_execution_policy_hash=policy_hash)
+                expected = self._triage_claim_identity(ticket, attempt_number=attempt_number, failure_evidence=failure_compact, triage_execution_policy_hash=policy_hash)
                 if (triage_identity != expected or not isinstance(triage_result, dict)
                     or triage_result.get("candidate_identity") != expected or triage_result.get("ticket_id") != ticket_id
                     or triage_result.get("attempt_number") != attempt_number or applied != triage_result
@@ -6481,6 +6514,9 @@ class Ledger:
             "triage_model_hash": None if triage_model is None else canonical_sha256(dict(triage_model)),
             "triage_artifact_sha256": hashlib.sha256(triage_bytes).hexdigest() if triage_bytes is not None else None,
         }
+        if archived_validation is not None:
+            authority["archived_failed_validation_hash"] = canonical_sha256(dict(archived_validation))
+            authority["archived_failed_validation_artifact_sha256"] = hashlib.sha256(archived_validation_bytes).hexdigest()
         return authority, rows
 
     def stale_routing_recovery_projection(self, ticket_id: str, attempt_number: int, *, operator_config_path: Path | None = None) -> dict[str, Any]:

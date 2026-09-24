@@ -84,6 +84,36 @@ class StaleRoutingRecoveryTests(unittest.TestCase):
         names = [row[0] for row in self.ledger.connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
         return [(name, [tuple(row) for row in self.ledger.connection.execute(f'SELECT * FROM "{name}" ORDER BY 1')]) for name in names]
 
+    def test_archived_failed_validation_then_later_pass_can_supersede_old_routing(self) -> None:
+        old_claim = self.ledger.connection.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage='validation:1'", (self.ticket,)).fetchone()
+        old_stage = self.ledger.connection.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage='validation-1'", (self.ticket,)).fetchone()
+        archive_detail = {"original_stage": "validation-1", "terminal_generation": 1, "reason": "replayed validation", "record": json.loads(old_stage['detail']), "claim_status": "completed", "claim_result": {**json.loads(old_claim['result_json']), "ticket_id": self.ticket, "replayed": False}}
+        self.ledger.connection.execute("INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,created_at) VALUES (?,?,?,?,?,?,?)", (self.ticket, 'validation-controller-defect-archive-1-1', json.dumps(archive_detail), 1, old_stage['artifact_path'], old_stage['artifact_sha256'], 105))
+        new_artifact = Path(self.temp.name) / 'replay-validation.json'
+        new_artifact.write_text('{"passed":true}')
+        digest = hashlib.sha256(new_artifact.read_bytes()).hexdigest()
+        new_validation = {"candidate_identity": json.loads(old_claim['candidate_identity_json']), "passed": True, "compact_evidence": "new validation passed", "validation_artifact": str(new_artifact), "validation_artifact_sha256": digest}
+        self.ledger.connection.execute("UPDATE scheduler_stage_claims SET result_json=?,side_effect_completed_at=110,finalized_at=111 WHERE claim_id='validation-claim'", (json.dumps(new_validation),))
+        self.ledger.connection.execute("UPDATE runtime_stages SET detail=?,artifact_path=?,artifact_sha256=?,created_at=110 WHERE ticket_id=? AND stage='validation-1'", (json.dumps(new_validation), str(new_artifact), digest, self.ticket))
+        self.ledger.connection.execute("UPDATE review_candidates SET validation_evidence=? WHERE ticket_id=?", ('new validation passed', self.ticket))
+        self.ledger.connection.commit()
+        doc = self.document('archived-failure-new-pass')
+        self.assertEqual(doc['authority']['routing_claim_id'], 'route-claim')
+        archive = self.ledger.connection.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage=?", (self.ticket, 'validation-controller-defect-archive-1-1')).fetchone()
+        altered = json.loads(archive['detail']); altered['record']['compact_evidence'] = 'different failure'
+        self.ledger.connection.execute("UPDATE runtime_stages SET detail=? WHERE ticket_id=? AND stage=?", (json.dumps(altered), self.ticket, archive['stage']))
+        with self.assertRaises(ValueError):
+            self.ledger.stale_routing_recovery_projection(self.ticket, 1, operator_config_path=self.config)
+        self.ledger.connection.execute("UPDATE runtime_stages SET detail=? WHERE ticket_id=? AND stage=?", (archive['detail'], self.ticket, archive['stage']))
+        archived_artifact = Path(archive['artifact_path']); original_bytes = archived_artifact.read_bytes()
+        archived_artifact.write_bytes(b'tampered archive artifact')
+        with self.assertRaises(ValueError):
+            self.ledger.stale_routing_recovery_projection(self.ticket, 1, operator_config_path=self.config)
+        archived_artifact.write_bytes(original_bytes)
+        result = self.execute(doc)
+        self.assertEqual(result['status'], 'superseded')
+        self.assertEqual(preview_next(self.ledger, now=200).next_stage, 'paused')
+
     def test_signed_supersession_preserves_prior_evidence_and_replay(self) -> None:
         doc = self.document()
         self.assertEqual(doc['authority']['routing_claim_id'], 'route-claim')
