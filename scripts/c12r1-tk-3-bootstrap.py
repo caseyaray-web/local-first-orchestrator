@@ -136,7 +136,7 @@ def build_bundle(repo: Path, commit: str, destination: Path, *, ledger: Path, co
         raise ValueError("runtime paths must be absolute and normalized")
     env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LANG": "C", "GIT_NO_REPLACE_OBJECTS": "1",
            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_ATTR_NOSYSTEM": "1"}
-    result = subprocess.run(("/usr/bin/git", "-C", str(repo), "archive", "--format=tar", commit, "--",
+    result = subprocess.run(("/usr/bin/git", "-c", f"safe.directory={repo}", "-C", str(repo), "archive", "--format=tar", commit, "--",
                              "local_first_orchestrator", _TEMPLATE), env=env, capture_output=True, timeout=60)
     if result.returncode or len(result.stdout) > 2 * _MAX_BYTES:
         raise ValueError("approved Git archive is unavailable or oversized")

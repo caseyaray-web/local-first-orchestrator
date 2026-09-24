@@ -72,6 +72,15 @@ class PinnedBootstrapTests(unittest.TestCase):
                 exchange=self.root / "exchange", python_executable=Path("/usr/bin/python3").resolve())
         self.assertFalse(self.bundle.exists())
 
+    def test_archive_succeeds_with_git_owner_mismatch_without_global_config(self):
+        real_run = subprocess.run
+        def simulate_root_git(argv, **kwargs):
+            assert kwargs["env"]["GIT_CONFIG_GLOBAL"] == "/dev/null"
+            return real_run(argv, **{**kwargs, "env": {**kwargs["env"], "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}})
+        with mock.patch.object(bootstrap.subprocess, "run", side_effect=simulate_root_git):
+            self.build()
+        self.assertEqual((self.bundle / "source" / "local_first_orchestrator" / "__init__.py").read_text(), "APPROVED = True\n")
+
     def test_replacement_ref_cannot_override_approved_commit(self):
         (self.repo / "local_first_orchestrator" / "__init__.py").write_text("APPROVED = False\n")
         subprocess.run(("git", "add", "."), cwd=self.repo, check=True)
