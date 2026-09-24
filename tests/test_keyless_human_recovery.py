@@ -104,10 +104,9 @@ class KeylessHumanRecoveryTests(unittest.TestCase):
         transcript = io.StringIO()
         helper = KeylessHumanRecovery(self._runtime(), runner=runner, confirmer=lambda message: (transcript.write(message), True)[1], identity=lambda: (0, True, True, 1000, 1000), source_validator=lambda _: None)
         prepared = helper.prepare_enrollment()
-        with patch("local_first_orchestrator.keyless_human_recovery.os.chown", wraps=os.chown) as chown:
-            helper.confirm_and_enroll(prepared)
+        helper.confirm_and_enroll(prepared)
         signature = prepared.document_path.with_name("enrollment.sig")
-        self.assertIn((signature, 1000, 1000), [call.args for call in chown.call_args_list])
+        self.assertEqual(stat.S_IMODE(signature.stat().st_mode), 0o644)
         self.assertEqual(len(calls), 2)
         self.assertIn("enroll-operator-signer", calls[1])
         self.assertIn(prepared.document_hash, transcript.getvalue())
@@ -162,6 +161,40 @@ class KeylessHumanRecoveryTests(unittest.TestCase):
         self.assertEqual(calls[0][calls[0].index("--attempt-number") + 1], "2")
         self.assertIn("recover-stale-routing", calls[1])
         self.assertNotIn("--allow-board-writes", calls[1])
+
+    def test_prompt_time_document_replacement_cannot_change_signed_bytes(self) -> None:
+        """The document shown to the human is the document passed to the CLI."""
+        from local_first_orchestrator.keyless_human_recovery import KeylessHumanRecovery
+        calls = []
+        def runner(argv, *, uid, gid):
+            calls.append(argv)
+            if "--output-file" in argv:
+                Path(argv[argv.index("--output-file") + 1]).write_bytes(b'{"canonical":"approved"}')
+            return "{}"
+        helper = KeylessHumanRecovery(self._runtime(), runner=runner,
+            confirmer=lambda _: (prepared.document_path.unlink(), prepared.document_path.write_bytes(b'{"canonical":"swapped"}'), True)[2],
+            identity=lambda: (0, True, True, 1000, 1000), source_validator=lambda _: None)
+        prepared = helper.prepare_enrollment()
+        with self.assertRaises(RuntimeError):
+            helper.confirm_and_enroll(prepared)
+        self.assertEqual(len(calls), 1)
+
+    def test_signature_symlink_is_never_followed_or_written_by_root(self) -> None:
+        from local_first_orchestrator.keyless_human_recovery import KeylessHumanRecovery
+        target = self.root / "must-not-change"
+        target.write_bytes(b"original")
+        def runner(argv, *, uid, gid):
+            if "--output-file" in argv:
+                output = Path(argv[argv.index("--output-file") + 1])
+                output.write_bytes(b'{"canonical":"enrollment"}')
+            return "{}"
+        helper = KeylessHumanRecovery(self._runtime(), runner=runner, confirmer=lambda _: True,
+            identity=lambda: (0, True, True, 1000, 1000), source_validator=lambda _: None)
+        prepared = helper.prepare_enrollment()
+        prepared.document_path.with_name("enrollment.sig").symlink_to(target)
+        with self.assertRaises((FileExistsError, PermissionError)):
+            helper.confirm_and_enroll(prepared)
+        self.assertEqual(target.read_bytes(), b"original")
 
 
 if __name__ == "__main__":

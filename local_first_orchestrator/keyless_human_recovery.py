@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import pwd
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -21,7 +23,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 TARGET_TICKET = "C12R1-TK-3"
 TARGET_ATTEMPT = 2
@@ -177,8 +179,67 @@ class KeylessHumanRecovery:
             if stat.S_IMODE(os.lstat(parent).st_mode) & 0o005 != 0o005:
                 raise PermissionError("exchange parent must be traversable by the ledger owner")
         directory = Path(tempfile.mkdtemp(dir=parent, prefix="c12r1-tk-3-"))
-        os.chown(directory, uid, gid); os.chmod(directory, 0o700)
+        # The CLI gets only this incoming directory.  Root promotes its output
+        # into the parent before displaying or signing it.
+        os.chmod(directory, 0o711)
+        incoming = directory / "incoming"
+        incoming.mkdir(mode=0o700)
+        os.chown(incoming, uid, gid); os.chmod(incoming, 0o700)
         return directory
+
+    @staticmethod
+    def _read_regular_nofollow(path: Path) -> bytes:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise PermissionError("approval evidence must be a regular file")
+            chunks = []
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _write_new_nofollow(path: Path, data: bytes, mode: int) -> None:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), mode)
+        try:
+            offset = 0
+            while offset < len(data):
+                offset += os.write(fd, data[offset:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        # Read the named output again with O_NOFOLLOW.  This proves both the
+        # strict detached-signature bytes and that no replacement raced us.
+        if KeylessHumanRecovery._read_regular_nofollow(path) != data:
+            raise RuntimeError("protected approval output readback mismatch")
+
+    def _promote_document(self, exchange: Path, incoming: Path, name: str) -> tuple[Path, bytes]:
+        data = self._read_regular_nofollow(incoming)
+        document = exchange / name
+        self._write_new_nofollow(document, data, 0o644)
+        if os.geteuid() == 0:
+            os.chown(document, 0, 0)
+        return document, data
+
+    def _sign_exact_document(self, prepared: PreparedApproval, key: Ed25519PrivateKey, signature_name: str) -> Path:
+        data = self._read_regular_nofollow(prepared.document_path)
+        if hashlib.sha256(data).hexdigest() != prepared.document_hash:
+            raise RuntimeError("approval evidence drifted after confirmation")
+        signature = prepared.document_path.with_name(signature_name)
+        signed = key.sign(data)
+        self._write_new_nofollow(signature, signed, 0o644)
+        if os.geteuid() == 0:
+            os.chown(signature, 0, 0)
+        public = base64.b64decode(prepared.public_key_b64, validate=True)
+        try:
+            Ed25519PublicKey.from_public_bytes(public).verify(self._read_regular_nofollow(signature), data)
+        except Exception as exc:
+            raise RuntimeError("detached signature readback proof failed") from exc
+        return signature
 
     def _argv(self, *command: str) -> list[str]:
         # -I rejects user Python path/site customizations. The module must be
@@ -203,9 +264,10 @@ class KeylessHumanRecovery:
             raise ValueError("helper is permanently scoped to C12R1-TK-3")
         _, public_key, fingerprint = self._key()
         exchange = self._exchange(uid, gid)
-        document = exchange / "enrollment.json"
-        self._call(self._argv("prepare-operator-signer-enrollment", "--operator-id", self.runtime.actor, "--reason", ENROLLMENT_REASON, "--ticket-id", TARGET_TICKET, "--public-key", public_key, "--fingerprint", fingerprint, "--output-file", str(document)), uid, gid)
-        return PreparedApproval(TARGET_TICKET, document, self._hash(document), self._hash(self.runtime.config_path), public_key, fingerprint)
+        incoming = exchange / "incoming" / "enrollment.json"
+        self._call(self._argv("prepare-operator-signer-enrollment", "--operator-id", self.runtime.actor, "--reason", ENROLLMENT_REASON, "--ticket-id", TARGET_TICKET, "--public-key", public_key, "--fingerprint", fingerprint, "--output-file", str(incoming)), uid, gid)
+        document, data = self._promote_document(exchange, incoming, "enrollment.json")
+        return PreparedApproval(TARGET_TICKET, document, hashlib.sha256(data).hexdigest(), self._hash(self.runtime.config_path), public_key, fingerprint)
 
     def confirm_and_enroll(self, prepared: PreparedApproval) -> None:
         uid, gid = self._guard()
@@ -214,17 +276,17 @@ class KeylessHumanRecovery:
         if not self._confirmer(f"ENROLL C12R1-TK-3 exact document SHA-256 {prepared.document_hash}"):
             raise PermissionError("human declined enrollment")
         key, _, _ = self._key()
-        signature = prepared.document_path.with_name("enrollment.sig")
-        signature.write_bytes(key.sign(prepared.document_path.read_bytes())); os.chmod(signature, 0o600); os.chown(signature, uid, gid)
+        signature = self._sign_exact_document(prepared, key, "enrollment.sig")
         self._call(self._argv("enroll-operator-signer", "--operator-id", self.runtime.actor, "--reason", ENROLLMENT_REASON, "--ticket-id", TARGET_TICKET, "--public-key", prepared.public_key_b64, "--fingerprint", prepared.fingerprint, "--document-file", str(prepared.document_path), "--signature-file", str(signature)), uid, gid)
 
     def prepare_stale_routing_recovery(self) -> PreparedApproval:
         uid, gid = self._guard()
         exchange = self._exchange(uid, gid)
-        document = exchange / "recovery.json"; request_id = uuid.uuid4().hex
-        self._call(self._argv("prepare-stale-routing-recovery", "--task-id", TARGET_TICKET, "--attempt-number", str(TARGET_ATTEMPT), "--operator-id", self.runtime.actor, "--reason", RECOVERY_REASON, "--request-id", request_id, "--output-file", str(document)), uid, gid)
+        incoming = exchange / "incoming" / "recovery.json"; request_id = uuid.uuid4().hex
+        self._call(self._argv("prepare-stale-routing-recovery", "--task-id", TARGET_TICKET, "--attempt-number", str(TARGET_ATTEMPT), "--operator-id", self.runtime.actor, "--reason", RECOVERY_REASON, "--request-id", request_id, "--output-file", str(incoming)), uid, gid)
+        document, data = self._promote_document(exchange, incoming, "recovery.json")
         _, public_key, fingerprint = self._key()
-        return PreparedApproval(TARGET_TICKET, document, self._hash(document), self._hash(self.runtime.config_path), public_key, fingerprint, request_id)
+        return PreparedApproval(TARGET_TICKET, document, hashlib.sha256(data).hexdigest(), self._hash(self.runtime.config_path), public_key, fingerprint, request_id)
 
     def confirm_and_recover_stale_routing(self, prepared: PreparedApproval) -> None:
         uid, gid = self._guard()
@@ -232,9 +294,101 @@ class KeylessHumanRecovery:
             raise RuntimeError("recovery evidence/config drifted; prepare again")
         if not self._confirmer(f"RECOVER C12R1-TK-3 attempt 2 exact document SHA-256 {prepared.document_hash}"):
             raise PermissionError("human declined stale-routing recovery")
-        key, _, _ = self._key(); signature = prepared.document_path.with_name("recovery.sig")
-        signature.write_bytes(key.sign(prepared.document_path.read_bytes())); os.chmod(signature, 0o600); os.chown(signature, uid, gid)
+        key, _, _ = self._key(); signature = self._sign_exact_document(prepared, key, "recovery.sig")
         self._call(self._argv("recover-stale-routing", "--task-id", TARGET_TICKET, "--attempt-number", str(TARGET_ATTEMPT), "--operator-id", self.runtime.actor, "--reason", RECOVERY_REASON, "--request-id", prepared.request_id, "--approval-file", str(prepared.document_path), "--signature-file", str(signature)), uid, gid)
+
+    def _reconciliation(self) -> tuple[str, sqlite3.Row | None]:
+        """Classify the one fixed enrollment without inventing new authority."""
+        config_raw = self._read_regular_nofollow(self.runtime.config_path)
+        try:
+            config = json.loads(config_raw)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("configured signer authority is malformed") from exc
+        fingerprint = config.get("operator_signing_key_fingerprint") if type(config) is dict else None
+        public_key = config.get("operator_signing_public_key") if type(config) is dict else None
+        if fingerprint is None and public_key is None:
+            fingerprint = public_key = ""
+        elif type(fingerprint) is not str or type(public_key) is not str:
+            raise RuntimeError("configured signer authority is malformed")
+        with sqlite3.connect(f"file:{self.runtime.ledger_path}?mode=ro", uri=True) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute("SELECT * FROM runtime_signer_enrollment_intents WHERE operator_id=? AND reason=?", (self.runtime.actor, ENROLLMENT_REASON)).fetchall()
+            if len(rows) > 1:
+                raise RuntimeError("ambiguous signer enrollment reconciliation")
+            binding = db.execute("SELECT operator_signer_fingerprint,operator_authority_hash FROM runtime_bindings WHERE ticket_id=?", (TARGET_TICKET,)).fetchone()
+            archive = db.execute("SELECT document_json,detached_signature,operator_id,reason FROM stale_routing_recovery_archives WHERE ticket_id=? AND attempt_number=?", (TARGET_TICKET, TARGET_ATTEMPT)).fetchall()
+        if len(archive) > 1:
+            raise RuntimeError("ambiguous stale-routing recovery reconciliation")
+        if archive:
+            item = archive[0]
+            try:
+                document = json.loads(item["document_json"])
+                authority = document["authority"]
+                exact_recovery = (item["operator_id"] == self.runtime.actor and item["reason"] == RECOVERY_REASON and authority["ticket_id"] == TARGET_TICKET and authority["attempt_number"] == TARGET_ATTEMPT and authority["signer_fingerprint"] == fingerprint)
+            except (KeyError, TypeError, json.JSONDecodeError):
+                exact_recovery = False
+            if not exact_recovery:
+                raise RuntimeError("stale-routing recovery evidence drifted")
+            return "recovered", None
+        if not rows:
+            if binding is not None and binding["operator_signer_fingerprint"] is not None:
+                raise RuntimeError("signer binding exists without exact enrollment evidence")
+            return "fresh", None
+        intent = rows[0]
+        try:
+            selected = json.loads(intent["ticket_ids_json"])
+            document = json.loads(intent["document_json"])
+            exact = (selected == [TARGET_TICKET] and intent["public_key_fingerprint"] == fingerprint and document["new_public_key"] == public_key and document["new_fingerprint"] == fingerprint and document["operator_id"] == self.runtime.actor and document["reason"] == ENROLLMENT_REASON)
+        except (KeyError, TypeError, json.JSONDecodeError):
+            exact = False
+        if not exact or binding is None:
+            raise RuntimeError("signer enrollment evidence drifted")
+        if intent["status"] == "finalized":
+            with sqlite3.connect(f"file:{self.runtime.ledger_path}?mode=ro", uri=True) as db:
+                events = db.execute("SELECT payload_json FROM events WHERE event_type='runtime_signer_enrollment_completed' AND json_extract(payload_json,'$.enrollment_key')=?", (intent["enrollment_key"],)).fetchall()
+            if binding["operator_signer_fingerprint"] != fingerprint or len(events) != 1:
+                raise RuntimeError("finalized signer binding drifted")
+            try:
+                event = json.loads(events[0][0])
+                if event["public_key_fingerprint"] != fingerprint or event["ticket_ids"] != [TARGET_TICKET] or event["operator_id"] != self.runtime.actor or event["reason"] != ENROLLMENT_REASON:
+                    raise ValueError
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("finalized signer event drifted") from exc
+            return "enrolled", intent
+        if intent["status"] not in {"pending_config", "config_written"}:
+            raise RuntimeError("signer enrollment is not safely recoverable")
+        return "partial", intent
+
+    def _resume_exact_enrollment(self, intent: sqlite3.Row) -> None:
+        """Replay only the already signed, durably recorded enrollment bytes."""
+        uid, gid = self._guard()
+        document = str(intent["document_json"]).encode("utf-8")
+        signature = base64.b64decode(str(intent["detached_signature"]), validate=True)
+        exchange = self._exchange(uid, gid)
+        document_path = exchange / "enrollment.json"
+        signature_path = exchange / "enrollment.sig"
+        self._write_new_nofollow(document_path, document, 0o644)
+        self._write_new_nofollow(signature_path, signature, 0o644)
+        self._call(self._argv("enroll-operator-signer", "--operator-id", self.runtime.actor, "--reason", ENROLLMENT_REASON, "--ticket-id", TARGET_TICKET, "--public-key", json.loads(document)["new_public_key"], "--fingerprint", str(intent["public_key_fingerprint"]), "--document-file", str(document_path), "--signature-file", str(signature_path)), uid, gid)
+
+    def run(self) -> None:
+        state, intent = self._reconciliation()
+        if state == "recovered":
+            return
+        if state == "partial":
+            assert intent is not None
+            self._resume_exact_enrollment(intent)
+            state, intent = self._reconciliation()
+            if state != "enrolled":
+                raise RuntimeError("signer enrollment replay did not finalize exactly")
+        elif state == "fresh":
+            enrollment = self.prepare_enrollment()
+            self.confirm_and_enroll(enrollment)
+            state, intent = self._reconciliation()
+            if state != "enrolled":
+                raise RuntimeError("signer enrollment did not finalize exactly")
+        recovery = self.prepare_stale_routing_recovery()
+        self.confirm_and_recover_stale_routing(recovery)
 
 def _load_installed_runtime(path: Path = Path("/etc/local-first-orchestrator/c12r1-tk-3-human-recovery.json")) -> HelperRuntime:
     """Load only a root-owned immutable installation manifest, never CLI paths."""
@@ -252,10 +406,7 @@ def _load_installed_runtime(path: Path = Path("/etc/local-first-orchestrator/c12
 def main() -> int:
     """Installed root entry point; intentionally has no path/ticket arguments."""
     helper = KeylessHumanRecovery(_load_installed_runtime())
-    enrollment = helper.prepare_enrollment()
-    helper.confirm_and_enroll(enrollment)
-    recovery = helper.prepare_stale_routing_recovery()
-    helper.confirm_and_recover_stale_routing(recovery)
+    helper.run()
     return 0
 
 
