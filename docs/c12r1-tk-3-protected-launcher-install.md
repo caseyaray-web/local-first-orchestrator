@@ -6,7 +6,7 @@ This is a **code-only staging and installation procedure**. Do not run it from t
 
 The root launcher is installed at the fixed path `/usr/local/sbin/local-first-orchestrator-c12r1-tk-3-human-recovery`. It accepts **no arguments** and has no runtime source-path or environment override. Before it executes `python -I -c ...`, it checks:
 
-- each component of the fixed snapshot path is `root:root` and mode `0555`;
+- each component of the snapshot path is root-owned, a directory, and not group/world-writable (normal `0755` system ancestors and `0555` snapshot directories are accepted);
 - every listed Python source is `root:root`, regular, and mode `0444`;
 - `/etc/local-first-orchestrator/c12r1-tk-3-human-recovery.json` is `root:root`, regular, and mode `0600`;
 - `source.sha256`, its fixed SHA-256 embedded in the launcher, the runtime manifest's fixed SHA-256 embedded in the launcher, and the resolved system Python's fixed SHA-256 all match;

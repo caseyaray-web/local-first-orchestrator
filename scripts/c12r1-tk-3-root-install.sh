@@ -14,8 +14,15 @@ SOURCE_MANIFEST=$DESTINATION/source.sha256
 TEMPLATE=$STAGE/root-launcher.sh.in
 [ -d "$STAGE/snapshot/local_first_orchestrator" ] && [ -f "$STAGE/c12r1-tk-3-human-recovery.json" ] && [ -f "$TEMPLATE" ] || { printf '%s\n' 'incomplete staging directory' >&2; exit 1; }
 find "$STAGE/snapshot" -type l -print -quit | grep -q . && { printf '%s\n' 'staging contains symlink' >&2; exit 1; }
-rm -rf -- "$DESTINATION"
-install -d -o root -g root -m 0555 "$DESTINATION" "$SOURCE_ROOT" /etc/local-first-orchestrator
+for target in "$DESTINATION" "$LAUNCHER" "$RUNTIME_MANIFEST"; do
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        printf '%s\n' 'refusing to replace an existing recovery installation' >&2
+        exit 1
+    fi
+done
+install -d -o root -g root -m 0755 /usr/local/lib/local-first-orchestrator /etc/local-first-orchestrator
+mkdir -m 0700 -- "$DESTINATION"
+install -d -o root -g root -m 0555 "$DESTINATION" "$SOURCE_ROOT"
 ( cd "$STAGE/snapshot" && tar -cf - . ) | ( cd "$SOURCE_ROOT" && tar -xf - )
 chown -R root:root "$SOURCE_ROOT"
 find "$SOURCE_ROOT" -type d -exec chmod 0555 {} \;

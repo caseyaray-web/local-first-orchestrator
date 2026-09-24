@@ -79,6 +79,12 @@ class ProtectedLauncherTests(unittest.TestCase):
         self.assertIn("keyless_human_recovery", invocation)
         self.assertNotIn("--", invocation)
 
+    def test_root_owned_0755_ancestors_are_accepted(self) -> None:
+        self._write_tool("stat", "#!/bin/sh\nfor value do last=$value; done\ncase $last in *runtime.json) printf '0:600:regular file\\n' ;; *python3) printf '0:755:regular file\\n' ;; *snapshot) printf '0:555:directory\\n' ;; *) if [ -d \"$last\" ]; then printf '0:755:directory\\n'; else printf '0:444:regular file\\n'; fi ;; esac\n")
+        result = self._run(self._launcher())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.called.exists())
+
     def test_runtime_manifest_hash_failure_prevents_python_execution(self) -> None:
         launcher = self._launcher()
         self.runtime_manifest.write_text('{"tampered":true}\n', encoding="utf-8")
@@ -109,6 +115,8 @@ class ProtectedLauncherTests(unittest.TestCase):
             self.assertTrue(text.startswith("#!/bin/sh"))
         for path in (STAGER, INSTALLER):
             self.assertNotIn("python -c", path.read_text(encoding="utf-8"))
+        self.assertNotIn('rm -rf -- "$DESTINATION"\ninstall -d', INSTALLER.read_text(encoding="utf-8"))
+        self.assertIn('mkdir -m 0700 -- "$DESTINATION"', INSTALLER.read_text(encoding="utf-8"))
         template = TEMPLATE.read_text(encoding="utf-8")
         self.assertIn("exec \"$PYTHON_BIN\" -I -c", template)
         self.assertIn("runtime manifest digest mismatch", template)

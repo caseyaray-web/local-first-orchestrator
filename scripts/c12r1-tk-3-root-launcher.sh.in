@@ -20,6 +20,12 @@ fail() { printf '%s\n' "$1" >&2; exit 1; }
 [ "$("$ID_BIN" -u)" = 0 ] || fail 'launcher requires effective root'
 meta() { "$STAT_BIN" -c '%u:%a:%F' -- "$1" 2>/dev/null || fail "missing protected path: $1"; }
 check_meta() { [ "$(meta "$1")" = "0:$2:$3" ] || fail "owner/mode/type mismatch: $1"; }
+check_root_directory() {
+    case "$(meta "$1")" in
+        0:555:directory|0:755:directory|0:700:directory|0:750:directory|0:500:directory) ;;
+        *) fail "owner/mode/type mismatch: $1" ;;
+    esac
+}
 check_chain() {
     case "$1" in /*) ;; *) fail 'protected path is not absolute' ;; esac
     current=/
@@ -27,7 +33,7 @@ check_chain() {
     for component in "$@"; do
         [ -n "$component" ] || continue
         current=$current/$component
-        check_meta "$current" 555 directory
+        check_root_directory "$current"
     done
 }
 check_chain "$SOURCE_ROOT"
