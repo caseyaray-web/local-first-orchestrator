@@ -114,6 +114,52 @@ class StaleRoutingRecoveryTests(unittest.TestCase):
         self.assertEqual(result['status'], 'superseded')
         self.assertEqual(preview_next(self.ledger, now=200).next_stage, 'paused')
 
+    def test_supersession_retains_linked_artifact_bytes_after_sources_disappear(self) -> None:
+        db = self.ledger.connection
+        old_claim = db.execute("SELECT * FROM scheduler_stage_claims WHERE ticket_id=? AND stage='validation:1'", (self.ticket,)).fetchone()
+        old_stage = db.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage='validation-1'", (self.ticket,)).fetchone()
+        archive_detail = {"original_stage": "validation-1", "terminal_generation": 1, "reason": "replayed validation", "record": json.loads(old_stage['detail']), "claim_status": "completed", "claim_result": {**json.loads(old_claim['result_json']), "ticket_id": self.ticket, "replayed": False}}
+        db.execute("INSERT INTO runtime_stages(ticket_id,stage,detail,attempt_number,artifact_path,artifact_sha256,created_at) VALUES (?,?,?,?,?,?,?)", (self.ticket, 'validation-controller-defect-archive-1-1', json.dumps(archive_detail), 1, old_stage['artifact_path'], old_stage['artifact_sha256'], 105))
+        current_validation = Path(self.temp.name) / 'replay-validation.json'
+        current_validation.write_bytes(b'{"passed":true}\n')
+        current_sha = hashlib.sha256(current_validation.read_bytes()).hexdigest()
+        new_validation = {"candidate_identity": json.loads(old_claim['candidate_identity_json']), "passed": True, "compact_evidence": "new validation passed", "validation_artifact": str(current_validation), "validation_artifact_sha256": current_sha}
+        db.execute("UPDATE scheduler_stage_claims SET result_json=?,side_effect_completed_at=110,finalized_at=111 WHERE claim_id='validation-claim'", (json.dumps(new_validation),))
+        db.execute("UPDATE runtime_stages SET detail=?,artifact_path=?,artifact_sha256=?,created_at=110 WHERE ticket_id=? AND stage='validation-1'", (json.dumps(new_validation), str(current_validation), current_sha, self.ticket))
+        db.execute("UPDATE review_candidates SET validation_evidence=? WHERE ticket_id=?", ('new validation passed', self.ticket))
+        db.commit()
+
+        doc = self.document('artifact-lineage')
+        self.assertEqual(self.execute(doc)['status'], 'superseded')
+        rows = db.execute("SELECT artifact_kind,source_path,sha256,content FROM stale_routing_recovery_artifacts WHERE request_id=? ORDER BY artifact_kind", ('artifact-lineage',)).fetchall()
+        self.assertEqual([row['artifact_kind'] for row in rows], ['archived_failed_validation', 'current_validation', 'implementation', 'review'])
+        for row in rows:
+            self.assertEqual(hashlib.sha256(bytes(row['content'])).hexdigest(), row['sha256'])
+            self.assertEqual(bytes(row['content']), Path(row['source_path']).read_bytes())
+        for row in rows:
+            Path(row['source_path']).unlink()
+        before = self.snapshot()
+        self.assertEqual(self.execute(doc)['status'], 'already_superseded')
+        self.assertEqual(before, self.snapshot())
+
+    def test_supersession_rolls_back_artifact_archive_with_reopen_failure(self) -> None:
+        doc = self.document('artifact-rollback')
+        self.ledger.connection.execute("CREATE TRIGGER reject_reopen_artifact_archive BEFORE UPDATE ON scheduler_stage_claims WHEN NEW.claim_id='route-claim' BEGIN SELECT RAISE(ABORT, 'forced rollback'); END")
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.execute(doc)
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM stale_routing_recovery_artifacts WHERE request_id=?", ('artifact-rollback',)).fetchone()[0], 0)
+
+    def test_replay_refuses_tampered_retained_artifact_without_mutation(self) -> None:
+        doc = self.document('artifact-mismatch')
+        self.assertEqual(self.execute(doc)['status'], 'superseded')
+        db = self.ledger.connection
+        db.execute('DROP TRIGGER stale_routing_recovery_artifacts_immutable_update')
+        db.execute("UPDATE stale_routing_recovery_artifacts SET content=? WHERE request_id=? AND artifact_kind='review'", (b'tampered', 'artifact-mismatch'))
+        before = self.snapshot()
+        with self.assertRaises(ValueError):
+            self.execute(doc)
+        self.assertEqual(before, self.snapshot())
+
     def test_signed_supersession_preserves_prior_evidence_and_replay(self) -> None:
         doc = self.document()
         self.assertEqual(doc['authority']['routing_claim_id'], 'route-claim')

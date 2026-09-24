@@ -238,6 +238,19 @@ CREATE TRIGGER IF NOT EXISTS stale_routing_recovery_archives_immutable_update
 BEFORE UPDATE ON stale_routing_recovery_archives BEGIN SELECT RAISE(ABORT, 'stale routing recovery archives are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS stale_routing_recovery_archives_immutable_delete
 BEFORE DELETE ON stale_routing_recovery_archives BEGIN SELECT RAISE(ABORT, 'stale routing recovery archives are append-only'); END;
+CREATE TABLE IF NOT EXISTS stale_routing_recovery_artifacts (
+    request_id TEXT NOT NULL REFERENCES stale_routing_recovery_archives(request_id),
+    artifact_kind TEXT NOT NULL CHECK(artifact_kind IN ('archived_failed_validation', 'current_validation', 'review', 'implementation', 'triage')),
+    source_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    content BLOB NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(request_id, artifact_kind)
+);
+CREATE TRIGGER IF NOT EXISTS stale_routing_recovery_artifacts_immutable_update
+BEFORE UPDATE ON stale_routing_recovery_artifacts BEGIN SELECT RAISE(ABORT, 'stale routing recovery artifacts are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS stale_routing_recovery_artifacts_immutable_delete
+BEFORE DELETE ON stale_routing_recovery_artifacts BEGIN SELECT RAISE(ABORT, 'stale routing recovery artifacts are append-only'); END;
 CREATE TABLE IF NOT EXISTS features (
     id TEXT PRIMARY KEY,
     external_id TEXT UNIQUE,
@@ -6281,7 +6294,7 @@ class Ledger:
             self._append_event(conn, entity_type="ticket", entity_id=ticket_id, event_type="scheduler_stage_effect_completed", actor_id=owner, payload={"claim_id":claim_id,"stage":"repair_routing","result":result})
             return dict(conn.execute("SELECT * FROM scheduler_stage_claims WHERE claim_id=?", (claim_id,)).fetchone())
 
-    def _stale_routing_recovery_evidence(self, conn: sqlite3.Connection, ticket_id: str, attempt_number: int, now: int) -> tuple[dict[str, Any], dict[str, sqlite3.Row | None]]:
+    def _stale_routing_recovery_evidence(self, conn: sqlite3.Connection, ticket_id: str, attempt_number: int, now: int) -> tuple[dict[str, Any], dict[str, sqlite3.Row | None], tuple[tuple[str, str, str, bytes], ...]]:
         """One read-only authority calculation, shared by approval and the write transaction."""
         attempt_number = _strict_positive_identity_int(attempt_number, name="attempt_number")
         paused = conn.execute("SELECT paused FROM controller_state WHERE id=1").fetchone()
@@ -6513,11 +6526,26 @@ class Ledger:
             "triage_applied_hash": None if triage_applied is None else canonical_sha256(dict(triage_applied)),
             "triage_model_hash": None if triage_model is None else canonical_sha256(dict(triage_model)),
             "triage_artifact_sha256": hashlib.sha256(triage_bytes).hexdigest() if triage_bytes is not None else None,
+            "implementation_artifact_sha256": hashlib.sha256(implementation_bytes).hexdigest(),
+            "recovery_artifact_archive_version": 1,
         }
+        artifacts: list[tuple[str, str, str, bytes]] = [
+            ("current_validation", str(validation_path), hashlib.sha256(validation_bytes).hexdigest(), validation_bytes),
+            ("review", str(model["response_artifact"]), hashlib.sha256(artifact_bytes).hexdigest(), artifact_bytes),
+            ("implementation", str(implementation_path), hashlib.sha256(implementation_bytes).hexdigest(), implementation_bytes),
+        ]
         if archived_validation is not None:
+            assert archived_validation_bytes is not None
             authority["archived_failed_validation_hash"] = canonical_sha256(dict(archived_validation))
             authority["archived_failed_validation_artifact_sha256"] = hashlib.sha256(archived_validation_bytes).hexdigest()
-        return authority, rows
+            artifacts.append(("archived_failed_validation", str(archived_validation["artifact_path"]), hashlib.sha256(archived_validation_bytes).hexdigest(), archived_validation_bytes))
+        if triage_bytes is not None:
+            assert triage_model is not None
+            artifacts.append(("triage", str(triage_model["response_artifact"]), hashlib.sha256(triage_bytes).hexdigest(), triage_bytes))
+        if any(len(content) > 4 * 1024 * 1024 for _, _, _, content in artifacts) or sum(len(content) for _, _, _, content in artifacts) > 16 * 1024 * 1024:
+            raise ValueError("stale routing recovery artifacts exceed durable archive limit")
+        authority["recovery_artifact_kinds"] = sorted(kind for kind, _, _, _ in artifacts)
+        return authority, rows, tuple(artifacts)
 
     def stale_routing_recovery_projection(self, ticket_id: str, attempt_number: int, *, operator_config_path: Path | None = None) -> dict[str, Any]:
         from .operator_config import _locked_config, _parse_operator_config_bytes, _read_verified_fd, default_config_path
@@ -6525,7 +6553,7 @@ class Ledger:
         with _locked_config(config_path, write=False) as (fd, identity):
             raw = _read_verified_fd(fd, identity)
             registered = _parse_operator_config_bytes(raw, config_path)
-            authority, _ = self._stale_routing_recovery_evidence(self.connection, ticket_id, attempt_number, self._now())
+            authority, _, _ = self._stale_routing_recovery_evidence(self.connection, ticket_id, attempt_number, self._now())
             if (registered.ledger_path != self.database.resolve() or registered.canonical_repository != Path(str(self.connection.execute("SELECT repository_path FROM runtime_bindings WHERE ticket_id=?", (ticket_id,)).fetchone()[0])).resolve()
                 or registered.operator_signing_key_fingerprint != authority["signer_fingerprint"]):
                 raise PermissionError("stale routing recovery registration conflicts with ledger")
@@ -6587,6 +6615,30 @@ class Ledger:
                         or archived_authority.get("operator_config_sha256") != hashlib.sha256(config_bytes).hexdigest()
                         or any((canonical_sha256(value) if value is not None else None) != archived_authority[key] for key, value in archived_rows.items())):
                         raise ValueError("stale routing recovery archive authority conflicts")
+                    archive_version = archived_authority.get("recovery_artifact_archive_version")
+                    if archive_version is not None:
+                        if archive_version != 1:
+                            raise ValueError("stale routing recovery artifact archive version is unsupported")
+                        expected_artifacts = {
+                            "implementation": archived_authority["implementation_artifact_sha256"],
+                            "review": archived_authority["review_artifact_sha256"],
+                            "current_validation": archived_authority["validation_artifact_sha256"],
+                        }
+                        if archived_authority.get("archived_failed_validation_artifact_sha256") is not None:
+                            expected_artifacts["archived_failed_validation"] = archived_authority["archived_failed_validation_artifact_sha256"]
+                        if archived_authority.get("triage_artifact_sha256") is not None:
+                            expected_artifacts["triage"] = archived_authority["triage_artifact_sha256"]
+                        artifact_rows = conn.execute("SELECT artifact_kind,source_path,sha256,content FROM stale_routing_recovery_artifacts WHERE request_id=? ORDER BY artifact_kind", (request_id,)).fetchall()
+                        if (archived_authority.get("recovery_artifact_kinds") != sorted(expected_artifacts)
+                            or {row["artifact_kind"] for row in artifact_rows} != set(expected_artifacts)
+                            or len(artifact_rows) != len(expected_artifacts)):
+                            raise ValueError("stale routing recovery artifact archive linkage conflicts")
+                        for artifact_row in artifact_rows:
+                            content = bytes(artifact_row["content"])
+                            if (not isinstance(artifact_row["source_path"], str) or not artifact_row["source_path"]
+                                or artifact_row["sha256"] != expected_artifacts[artifact_row["artifact_kind"]]
+                                or hashlib.sha256(content).hexdigest() != artifact_row["sha256"]):
+                                raise ValueError("stale routing recovery artifact archive content conflicts")
                 except (TypeError, KeyError, ValueError) as exc:
                     raise ValueError("stale routing recovery archive evidence is malformed") from exc
                 ticket = conn.execute("SELECT state,lease_owner,lease_expires_at FROM tickets WHERE id=?", (ticket_id,)).fetchone()
@@ -6603,7 +6655,7 @@ class Ledger:
                 return {"ticket_id": ticket_id, "attempt_number": attempt_number, "request_id": request_id, "status": "already_superseded"}
             if conn.execute("SELECT 1 FROM stale_routing_recovery_archives WHERE request_id=?", (request_id,)).fetchone():
                 raise ValueError("stale routing recovery request identity already used")
-            authority, rows = self._stale_routing_recovery_evidence(conn, ticket_id, attempt_number, now)
+            authority, rows, artifacts = self._stale_routing_recovery_evidence(conn, ticket_id, attempt_number, now)
             authority["operator_config_sha256"] = hashlib.sha256(config_bytes).hexdigest()
             authority["operator_config_identity"] = config_identity
             if (approval_document["authority"] != authority or authority["signer_fingerprint"] != signer_fingerprint
@@ -6613,6 +6665,7 @@ class Ledger:
                 raise PermissionError("stale routing recovery registration changed before commit")
             snapshots = {key: None if row is None else json.dumps(dict(row), sort_keys=True, separators=(",", ":")) for key, row in rows.items()}
             conn.execute("INSERT INTO stale_routing_recovery_archives(request_id,ticket_id,attempt_number,authority_json,document_json,detached_signature,routing_claim_json,routing_stage_json,feedback_stage_json,triage_claim_json,validation_claim_json,validation_stage_json,triage_applied_json,triage_model_json,operator_id,reason,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (request_id,ticket_id,attempt_number,json.dumps(authority,sort_keys=True,separators=(",", ":")),raw.decode(),detached_signature,snapshots["routing"],snapshots["route_stage"],snapshots["feedback"],snapshots["triage"],snapshots["validation_claim"],snapshots["validation_stage"],snapshots["triage_applied"],snapshots["triage_model"],operator_id,reason,now))
+            conn.executemany("INSERT INTO stale_routing_recovery_artifacts(request_id,artifact_kind,source_path,sha256,content,created_at) VALUES (?,?,?,?,?,?)", ((request_id, kind, source_path, digest, content, now) for kind, source_path, digest, content in artifacts))
             conn.execute("DELETE FROM runtime_stages WHERE ticket_id=? AND stage IN (?,?,?)", (ticket_id, f"repair-routing-{attempt_number}", f"triage-feedback-{attempt_number}", f"triage-applied-{attempt_number}"))
             if rows["triage"] is not None:
                 if conn.execute("UPDATE scheduler_stage_claims SET status='failed',last_error=?,updated_at=? WHERE claim_id=? AND status='completed'", (f"superseded by stale routing recovery {request_id}", now, rows["triage"]["claim_id"])).rowcount != 1:
