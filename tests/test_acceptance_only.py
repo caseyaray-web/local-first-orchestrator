@@ -87,20 +87,70 @@ class AcceptanceOnlyTests(unittest.TestCase):
         self.assertEqual(self.ledger.connection.execute("select count(*) from accepted_evidence where ticket_id=?", (self.ticket,)).fetchone()[0], 1)
         self.assertEqual(self.model.calls, ["implementation"])
 
-    def _convert_implementation_to_hermes_reconciliation(self) -> Path:
+    def _commit_stacked_candidate(self):
+        attempt = self.ledger.connection.execute("select * from attempts where ticket_id=? and attempt_number=1", (self.ticket,)).fetchone()
+        worktree = Path(attempt["worktree_path"])
+        (worktree / "app.py").write_text("def value():\n    return 'intermediate'\n", encoding="utf-8")
+        self.git_w(worktree, "add", "app.py")
+        self.git_w(worktree, "commit", "-qm", "intermediate attempt")
+        intermediate = self.git_w(worktree, "rev-parse", "HEAD")
+        (worktree / "app.py").write_text("def value():\n    return 'ok'\n", encoding="utf-8")
+        self.git_w(worktree, "add", "app.py")
+        self.git_w(worktree, "commit", "-qm", "selected reviewed candidate")
+        selected = self.git_w(worktree, "rev-parse", "HEAD")
+        self.assertEqual(self.git_w(worktree, "rev-parse", "HEAD^"), intermediate)
+        candidate = self.ledger.review_candidate(self.ticket, 1)
+        self.assertIsNotNone(candidate)
+        committed = subprocess.run(("git", "diff", "--binary", "--no-ext-diff", self.base, selected, "--"), cwd=worktree, capture_output=True, check=True).stdout
+        self.assertEqual(hashlib.sha256(committed).hexdigest(), candidate["candidate_fingerprint"])
+        return worktree, intermediate, selected
+
+    def test_accepts_linear_stacked_commit_without_rewriting_reviewed_head(self):
+        worktree, intermediate, selected = self._commit_stacked_candidate()
+        result = self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)
+        self.assertEqual(result["accepted_commit_sha"], selected)
+        self.assertEqual(self.git_w(worktree, "rev-parse", "HEAD"), selected)
+        self.assertEqual(self.git_w(worktree, "rev-parse", "HEAD^"), intermediate)
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), self.base)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from accepted_evidence where ticket_id=?", (self.ticket,)).fetchone()[0], 1)
+
+    def test_stacked_commit_replay_after_ledger_failure_keeps_selected_sha(self):
+        worktree, _, selected = self._commit_stacked_candidate()
+        with mock.patch.object(self.ledger, "persist_accepted_candidate", side_effect=RuntimeError("crash before ledger write")):
+            with self.assertRaisesRegex(RuntimeError, "crash before ledger write"):
+                self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)
+        self.assertIsNone(self.ledger.accepted_commit(self.ticket))
+        result = self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)
+        self.assertEqual(result["accepted_commit_sha"], selected)
+        self.assertEqual(self.git_w(worktree, "rev-parse", "HEAD"), selected)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from accepted_evidence where ticket_id=?", (self.ticket,)).fetchone()[0], 1)
+
+    def test_rejects_merge_above_stacked_selected_commit(self):
+        worktree, _, selected = self._commit_stacked_candidate()
+        side = self.git_w(worktree, "commit-tree", f"{self.base}^{{tree}}", "-p", self.base, "-m", "unrelated side")
+        self.git_w(worktree, "merge", "-s", "ours", "--no-ff", side, "-m", "merge unrelated side")
+        self.assertEqual(self.git_w(worktree, "diff", "--name-only", selected, "HEAD"), "")
+        with self.assertRaisesRegex(RuntimeError, "post-commit acceptance state is ambiguous"):
+            self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)
+        self.assertIsNone(self.ledger.accepted_commit(self.ticket))
+
+    def _convert_implementation_to_hermes_reconciliation(self, *, status="done", outcome="success", summary="", run_id=17, recorded_branch=True) -> Path:
         attempt = self.ledger.connection.execute("select * from attempts where ticket_id=? and attempt_number=1", (self.ticket,)).fetchone()
         impl = self.ledger.model_stage(self.ticket, 1, "implementation")
         candidate = self.ledger.review_candidate(self.ticket, 1)
         self.assertIsNotNone(attempt); self.assertIsNotNone(impl); self.assertIsNotNone(candidate)
         payload = {
+            "adapter": "hermes-dispatch",
             "external_task_id": "accept-fixture",
-            "hermes_run_id": "hermes-run",
-            "attempt_number": 1,
+            "hermes_run": {"id": run_id, "status": status, "outcome": outcome,
+                           "started_at": "2026-01-01T00:00:00Z", "ended_at": "2026-01-01T00:01:00Z",
+                           "summary": summary, "profile": "fixture", "worker_pid": None, "metadata": {}},
+            "session_id": None,
+            "branch_name": str(attempt["branch"]) if recorded_branch else None,
             "workspace_path": str(attempt["worktree_path"]),
             "base_sha": self.base,
+            "head_sha": self.base,
             "diff_hash": str(impl["diff_hash"]),
-            "run_status": "completed",
-            "run_outcome": "success",
         }
         artifact = self.root / "hermes-reconciliation.json"
         artifact.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
@@ -111,7 +161,7 @@ class AcceptanceOnlyTests(unittest.TestCase):
         self.ledger.connection.execute("update attempts set post_diff_hash=? where ticket_id=? and attempt_number=1", (str(impl["diff_hash"]), self.ticket))
         self.ledger.record_hermes_execution_reconciliation(
             external_task_id="accept-fixture", hermes_run_id=17, ticket_id=self.ticket, attempt_number=1,
-            run_status="done", run_outcome="success", session_id=None, branch_name=str(attempt["branch"]),
+            run_status=status, run_outcome=outcome, session_id=None, branch_name=str(attempt["branch"]) if recorded_branch else None,
             workspace_path=str(attempt["worktree_path"]), base_sha=self.base, head_sha=self.base, diff_hash=str(impl["diff_hash"]),
             artifact_path=str(artifact), snapshot_hash=snapshot_hash,
         )
@@ -133,6 +183,59 @@ class AcceptanceOnlyTests(unittest.TestCase):
         evidence = self.ledger.connection.execute("select diff_summary from accepted_evidence where ticket_id=?", (self.ticket,)).fetchone()
         self.assertIn("hermes-run:accept-fixture:17", str(evidence["diff_summary"]))
         self.assertEqual(self.ledger.connection.execute("select count(*) from model_invocations where ticket_id=? and stage='implementation'", (self.ticket,)).fetchone()[0], 0)
+
+    def test_accepts_exact_reconciled_blocked_handoff(self):
+        self._convert_implementation_to_hermes_reconciliation(status="blocked", outcome="blocked", summary="local-first-awaiting-reconciliation")
+        result = self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)
+        self.assertEqual(result["status"], "accepted")
+        evidence = self.ledger.connection.execute("select diff_summary from accepted_evidence where ticket_id=?", (self.ticket,)).fetchone()
+        self.assertIn("hermes-run:accept-fixture:17", str(evidence["diff_summary"]))
+
+    def test_accepts_bound_blocked_handoff_with_stacked_selected_commit(self):
+        self._convert_implementation_to_hermes_reconciliation(status="blocked", outcome="blocked", summary="local-first-awaiting-reconciliation", recorded_branch=False)
+        worktree, _, selected = self._commit_stacked_candidate()
+        result = self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)
+        self.assertEqual(result["accepted_commit_sha"], selected)
+        self.assertEqual(self.git_w(worktree, "rev-parse", "HEAD"), selected)
+
+    def test_rejects_unrelated_blocked_hermes_run(self):
+        self._convert_implementation_to_hermes_reconciliation(status="blocked", outcome="blocked", summary="worker blocked")
+        with self.assertRaises(PermissionError):
+            self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)
+        self.assertIsNone(self.ledger.accepted_commit(self.ticket))
+
+    def test_rejects_blocked_handoff_with_wrong_run_identity(self):
+        self._convert_implementation_to_hermes_reconciliation(status="blocked", outcome="blocked", summary="local-first-awaiting-reconciliation", run_id=18)
+        with self.assertRaises(PermissionError):
+            self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)
+        self.assertIsNone(self.ledger.accepted_commit(self.ticket))
+
+    def test_blocked_handoff_rejects_mutable_attempt_workspace_rebinding(self):
+        self._convert_implementation_to_hermes_reconciliation(status="blocked", outcome="blocked", summary="local-first-awaiting-reconciliation")
+        alternate = self.root / "alternate-worktree"
+        self.git("worktree", "add", "-q", "-b", "alternate", str(alternate), self.base)
+        (alternate / "app.py").write_text("def value():\n    return 'ok'\n", encoding="utf-8")
+        self.ledger.connection.execute("update attempts set worktree_path=?, branch=? where ticket_id=? and attempt_number=1", (str(alternate), "alternate", self.ticket))
+        with self.assertRaisesRegex(PermissionError, "immutable Hermes candidate identity mismatch"):
+            self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)
+        self.assertIsNone(self.ledger.accepted_commit(self.ticket))
+        self.assertEqual(self.ledger.connection.execute("select count(*) from accepted_evidence where ticket_id=?", (self.ticket,)).fetchone()[0], 0)
+
+    def test_blocked_handoff_rejects_mutable_attempt_base_rebinding(self):
+        self._convert_implementation_to_hermes_reconciliation(status="blocked", outcome="blocked", summary="local-first-awaiting-reconciliation")
+        self.git("commit", "-qm", "alternate base", "--allow-empty")
+        alternate_base = self.git("rev-parse", "HEAD").stdout.strip()
+        self.ledger.connection.execute("update attempts set base_sha=? where ticket_id=? and attempt_number=1", (alternate_base, self.ticket))
+        with self.assertRaisesRegex(PermissionError, "immutable Hermes candidate identity mismatch"):
+            self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)
+        self.assertIsNone(self.ledger.accepted_commit(self.ticket))
+
+    def test_blocked_handoff_rejects_mutable_candidate_fingerprint_rebinding(self):
+        self._convert_implementation_to_hermes_reconciliation(status="blocked", outcome="blocked", summary="local-first-awaiting-reconciliation")
+        self.ledger.connection.execute("update review_candidates set candidate_fingerprint=? where ticket_id=? and attempt_number=1", ("f" * 64, self.ticket))
+        with self.assertRaisesRegex(PermissionError, "immutable Hermes candidate identity mismatch"):
+            self.controller.accept_reviewed_candidate_only(self.ticket, 1, repository=self.repo)
+        self.assertIsNone(self.ledger.accepted_commit(self.ticket))
 
     def test_rejects_tampered_reconciled_hermes_artifact(self):
         artifact = self._convert_implementation_to_hermes_reconciliation()
@@ -185,6 +288,24 @@ class AcceptanceOnlyTests(unittest.TestCase):
         self.assertEqual(result["status"], "integrated")
         self.assertEqual(self.git("rev-parse", "refs/local-first/tranches/fixture-tranche/integration-head").stdout.strip(), accepted)
         self.assertEqual(self.ledger.connection.execute("select count(*) from tranche_completion_rechecks").fetchone()[0], 0)
+
+    def test_integration_only_fast_forwards_stacked_candidate_from_exact_base(self):
+        worktree, intermediate, selected = self._commit_stacked_candidate()
+        self._prepare_integration_ref()
+        result = self.controller.integrate_accepted_candidate_only(self.ticket, 1, repository=self.repo)
+        self.assertEqual(result["integration_head"], selected)
+        self.assertEqual(self.git("rev-parse", "refs/local-first/tranches/fixture-tranche/integration-head").stdout.strip(), selected)
+        self.assertEqual(self.git_w(worktree, "rev-parse", "HEAD^"), intermediate)
+        self.assertEqual(self.ledger.connection.execute("select count(*) from tranche_completion_rechecks").fetchone()[0], 0)
+
+    def test_integration_rejects_intermediate_anchor_of_stacked_candidate(self):
+        _, intermediate, selected = self._commit_stacked_candidate()
+        self._prepare_integration_ref()
+        ref = "refs/local-first/tranches/fixture-tranche/integration-head"
+        self.git("update-ref", ref, intermediate, self.base)
+        with self.assertRaises(RuntimeError):
+            self.controller.integrate_accepted_candidate_only(self.ticket, 1, repository=self.repo)
+        self.assertEqual(self.git("rev-parse", ref).stdout.strip(), intermediate)
 
     def test_integration_replay_is_exact_and_idempotent(self):
         self._prepare_integration_ref()

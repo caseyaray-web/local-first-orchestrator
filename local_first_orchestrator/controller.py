@@ -98,6 +98,21 @@ def _isolated_candidate_diff(
         "untracked_paths": untracked,
     }
 
+def _linear_committed_candidate(path: Path, base_sha: str, selected_sha: str) -> bool:
+    """Require a selected commit to descend from its base without merged history."""
+    env = safe_git_env()
+    ancestor = subprocess.run(
+        safe_git_argv(("merge-base", "--is-ancestor", base_sha, selected_sha)),
+        cwd=path, env=env, capture_output=True, timeout=30,
+    )
+    if ancestor.returncode != 0:
+        return False
+    merges = subprocess.run(
+        safe_git_argv(("rev-list", "--merges", f"{base_sha}..{selected_sha}")),
+        cwd=path, env=env, capture_output=True, timeout=30,
+    )
+    return merges.returncode == 0 and not merges.stdout.strip()
+
 
 def _write_replayable_artifact(path: Path, encoded: str) -> str:
     """Atomically persist an immutable artifact; exact crash-orphans are safe to replay."""
@@ -3979,17 +3994,16 @@ class LocalFirstController:
         ticket = ticket_from_ledger(ticket_row); authorized = set(ticket.allowed_files) | set(ticket.create_files) | set(ticket.new_test_files); adapter = GitWorktreeAdapter(repo, worktree_root)
         implementation_stage = self.ledger.model_stage(ticket_id, attempt_number, "implementation")
         manual_adoption = implementation_stage is not None and str(implementation_stage["adapter"]) == "manual-adoption"
-        commit_parent = subprocess.run(("git", "rev-parse", f"{accepted}^"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
         committed_candidate = _isolated_candidate_diff(repo, base, target_sha=accepted)
         names = list(committed_candidate["changed_paths"])
         identity_diff = str(committed_candidate["diff"])
         current = adapter.existing_execution_base(str(ticket_row["tranche_id"]), base)
-        if commit_parent != base or not names or any(name not in authorized for name in names) or hashlib.sha256(identity_diff.encode()).hexdigest() != candidate_fp:
+        if not _linear_committed_candidate(repo, base, accepted) or not names or any(name not in authorized for name in names) or hashlib.sha256(identity_diff.encode()).hexdigest() != candidate_fp:
             raise PermissionError("accepted commit no longer matches frozen candidate")
         if current == accepted:
             return {"status": "already_integrated", "integrated": True, "integration_head": accepted}
-        if current != commit_parent:
-            raise RuntimeError("integration head is not the accepted commit parent")
+        if current != base:
+            raise RuntimeError("integration head is not the immutable attempt base")
         integrated = adapter.advance_integration_head(str(ticket_row["tranche_id"]), current, accepted)
         return {"status": "integrated", "integrated": True, "integration_head": integrated}
 
@@ -4040,8 +4054,6 @@ class LocalFirstController:
         elif hermes_execution is not None:
             if invocation is not None or manual_adoption is not None:
                 raise PermissionError("accepted Hermes execution provenance is ambiguous")
-            if str(hermes_execution["run_status"]) not in {"done", "completed"} or str(hermes_execution["run_outcome"]) not in {"completed", "success", "succeeded"}:
-                raise PermissionError("accepted Hermes execution is not a completed successful run")
             if str(hermes_execution["workspace_path"]) != str(impl["worktree_path"]) or str(hermes_execution["base_sha"]) != str(impl["base_sha"]) or str(hermes_execution["diff_hash"]) != str(impl["diff_hash"]) or str(hermes_execution["artifact_path"]) != str(impl["response_artifact"]):
                 raise PermissionError("accepted Hermes execution provenance conflicts with implementation")
             hermes_artifact = Path(str(hermes_execution["artifact_path"] or ""))
@@ -4053,6 +4065,38 @@ class LocalFirstController:
                 raise PermissionError("accepted Hermes execution artifact is malformed") from exc
             if canonical_sha256(hermes_payload) != str(hermes_execution["snapshot_hash"]):
                 raise PermissionError("accepted Hermes execution artifact integrity failed")
+            successful_run = (str(hermes_execution["run_status"]) in {"done", "completed"}
+                              and str(hermes_execution["run_outcome"]) in {"completed", "success", "succeeded"})
+            run = hermes_payload.get("hermes_run") if isinstance(hermes_payload, dict) else None
+            bound_handoff = (
+                str(hermes_execution["run_status"]) == "blocked"
+                and str(hermes_execution["run_outcome"]) == "blocked"
+                and isinstance(run, dict)
+                and hermes_payload.get("adapter") == "hermes-dispatch"
+                and hermes_payload.get("external_task_id") == hermes_execution["external_task_id"]
+                and type(run.get("id")) is int and run["id"] == hermes_execution["hermes_run_id"]
+                and run.get("status") == "blocked" and run.get("outcome") == "blocked"
+                and run.get("summary") == HANDOFF_SENTINEL
+                and all(hermes_payload.get(field) == hermes_execution[field] for field in (
+                    "session_id", "branch_name", "workspace_path", "base_sha", "head_sha", "diff_hash"
+                ))
+            )
+            if not (successful_run or bound_handoff):
+                raise PermissionError("accepted Hermes execution is neither successful nor a bound reconciliation handoff")
+            # The reconciliation is append-only, while the attempt and candidate rows
+            # can change. Do not let its valid terminal handoff authorize a different
+            # worktree, base, or reviewed diff by rebinding those mutable rows.
+            if (
+                any(value != hermes_execution["workspace_path"] for value in
+                    (attempt["worktree_path"], impl["worktree_path"]))
+                or any(value != hermes_execution["base_sha"] for value in
+                    (attempt["base_sha"], impl["base_sha"]))
+                or any(value != hermes_execution["diff_hash"] for value in
+                    (attempt["post_diff_hash"], impl["diff_hash"], candidate["candidate_fingerprint"]))
+                or (hermes_execution["branch_name"] is not None
+                    and attempt["branch"] != hermes_execution["branch_name"])
+            ):
+                raise PermissionError("immutable Hermes candidate identity mismatch")
             implementation_execution_id = f"hermes-run:{hermes_execution['external_task_id']}:{hermes_execution['hermes_run_id']}"
         else:
             if invocation is None or invocation["status"] != "completed":
@@ -4090,12 +4134,12 @@ class LocalFirstController:
             created_new_commit = True
             self._crash("accepted_commit_created")
         else:
-            parent = subprocess.run(("git", "rev-parse", "HEAD^"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); committed_candidate = _isolated_candidate_diff(worktree, base, target_sha="HEAD"); names = list(committed_candidate["changed_paths"]); clean = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() == ""
-            if parent != base or str(committed_candidate["diff_hash"]) != candidate_fp or not names or any(name not in authorized_files for name in names) or not clean:
+            committed_candidate = _isolated_candidate_diff(worktree, base, target_sha="HEAD"); names = list(committed_candidate["changed_paths"]); clean = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() == ""
+            if not _linear_committed_candidate(worktree, base, live_head) or str(committed_candidate["diff_hash"]) != candidate_fp or not names or any(name not in authorized_files for name in names) or not clean:
                 raise RuntimeError("post-commit acceptance state is ambiguous")
             accepted_sha = live_head
-        final_parent = subprocess.run(("git", "rev-parse", "HEAD^"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip(); final_candidate = _isolated_candidate_diff(worktree, base, target_sha="HEAD"); final_names = list(final_candidate["changed_paths"]); final_clean = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() == ""
-        if accepted_sha != subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() or final_parent != base or str(final_candidate["diff_hash"]) != candidate_fp or not final_names or any(name not in authorized_files for name in final_names) or not final_clean:
+        final_candidate = _isolated_candidate_diff(worktree, base, target_sha="HEAD"); final_names = list(final_candidate["changed_paths"]); final_clean = subprocess.run(("git", "status", "--porcelain=v1"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() == ""
+        if accepted_sha != subprocess.run(("git", "rev-parse", "HEAD"), cwd=worktree, text=True, capture_output=True, check=True).stdout.strip() or not _linear_committed_candidate(worktree, base, accepted_sha) or str(final_candidate["diff_hash"]) != candidate_fp or not final_names or any(name not in authorized_files for name in final_names) or not final_clean:
             raise RuntimeError("accepted commit does not match frozen candidate")
         provenance = json.loads(str(candidate["historical_provenance_json"]))
         if provenance.get("authorization_hash"):
