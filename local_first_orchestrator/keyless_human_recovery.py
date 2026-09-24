@@ -390,17 +390,34 @@ class KeylessHumanRecovery:
         recovery = self.prepare_stale_routing_recovery()
         self.confirm_and_recover_stale_routing(recovery)
 
-def _load_installed_runtime(path: Path = Path("/etc/local-first-orchestrator/c12r1-tk-3-human-recovery.json")) -> HelperRuntime:
-    """Load only a root-owned immutable installation manifest, never CLI paths."""
-    import json
-    item = os.lstat(path)
-    if stat.S_ISLNK(item.st_mode) or item.st_uid != 0 or item.st_mode & 0o022:
-        raise PermissionError("installed helper manifest must be root-owned and non-writable")
-    raw = json.loads(path.read_text(encoding="utf-8"))
+ROOT_BUNDLE = Path("/usr/local/lib/local-first-orchestrator/c12r1-tk-3")
+
+
+def _parse_installed_runtime(raw: object, *, bundle_root: Path = ROOT_BUNDLE) -> HelperRuntime:
     required = {"ledger_path", "config_path", "source_root", "python_executable", "key_path", "exchange_parent"}
-    if set(raw) != required or any(not isinstance(raw[name], str) or not raw[name].startswith("/") for name in required):
+    if (not isinstance(raw, dict) or set(raw) != required or
+            any(not isinstance(raw[name], str) or not raw[name].startswith("/") or ".." in Path(raw[name]).parts
+                for name in required)):
         raise ValueError("installed helper manifest is malformed")
-    return HelperRuntime(Path(raw["ledger_path"]), Path(raw["config_path"]), SourcePrerequisite(Path(raw["source_root"]), Path(raw["python_executable"])), Path(raw["key_path"]), ACTOR, Path(raw["exchange_parent"]))
+    source = bundle_root / "source"
+    python = Path("/usr/bin/python3").resolve()
+    if raw["source_root"] != str(source) or raw["python_executable"] != str(python):
+        raise PermissionError("installed helper manifest redirects protected code or interpreter")
+    return HelperRuntime(Path(raw["ledger_path"]), Path(raw["config_path"]),
+                         SourcePrerequisite(source, python), Path(raw["key_path"]),
+                         ACTOR, Path(raw["exchange_parent"]))
+
+
+def _load_installed_runtime(path: Path = ROOT_BUNDLE / "runtime.json") -> HelperRuntime:
+    """Load only the root-owned manifest inside the atomically published bundle."""
+    import json
+    if path != ROOT_BUNDLE / "runtime.json":
+        raise PermissionError("runtime manifest must be in the protected bundle")
+    _protected_chain(path)
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+        raise PermissionError("installed helper manifest must be root-owned and non-writable")
+    return _parse_installed_runtime(json.loads(path.read_text(encoding="utf-8")))
 
 
 def main() -> int:

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Rendered only by c12r1-tk-3-root-install.sh. Do not invoke this template.
+# Rendered only by the pinned-commit root bootstrap. Do not invoke this template.
 set -eu
 PATH=/usr/bin:/bin
 export PATH
@@ -36,7 +36,11 @@ check_chain() {
         check_root_directory "$current"
     done
 }
+check_chain "$(dirname "$0")"
 check_chain "$SOURCE_ROOT"
+check_chain "$(dirname "$SOURCE_MANIFEST")"
+check_chain "$(dirname "$RUNTIME_MANIFEST")"
+check_chain "$(dirname "$PYTHON_BIN")"
 check_meta "$SOURCE_MANIFEST" 444 'regular file'
 check_meta "$RUNTIME_MANIFEST" 600 'regular file'
 check_meta "$PYTHON_BIN" "$PYTHON_MODE" 'regular file'

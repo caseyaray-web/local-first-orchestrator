@@ -1,66 +1,20 @@
-# C12R1-TK-3 protected launcher installation (future manual procedure)
+# C12R1-TK-3 protected installation candidate (not approved for sudo)
 
-This is a **code-only staging and installation procedure**. Do not run it from this checkout until independent review approves the exact commit and a human has supplied the real absolute ledger/config/key/exchange paths. Neither script invokes project Python; the root installer only copies bytes and generates checksums.
+**STOP:** This is an isolated code-only candidate. The prior `stage-install.sh` and `root-install.sh` have been removed because they read user-writable files after privileged validation. Do not run a checkout script with sudo, install this candidate, or invoke the recovery launcher until the merged correction has passed independent security review and Casey is present for interactive authorization. Production controller and board remain paused and unchanged.
 
-## Properties and handoff boundary
+## Trust boundary
 
-The root launcher is installed at the fixed path `/usr/local/sbin/local-first-orchestrator-c12r1-tk-3-human-recovery`. It accepts **no arguments** and has no runtime source-path or environment override. Before it executes `python -I -c ...`, it checks:
+`scripts/c12r1-tk-3-bootstrap.py` is Python-stdlib-only. The reviewed installer must be rendered with an independently approved **full 40-hex Git commit** in `APPROVED_COMMIT`, byte-reviewed, copied to `/usr/local/libexec/local-first-orchestrator/c12r1-tk-3-install` as root-owned `0555` data, and verified there against the reviewed SHA-256 **before** any root execution. A checkout copy, stage file, moving ref, abbreviated ID, or user-controlled commit CLI argument is not a trusted installer. This bootstrap does not install itself. Its template placeholder intentionally prevents execution as shipped.
 
-- each component of the snapshot path is root-owned, a directory, and not group/world-writable (normal `0755` system ancestors and `0555` snapshot directories are accepted);
-- every listed Python source is `root:root`, regular, and mode `0444`;
-- `/etc/local-first-orchestrator/c12r1-tk-3-human-recovery.json` is `root:root`, regular, and mode `0600`;
-- `source.sha256`, its fixed SHA-256 embedded in the launcher, the runtime manifest's fixed SHA-256 embedded in the launcher, and the resolved system Python's fixed SHA-256 all match;
-- the resolved system Python is `root:root`, regular, and has the installed exact mode.
+The root-owned installed bootstrap executes `/usr/bin/git archive` against that exact commit with a fixed environment, replacement objects disabled, and a fixed member selection. It rejects unsafe tar members and extracts regular bytes into a fresh private directory under a protected root-owned parent. It generates the launcher and both hash manifests from those bytes, and publishes **one complete directory** by rename to `/usr/local/lib/local-first-orchestrator/c12r1-tk-3`. The only recovery entry point is `<bundle>/launcher`, installed `root:root 0555`, with no CLI arguments. It never reads the removed `/var/tmp` stage. A crash before rename leaves at most an unpublished root-only `.c12-assembly-*` directory; it must not be treated as an installed bundle. If the destination already exists, the bootstrap refuses to replace it.
 
-The protected signing-key path is a separate manifest field; it is never staged below the source snapshot. The helper module remains unchanged in this correction. Integration must retain its existing `_guard()` source validation, but the launcher establishes the stronger prerequisite: no user-writable Python import occurs as root before the snapshot has passed owner/mode/hash checks.
+The runtime manifest lives in that same atomic bundle (`runtime.json`, `0600`). The helper rejects source/interpreter redirects; the launcher checks owner/mode/digests and ancestors for source, manifest, interpreter, and launcher. The helper's actor-run subprocess uses the same installed source and fixed interpreter. The system interpreter uses `-I` for application execution: `-I -S` was tested and cannot import the installed `cryptography` dependency on this host. The bootstrap itself uses `-I -S` and imports no project code. Root-owned system site-packages and their ancestors must be verified as part of the later privileged deployment review; a root/admin adversary remains outside the model.
 
-## Future commands (do not run as part of this change)
+## Required later gate (not commands to execute now)
 
-From the reviewed checkout, stage bytes as the unprivileged operator. Replace every `/ABSOLUTE/...` value with the approved real path; the destination is fixed and is deliberately repeated in the staging manifest:
+1. Integrate the restart fix and this installer correction into **one reviewed commit**. Run focused tests, the full suite, shell syntax, disposable exact-commit archive assembly, and adversarial failure/race tests. Review the exact combined diff; do not patch after review.
+2. Render `@APPROVED_FULL_COMMIT@` in a copy of the bootstrap from that commit to the exact approved full commit ID. Record the rendered byte digest and independently review its resolved constants, especially ledger, config, exchange, key, resolved Python, repo, source, and manifest paths. The rendered bootstrap is a separate approval artifact, not automatically approved by the commit's tests.
+3. Only with the user present and the reviewed hash in hand: install that rendered file as data under the protected root-owned libexec parent. Verify the installed byte hash, root owner, exact mode, and every ancestor with `namei -l`/`stat` **before** running it with a fixed interpreter and `-I -S`. Never run it from the checkout or an unverified stage path. If verification fails, STOP.
+4. Verify the published bundle and every path ancestor, per-file source hashes, exact manifest fields, interpreter hash, source/launcher modes, and rejection of unprivileged writes. Use a disposable non-destructive fixture to exercise the launcher first. Installation is separate from enrollment/recovery; **do not** invoke the real launcher as an install smoke test. Resume/dispatch is a separate later authorization even after recovery.
 
-```sh
-chmod 0755 scripts/c12r1-tk-3-stage-install.sh scripts/c12r1-tk-3-root-install.sh
-scripts/c12r1-tk-3-stage-install.sh \
-  /var/tmp/c12r1-tk-3-stage \
-  /ABSOLUTE/ledger.db \
-  /ABSOLUTE/operator.json \
-  /usr/bin/python3 \
-  /root/.local-first-orchestrator/c12r1-tk-3-ed25519.key \
-  /ABSOLUTE/c12r1-tk-3-exchange \
-  /usr/local/lib/local-first-orchestrator/c12r1-tk-3
-```
-
-Review staged bytes and the manifest before any root action:
-
-```sh
-find /var/tmp/c12r1-tk-3-stage -type l -print
-sha256sum /var/tmp/c12r1-tk-3-stage/c12r1-tk-3-human-recovery.json
-sha256sum /var/tmp/c12r1-tk-3-stage/root-launcher.sh.in
-```
-
-Only after independent approval, run the root installer exactly once with the fixed staging directory:
-
-```sh
-sudo /bin/sh scripts/c12r1-tk-3-root-install.sh /var/tmp/c12r1-tk-3-stage
-```
-
-Then independently verify the installed values before invoking the launcher. The digest output is the exact deployment evidence and must be retained with the approval record:
-
-```sh
-stat -Lc '%n %u:%g %a %F' \
-  /usr/local/lib/local-first-orchestrator/c12r1-tk-3 \
-  /usr/local/lib/local-first-orchestrator/c12r1-tk-3/source \
-  /usr/local/lib/local-first-orchestrator/c12r1-tk-3/source.sha256 \
-  /etc/local-first-orchestrator/c12r1-tk-3-human-recovery.json \
-  /usr/local/sbin/local-first-orchestrator-c12r1-tk-3-human-recovery
-sha256sum \
-  /usr/local/lib/local-first-orchestrator/c12r1-tk-3/source.sha256 \
-  /etc/local-first-orchestrator/c12r1-tk-3-human-recovery.json \
-  "$(readlink -f /usr/bin/python3)"
-( cd /usr/local/lib/local-first-orchestrator/c12r1-tk-3/source && sha256sum -c ../source.sha256 )
-find /usr/local/lib/local-first-orchestrator/c12r1-tk-3/source -type l -print
-find /usr/local/lib/local-first-orchestrator/c12r1-tk-3/source -type f ! -perm 0444 -print
-find /usr/local/lib/local-first-orchestrator/c12r1-tk-3/source -type d ! -perm 0555 -print
-```
-
-Expected results: `stat` shows UID/GID `0:0`; source directories `555`, source files and `source.sha256` `444`, runtime manifest `600`, and launcher `555`; `sha256sum -c` prints only `OK`; all three `find` commands print nothing. Do not invoke the launcher if any command differs. The installer intentionally does not create the private-key or exchange directories; create and verify those under a separately approved key-custody procedure.
+No privileged test, production install, sudo request, board write, signer enrollment, recovery, or controller resume was performed by this candidate.

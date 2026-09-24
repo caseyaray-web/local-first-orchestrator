@@ -11,8 +11,6 @@ from tempfile import TemporaryDirectory
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 TEMPLATE = REPOSITORY / "scripts" / "c12r1-tk-3-root-launcher.sh.in"
-STAGER = REPOSITORY / "scripts" / "c12r1-tk-3-stage-install.sh"
-INSTALLER = REPOSITORY / "scripts" / "c12r1-tk-3-root-install.sh"
 
 
 class ProtectedLauncherTests(unittest.TestCase):
@@ -109,18 +107,19 @@ class ProtectedLauncherTests(unittest.TestCase):
         self.assertIn("owner/mode/type mismatch", result.stderr)
         self.assertFalse(self.called.exists())
 
-    def test_staging_and_root_installer_are_shell_only_and_do_not_accept_runtime_source_arguments(self) -> None:
-        for path in (STAGER, INSTALLER, TEMPLATE):
-            text = path.read_text(encoding="utf-8")
-            self.assertTrue(text.startswith("#!/bin/sh"))
-        for path in (STAGER, INSTALLER):
-            self.assertNotIn("python -c", path.read_text(encoding="utf-8"))
-        self.assertNotIn('rm -rf -- "$DESTINATION"\ninstall -d', INSTALLER.read_text(encoding="utf-8"))
-        self.assertIn('mkdir -m 0700 -- "$DESTINATION"', INSTALLER.read_text(encoding="utf-8"))
+    def test_interpreter_ancestor_failure_prevents_python_execution(self) -> None:
+        launcher = self._launcher()
+        self._write_tool("stat", "#!/bin/sh\nfor value do last=$value; done\ncase $last in *runtime.json) printf '0:600:regular file\\n' ;; *python3) printf '0:755:regular file\\n' ;; *tools) printf '0:777:directory\\n' ;; *) if [ -d \"$last\" ]; then printf '0:555:directory\\n'; else printf '0:444:regular file\\n'; fi ;; esac\n")
+        result = self._run(launcher)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.called.exists())
+
+    def test_launcher_checks_all_read_and_exec_ancestors(self) -> None:
         template = TEMPLATE.read_text(encoding="utf-8")
+        for expression in ('check_chain "$SOURCE_ROOT"', 'check_chain "$(dirname "$SOURCE_MANIFEST")"',
+                           'check_chain "$(dirname "$RUNTIME_MANIFEST")"', 'check_chain "$(dirname "$PYTHON_BIN")"'):
+            self.assertIn(expression, template)
         self.assertIn("exec \"$PYTHON_BIN\" -I -c", template)
-        self.assertIn("runtime manifest digest mismatch", template)
-        self.assertIn("source file digest mismatch", template)
         self.assertIn("expected no launcher arguments", template)
 
 
