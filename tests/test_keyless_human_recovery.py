@@ -75,6 +75,41 @@ class KeylessHumanRecoveryTests(unittest.TestCase):
         self.assertEqual(self.ledger.connection.execute("SELECT operator_signer_fingerprint FROM runtime_bindings WHERE ticket_id=?", (self.ticket,)).fetchone()[0], prepared.fingerprint)
         self.assertEqual(self.ledger.connection.execute("SELECT count(*) FROM board_projection_outbox WHERE ticket_id=?", (self.ticket,)).fetchone()[0], 1)
 
+    def test_pending_config_before_config_write_reconciles_and_replays_exact_intent(self) -> None:
+        from dataclasses import replace
+        from local_first_orchestrator.keyless_human_recovery import KeylessHumanRecovery, SourcePrerequisite, ENROLLMENT_REASON
+        from local_first_orchestrator.signer_enrollment import enroll_operator_signer
+        runtime = self._runtime()
+        runtime = replace(runtime, installed_source=SourcePrerequisite(Path(__file__).resolve().parents[1], runtime.installed_source.python_executable))
+        def runner(argv, *, uid, gid):
+            process = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+            if process.returncode:
+                raise RuntimeError(process.stderr)
+            return process.stdout
+        helper = KeylessHumanRecovery(runtime, runner=runner, confirmer=lambda _: True,
+            identity=lambda: (0, True, True, os.getuid(), os.getgid()), source_validator=lambda _: None)
+        prepared = helper.prepare_enrollment()
+        key, public_key, fingerprint = helper._key()
+        document = json.loads(prepared.document_path.read_text())
+        original_config = self.config.read_bytes()
+        def crash(point):
+            if point == "before_config_write":
+                raise RuntimeError("injected crash before config write")
+        with self.assertRaisesRegex(RuntimeError, "injected crash before config write"):
+            enroll_operator_signer(self.ledger, config_path=self.config, document=document,
+                detached_signature=key.sign(prepared.document_path.read_bytes()), public_key_b64=public_key,
+                fingerprint=fingerprint, failure_injector=crash)
+        self.assertEqual(self.config.read_bytes(), original_config)
+        self.assertEqual(self.ledger.connection.execute("SELECT status FROM runtime_signer_enrollment_intents WHERE operator_id=? AND reason=?", ("ocadmin", ENROLLMENT_REASON)).fetchone()[0], "pending_config")
+        state, intent = helper._reconciliation()
+        self.assertEqual(state, "partial")
+        self.assertIsNotNone(intent)
+        helper._confirmer = lambda _: self.fail("pending enrollment replay must not ask for a new approval")
+        with self.assertRaisesRegex(RuntimeError, "stale routing recovery requires an unleased local_review ticket"):
+            helper.run()
+        self.assertEqual(helper._reconciliation()[0], "enrolled")
+        self.assertEqual(self.ledger.connection.execute("SELECT COUNT(*) FROM runtime_signer_enrollments WHERE ticket_id=?", (self.ticket,)).fetchone()[0], 1)
+
     def test_prepare_is_exactly_scoped_and_never_uses_sudo_or_board(self) -> None:
         from local_first_orchestrator.keyless_human_recovery import KeylessHumanRecovery
         calls = []

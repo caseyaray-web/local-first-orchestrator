@@ -338,7 +338,19 @@ class KeylessHumanRecovery:
         try:
             selected = json.loads(intent["ticket_ids_json"])
             document = json.loads(intent["document_json"])
-            exact = (selected == [TARGET_TICKET] and intent["public_key_fingerprint"] == fingerprint and document["new_public_key"] == public_key and document["new_fingerprint"] == fingerprint and document["operator_id"] == self.runtime.actor and document["reason"] == ENROLLMENT_REASON)
+            expected_fingerprint = document["new_fingerprint"]
+            expected_public_key = document["new_public_key"]
+            old_config_pending = (
+                intent["status"] == "pending_config"
+                and not fingerprint and not public_key
+                and hashlib.sha256(config_raw).hexdigest() == document["old_config_hash"] == intent["old_config_hash"]
+                and binding is not None and binding["operator_signer_fingerprint"] is None
+                and binding["operator_authority_hash"] is None
+            )
+            new_config_present = fingerprint == expected_fingerprint and public_key == expected_public_key
+            exact = (selected == [TARGET_TICKET] and intent["public_key_fingerprint"] == expected_fingerprint
+                and (old_config_pending or new_config_present)
+                and document["operator_id"] == self.runtime.actor and document["reason"] == ENROLLMENT_REASON)
         except (KeyError, TypeError, json.JSONDecodeError):
             exact = False
         if not exact or binding is None:
