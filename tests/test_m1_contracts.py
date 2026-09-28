@@ -86,35 +86,54 @@ def test_contract_rejects_unsafe_paths_unbounded_verification_and_mutable_inputs
         dataclasses.replace(ticket(), criterion_ids=["AC-1"])
 
 
+def test_ticket_rejects_non_string_tuple_members():
+    for field in ("non_goals", "dependencies"):
+        with pytest.raises(ValueError):
+            dataclasses.replace(ticket(), **{field: ({"mutable": True},)})
+
+
+def test_plan_iteratively_validates_deep_chain_and_fails_closed_at_trusted_limit():
+    count = 1100
+    tickets = tuple(dataclasses.replace(ticket(), ticket_id=f"TK-{i}", dependencies=(f"TK-{i+1}",) if i < count - 1 else ()) for i in range(count))
+    tranche = TrancheContract("TR-1", 0, tickets, ("AC-1",))
+    p = PlanContract("PL", 1, (tranche,), {"AC-1": tuple(t.ticket_id for t in tickets)})
+    assert validate_plan(p, expected_criteria={"AC-1"}, max_tranches=10, max_tickets=1200) == ()
+    assert validate_plan(p, expected_criteria={"AC-1"}, max_tranches=10, max_tickets=1000) == ("plan_limit_exceeded",)
+    for kwargs in ({"max_tranches": 0, "max_tickets": 1200}, {"max_tranches": 129, "max_tickets": 1200},
+                   {"max_tranches": 10, "max_tickets": 2049}):
+        with pytest.raises(ValueError, match="trusted plan limits"):
+            validate_plan(p, expected_criteria={"AC-1"}, **kwargs)
+
+
 def test_plan_requires_unique_ids_exact_coverage_and_acyclic_dependencies():
     t = ticket()
     duplicate = TrancheContract("TR-1", 1, (t,), ("AC-1",))
-    assert "duplicate_tranche_id" in validate_plan(PlanContract("PL", 1, (plan().tranches[0], duplicate), {"AC-1": ("TK-1",)}), expected_criteria={"AC-1"})
+    assert "duplicate_tranche_id" in validate_plan(PlanContract("PL", 1, (plan().tranches[0], duplicate), {"AC-1": ("TK-1",)}), expected_criteria={"AC-1"}, max_tranches=10, max_tickets=100)
     second = dataclasses.replace(t, ticket_id="TK-2", dependencies=("TK-1",))
     first = dataclasses.replace(t, dependencies=("TK-2",))
     tr = TrancheContract("TR-1", 0, (first, second), ("AC-1",))
     cyclic_plan = PlanContract("PL-1", 1, (tr,), {"AC-1": ("TK-1", "TK-2")})
-    assert "dependency_cycle" in validate_plan(cyclic_plan, expected_criteria={"AC-1"})
-    assert "criterion_coverage_mismatch" in validate_plan(dataclasses.replace(plan(), criterion_coverage={}), expected_criteria={"AC-1"})
+    assert "dependency_cycle" in validate_plan(cyclic_plan, expected_criteria={"AC-1"}, max_tranches=10, max_tickets=100)
+    assert "criterion_coverage_mismatch" in validate_plan(dataclasses.replace(plan(), criterion_coverage={}), expected_criteria={"AC-1"}, max_tranches=10, max_tickets=100)
 
 
 def test_plan_hash_covers_full_ticket_payload_and_trusted_expected_criteria():
     original = plan()
     changed = plan(dataclasses.replace(ticket(), objective="Different objective"))
     assert original.contract_hash != changed.contract_hash
-    assert "missing_required_criterion" in validate_plan(original, expected_criteria={"AC-1", "AC-2"})
+    assert "missing_required_criterion" in validate_plan(original, expected_criteria={"AC-1", "AC-2"}, max_tranches=10, max_tickets=100)
     duplicate_ordinal = dataclasses.replace(original, tranches=(original.tranches[0], dataclasses.replace(original.tranches[0], tranche_id="TR-2")))
-    assert "duplicate_tranche_ordinal" in validate_plan(duplicate_ordinal, expected_criteria={"AC-1"})
+    assert "duplicate_tranche_ordinal" in validate_plan(duplicate_ordinal, expected_criteria={"AC-1"}, max_tranches=10, max_tickets=100)
 
 
 def test_plan_requires_trusted_criteria_and_frozen_coverage():
     p = plan()
     with pytest.raises(TypeError):
-        validate_plan(p)
-    assert "missing_required_criterion" in validate_plan(p, expected_criteria={"AC-1", "AC-2"})
+        validate_plan(p, max_tranches=10, max_tickets=100)
+    assert "missing_required_criterion" in validate_plan(p, expected_criteria={"AC-1", "AC-2"}, max_tranches=10, max_tickets=100)
     expanded = dataclasses.replace(p.tranches[0], criterion_ids=("AC-1", "AC-2"))
     forged = dataclasses.replace(p, tranches=(expanded,), criterion_coverage={"AC-1": ("TK-1",), "AC-2": ("TK-1",)})
-    assert "unknown_criterion" in validate_plan(forged, expected_criteria={"AC-1"})
+    assert "unknown_criterion" in validate_plan(forged, expected_criteria={"AC-1"}, max_tranches=10, max_tickets=100)
     raw = {"AC-1": ("TK-1",)}
     frozen = dataclasses.replace(p, criterion_coverage=raw)
     original_hash = frozen.contract_hash
@@ -129,7 +148,7 @@ def test_plan_rejects_ticket_criteria_not_bound_to_coverage():
     other = dataclasses.replace(original, ticket_id="TK-2")
     tranche = TrancheContract("TR-1", 0, (original, other), ("AC-1",))
     p = PlanContract("PL-1", 1, (tranche,), {"AC-1": ("TK-1",)})
-    assert "ticket_criterion_uncovered" in validate_plan(p, expected_criteria={"AC-1"})
+    assert "ticket_criterion_uncovered" in validate_plan(p, expected_criteria={"AC-1"}, max_tranches=10, max_tickets=100)
 
 
 def test_plan_rejects_dependency_on_future_tranche():
@@ -138,7 +157,7 @@ def test_plan_rejects_dependency_on_future_tranche():
     early = TrancheContract("TR-1", 0, (first,), ("AC-1",))
     later = TrancheContract("TR-2", 1, (second,), ("AC-1",))
     p = PlanContract("PL-1", 1, (early, later), {"AC-1": ("TK-1", "TK-2")})
-    assert "dependency_future_tranche" in validate_plan(p, expected_criteria={"AC-1"})
+    assert "dependency_future_tranche" in validate_plan(p, expected_criteria={"AC-1"}, max_tranches=10, max_tickets=100)
 
 
 def test_escalation_requires_an_actionable_reason():

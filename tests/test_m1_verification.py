@@ -39,11 +39,21 @@ def contract(command):
     )
 
 
-def test_git_inspection_refuses_truncated_path_listing(monkeypatch, tmp_path):
-    oversized = subprocess.CompletedProcess(["git", "ls-files"], 0, stdout="x" * 1_000_001, stderr="")
-    monkeypatch.setattr("local_first_orchestrator.validation.subprocess.run", lambda *args, **kwargs: oversized)
-    with pytest.raises(ValidationError, match="inspection.*limit"):
-        DeterministicValidator(artifact_root=tmp_path / "evidence")._git(tmp_path, "ls-files", "--others")
+def test_git_inspection_caps_output_before_buffering(candidate):
+    repo, _ = candidate
+    (repo / "bulk.txt").write_text("seed\n")
+    git(repo, "add", "app.py", "bulk.txt")
+    git(repo, "commit", "-qm", "bulk base")
+    (repo / "bulk.txt").write_text("x" * 16_777_216 + "\n")
+    validator = DeterministicValidator(artifact_root=repo.parent / (repo.name + "-evidence"))
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValidationError, match="inspection.*limit"):
+            validator._git(repo, "diff", "--binary", "HEAD", "--")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 4_000_000, f"git inspection buffered {peak} bytes in Python"
 
 
 def test_ignored_file_mutation_invalidates_snapshot(candidate):

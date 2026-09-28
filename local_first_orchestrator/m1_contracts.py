@@ -5,7 +5,7 @@ import json
 import re
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Mapping
+from typing import Iterator, Mapping
 
 from .source_languages import normalized_repository_path
 
@@ -76,8 +76,10 @@ class TicketContract:
             raise ValueError("ticket paths must be unique normalized repository files")
         if len(self.allowed_paths) > self.patch_budget.max_files:
             raise ValueError("ticket paths exceed declared file budget")
-        if not isinstance(self.non_goals, tuple) or not isinstance(self.dependencies, tuple) or not _unique(self.dependencies) or self.ticket_id in self.dependencies:
-            raise ValueError("ticket non-goals/dependencies must be immutable and dependencies unique")
+        if (not isinstance(self.non_goals, tuple) or any(not isinstance(x, str) or not x.strip() for x in self.non_goals)
+                or not isinstance(self.dependencies, tuple) or any(not isinstance(x, str) or not x.strip() for x in self.dependencies)
+                or not _unique(self.dependencies) or self.ticket_id in self.dependencies):
+            raise ValueError("ticket non-goals/dependencies must be immutable non-empty strings and dependencies unique")
 
     def payload(self) -> dict[str, object]:
         return {"schema_version": self.schema_version, "ticket_id": self.ticket_id, "objective": self.objective,
@@ -134,10 +136,18 @@ class PlanContract:
                       "criterion_coverage": {k: list(v) for k, v in sorted(self.criterion_coverage.items())}})
 
 
-def validate_plan(plan: PlanContract, *, expected_criteria: set[str] | frozenset[str]) -> tuple[str, ...]:
-    errors: set[str] = set()
+def validate_plan(
+    plan: PlanContract, *, expected_criteria: set[str] | frozenset[str],
+    max_tranches: int, max_tickets: int,
+) -> tuple[str, ...]:
     if not expected_criteria or any(not isinstance(c, str) or not c for c in expected_criteria):
         raise ValueError("trusted expected criteria must be non-empty IDs")
+    if (type(max_tranches) is not int or type(max_tickets) is not int
+            or not 1 <= max_tranches <= 128 or not 1 <= max_tickets <= 2048):
+        raise ValueError("trusted plan limits must be positive integers within hard ceilings")
+    if len(plan.tranches) > max_tranches or sum(len(tr.tickets) for tr in plan.tranches) > max_tickets:
+        return ("plan_limit_exceeded",)
+    errors: set[str] = set()
     if plan.schema_version != 1 or not plan.plan_id.strip():
         errors.add("invalid_plan_identity")
     tranche_ids = [t.tranche_id for t in plan.tranches]
@@ -168,26 +178,37 @@ def validate_plan(plan: PlanContract, *, expected_criteria: set[str] | frozenset
             errors.add("missing_dependency")
         if any(ordinal_by_ticket.get(dependency, -1) > ordinal_by_ticket[t.ticket_id] for dependency in t.dependencies):
             errors.add("dependency_future_tranche")
-    visiting: set[str] = set()
     visited: set[str] = set()
-    def visit(node: str) -> bool:
-        if node in visiting:
-            return True
-        if node in visited:
-            return False
-        visiting.add(node)
-        cyclic = any(visit(dep) for dep in graph.get(node, ()) if dep in graph)
-        visiting.remove(node)
-        visited.add(node)
-        return cyclic
-    if any(visit(node) for node in graph):
-        errors.add("dependency_cycle")
+    for root in graph:
+        if root in visited:
+            continue
+        active: set[str] = set()
+        stack: list[tuple[str, Iterator[str]]] = [(root, iter(dep for dep in graph[root] if dep in graph))]
+        active.add(root)
+        while stack:
+            node, children = stack[-1]
+            try:
+                dep = next(children)
+            except StopIteration:
+                stack.pop()
+                active.remove(node)
+                visited.add(node)
+                continue
+            if dep in active:
+                errors.add("dependency_cycle")
+                break
+            if dep not in visited:
+                active.add(dep)
+                stack.append((dep, iter(child for child in graph[dep] if child in graph)))
+        if "dependency_cycle" in errors:
+            break
     for criterion, refs in plan.criterion_coverage.items():
         if not refs or len(refs) != len(set(refs)) or any(ref not in ids for ref in refs):
             errors.add("invalid_criterion_coverage")
             continue
+        ref_set = set(refs)
         for ticket in ticket_list:
-            if ticket.ticket_id in refs and criterion not in ticket.criterion_ids:
+            if ticket.ticket_id in ref_set and criterion not in ticket.criterion_ids:
                 errors.add("criterion_ticket_mismatch")
     for tranche in plan.tranches:
         for ticket in tranche.tickets:

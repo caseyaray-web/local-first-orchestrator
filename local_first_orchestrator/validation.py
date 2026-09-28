@@ -170,19 +170,46 @@ class DeterministicValidator:
         return result
 
     def _git(self, path: Path, *args: str) -> str:
-        """Run bounded, non-interactive internal Git inspection only."""
-        env = safe_git_env()
+        """Run non-interactive Git inspection with a hard streaming output cap."""
         argv = safe_git_argv(args)
+        process = subprocess.Popen(argv, cwd=path, env=safe_git_env(), stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+        output = {"stdout": bytearray(), "stderr": bytearray()}
+        limits = {"stdout": 1_000_000, "stderr": 8_192}
+        deadline = time.monotonic() + 15
         try:
-            completed = subprocess.run(argv, cwd=path, env=env, text=True, capture_output=True, timeout=15, check=False)
-        except subprocess.TimeoutExpired as exc:
-            raise ValidationError(f"git inspection timed out: {' '.join(args[:3])}") from exc
-        if completed.returncode:
-            detail = self._redact((completed.stderr or completed.stdout or "git command failed")[:2000]).strip()
+            with selectors.DefaultSelector() as selector:
+                assert process.stdout is not None and process.stderr is not None
+                selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+                selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+                while selector.get_map() or process.poll() is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ValidationError(f"git inspection timed out: {' '.join(args[:3])}")
+                    for key, _ in selector.select(timeout=min(.1, remaining)):
+                        chunk = os.read(key.fd, 65536)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        stream = key.data
+                        if len(output[stream]) + len(chunk) > limits[stream]:
+                            raise ValidationError("git inspection exceeded output limit; cannot pin complete candidate identity")
+                        output[stream].extend(chunk)
+            process.wait(timeout=.5)
+        finally:
+            if process.poll() is None:
+                try: os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                try: process.wait(timeout=.5)
+                except subprocess.TimeoutExpired: pass
+            if process.stdout is not None: process.stdout.close()
+            if process.stderr is not None: process.stderr.close()
+        stdout = output["stdout"].decode("utf-8", errors="replace")
+        stderr = output["stderr"].decode("utf-8", errors="replace")
+        if process.returncode:
+            detail = self._redact((stderr or stdout or "git command failed")[:2000]).strip()
             raise ValidationError(f"git inspection failed: {detail}")
-        if len(completed.stdout) > 1_000_000:
-            raise ValidationError("git inspection exceeded output limit; cannot pin complete candidate identity")
-        return completed.stdout
+        return stdout
 
     @staticmethod
     def _validated_base_sha(base_sha: str) -> str:

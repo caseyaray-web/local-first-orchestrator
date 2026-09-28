@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from local_first_orchestrator.validation import DeterministicValidator
+from local_first_orchestrator.git_security import safe_git_argv
 from local_first_orchestrator.ticket import MicroTicket, PatchBudget, VerificationProfile
 
 
@@ -67,13 +68,21 @@ class SafeGitInvocationTests(unittest.TestCase):
             self.assertIn("scope_unverified", result.compact_evidence)
     def test_internal_git_disables_interactive_and_external_diff_paths(self):
         with TemporaryDirectory() as temp:
-            calls=[]
-            def fake_run(argv, **kwargs):
-                calls.append((argv, kwargs))
-                return subprocess.CompletedProcess(argv, 0, "", "")
-            with patch("local_first_orchestrator.validation.subprocess.run", fake_run):
-                DeterministicValidator(artifact_root=Path(temp))._git(Path(temp), "diff", "--numstat", "a" * 40, "--")
-            argv, kwargs=calls[0]
+            root = Path(temp)
+            subprocess.run(("git", "init", "-q"), cwd=root, check=True)
+            calls = []
+            def capture_argv(args):
+                argv = safe_git_argv(args)
+                calls.append(argv)
+                return argv
+            real_popen = subprocess.Popen
+            launches = []
+            def capture_popen(*args, **kwargs):
+                launches.append(kwargs)
+                return real_popen(*args, **kwargs)
+            with patch("local_first_orchestrator.validation.safe_git_argv", capture_argv), patch("local_first_orchestrator.validation.subprocess.Popen", capture_popen):
+                DeterministicValidator(artifact_root=root / "artifacts")._git(root, "diff", "--numstat", "--")
+            argv, kwargs = calls[0], launches[0]
             self.assertEqual(argv[:5], ("git", "--no-pager", "-c", "core.pager=cat", "-c"))
             self.assertIn("diff.external=false", argv)
             self.assertIn("core.fsmonitor=false", argv)
@@ -81,7 +90,7 @@ class SafeGitInvocationTests(unittest.TestCase):
             self.assertIn("--no-ext-diff", argv)
             self.assertIn("--no-textconv", argv)
             self.assertEqual(argv[-1], "--")
-            self.assertEqual(kwargs["timeout"], 15)
+            self.assertTrue(kwargs["start_new_session"])
             self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
 
     def test_internal_git_ignores_ambient_repository_redirection(self):
