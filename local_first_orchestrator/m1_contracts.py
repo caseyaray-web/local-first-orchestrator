@@ -61,10 +61,13 @@ class TicketContract:
     allowed_paths: tuple[str, ...]
     verification: VerificationProfile
     patch_budget: PatchBudget
+    context_budget_tokens: int
     dependencies: tuple[str, ...] = ()
     schema_version: int = 1
 
     def __post_init__(self) -> None:
+        if type(self.context_budget_tokens) is not int or self.context_budget_tokens <= 0:
+            raise ValueError("context budget must be a positive finite integer")
         if self.schema_version != 1 or not self.ticket_id.strip() or not self.objective.strip():
             raise ValueError("invalid ticket identity, objective, or schema version")
         if not isinstance(self.criterion_ids, tuple) or not self.criterion_ids or any(not isinstance(x, str) or not x.strip() for x in self.criterion_ids) or not _unique(self.criterion_ids):
@@ -81,6 +84,7 @@ class TicketContract:
                 "criterion_ids": list(self.criterion_ids), "non_goals": list(self.non_goals),
                 "allowed_paths": list(self.allowed_paths), "dependencies": list(self.dependencies),
                 "patch_budget": {"max_files": self.patch_budget.max_files, "max_changed_lines": self.patch_budget.max_changed_lines, "max_attempts": self.patch_budget.max_attempts},
+                "context_budget_tokens": self.context_budget_tokens,
                 "verification": {"commands": [list(c) for c in self.verification.commands], "working_directory": self.verification.working_directory,
                                  "timeout_seconds": self.verification.timeout_seconds, "output_limit": self.verification.output_limit}}
 

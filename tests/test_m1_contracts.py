@@ -18,6 +18,7 @@ def ticket():
         non_goals=("No API changes",), allowed_paths=("app.py", "test_app.py"),
         verification=VerificationProfile(commands=(("python", "-m", "pytest"),), timeout_seconds=60, output_limit=20000),
         patch_budget=PatchBudget(max_files=2, max_changed_lines=100, max_attempts=2),
+        context_budget_tokens=4096,
     )
 
 
@@ -43,6 +44,24 @@ def test_ticket_is_immutable_versioned_and_canonically_identified():
     assert t.contract_hash == hashlib.sha256(json.dumps(t.payload(), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     with pytest.raises(dataclasses.FrozenInstanceError):
         t.objective = "changed"
+
+
+def test_context_budget_is_required_positive_integer_and_hash_bound():
+    with pytest.raises(TypeError):
+        TicketContract(
+            ticket_id="TK-1", objective="Implement guard", criterion_ids=("AC-1",),
+            non_goals=("No API changes",), allowed_paths=("app.py", "test_app.py"),
+            verification=VerificationProfile(commands=(("python", "-m", "pytest"),), timeout_seconds=60, output_limit=20000),
+            patch_budget=PatchBudget(max_files=2, max_changed_lines=100, max_attempts=2),
+        )
+    for invalid in (0, -1, True):
+        with pytest.raises(ValueError, match="context budget"):
+            dataclasses.replace(ticket(), context_budget_tokens=invalid)
+    original = ticket()
+    changed = dataclasses.replace(original, context_budget_tokens=original.context_budget_tokens + 1)
+    assert original.payload()["context_budget_tokens"] == 4096
+    assert original.contract_hash != changed.contract_hash
+    assert plan(original).contract_hash != plan(changed).contract_hash
 
 
 def test_new_contract_requires_explicit_limits_instead_of_legacy_defaults():

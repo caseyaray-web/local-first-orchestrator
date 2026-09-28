@@ -143,24 +143,18 @@ class DeterministicValidator:
             raise ValidationError("candidate paths must be normalized repository-relative files")
 
         artifact_root = self.artifact_root.resolve()
-        try:
-            artifact_prefix = artifact_root.relative_to(worktree)
-        except ValueError:
-            artifact_prefix = None
-        if artifact_prefix == Path("."):
-            raise ValidationError("validation artifacts must not use the candidate root")
+        if artifact_root == worktree or worktree in artifact_root.parents:
+            raise ValidationError("validation artifacts must be outside the candidate worktree")
 
         def identity() -> tuple[str, str, tuple[tuple[str, str | None], ...]]:
             head = self._git(worktree, "rev-parse", "HEAD").strip()
             tracked_diff = self._git(worktree, "diff", "--binary", "HEAD", "--")
             tracked_paths = self._git(worktree, "diff", "--name-only", "-z", "HEAD", "--")
             untracked = self._git(worktree, "ls-files", "--others", "--exclude-standard", "-z", "--")
-            extra = (
-                path for path in untracked.split("\0") if path and
-                (artifact_prefix is None or Path(path) != artifact_prefix and artifact_prefix not in Path(path).parents)
-            )
+            ignored = self._git(worktree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--")
+            extra = {path for path in (untracked + ignored).split("\0") if path}
             contents = []
-            for path in sorted(set(paths) | set(extra) | {p for p in tracked_paths.split("\0") if p}):
+            for path in sorted(set(paths) | extra | {p for p in tracked_paths.split("\0") if p}):
                 candidate = worktree / path
                 resolved = candidate.resolve()
                 if candidate.is_symlink() or worktree not in resolved.parents:
@@ -186,7 +180,9 @@ class DeterministicValidator:
         if completed.returncode:
             detail = self._redact((completed.stderr or completed.stdout or "git command failed")[:2000]).strip()
             raise ValidationError(f"git inspection failed: {detail}")
-        return completed.stdout[:1_000_000]
+        if len(completed.stdout) > 1_000_000:
+            raise ValidationError("git inspection exceeded output limit; cannot pin complete candidate identity")
+        return completed.stdout
 
     @staticmethod
     def _validated_base_sha(base_sha: str) -> str:
