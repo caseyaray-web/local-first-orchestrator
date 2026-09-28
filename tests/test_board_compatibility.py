@@ -270,21 +270,43 @@ import threading
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 barrier = threading.Barrier(2, timeout=10)
-original = kb._new_task_id
-def synchronized_id():
-    barrier.wait()
-    return original()
-kb._new_task_id = synchronized_id
+reached = []
 outcomes = []
+errors = []
 def create(n):
-    with kbc.connect(board="m0-fixture") as conn:
-        outcomes.append(kb.create_task(conn, title=f"concurrent-{n}",
-                         idempotency_key="same", initial_status="blocked"))
+    try:
+        with kbc.connect(board="m0-fixture") as conn:
+            saw_lookup = False
+            def trace(sql):
+                nonlocal saw_lookup
+                normalized = sql.strip().upper()
+                if normalized.startswith("SELECT ID FROM TASKS WHERE IDEMPOTENCY_KEY"):
+                    saw_lookup = True
+                elif saw_lookup and normalized == "BEGIN IMMEDIATE":
+                    reached.append(n)
+                    try:
+                        barrier.wait()
+                    except threading.BrokenBarrierError:
+                        errors.append(f"caller {n} did not meet the pre-write barrier")
+            conn.set_trace_callback(trace)
+            try:
+                outcomes.append(kb.create_task(conn, title=f"concurrent-{n}",
+                               idempotency_key="same", initial_status="blocked"))
+            finally:
+                conn.set_trace_callback(None)
+    except Exception as exc:
+        errors.append(repr(exc))
 threads = [threading.Thread(target=create, args=(n,)) for n in range(2)]
 for thread in threads: thread.start()
 for thread in threads: thread.join(timeout=15)
 assert all(not thread.is_alive() for thread in threads)
+assert not errors, errors
+assert sorted(reached) == [0, 1], reached
 assert len(outcomes) == 2 and len(set(outcomes)) == 2, outcomes
+with kbc.connect(board="m0-fixture") as conn:
+    rows = conn.execute("SELECT id, status FROM tasks WHERE idempotency_key = ?", ("same",)).fetchall()
+    assert {row["id"] for row in rows} == set(outcomes), rows
+    assert all(row["status"] == "blocked" for row in rows), rows
 '''
     p = run_probe(str(Path(binary).with_name("python")), script, env, timeout=30)
     assert p.returncode == 0, p.stdout + p.stderr
