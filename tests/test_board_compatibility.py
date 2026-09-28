@@ -1,9 +1,11 @@
-"""M0 native CLI characterization. No model calls, dispatch, or production board access."""
+"""M0 native CLI characterization with isolated boards and stub-only dispatch."""
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
+import sys
 
 import pytest
 
@@ -32,6 +34,59 @@ def native(tmp_path):
     def scoped(*args, ok=True):
         return run("--board", "m0-fixture", *args, ok=ok)
     return scoped, home
+
+
+def run_probe(python, script, env, *, timeout=30.0):
+    """Run a fixture probe in a killable session, including its stub descendants."""
+    command = [python, "-c", script]
+    process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=2)
+            raise TimeoutError(f"fixture probe exceeded {timeout}s") from exc
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    finally:
+        # A probe can exit while a stub worker remains in its process group.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if process.poll() is None:
+            process.communicate(timeout=2)
+
+
+def test_probe_timeout_stops_descendant_before_late_write(tmp_path):
+    marker = tmp_path / "late-write"
+    script = '''import subprocess, sys, time
+subprocess.Popen([sys.executable, "-c", "import pathlib,time; time.sleep(1); pathlib.Path(%r).write_text('late')"])
+time.sleep(30)
+''' % str(marker)
+    with pytest.raises(TimeoutError):
+        run_probe(sys.executable, script, os.environ.copy(), timeout=0.2)
+    import time
+    time.sleep(1.2)
+    assert not marker.exists(), "timed-out probe left a worker running"
+
+
+def test_probe_timeout_escalates_for_term_ignoring_descendant(tmp_path):
+    marker = tmp_path / "late-write"
+    script = '''import subprocess, sys, time
+subprocess.Popen([sys.executable, "-c", "import pathlib,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(4); pathlib.Path(%r).write_text('late')"])
+time.sleep(30)
+''' % str(marker)
+    with pytest.raises(TimeoutError):
+        run_probe(sys.executable, script, os.environ.copy(), timeout=0.3)
+    import time
+    time.sleep(4.1)
+    assert not marker.exists(), "TERM-ignoring worker survived probe escalation"
 
 
 def create(native, name, *, held=False):
@@ -74,6 +129,20 @@ def test_done_and_archive_release_native_dependents(native):
     assert read(native, archive_child)["task"]["status"] == "todo"
     run("archive", archive_parent)
     assert read(native, archive_child)["task"]["status"] == "ready"
+
+
+def test_show_reads_comments_and_dependency_edges(native):
+    run, _ = native
+    parent = create(native, "fixture prerequisite", held=True)
+    child = create(native, "fixture dependent", held=True)
+    run("link", parent, child)
+    run("comment", child, "m0 marker: review required", "--author", "fixture")
+    child_record = read(native, child)
+    parent_record = read(native, parent)
+    assert child_record["parents"] == [parent]
+    assert parent_record["children"] == [child]
+    assert any(c["body"] == "m0 marker: review required" and c["author"] == "fixture"
+               for c in child_record["comments"])
 
 
 def test_non_review_run_cannot_request_changes(native):
@@ -153,8 +222,7 @@ with kbc.connect(board="m0-fixture") as conn:
     os.environ["M0_CHILD"] = child
     assert kb.complete_task(conn, parent, result="fixture only")
 '''
-    p = subprocess.run([str(Path(binary).with_name("python")), "-c", script],
-                       capture_output=True, text=True, timeout=30, env=env)
+    p = run_probe(str(Path(binary).with_name("python")), script, env, timeout=30)
     assert p.returncode == 0, p.stdout + p.stderr
     assert marker.is_file(), "isolated kanban_task_completed hook did not write its observation"
     assert marker.read_text() == "ready"
@@ -178,8 +246,7 @@ with kbc.connect(board="m0-fixture") as conn:
     claimed = kb.claim_review_task(conn, "{task}", claimer="fixture-review")
     assert claimed and claimed.status == "running", claimed
 '''
-    p = subprocess.run([str(Path(binary).with_name("python")), "-c", script],
-                       capture_output=True, text=True, timeout=30, env=env)
+    p = run_probe(str(Path(binary).with_name("python")), script, env, timeout=30)
     assert p.returncode == 0, p.stdout + p.stderr
     observed = read(native, task)
     assert observed["task"]["status"] == "running"
@@ -219,8 +286,7 @@ for thread in threads: thread.join(timeout=15)
 assert all(not thread.is_alive() for thread in threads)
 assert len(outcomes) == 2 and len(set(outcomes)) == 2, outcomes
 '''
-    p = subprocess.run([str(Path(binary).with_name("python")), "-c", script],
-                       capture_output=True, text=True, timeout=30, env=env)
+    p = run_probe(str(Path(binary).with_name("python")), script, env, timeout=30)
     assert p.returncode == 0, p.stdout + p.stderr
 
 
@@ -258,8 +324,7 @@ with kbc.connect(board="m0-fixture") as conn:
             if worker.poll() is None: worker.terminate()
             worker.wait(timeout=10)
 '''
-    p = subprocess.run([str(Path(binary).with_name("python")), "-c", script],
-                       capture_output=True, text=True, timeout=40, env=env)
+    p = run_probe(str(Path(binary).with_name("python")), script, env, timeout=40)
     assert p.returncode == 0, p.stdout + p.stderr
 
 
@@ -288,17 +353,27 @@ with kbc.connect(board="m0-fixture") as conn:
         dispatch.dispatch_once(conn, spawn_fn=spawn, board="m0-fixture", max_spawn=1,
                                reconcile_orphans=False)
         assert len(workers) == 1
-        assert kb.get_task(conn, task).status == "running"
+        claimed = kb.get_task(conn, task)
+        assert claimed.status == "running" and claimed.current_run_id is not None
+        task_row = conn.execute("SELECT worker_pid, worker_started_at, claim_lock FROM tasks WHERE id = ?", (task,)).fetchone()
+        assert task_row["worker_pid"] == workers[0].pid
+        assert task_row["worker_started_at"] not in (None, dispatch.UNVERIFIED_WORKER_FINGERPRINT)
+        run = conn.execute("SELECT worker_pid, worker_started_at, claim_lock FROM task_runs WHERE id = ? AND task_id = ?",
+                           (claimed.current_run_id, task)).fetchone()
+        assert run and run["worker_pid"] == workers[0].pid
+        assert run["worker_started_at"] == task_row["worker_started_at"]
+        assert run["claim_lock"] == task_row["claim_lock"]
         assert kb.reclaim_task(conn, task, reason="fixture stop")
         workers[0].wait(timeout=10)
         assert kb.get_task(conn, task).status == "ready"
+        closed = conn.execute("SELECT outcome FROM task_runs WHERE id = ?", (claimed.current_run_id,)).fetchone()
+        assert closed["outcome"] == "reclaimed"
     finally:
         for worker in workers:
             if worker.poll() is None: worker.terminate()
             worker.wait(timeout=10)
 '''
-    p = subprocess.run([str(Path(binary).with_name("python")), "-c", script],
-                       capture_output=True, text=True, timeout=40, env=env)
+    p = run_probe(str(Path(binary).with_name("python")), script, env, timeout=40)
     assert p.returncode == 0, p.stdout + p.stderr
 
 
@@ -331,8 +406,7 @@ assert "fixture" in blocked and "BLOCKED" in blocked.upper(), blocked
 assert manager.unload("m0_probe")
 assert "kanban_task_completed" not in manager._hooks
 '''
-        p = subprocess.run([str(Path(binary).with_name("python")), "-c", script],
-                           capture_output=True, text=True, timeout=30, env=env)
+        p = run_probe(str(Path(binary).with_name("python")), script, env, timeout=30)
         assert p.returncode == 0, f"{profile}: {p.stdout}{p.stderr}"
 
 
@@ -357,8 +431,7 @@ with kbc.connect(board="m0-fixture") as conn:
     assert not ok and reason == "run_id mismatch", (ok, reason)
     assert kb.get_task(conn, "{task}").status == "running"
 '''
-    p = subprocess.run([str(Path(binary).with_name("python")), "-c", script],
-                       capture_output=True, text=True, timeout=30, env=env)
+    p = run_probe(str(Path(binary).with_name("python")), script, env, timeout=30)
     assert p.returncode == 0, p.stdout + p.stderr
 
 
@@ -401,8 +474,7 @@ with kbc.connect(board="m0-fixture") as conn:
             if worker.poll() is None: worker.terminate()
             worker.wait(timeout=10)
 '''
-    p = subprocess.run([str(Path(binary).with_name("python")), "-c", script],
-                       capture_output=True, text=True, timeout=40, env=env)
+    p = run_probe(str(Path(binary).with_name("python")), script, env, timeout=40)
     assert p.returncode == 0, p.stdout + p.stderr
 
 
@@ -422,6 +494,7 @@ def test_documented_cli_help_matches_target_host(native):
 def test_held_card_is_not_in_dispatch_preview(native):
     run, _ = native
     task = create(native, "held for dispatch preview", held=True)
-    preview = run("dispatch", "--dry-run", "--json")
-    assert task not in preview.stdout
+    preview = json.loads(run("dispatch", "--dry-run", "--json").stdout)
+    assert preview["spawned"] == []
+    assert preview["skipped_unassigned"] == []
     assert read(native, task)["task"]["status"] == "blocked"
