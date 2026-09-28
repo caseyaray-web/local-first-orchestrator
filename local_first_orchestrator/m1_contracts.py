@@ -10,6 +10,10 @@ from typing import Iterator, Mapping
 from .source_languages import normalized_repository_path
 
 
+MAX_REFERENCES_PER_TICKET = 2048
+MAX_PLAN_REFERENCES = 16384
+
+
 def _canonical(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -77,7 +81,8 @@ class TicketContract:
         if len(self.allowed_paths) > self.patch_budget.max_files:
             raise ValueError("ticket paths exceed declared file budget")
         if (not isinstance(self.non_goals, tuple) or any(not isinstance(x, str) or not x.strip() for x in self.non_goals)
-                or not isinstance(self.dependencies, tuple) or any(not isinstance(x, str) or not x.strip() for x in self.dependencies)
+                or not isinstance(self.dependencies, tuple) or len(self.dependencies) > MAX_REFERENCES_PER_TICKET
+                or any(not isinstance(x, str) or not x.strip() for x in self.dependencies)
                 or not _unique(self.dependencies) or self.ticket_id in self.dependencies):
             raise ValueError("ticket non-goals/dependencies must be immutable non-empty strings and dependencies unique")
 
@@ -121,10 +126,14 @@ class PlanContract:
     def __post_init__(self) -> None:
         if not isinstance(self.tranches, tuple) or not isinstance(self.criterion_coverage, Mapping):
             raise ValueError("plan tranches and criterion coverage must be immutable-compatible")
+        if len(self.criterion_coverage) > MAX_PLAN_REFERENCES:
+            raise ValueError("plan criterion count exceeds reference limit")
         coverage = {}
         for criterion, refs in self.criterion_coverage.items():
             if not isinstance(criterion, str) or not isinstance(refs, tuple) or any(not isinstance(ref, str) for ref in refs):
                 raise ValueError("criterion coverage must map IDs to ticket-ID tuples")
+            if len(refs) > MAX_REFERENCES_PER_TICKET:
+                raise ValueError("criterion coverage exceeds per-criterion reference limit")
             coverage[criterion] = refs
         object.__setattr__(self, "criterion_coverage", MappingProxyType(coverage))
 
@@ -146,6 +155,10 @@ def validate_plan(
             or not 1 <= max_tranches <= 128 or not 1 <= max_tickets <= 2048):
         raise ValueError("trusted plan limits must be positive integers within hard ceilings")
     if len(plan.tranches) > max_tranches or sum(len(tr.tickets) for tr in plan.tranches) > max_tickets:
+        return ("plan_limit_exceeded",)
+    dependency_refs = sum(len(ticket.dependencies) for tranche in plan.tranches for ticket in tranche.tickets)
+    coverage_refs = sum(len(refs) for refs in plan.criterion_coverage.values())
+    if dependency_refs > MAX_PLAN_REFERENCES or coverage_refs > MAX_PLAN_REFERENCES:
         return ("plan_limit_exceeded",)
     errors: set[str] = set()
     if plan.schema_version != 1 or not plan.plan_id.strip():

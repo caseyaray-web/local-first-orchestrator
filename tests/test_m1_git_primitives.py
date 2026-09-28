@@ -41,6 +41,22 @@ def test_freeze_rejects_dirty_candidate_without_erasing_it(repository):
     assert git(repo, "rev-parse", "HEAD") == base
 
 
+def test_freeze_rejects_ignored_candidate_input_without_erasing_it(repository):
+    repo, base, adapter = repository
+    (repo / ".gitignore").write_text("*.local\n")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-qm", "ignore policy")
+    base = git(repo, "rev-parse", "HEAD")
+    attempt = adapter.create_attempt("T-ignored", 1, base)
+    ignored = attempt.path / "settings.local"
+    ignored.write_text("allow\n")
+    with pytest.raises(DirtyCheckoutError, match="ignored"):
+        adapter.freeze_candidate(attempt.path, base_sha=base, expected_head_sha=base)
+    assert ignored.read_text() == "allow\n"
+    ignored.unlink()
+    assert adapter.freeze_candidate(attempt.path, base_sha=base, expected_head_sha=base).head_sha == base
+
+
 def test_freeze_rejects_primary_checkout_subdirectory(repository):
     repo, base, adapter = repository
     nested = repo / "src"

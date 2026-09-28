@@ -92,6 +92,29 @@ def test_ticket_rejects_non_string_tuple_members():
             dataclasses.replace(ticket(), **{field: ({"mutable": True},)})
 
 
+def test_plan_rejects_excessive_dependency_and_coverage_references():
+    base = ticket()
+    with pytest.raises(ValueError, match="dependencies"):
+        dataclasses.replace(base, dependencies=tuple(f"TK-{i}" for i in range(2049)))
+    with pytest.raises(ValueError, match="coverage"):
+        PlanContract("PL", 1, (), {"AC-1": tuple(f"TK-{i}" for i in range(2049))})
+
+    # Individually legal lists can still exceed the aggregate reference ceiling.
+    tickets = tuple(dataclasses.replace(base, ticket_id=f"TK-{i}", dependencies=tuple(f"MISSING-{j}" for j in range(16))) for i in range(1025))
+    tranche = TrancheContract("TR-1", 0, tickets, ("AC-1",))
+    p = PlanContract("PL", 1, (tranche,), {"AC-1": tuple(t.ticket_id for t in tickets)})
+    assert validate_plan(p, expected_criteria={"AC-1"}, max_tranches=10, max_tickets=1200) == ("plan_limit_exceeded",)
+    coverage_heavy = PlanContract("PL", 1, (tranche,), {
+        f"AC-{i}": tuple(f"TK-{j}" for j in range(2048)) for i in range(9)
+    })
+    assert validate_plan(coverage_heavy, expected_criteria={"AC-1"}, max_tranches=10, max_tickets=1200) == ("plan_limit_exceeded",)
+
+
+def test_plan_rejects_excessive_criterion_keys_before_copying_references():
+    with pytest.raises(ValueError, match="criterion.*limit"):
+        PlanContract("PL", 1, (), {f"AC-{i}": () for i in range(16385)})
+
+
 def test_plan_iteratively_validates_deep_chain_and_fails_closed_at_trusted_limit():
     count = 1100
     tickets = tuple(dataclasses.replace(ticket(), ticket_id=f"TK-{i}", dependencies=(f"TK-{i+1}",) if i < count - 1 else ()) for i in range(count))

@@ -56,16 +56,68 @@ def test_git_inspection_caps_output_before_buffering(candidate):
     assert peak < 4_000_000, f"git inspection buffered {peak} bytes in Python"
 
 
-def test_ignored_file_mutation_invalidates_snapshot(candidate):
+def test_untracked_file_snapshot_streams_without_loading_full_contents(candidate):
+    repo, base = candidate
+    with (repo / "large.bin").open("wb") as handle:
+        handle.truncate(24 * 1024 * 1024)
+    command = (sys.executable, "-c", "print('verified')")
+    tracemalloc.start()
+    try:
+        result = DeterministicValidator(artifact_root=repo.parent / (repo.name + "-evidence")).validate_strict(
+            repo, contract(command), base_sha=base, trusted_commands=(command,),
+            trusted_max_timeout_seconds=3, trusted_max_output_limit=100,
+            trusted_max_snapshot_file_bytes=32 * 1024 * 1024,
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert not result.passed
+    assert any("outside allowlist" in error for error in result.errors)
+    assert peak < 4_000_000, f"candidate snapshot buffered {peak} bytes in Python"
+
+
+def test_snapshot_rejects_oversized_file_before_check_and_preserves_it(candidate):
+    repo, base = candidate
+    with (repo / "large.bin").open("wb") as handle:
+        handle.truncate(4096)
+    marker = repo.parent / (repo.name + "-check-ran")
+    command = (sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()")
+    validator = DeterministicValidator(artifact_root=repo.parent / (repo.name + "-evidence"))
+    with pytest.raises(ValidationError, match="snapshot.*limit"):
+        validator.validate_strict(repo, contract(command), base_sha=base, trusted_commands=(command,),
+                                  trusted_max_timeout_seconds=3, trusted_max_output_limit=100,
+                                  trusted_max_snapshot_file_bytes=2048)
+    assert (repo / "large.bin").stat().st_size == 4096
+    assert not marker.exists()
+
+
+def test_snapshot_rejects_aggregate_limit_before_check(candidate):
+    repo, base = candidate
+    (repo / "one.bin").write_bytes(b"x" * 1500)
+    (repo / "two.bin").write_bytes(b"y" * 1500)
+    marker = repo.parent / (repo.name + "-check-ran")
+    command = (sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()")
+    with pytest.raises(ValidationError, match="snapshot.*limit"):
+        DeterministicValidator(artifact_root=repo.parent / (repo.name + "-evidence")).validate_strict(
+            repo, contract(command), base_sha=base, trusted_commands=(command,),
+            trusted_max_timeout_seconds=3, trusted_max_output_limit=100,
+            trusted_max_snapshot_total_bytes=2048)
+    assert not marker.exists()
+    assert (repo / "one.bin").read_bytes() == b"x" * 1500
+
+
+def test_ignored_file_blocks_verification_before_it_can_depend_on_missing_frozen_input(candidate):
     repo, base = candidate
     ignored = repo / "settings.local"
-    ignored.write_text("before\n")
-    command = (sys.executable, "-c", "from pathlib import Path; Path('settings.local').write_text('after')")
+    ignored.write_text("allow\n")
+    marker = repo.parent / (repo.name + "-check-ran")
+    command = (sys.executable, "-c", f"from pathlib import Path; assert Path('settings.local').read_text() == 'allow\\n'; Path({str(marker)!r}).touch()")
     validator = DeterministicValidator(artifact_root=repo.parent / (repo.name + "-evidence"))
-    with pytest.raises(ValidationError, match="candidate.*changed"):
+    with pytest.raises(ValidationError, match="ignored.*frozen"):
         validator.validate_strict(repo, contract(command), base_sha=base, trusted_commands=(command,),
                                   trusted_max_timeout_seconds=3, trusted_max_output_limit=100)
-    assert ignored.read_text() == "after"  # Preserve the work; never reset it.
+    assert ignored.read_text() == "allow\n"  # Preserve useful work; never reset it.
+    assert not marker.exists()
 
 
 def test_artifacts_inside_candidate_are_refused_before_any_write(candidate):

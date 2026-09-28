@@ -156,6 +156,8 @@ class GitWorktreeAdapter:
             raise GitAdapterError("candidate base is not an ancestor of head")
         if self._git("status", "--porcelain=v1", "--untracked-files=all", cwd=workspace).stdout.strip():
             raise DirtyCheckoutError("candidate worktree is dirty; preserve and reconcile before freezing")
+        if self._git("ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", cwd=workspace).stdout:
+            raise DirtyCheckoutError("candidate worktree contains ignored files outside frozen Git evidence; preserve and reconcile before freezing")
         tree = self._git("rev-parse", "HEAD^{tree}", cwd=workspace).stdout.strip()
         if self._git("rev-parse", "HEAD", cwd=workspace).stdout.strip() != actual:
             raise GitAdapterError("candidate head changed while freezing")

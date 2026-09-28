@@ -125,8 +125,14 @@ class DeterministicValidator:
         self, worktree: Path, ticket: MicroTicket, *, base_sha: str,
         trusted_commands: tuple[tuple[str, ...], ...], expected_head_sha: str | None = None,
         trusted_max_timeout_seconds: int, trusted_max_output_limit: int,
+        trusted_max_snapshot_file_bytes: int = 8 * 1024 * 1024,
+        trusted_max_snapshot_total_bytes: int = 64 * 1024 * 1024,
     ) -> ValidationResult:
         """M1 boundary: authorize commands and budgets independently; pin candidate content."""
+        if (type(trusted_max_snapshot_file_bytes) is not int or type(trusted_max_snapshot_total_bytes) is not int
+                or not 0 < trusted_max_snapshot_file_bytes <= 64 * 1024 * 1024
+                or not 0 < trusted_max_snapshot_total_bytes <= 256 * 1024 * 1024):
+            raise ValidationError("trusted snapshot limits must be finite positive integers within hard ceilings")
         if not 0 < trusted_max_timeout_seconds <= 3600 or not 0 < trusted_max_output_limit <= 1_000_000:
             raise ValidationError("trusted verification limits must be finite and positive")
         if not 0 < ticket.verification.timeout_seconds <= trusted_max_timeout_seconds:
@@ -152,14 +158,32 @@ class DeterministicValidator:
             tracked_paths = self._git(worktree, "diff", "--name-only", "-z", "HEAD", "--")
             untracked = self._git(worktree, "ls-files", "--others", "--exclude-standard", "-z", "--")
             ignored = self._git(worktree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--")
-            extra = {path for path in (untracked + ignored).split("\0") if path}
+            if ignored:
+                raise ValidationError("ignored candidate files are not in frozen Git evidence; preserve and remove them from the candidate worktree before verification")
+            extra = {path for path in untracked.split("\0") if path}
             contents = []
+            total_bytes = 0
             for path in sorted(set(paths) | extra | {p for p in tracked_paths.split("\0") if p}):
                 candidate = worktree / path
                 resolved = candidate.resolve()
                 if candidate.is_symlink() or worktree not in resolved.parents:
                     raise ValidationError(f"candidate path escapes or is a symlink: {path}")
-                digest = hashlib.sha256(candidate.read_bytes()).hexdigest() if candidate.is_file() else None
+                digest = None
+                if candidate.is_file():
+                    size = candidate.stat().st_size
+                    if size > trusted_max_snapshot_file_bytes or total_bytes + size > trusted_max_snapshot_total_bytes:
+                        raise ValidationError("candidate snapshot exceeded file or aggregate byte limit")
+                    checksum = hashlib.sha256()
+                    file_bytes = 0
+                    with candidate.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(65536), b""):
+                            file_bytes += len(chunk)
+                            if (file_bytes > trusted_max_snapshot_file_bytes
+                                    or total_bytes + file_bytes > trusted_max_snapshot_total_bytes):
+                                raise ValidationError("candidate snapshot exceeded file or aggregate byte limit")
+                            checksum.update(chunk)
+                    total_bytes += file_bytes
+                    digest = checksum.hexdigest()
                 contents.append((path, digest))
             return head, hashlib.sha256(tracked_diff.encode()).hexdigest(), tuple(contents)
 
@@ -271,6 +295,8 @@ class DeterministicValidator:
         declared_create = set(ticket.create_files)
         declared_new = declared_create | set(ticket.new_test_files)
         errors += [f"changed path outside allowlist: {p}" for p in names if p not in set(declared_ticket_paths(ticket))]
+        # Undeclared paths already fail scope; do not load their contents for secret/symbol checks.
+        declared_names = [p for p in names if p in set(declared_ticket_paths(ticket))]
         for path in names:
             if path not in declared_new:
                 continue
@@ -285,11 +311,11 @@ class DeterministicValidator:
             if self._git(worktree, "ls-tree", "-r", "--name-only", base_sha, "--", path).strip() == path:
                 errors.append(f"declared new file existed at base: {path}")
         errors += [f"forbidden file type: {p}" for p in names if p.endswith(self.denied_suffixes)]
-        errors += [error for path in names if (error := self._secret_scan_error(worktree, path))]
+        errors += [error for path in declared_names if (error := self._secret_scan_error(worktree, path))]
         if contract_target_scope(ticket) == "file":
             symbol_errors, scope_unverified = (), False
         else:
-            symbol_errors, scope_unverified = enforce_symbol_scope(worktree, names, ticket, base_sha)
+            symbol_errors, scope_unverified = enforce_symbol_scope(worktree, declared_names, ticket, base_sha)
         errors.extend(symbol_errors)
         diff = self._git(worktree, "diff", "--numstat", base_sha, "--")
         numstat_rows = [line.split("\t") for line in diff.splitlines() if line]
