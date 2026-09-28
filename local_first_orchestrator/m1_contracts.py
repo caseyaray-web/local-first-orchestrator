@@ -12,6 +12,10 @@ from .source_languages import normalized_repository_path
 
 MAX_REFERENCES_PER_TICKET = 2048
 MAX_PLAN_REFERENCES = 16384
+MAX_VERIFICATION_COMMANDS = 32
+MAX_ARGV_MEMBERS = 32
+MAX_ARG_LENGTH = 256
+MAX_ARGV_BYTES = 4096
 
 
 def _canonical(value: object) -> str:
@@ -45,11 +49,17 @@ class VerificationProfile:
     working_directory: str = "."
 
     def __post_init__(self) -> None:
-        if not isinstance(self.commands, tuple) or not self.commands or any(
-            not isinstance(c, tuple) or not c or any(not isinstance(a, str) or not a for a in c)
+        if not isinstance(self.commands, tuple) or not self.commands or len(self.commands) > MAX_VERIFICATION_COMMANDS or any(
+            not isinstance(c, tuple) or not c or len(c) > MAX_ARGV_MEMBERS or any(
+                not isinstance(a, str) or not a.strip() or len(a) > MAX_ARG_LENGTH for a in c
+            )
             for c in self.commands
         ):
             raise ValueError("verification requires immutable non-empty command argv")
+        if len(set(self.commands)) != len(self.commands):
+            raise ValueError("verification commands must be unique")
+        if sum(len(arg.encode("utf-8")) for command in self.commands for arg in command) > MAX_ARGV_BYTES:
+            raise ValueError("verification argv exceeds byte limit")
         if type(self.timeout_seconds) is not int or self.timeout_seconds <= 0 or type(self.output_limit) is not int or self.output_limit <= 0:
             raise ValueError("verification limits must be positive finite integers")
         if self.working_directory != "." and normalized_repository_path(self.working_directory) is None:
@@ -70,6 +80,8 @@ class TicketContract:
     schema_version: int = 1
 
     def __post_init__(self) -> None:
+        if type(self.verification) is not VerificationProfile or type(self.patch_budget) is not PatchBudget:
+            raise ValueError("ticket verification and patch budget must be exact immutable contract types")
         if type(self.context_budget_tokens) is not int or self.context_budget_tokens <= 0:
             raise ValueError("context budget must be a positive finite integer")
         if self.schema_version != 1 or not self.ticket_id.strip() or not self.objective.strip():

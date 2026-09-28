@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import subprocess
 import sys
 import tracemalloc
@@ -37,6 +38,59 @@ def contract(command):
         VerificationProfile((command,), timeout_seconds=3, output_limit=100),
         "low", True, 2, (),
     )
+
+
+def test_strict_rejects_legacy_ticket_with_excessive_commands(candidate):
+    repo, base = candidate
+    marker = repo.parent / (repo.name + "-check-ran")
+    command = (sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()")
+    ticket = dataclasses.replace(contract(command), verification=VerificationProfile((command,) * 33, timeout_seconds=2, output_limit=100))
+    with pytest.raises(ValidationError, match="command.*limit"):
+        DeterministicValidator(artifact_root=repo.parent / (repo.name + "-evidence")).validate_strict(
+            repo, ticket, base_sha=base, trusted_commands=(command,),
+            trusted_max_timeout_seconds=2, trusted_max_output_limit=100)
+    assert not marker.exists()
+
+
+def test_strict_total_verification_deadline_stops_later_commands(candidate):
+    repo, base = candidate
+    marker = repo.parent / (repo.name + "-second-ran")
+    first = (sys.executable, "-c", "import time; time.sleep(.4)")
+    second = (sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()")
+    ticket = dataclasses.replace(contract(first), verification=VerificationProfile((first, second), timeout_seconds=2, output_limit=100))
+    result = DeterministicValidator(artifact_root=repo.parent / (repo.name + "-evidence")).validate_strict(
+        repo, ticket, base_sha=base, trusted_commands=(first, second), trusted_max_timeout_seconds=2,
+        trusted_max_output_limit=100, trusted_max_total_verification_seconds=0.1)
+    assert not result.passed
+    assert len(result.commands) == 1
+    assert not marker.exists()
+
+
+def test_strict_multi_command_check_succeeds_within_total_budget(candidate):
+    repo, base = candidate
+    first = (sys.executable, "-c", "print('first')")
+    second = (sys.executable, "-c", "print('second')")
+    ticket = dataclasses.replace(contract(first), verification=VerificationProfile((first, second), timeout_seconds=2, output_limit=100))
+    result = DeterministicValidator(artifact_root=repo.parent / (repo.name + "-evidence")).validate_strict(
+        repo, ticket, base_sha=base, trusted_commands=(first, second), trusted_max_timeout_seconds=2,
+        trusted_max_output_limit=100, trusted_max_total_verification_seconds=2)
+    assert result.passed
+    assert [record.stdout_summary.strip() for record in result.commands] == ["first", "second"]
+
+
+def test_strict_accepts_changed_file_below_snapshot_limit_with_large_diff(candidate):
+    repo, base = candidate
+    (repo / "app.py").write_text("def value(): return '" + "a" * 1_200_000 + "'\n")
+    git(repo, "add", "app.py")
+    git(repo, "commit", "-qm", "large base")
+    base = git(repo, "rev-parse", "HEAD")
+    (repo / "app.py").write_text("def value(): return '" + "b" * 1_200_000 + "'\n")
+    command = (sys.executable, "-c", "print('verified')")
+    ticket = contract(command)
+    result = DeterministicValidator(artifact_root=repo.parent / (repo.name + "-evidence")).validate_strict(
+        repo, ticket, base_sha=base, trusted_commands=(command,),
+        trusted_max_timeout_seconds=3, trusted_max_output_limit=100)
+    assert result.passed
 
 
 def test_git_inspection_caps_output_before_buffering(candidate):
@@ -228,6 +282,40 @@ def test_check_moving_head_invalidates_candidate_without_reset(candidate):
         validator.validate_strict(repo, contract(command), base_sha=base, trusted_commands=(command,), trusted_max_timeout_seconds=3, trusted_max_output_limit=100)
     assert git(repo, "rev-parse", "HEAD") != base
     assert (repo / "app.py").read_text() == "def value(): return 2\n"
+
+
+def test_strict_evidence_is_candidate_bound_and_never_overwrites_prior_result(candidate):
+    repo, base = candidate
+    git(repo, "add", "app.py")
+    git(repo, "commit", "-qm", "first candidate")
+    first_head = git(repo, "rev-parse", "HEAD")
+    command = (sys.executable, "-c", "print('verified')")
+    validator = DeterministicValidator(artifact_root=repo.parent / (repo.name + "-evidence"))
+    first = validator.validate_strict(repo, contract(command), base_sha=base, expected_head_sha=first_head,
+                                      trusted_commands=(command,), trusted_max_timeout_seconds=3, trusted_max_output_limit=100)
+    first_evidence = first.full_evidence_path.read_bytes()
+    (repo / "app.py").write_text("def value(): return 3\n")
+    git(repo, "add", "app.py")
+    git(repo, "commit", "-qm", "second candidate")
+    second_head = git(repo, "rev-parse", "HEAD")
+    second = validator.validate_strict(repo, contract(command), base_sha=base, expected_head_sha=second_head,
+                                       trusted_commands=(command,), trusted_max_timeout_seconds=3, trusted_max_output_limit=100)
+    assert first.passed and second.passed
+    assert first.full_evidence_path != second.full_evidence_path
+    assert first.full_evidence_path.read_bytes() == first_evidence
+    assert json.loads(first_evidence)["candidate_sha"] == first_head
+    assert json.loads(second.full_evidence_path.read_text())["candidate_sha"] == second_head
+
+
+def test_strict_rejects_mutating_check_without_persisting_pass_evidence(candidate):
+    repo, base = candidate
+    command = (sys.executable, "-c", "from pathlib import Path; Path('app.py').write_text('def value(): return 3\\n')")
+    evidence = repo.parent / (repo.name + "-evidence")
+    with pytest.raises(ValidationError, match="candidate.*changed"):
+        DeterministicValidator(artifact_root=evidence).validate_strict(
+            repo, contract(command), base_sha=base, trusted_commands=(command,),
+            trusted_max_timeout_seconds=3, trusted_max_output_limit=100)
+    assert not tuple(evidence.glob("validation-*.json"))
 
 
 def test_mutating_check_fails_closed_and_preserves_work(candidate):

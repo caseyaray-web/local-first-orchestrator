@@ -93,6 +93,37 @@ class FailedAttemptReconciliationTests(unittest.TestCase):
         self.assertEqual(self.ledger.cleanup_prerequisites()[0]["cleanup_confirmed"], False)
         self.assertTrue(worktree.exists()); self.assertTrue(artifact.exists())
 
+    def test_historical_deterministic_validation_artifact_remains_admissible(self) -> None:
+        _, artifact = self.fail_validation_attempt()
+        record, current = self.validation_record()
+        stage = self.ledger.connection.execute("SELECT worktree_path,base_sha FROM model_stage_artifacts WHERE ticket_id=? AND stage='implementation'", (self.ticket,)).fetchone()
+        self.assertIsNotNone(stage)
+        legacy_name = "validation-" + hashlib.sha256((str(stage["worktree_path"]) + str(stage["base_sha"])).encode()).hexdigest()[:12] + ".json"
+        historical = current.parent / legacy_name
+        payload = json.loads(current.read_text(encoding="utf-8"))
+        payload.pop("candidate_sha", None)
+        payload.pop("worktree", None)
+        historical.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        digest = hashlib.sha256(historical.read_bytes()).hexdigest()
+        record["artifact_path"], record["artifact_sha256"] = str(historical), digest
+        self.ledger.connection.execute("UPDATE runtime_stages SET detail=?,artifact_path=?,artifact_sha256=? WHERE ticket_id=? AND stage='validation-1'",
+                                       (json.dumps(record, sort_keys=True), str(historical), digest, self.ticket))
+        self.assertEqual(self.reconcile_validation(artifact)["status"], "reconciled")
+
+    def test_validation_artifact_worktree_binding_cannot_be_substituted_with_matching_hash(self) -> None:
+        _, artifact = self.fail_validation_attempt()
+        _, validation_artifact = self.validation_record()
+        payload = json.loads(validation_artifact.read_text(encoding="utf-8"))
+        payload["worktree"] = str(self.root / "different-worktree")
+        validation_artifact.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        digest = hashlib.sha256(validation_artifact.read_bytes()).hexdigest()
+        self.ledger.connection.execute("UPDATE runtime_stages SET artifact_sha256=? WHERE ticket_id=? AND stage='validation-1'", (digest, self.ticket))
+        record, _ = self.validation_record()
+        record["artifact_sha256"] = digest
+        self.ledger.connection.execute("UPDATE runtime_stages SET detail=? WHERE ticket_id=? AND stage='validation-1'", (json.dumps(record, sort_keys=True), self.ticket))
+        with self.assertRaisesRegex(ValueError, "structured validation"):
+            self.reconcile_validation(artifact)
+
     def test_validation_artifact_sha_is_durable_and_verified(self) -> None:
         _, artifact = self.fail_validation_attempt(); record, validation_artifact = self.validation_record()
         row = self.ledger.connection.execute("SELECT * FROM runtime_stages WHERE ticket_id=? AND stage='validation-1'", (self.ticket,)).fetchone(); assert row is not None

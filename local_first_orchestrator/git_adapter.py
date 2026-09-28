@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import selectors
+import signal
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -123,9 +127,17 @@ class GitWorktreeAdapter:
         # The canonical checkout is read-only for attempts; its user changes need not block
         # creating a separate worktree from an immutable commit.
         self._require_safe_worktree_root()
-        resolved = self._git("rev-parse", "--verify", f"{base_sha}^{{commit}}").stdout.strip()
+        if (not isinstance(ticket_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", ticket_id)
+                or type(attempt_number) is not int or attempt_number <= 0):
+            raise ValueError("invalid ticket id or attempt number for worktree")
         branch = f"local-first/{ticket_id}/attempt-{attempt_number}"
-        path = self.worktree_root / ticket_id / f"attempt-{attempt_number}"
+        if self._git("check-ref-format", "--branch", branch, check=False).returncode:
+            raise ValueError("invalid ticket id for branch")
+        parent = (self.worktree_root / ticket_id).resolve()
+        if parent.parent != self.worktree_root:
+            raise GitAdapterError("ticket worktree path escapes configured root")
+        resolved = self._git("rev-parse", "--verify", f"{base_sha}^{{commit}}").stdout.strip()
+        path = parent / f"attempt-{attempt_number}"
         if path.exists():
             raise GitAdapterError("attempt worktree already exists; reconcile it instead")
         if self._git("show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0:
@@ -164,8 +176,49 @@ class GitWorktreeAdapter:
         return FrozenCandidate(workspace, base_sha, actual, tree)
 
     def diff_hash(self, attempt: Path) -> str:
-        diff = self._git("diff", "--binary", "--no-ext-diff", "HEAD", cwd=attempt).stdout
-        return hashlib.sha256(diff.encode()).hexdigest()
+        """Hash a bounded Git diff without retaining its full output in memory."""
+        argv = safe_git_argv(("diff", "--binary", "--no-ext-diff", "HEAD"))
+        process = subprocess.Popen(argv, cwd=attempt, env=safe_git_env(), stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+        checksum = hashlib.sha256()
+        stderr = bytearray()
+        total = 0
+        deadline = time.monotonic() + 30
+        try:
+            with selectors.DefaultSelector() as selector:
+                assert process.stdout is not None and process.stderr is not None
+                selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+                selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+                while selector.get_map() or process.poll() is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise GitAdapterError("diff inspection timed out")
+                    for key, _ in selector.select(timeout=min(.1, remaining)):
+                        chunk = os.read(key.fd, 65536)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        if key.data == "stdout":
+                            total += len(chunk)
+                            if total > 16_000_000:
+                                raise GitAdapterError("diff exceeds bounded inspection limit")
+                            checksum.update(chunk)
+                        else:
+                            if len(stderr) + len(chunk) > 8192:
+                                raise GitAdapterError("diff stderr exceeds inspection limit")
+                            stderr.extend(chunk)
+            process.wait(timeout=.5)
+        finally:
+            if process.poll() is None:
+                try: os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                try: process.wait(timeout=.5)
+                except subprocess.TimeoutExpired: pass
+            if process.stdout is not None: process.stdout.close()
+            if process.stderr is not None: process.stderr.close()
+        if process.returncode:
+            raise GitAdapterError("diff inspection failed: " + stderr.decode("utf-8", errors="replace")[:2000])
+        return checksum.hexdigest()
 
     def metadata(self, attempt: AttemptWorktree) -> dict[str, str | int | None]:
         return {"base_sha": attempt.base_sha, "branch": attempt.branch, "worktree_path": str(attempt.path),

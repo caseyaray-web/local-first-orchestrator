@@ -2711,10 +2711,14 @@ class Ledger:
                     if validation_stage is None or validation_stage["attempt_number"] != retired or validation_stage["base_sha"] != implementation_stage["base_sha"] or not isinstance(validation_stage["artifact_path"], str) or not isinstance(validation_stage["artifact_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", validation_stage["artifact_sha256"]):
                         raise ValueError("missing or mismatched durable validation artifact binding")
                     artifact_path = Path(validation_stage["artifact_path"])
-                    expected_name = f"validation-{hashlib.sha256((str(implementation_stage['worktree_path']) + str(implementation_stage['base_sha'])).encode()).hexdigest()[:12]}.json"
-                    expected_path = Path(str(implementation_stage["response_artifact"])).parent / expected_name
+                    expected_parent = Path(str(implementation_stage["response_artifact"])).parent.resolve()
+                    legacy_name = f"validation-{hashlib.sha256((str(implementation_stage['worktree_path']) + str(implementation_stage['base_sha'])).encode()).hexdigest()[:12]}.json"
+                    new_name = re.fullmatch(r"validation-[0-9a-f]{32}\.json", artifact_path.name) is not None
+                    if (artifact_path.resolve().parent != expected_parent
+                            or (not new_name and artifact_path.name != legacy_name)):
+                        raise ValueError("validation artifact path is outside bound implementation evidence")
                     artifact_bytes = artifact_path.read_bytes()
-                    if artifact_path != expected_path or hashlib.sha256(artifact_bytes).hexdigest() != validation_stage["artifact_sha256"]:
+                    if hashlib.sha256(artifact_bytes).hexdigest() != validation_stage["artifact_sha256"]:
                         raise ValueError("validation artifact integrity binding mismatch")
                     record = json.loads(str(validation_stage["detail"]))
                     if not isinstance(record, dict):
@@ -2734,6 +2738,8 @@ class Ledger:
                         or record["compact_evidence"].strip().startswith("validation passed")
                         or not isinstance(artifact, dict)
                         or artifact.get("base_sha") != implementation_stage["base_sha"]
+                        or (new_name and (artifact.get("candidate_sha") != implementation_stage["base_sha"]
+                                          or artifact.get("worktree") != implementation_stage["worktree_path"]))
                         or not _is_string_list(artifact.get("changed_files"))
                         or not _is_json_int(artifact.get("changed_lines"))
                         or type(artifact.get("scope_unverified")) is not bool

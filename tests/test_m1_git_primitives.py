@@ -1,7 +1,9 @@
 """M1 Git evidence stays revision-bound and never discards useful work."""
 from __future__ import annotations
 
+import hashlib
 import subprocess
+import tracemalloc
 
 import pytest
 
@@ -27,6 +29,43 @@ def repository(tmp_path):
     base = git(repo, "rev-parse", "HEAD")
     adapter = GitWorktreeAdapter(repo, tmp_path / "attempts")
     return repo, base, adapter
+
+
+def test_create_attempt_rejects_escaping_ticket_ids_before_mkdir(repository):
+    repo, base, adapter = repository
+    for ticket_id in ("../escaped", "nested/escape", str(repo.parent / "absolute")):
+        with pytest.raises((ValueError, GitAdapterError), match="ticket"):
+            adapter.create_attempt(ticket_id, 1, base)
+    assert not (repo.parent / "escaped").exists()
+    assert not (repo.parent / "absolute").exists()
+    assert not (repo.parent / "attempts" / "nested").exists()
+
+
+def test_diff_hash_streams_large_work_without_buffering(repository):
+    _, base, adapter = repository
+    attempt = adapter.create_attempt("T-large", 1, base)
+    (attempt.path / "app.py").write_text("b" * 6_000_000 + "\n")
+    expected_diff = subprocess.run(("git", "diff", "--binary", "--no-ext-diff", "HEAD"),
+                                   cwd=attempt.path, capture_output=True, check=True).stdout
+    expected = hashlib.sha256(expected_diff).hexdigest()
+    del expected_diff
+    tracemalloc.start()
+    try:
+        actual = adapter.diff_hash(attempt.path)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert actual == expected
+    assert peak < 4_000_000, f"adapter buffered {peak} bytes of Git diff"
+
+
+def test_diff_hash_rejects_oversized_diff_without_deleting_work(repository):
+    _, base, adapter = repository
+    attempt = adapter.create_attempt("T-oversized", 1, base)
+    (attempt.path / "app.py").write_text("b" * 20_000_000 + "\n")
+    with pytest.raises(GitAdapterError, match="diff.*limit"):
+        adapter.diff_hash(attempt.path)
+    assert (attempt.path / "app.py").stat().st_size == 20_000_001
 
 
 def test_freeze_rejects_dirty_candidate_without_erasing_it(repository):

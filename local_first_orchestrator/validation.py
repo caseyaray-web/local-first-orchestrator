@@ -4,14 +4,16 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import selectors
 import signal
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .git_security import safe_git_argv, safe_git_env
+from .m1_contracts import MAX_VERIFICATION_COMMANDS, MAX_ARGV_MEMBERS, MAX_ARG_LENGTH, MAX_ARGV_BYTES
 
 from .ticket import MicroTicket, declared_ticket_paths
 from .source_languages import is_supported_source, is_test_path, normalized_repository_path
@@ -40,6 +42,7 @@ class ValidationResult:
     compact_evidence: str
     full_evidence_path: Path
     scope_unverified: bool = False
+    _artifact_json: str = field(default="", repr=False, compare=False)
 
 
 class DeterministicValidator:
@@ -55,7 +58,7 @@ class DeterministicValidator:
     def __init__(self, *, artifact_root: Path, environment_allowlist: tuple[str, ...] = ("PATH",), secret_patterns: tuple[str, ...] = ()) -> None:
         self.artifact_root, self.environment_allowlist, self.secret_patterns = Path(artifact_root), environment_allowlist, secret_patterns
 
-    def run_verification_command(self, argv: tuple[str, ...], *, allowed_commands: tuple[tuple[str, ...], ...], cwd: Path, timeout_seconds: int, output_limit: int) -> CommandEvidence:
+    def run_verification_command(self, argv: tuple[str, ...], *, allowed_commands: tuple[tuple[str, ...], ...], cwd: Path, timeout_seconds: float, output_limit: int) -> CommandEvidence:
         """Return evidence always: -124 timeout, -127 launch, -126 rejected."""
         started=time.monotonic()
         if argv not in allowed_commands:
@@ -121,14 +124,26 @@ class DeterministicValidator:
                                self._redact(raw_out), self._redact(raw_err[:output_limit]),
                                overflow["stdout"] or overflow["stderr"] or len(raw_err) > output_limit)
 
+    def _write_artifact(self, payload: str) -> Path:
+        """Create a new evidence file; never replace a previous candidate's record."""
+        self.artifact_root.mkdir(parents=True, exist_ok=True)
+        path = self.artifact_root / f"validation-{secrets.token_hex(16)}.json"
+        with path.open("x", encoding="utf-8") as handle:
+            handle.write(payload)
+        return path
+
     def validate_strict(
         self, worktree: Path, ticket: MicroTicket, *, base_sha: str,
         trusted_commands: tuple[tuple[str, ...], ...], expected_head_sha: str | None = None,
         trusted_max_timeout_seconds: int, trusted_max_output_limit: int,
         trusted_max_snapshot_file_bytes: int = 8 * 1024 * 1024,
         trusted_max_snapshot_total_bytes: int = 64 * 1024 * 1024,
+        trusted_max_total_verification_seconds: float = 300,
     ) -> ValidationResult:
         """M1 boundary: authorize commands and budgets independently; pin candidate content."""
+        if (type(trusted_max_total_verification_seconds) not in (int, float)
+                or not 0 < trusted_max_total_verification_seconds <= 3600):
+            raise ValidationError("trusted total verification deadline must be finite, positive and bounded")
         if (type(trusted_max_snapshot_file_bytes) is not int or type(trusted_max_snapshot_total_bytes) is not int
                 or not 0 < trusted_max_snapshot_file_bytes <= 64 * 1024 * 1024
                 or not 0 < trusted_max_snapshot_total_bytes <= 256 * 1024 * 1024):
@@ -139,9 +154,17 @@ class DeterministicValidator:
             raise ValidationError("verification exceeds trusted timeout limit")
         if not 0 < ticket.verification.output_limit <= trusted_max_output_limit:
             raise ValidationError("verification exceeds trusted output limit")
-        if not trusted_commands or not ticket.verification.commands or any(
-            command not in trusted_commands for command in ticket.verification.commands
-        ):
+        commands = ticket.verification.commands
+        if (not isinstance(commands, tuple) or not commands or not trusted_commands
+                or len(trusted_commands) > MAX_VERIFICATION_COMMANDS or len(commands) > MAX_VERIFICATION_COMMANDS
+                or any(not isinstance(command, tuple) or not command or len(command) > MAX_ARGV_MEMBERS
+                       or any(not isinstance(arg, str) or not arg.strip() or len(arg) > MAX_ARG_LENGTH
+                              for arg in command) for command in commands)):
+            raise ValidationError("verification command count or argv limit exceeded")
+        if (len(set(commands)) != len(commands)
+                or sum(len(arg.encode("utf-8")) for command in commands for arg in command) > MAX_ARGV_BYTES):
+            raise ValidationError("verification command count or argv limit exceeded")
+        if any(command not in trusted_commands for command in commands):
             raise ValidationError("verification commands are not in the trusted allowlist")
         worktree = Path(worktree).resolve(strict=True)
         paths = declared_ticket_paths(ticket)
@@ -154,7 +177,7 @@ class DeterministicValidator:
 
         def identity() -> tuple[str, str, tuple[tuple[str, str | None], ...]]:
             head = self._git(worktree, "rev-parse", "HEAD").strip()
-            tracked_diff = self._git(worktree, "diff", "--binary", "HEAD", "--")
+            tracked_metadata = self._git(worktree, "diff", "--raw", "-z", "HEAD", "--")
             tracked_paths = self._git(worktree, "diff", "--name-only", "-z", "HEAD", "--")
             untracked = self._git(worktree, "ls-files", "--others", "--exclude-standard", "-z", "--")
             ignored = self._git(worktree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--")
@@ -185,13 +208,18 @@ class DeterministicValidator:
                     total_bytes += file_bytes
                     digest = checksum.hexdigest()
                 contents.append((path, digest))
-            return head, hashlib.sha256(tracked_diff.encode()).hexdigest(), tuple(contents)
+            return head, hashlib.sha256(tracked_metadata.encode()).hexdigest(), tuple(contents)
 
         before = identity()
-        result = self.validate(worktree, ticket, base_sha=base_sha, expected_head_sha=expected_head_sha)
+        result = self.validate(worktree, ticket, base_sha=base_sha, expected_head_sha=expected_head_sha,
+                               verification_budget_seconds=trusted_max_total_verification_seconds,
+                               defer_artifact=True)
         if identity() != before:
             raise ValidationError("candidate content or head changed during verification; evidence is stale")
-        return result
+        payload = json.loads(result._artifact_json)
+        payload["candidate_identity"] = hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest()
+        path = self._write_artifact(json.dumps(payload, default=list, sort_keys=True))
+        return replace(result, full_evidence_path=path, _artifact_json="")
 
     def _git(self, path: Path, *args: str) -> str:
         """Run non-interactive Git inspection with a hard streaming output cap."""
@@ -268,7 +296,8 @@ class DeterministicValidator:
                 return f"secret material detected in changed file: {relative_path}"
         return None
 
-    def validate(self, worktree: Path, ticket: MicroTicket, *, base_sha: str, expected_head_sha: str | None = None) -> ValidationResult:
+    def validate(self, worktree: Path, ticket: MicroTicket, *, base_sha: str, expected_head_sha: str | None = None,
+                 verification_budget_seconds: float | None = None, defer_artifact: bool = False) -> ValidationResult:
         worktree = Path(worktree).resolve()
         base_sha = self._validated_base_sha(base_sha)
         # Resolve before diffing: no revision expression reaches the diff parser.
@@ -336,15 +365,32 @@ class DeterministicValidator:
             run_cwd = (worktree / ticket.verification.working_directory).resolve()
             if worktree not in run_cwd.parents and run_cwd != worktree:
                 raise ValidationError("verification working directory escapes worktree")
+            verification_deadline = (time.monotonic() + verification_budget_seconds
+                                     if verification_budget_seconds is not None else None)
             for argv in ticket.verification.commands:
-                evidence=self.run_verification_command(argv,allowed_commands=ticket.verification.commands,cwd=run_cwd,timeout_seconds=ticket.verification.timeout_seconds,output_limit=ticket.verification.output_limit)
+                remaining = (verification_deadline - time.monotonic()
+                             if verification_deadline is not None else ticket.verification.timeout_seconds)
+                if remaining <= 0:
+                    errors.append("aggregate verification deadline exceeded")
+                    break
+                evidence = self.run_verification_command(
+                    argv, allowed_commands=ticket.verification.commands, cwd=run_cwd,
+                    timeout_seconds=min(ticket.verification.timeout_seconds, remaining),
+                    output_limit=ticket.verification.output_limit)
                 records.append(evidence)
-                if evidence.returncode: errors.append(f"verification command failed: {' '.join(argv)}")
+                if evidence.returncode:
+                    errors.append(f"verification command failed: {' '.join(argv)}")
+                if verification_deadline is not None and time.monotonic() >= verification_deadline:
+                    errors.append("aggregate verification deadline exceeded")
+                    break
         compact_parts = errors or ["validation passed"]
         if scope_unverified:
             compact_parts.append("scope_unverified: symbol analysis unavailable; review/checkpoint policy required")
         compact = self._redact("; ".join(compact_parts))
-        self.artifact_root.mkdir(parents=True, exist_ok=True)
-        path = self.artifact_root / f"validation-{hashlib.sha256((str(worktree)+base_sha).encode()).hexdigest()[:12]}.json"
-        path.write_text(json.dumps({"base_sha": base_sha, "changed_files": names, "changed_lines": changed_lines, "scope_unverified": scope_unverified, "errors": errors, "commands": [r.__dict__ for r in records]}, default=list, sort_keys=True), encoding="utf-8")
-        return ValidationResult(not errors, tuple(errors), tuple(records), compact, path, scope_unverified)
+        payload = json.dumps({"base_sha": base_sha, "candidate_sha": head, "worktree": str(worktree),
+                              "changed_files": names, "changed_lines": changed_lines,
+                              "scope_unverified": scope_unverified, "errors": errors,
+                              "commands": [r.__dict__ for r in records]}, default=list, sort_keys=True)
+        path = self.artifact_root / "not-persisted" if defer_artifact else self._write_artifact(payload)
+        return ValidationResult(not errors, tuple(errors), tuple(records), compact, path, scope_unverified,
+                                payload if defer_artifact else "")

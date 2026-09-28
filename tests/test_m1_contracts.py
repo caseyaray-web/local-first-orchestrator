@@ -86,6 +86,51 @@ def test_contract_rejects_unsafe_paths_unbounded_verification_and_mutable_inputs
         dataclasses.replace(ticket(), criterion_ids=["AC-1"])
 
 
+def test_ticket_requires_exact_immutable_contract_value_types_and_stable_hash():
+    class MutableVerification:
+        commands = (("python", "-m", "pytest"),)
+        timeout_seconds = 60
+        output_limit = 20000
+        working_directory = "."
+
+    class MutableBudget:
+        max_files = 2
+        max_changed_lines = 100
+        max_attempts = 2
+
+    base = ticket()
+    original_hash = base.contract_hash
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        base.verification.commands = (("changed",),)
+    assert base.contract_hash == original_hash
+    for field, fake in (("verification", MutableVerification()), ("patch_budget", MutableBudget())):
+        with pytest.raises(ValueError):
+            dataclasses.replace(base, **{field: fake})
+
+
+def test_verification_profile_has_hard_argv_resource_caps_and_valid_multi_command():
+    valid = VerificationProfile(
+        commands=(("python", "-m", "pytest"), ("python", "-m", "compileall", ".")),
+        timeout_seconds=60, output_limit=20000,
+    )
+    assert len(valid.commands) == 2
+    cases = (
+        (("x",),) * 33,
+        (("x",) * 33,),
+        (("x" * 257,),),
+        (("x" * 256, "y" * 256, "z" * 256, "a" * 256,
+          "b" * 256, "c" * 256, "d" * 256, "e" * 256,
+          "f" * 256, "g" * 256, "h" * 256, "i" * 256,
+          "j" * 256, "k" * 256, "l" * 256, "m" * 256,
+          "n" * 256),),
+        (("python", "-m", "pytest"), ("python", "-m", "pytest")),
+        ((" ",),),
+    )
+    for commands in cases:
+        with pytest.raises(ValueError):
+            VerificationProfile(commands=commands, timeout_seconds=60, output_limit=20000)
+
+
 def test_ticket_rejects_non_string_tuple_members():
     for field in ("non_goals", "dependencies"):
         with pytest.raises(ValueError):
