@@ -82,7 +82,7 @@ class NewTestFilesContractTests(unittest.TestCase):
             "T-new-test", "Create one bounded regression test and its package registration.", ("AC-1",),
             "app.py::value", allowed,
             ("No production source changes.",), PatchBudget(2, lines),
-            VerificationProfile((("python", "-m", "unittest", "tests.test_new_behavior"),), timeout_seconds=30),
+            VerificationProfile((("python", "-m", "unittest", "discover", "-s", "tests", "-p", "test_new_behavior.py"),), timeout_seconds=30),
             "low", True, 2, (), new,
         )
 
@@ -148,10 +148,14 @@ class NewTestFilesContractTests(unittest.TestCase):
     def test_validator_allows_only_declared_new_test_and_counts_its_lines(self) -> None:
         worktree = self.repo
         (worktree / "tests").mkdir()
-        (worktree / "tests/test_new_behavior.py").write_text("\n".join("x = 1" for _ in range(20)) + "\n", encoding="utf-8")
+        (worktree / "tests/test_new_behavior.py").write_text("\n".join((
+            "import unittest", "class NewBehaviorTest(unittest.TestCase):",
+            "    def test_value(self):", "        self.assertEqual(1, 1)",
+            *("x = 1" for _ in range(16)),
+        )) + "\n", encoding="utf-8")
         (worktree / "package.json").write_text('{"scripts": {"test": "python -m unittest"}}\n', encoding="utf-8")
         result = DeterministicValidator(artifact_root=self.root / "artifacts").validate(worktree, self.ticket(lines=200), base_sha=self.base)
-        self.assertTrue(result.passed, result.errors)
+        self.assertTrue(result.passed, (result.errors, [c.stderr_summary for c in result.commands]))
         evidence = json.loads(result.full_evidence_path.read_text())
         self.assertIn("tests/test_new_behavior.py", evidence["changed_files"])
         self.assertGreaterEqual(evidence["changed_lines"], 20)

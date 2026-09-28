@@ -94,6 +94,8 @@ That distinction is especially important when using smaller or quantized models,
 
 ## Current status
 
+The plugin-only replacement is in staged development. M0 native-compatibility evidence is recorded separately; M1 pure contracts and safe Git/validation primitives are documented in [M1 safe primitives](docs/m1-safe-primitives.md). These are isolated source artifacts, not a loaded plugin or an active real-board execution path. The older design-v2 status below describes the legacy runtime and is **not** evidence that the new plugin-only workflow has been enrolled or accepted.
+
 The design-v2 implementation roadmap is complete for the current bounded policy. Representative live acceptance has been performed for:
 
 - Local First-owned implementation and review;

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import signal
 import subprocess
 import time
@@ -59,26 +60,120 @@ class DeterministicValidator:
         started=time.monotonic()
         if argv not in allowed_commands:
             return CommandEvidence(argv,self.NOT_ALLOWLISTED_RETURN_CODE,0.0,"","verification command rejected: not allowlisted")
-        env={key: os.environ[key] for key in self.environment_allowlist if key in os.environ}
-        process: subprocess.Popen[str] | None = None
+        env = {key: os.environ[key] for key in self.environment_allowlist if key in os.environ}
         try:
-            process=subprocess.Popen(argv,cwd=cwd,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
-            raw_out,raw_err=process.communicate(timeout=timeout_seconds); code=process.returncode
-        except subprocess.TimeoutExpired as exc:
-            raw_out=exc.stdout if isinstance(exc.stdout,str) else ""; raw_err=exc.stderr if isinstance(exc.stderr,str) else "verification command timed out"; code=self.TIMEOUT_RETURN_CODE
-            if process is not None:
-                try: os.killpg(process.pid,signal.SIGTERM)
-                except ProcessLookupError: pass
-                try: process.communicate(timeout=.5)
-                except subprocess.TimeoutExpired:
-                    try: os.killpg(process.pid,signal.SIGKILL)
-                    except ProcessLookupError: pass
-                    try: process.communicate(timeout=.5)
-                    except subprocess.TimeoutExpired: raw_err="verification cleanup failed"
+            process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, start_new_session=True)
         except OSError as exc:
-            raw_out=""; raw_err=f"verification launch failed: {type(exc).__name__}"; code=self.LAUNCH_FAILURE_RETURN_CODE
-        truncated=len(raw_out)>output_limit or len(raw_err)>output_limit
-        return CommandEvidence(argv,code,time.monotonic()-started,self._redact(raw_out[:output_limit]),self._redact(raw_err[:output_limit]),truncated)
+            message = f"verification launch failed: {type(exc).__name__}"
+            return CommandEvidence(argv, self.LAUNCH_FAILURE_RETURN_CODE, time.monotonic()-started,
+                                   "", self._redact(message[:output_limit]), len(message) > output_limit)
+        captured = {"stdout": bytearray(), "stderr": bytearray()}
+        overflow = {"stdout": False, "stderr": False}
+        timed_out = False
+        cleanup_failed = False
+        deadline = started + timeout_seconds
+        cleanup_deadline = deadline
+        phase = 0
+        try:
+            with selectors.DefaultSelector() as selector:
+                assert process.stdout is not None and process.stderr is not None
+                selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+                selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+                while selector.get_map() or process.poll() is None:
+                    now = time.monotonic()
+                    if phase == 0 and now >= deadline:
+                        timed_out = True
+                        phase, cleanup_deadline = 1, now + .5
+                        try: os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError: pass
+                    elif phase == 1 and now >= cleanup_deadline:
+                        phase, cleanup_deadline = 2, now + .5
+                        try: os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError: pass
+                    elif phase == 2 and now >= cleanup_deadline:
+                        cleanup_failed = True
+                        break
+                    cutoff = deadline if phase == 0 else cleanup_deadline
+                    for key, _ in selector.select(timeout=min(.1, max(0, cutoff - time.monotonic()))):
+                        chunk = os.read(key.fd, 65536)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        stream = key.data
+                        remaining = max(0, output_limit - len(captured[stream]))
+                        captured[stream].extend(chunk[:remaining])
+                        overflow[stream] |= len(chunk) > remaining
+            if process.poll() is None:
+                try: os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+            try: process.wait(timeout=.5)
+            except subprocess.TimeoutExpired: cleanup_failed = True
+        finally:
+            if process.stdout is not None: process.stdout.close()
+            if process.stderr is not None: process.stderr.close()
+        raw_out = captured["stdout"].decode("utf-8", errors="replace")
+        raw_err = captured["stderr"].decode("utf-8", errors="replace")
+        if timed_out and not raw_err: raw_err = "verification command timed out"
+        if cleanup_failed: raw_err = "verification cleanup failed"
+        code = self.TIMEOUT_RETURN_CODE if timed_out else process.returncode
+        return CommandEvidence(argv, code, time.monotonic()-started,
+                               self._redact(raw_out), self._redact(raw_err[:output_limit]),
+                               overflow["stdout"] or overflow["stderr"] or len(raw_err) > output_limit)
+
+    def validate_strict(
+        self, worktree: Path, ticket: MicroTicket, *, base_sha: str,
+        trusted_commands: tuple[tuple[str, ...], ...], expected_head_sha: str | None = None,
+        trusted_max_timeout_seconds: int, trusted_max_output_limit: int,
+    ) -> ValidationResult:
+        """M1 boundary: authorize commands and budgets independently; pin candidate content."""
+        if not 0 < trusted_max_timeout_seconds <= 3600 or not 0 < trusted_max_output_limit <= 1_000_000:
+            raise ValidationError("trusted verification limits must be finite and positive")
+        if not 0 < ticket.verification.timeout_seconds <= trusted_max_timeout_seconds:
+            raise ValidationError("verification exceeds trusted timeout limit")
+        if not 0 < ticket.verification.output_limit <= trusted_max_output_limit:
+            raise ValidationError("verification exceeds trusted output limit")
+        if not trusted_commands or not ticket.verification.commands or any(
+            command not in trusted_commands for command in ticket.verification.commands
+        ):
+            raise ValidationError("verification commands are not in the trusted allowlist")
+        worktree = Path(worktree).resolve(strict=True)
+        paths = declared_ticket_paths(ticket)
+        if any(normalized_repository_path(path) is None for path in paths):
+            raise ValidationError("candidate paths must be normalized repository-relative files")
+
+        artifact_root = self.artifact_root.resolve()
+        try:
+            artifact_prefix = artifact_root.relative_to(worktree)
+        except ValueError:
+            artifact_prefix = None
+        if artifact_prefix == Path("."):
+            raise ValidationError("validation artifacts must not use the candidate root")
+
+        def identity() -> tuple[str, str, tuple[tuple[str, str | None], ...]]:
+            head = self._git(worktree, "rev-parse", "HEAD").strip()
+            tracked_diff = self._git(worktree, "diff", "--binary", "HEAD", "--")
+            tracked_paths = self._git(worktree, "diff", "--name-only", "-z", "HEAD", "--")
+            untracked = self._git(worktree, "ls-files", "--others", "--exclude-standard", "-z", "--")
+            extra = (
+                path for path in untracked.split("\0") if path and
+                (artifact_prefix is None or Path(path) != artifact_prefix and artifact_prefix not in Path(path).parents)
+            )
+            contents = []
+            for path in sorted(set(paths) | set(extra) | {p for p in tracked_paths.split("\0") if p}):
+                candidate = worktree / path
+                resolved = candidate.resolve()
+                if candidate.is_symlink() or worktree not in resolved.parents:
+                    raise ValidationError(f"candidate path escapes or is a symlink: {path}")
+                digest = hashlib.sha256(candidate.read_bytes()).hexdigest() if candidate.is_file() else None
+                contents.append((path, digest))
+            return head, hashlib.sha256(tracked_diff.encode()).hexdigest(), tuple(contents)
+
+        before = identity()
+        result = self.validate(worktree, ticket, base_sha=base_sha, expected_head_sha=expected_head_sha)
+        if identity() != before:
+            raise ValidationError("candidate content or head changed during verification; evidence is stale")
+        return result
 
     def _git(self, path: Path, *args: str) -> str:
         """Run bounded, non-interactive internal Git inspection only."""

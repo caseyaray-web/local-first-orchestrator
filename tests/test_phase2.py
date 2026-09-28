@@ -64,7 +64,9 @@ class Phase2Tests(unittest.TestCase):
         (attempt.path / "app.py").write_text("def classify(value):\n    return 'ok'\n", encoding="utf-8")
         self.assertEqual(self.run_git("branch", "--show-current").stdout.strip(), "main")
         self.assertNotEqual(attempt.branch, "main")
-        adapter.teardown(attempt)
+        with self.assertRaises(DirtyCheckoutError):
+            adapter.teardown(attempt)
+        self.assertTrue(attempt.path.exists())
 
     def test_context_manifest_is_reproducible_and_required_content_cannot_exceed_budget(self) -> None:
         builder = ContextPacketBuilder(target_tokens=100, max_tokens=180)
@@ -105,7 +107,9 @@ class Phase2Tests(unittest.TestCase):
         self.assertNotIn("supersecret", result.compact_evidence)
         with self.assertRaises(ValidationError):
             validator.validate(attempt.path, self.ticket, base_sha="0" * 40)
-        adapter.teardown(attempt)
+        with self.assertRaises(DirtyCheckoutError):
+            adapter.teardown(attempt)
+        self.assertTrue((attempt.path / "outside.py").exists())
 
     def test_validator_rejects_no_changes(self) -> None:
         adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
@@ -146,7 +150,9 @@ class Phase2Tests(unittest.TestCase):
                 base_sha=self.base,
                 expected_head_sha=self.base,
             )
-        adapter.teardown(attempt)
+        with self.assertRaises(DirtyCheckoutError):
+            adapter.teardown(attempt)
+        self.assertTrue(attempt.path.exists())
 
     def test_validator_only_runs_ticket_allowlisted_commands(self) -> None:
         profile = VerificationProfile(commands=(("python", "-c", "print('allowed')"),), working_directory=".")
@@ -158,7 +164,9 @@ class Phase2Tests(unittest.TestCase):
         result = validator.validate(attempt.path, ticket, base_sha=self.base)
         self.assertTrue(result.passed)
         self.assertEqual(result.commands[0].argv, profile.commands[0])
-        adapter.teardown(attempt)
+        with self.assertRaises(DirtyCheckoutError):
+            adapter.teardown(attempt)
+        self.assertTrue(attempt.path.exists())
 
     def test_validator_rejects_secret_in_allowed_changed_file_before_commands_and_redacts_evidence(self) -> None:
         adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
@@ -176,7 +184,9 @@ class Phase2Tests(unittest.TestCase):
         self.assertNotIn(secret, " ".join(result.errors))
         self.assertNotIn(secret, result.compact_evidence)
         self.assertNotIn(secret, evidence)
-        adapter.teardown(attempt)
+        with self.assertRaises(DirtyCheckoutError):
+            adapter.teardown(attempt)
+        self.assertTrue(attempt.path.exists())
 
     def test_validator_rejects_conservative_default_secret_assignment_pattern(self) -> None:
         adapter = GitWorktreeAdapter(self.repo, self.root / "worktrees")
@@ -186,7 +196,9 @@ class Phase2Tests(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(result.errors, ("secret material detected in changed file: app.py",))
         self.assertNotIn("default-secret-value", result.full_evidence_path.read_text(encoding="utf-8"))
-        adapter.teardown(attempt)
+        with self.assertRaises(DirtyCheckoutError):
+            adapter.teardown(attempt)
+        self.assertTrue(attempt.path.exists())
 
     def test_fake_qwen_runner_gets_pinned_agentic_workspace(self) -> None:
         calls: list[tuple[tuple[str, ...], dict[str, object]]] = []

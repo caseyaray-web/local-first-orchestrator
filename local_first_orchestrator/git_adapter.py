@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,15 @@ class AttemptWorktree:
     branch: str
     path: Path
     pre_diff_hash: str
+
+
+@dataclass(frozen=True)
+class FrozenCandidate:
+    """Immutable Git evidence; the retained worktree remains user-owned."""
+    path: Path
+    base_sha: str
+    head_sha: str
+    tree_sha: str
 
 
 class GitWorktreeAdapter:
@@ -98,10 +108,12 @@ class GitWorktreeAdapter:
 
     def advance_integration_head(self, tranche_id: str | None, expected_base: str, accepted_commit: str) -> str:
         """CAS-advance a tranche anchor after an accepted isolated commit."""
-        if tranche_id is None:
-            return accepted_commit
         expected = self._git("rev-parse", "--verify", f"{expected_base}^{{commit}}").stdout.strip()
         accepted = self._git("rev-parse", "--verify", f"{accepted_commit}^{{commit}}").stdout.strip()
+        if self._git("merge-base", "--is-ancestor", expected, accepted, check=False).returncode != 0:
+            raise IntegrationHeadConflictError("accepted commit does not descend from expected integration head")
+        if tranche_id is None:
+            return accepted
         result = self._git("update-ref", self.integration_head_ref(tranche_id), accepted, expected, check=False)
         if result.returncode != 0:
             raise IntegrationHeadConflictError("integration head changed concurrently")
@@ -127,6 +139,28 @@ class GitWorktreeAdapter:
             return AttemptWorktree(ticket_id, attempt_number, resolved, branch, resolved_path, self.diff_hash(resolved_path))
         raise GitAdapterError("unsafe_worktree_root: concrete attempt resolves inside canonical_repository")
 
+    def freeze_candidate(self, workspace: Path, *, base_sha: str, expected_head_sha: str) -> FrozenCandidate:
+        """Read a clean, revision-pinned candidate without moving refs or deleting work."""
+        workspace = Path(workspace).resolve(strict=True)
+        if not re.fullmatch(r"[0-9a-f]{40}", base_sha) or not re.fullmatch(r"[0-9a-f]{40}", expected_head_sha):
+            raise GitAdapterError("candidate base/head must be full lowercase commit hashes")
+        common = self._git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=workspace).stdout.strip()
+        primary_common = self._git("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+        top_level = Path(self._git("rev-parse", "--show-toplevel", cwd=workspace).stdout.strip()).resolve()
+        if Path(common).resolve() != Path(primary_common).resolve() or top_level != workspace or top_level == self.primary_checkout:
+            raise GitAdapterError("candidate workspace is not an isolated worktree in this repository")
+        actual = self._git("rev-parse", "HEAD", cwd=workspace).stdout.strip()
+        if actual != expected_head_sha:
+            raise GitAdapterError("candidate head changed since observation")
+        if self._git("merge-base", "HEAD", base_sha, cwd=workspace).stdout.strip() != base_sha:
+            raise GitAdapterError("candidate base is not an ancestor of head")
+        if self._git("status", "--porcelain=v1", "--untracked-files=all", cwd=workspace).stdout.strip():
+            raise DirtyCheckoutError("candidate worktree is dirty; preserve and reconcile before freezing")
+        tree = self._git("rev-parse", "HEAD^{tree}", cwd=workspace).stdout.strip()
+        if self._git("rev-parse", "HEAD", cwd=workspace).stdout.strip() != actual:
+            raise GitAdapterError("candidate head changed while freezing")
+        return FrozenCandidate(workspace, base_sha, actual, tree)
+
     def diff_hash(self, attempt: Path) -> str:
         diff = self._git("diff", "--binary", "--no-ext-diff", "HEAD", cwd=attempt).stdout
         return hashlib.sha256(diff.encode()).hexdigest()
@@ -146,6 +180,10 @@ class GitWorktreeAdapter:
         return self._git("rev-parse", "HEAD", cwd=attempt.path).stdout.strip()
 
     def teardown(self, attempt: AttemptWorktree) -> None:
-        if not str(attempt.path).startswith(str(self.worktree_root) + "/"):
+        path = attempt.path.resolve(strict=True)
+        if self.worktree_root not in path.parents or path == self.primary_checkout:
             raise GitAdapterError("refusing teardown outside configured worktree root")
-        self._git("worktree", "remove", "--force", str(attempt.path))
+        if self._git("status", "--porcelain=v1", "--untracked-files=all", cwd=path).stdout.strip():
+            raise DirtyCheckoutError("attempt has useful uncommitted work; refusing teardown")
+        # Git's own non-forced guard remains authoritative if work changes after readback.
+        self._git("worktree", "remove", str(path))
