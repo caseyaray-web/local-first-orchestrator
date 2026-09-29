@@ -1,377 +1,51 @@
-"""Governed, proposal-only decomposition planning.
-
-The ``hermes chat`` executable is only a transport used by an explicitly
-trusted planner constructed with ``cost_class='local'``.  Its executable name
-does not determine cost policy; paid planners must be paid-model adapters.
-"""
-
+"""Pure plan evidence serialization and reconstruction; no lifecycle effects."""
 from __future__ import annotations
-
-import hashlib
 import json
-import subprocess
-from dataclasses import asdict, dataclass
-from dataclasses import replace
-from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Mapping
+from .decomposition_planner import PlanningRequest, PlanProposal, parse_proposal, request_payload, serialize_proposal
 
-from .decomposition import (
-    Criterion,
-    DecompositionPlan,
-    FeatureContract,
-    PlanValidationResult,
-    PlanValidator,
-    activate_validated_plan,
-)
-from .decomposition_planner import PlannerError, LocalDecompositionPlanner, packet, parse, planner_contract_hash
-from .admission import FeatureAdmissionSpec, decode_persisted_admission_envelope
-from .paid_model import PaidInvocationError, PaidModelAdapter
-from .repository_snapshot import RepositoryPlanValidator, RepositorySnapshot, snapshot
-from .usage_governor import PaidPurpose
-from .controller import RuntimeConfig
-from .ledger import Ledger
+def request_from_payload(value: Mapping[str, Any]) -> PlanningRequest:
+    if not isinstance(value, Mapping) or set(value) != set(PlanningRequest.__dataclass_fields__): raise ValueError("planning request fields mismatch")
+    data = dict(value)
+    for key in ("expected_criteria", "authorized_paths"):
+        items = data[key]
+        if type(items) is not list or any(type(item) is not str for item in items) or len(items) != len(set(items)):
+            raise ValueError(f"{key} must contain unique strings")
+        data[key] = frozenset(items)
+    commands = data["verification_commands"]
+    if type(commands) is not list or not commands or any(type(command) is not list or not command or any(type(arg) is not str for arg in command) for command in commands):
+        raise ValueError("verification_commands must be nested arrays of strings")
+    data["verification_commands"] = tuple(tuple(command) for command in commands)
+    if type(data["non_goals"]) is not list or any(type(item) is not str for item in data["non_goals"]):
+        raise ValueError("non_goals must be a string array")
+    data["non_goals"] = tuple(data["non_goals"])
+    statements = data["criterion_statements"]
+    if type(statements) is not list or any(type(pair) is not list or len(pair) != 2 or any(type(item) is not str for item in pair) for pair in statements):
+        raise ValueError("criterion_statements must be pairs of strings")
+    data["criterion_statements"] = tuple(tuple(pair) for pair in statements)
+    try:
+        request = PlanningRequest(**data)
+        if request_payload(request) != dict(value):
+            raise ValueError("planning request is not canonical")
+        return request
+    except (TypeError, UnicodeError) as error:
+        raise ValueError("planning request is malformed") from error
 
+def evidence_payload(request: PlanningRequest, proposal: PlanProposal, *, planner_task_id: str, planner_run_id: str, planner_session_id: str, planner_profile: str) -> dict[str, Any]:
+    if type(request) is not PlanningRequest or type(proposal) is not PlanProposal or proposal.request_identity != request.identity: raise ValueError("validated matching request and proposal required")
+    provenance = (planner_task_id, planner_run_id, planner_session_id, planner_profile)
+    if any(type(x) is not str or not x for x in provenance): raise ValueError("complete native planner provenance required")
+    serialized = serialize_proposal(proposal)
+    if parse_proposal(serialized, request) != proposal: raise ValueError("proposal failed canonical roundtrip")
+    return {"schema_version": 1, "request": request_payload(request), "request_identity": request.identity, "proposal": json.loads(serialized), "proposal_hash": proposal.proposal_hash, "planner": {"task_id": planner_task_id, "run_id": planner_run_id, "session_id": planner_session_id, "profile": planner_profile}}
 
-class Planner(Protocol):
-    cost_class: str
-    role: str
-    provider: str
-    model: str
-    profile: str
-    routing_source: str
-    planner_contract_hash: str
-
-
-@dataclass(frozen=True)
-class PlanningOutcome:
-    status: str
-    feature_id: str
-    request_key: str | None = None
-    snapshot_hash: str | None = None
-    plan_id: str | None = None
-    activated_ticket_ids: tuple[str, ...] = ()
-    reasons: tuple[str, ...] = ()
-
-
-class PlanningCoordinator:
-    """Coordinates proposal-only planning; it never projects or executes tickets."""
-
-    def __init__(
-        self,
-        ledger: Ledger,
-        config: RuntimeConfig,
-        planner: Planner,
-        *,
-        artifact_root: Path | None = None,
-        plan_validator: PlanValidator | None = None,
-        repository_validator: RepositoryPlanValidator | None = None,
-        planner_identity: str | None = None,
-    ) -> None:
-        self.ledger = ledger
-        self.config = config
-        self.planner = planner
-        self.artifact_root = Path(artifact_root or config.artifact_root)
-        self.plan_validator = plan_validator or PlanValidator()
-        self.repository_validator = repository_validator or RepositoryPlanValidator()
-        self.planner_identity = planner_identity or type(planner).__name__
-
-    def _cost_class(self) -> str:
-        value = getattr(self.planner, "cost_class", "unknown")
-        return value if value in {"local", "standard", "paid", "unknown"} else "unknown"
-
-    def _route(self) -> dict[str, str]:
-        values = {key: getattr(self.planner, key, None) for key in ("role", "provider", "model", "profile", "routing_source")}
-        values["planner_contract_hash"] = getattr(self.planner, "planner_contract_hash", planner_contract_hash())
-        if not all(isinstance(value, str) and value.strip() for value in values.values()):
-            raise ValueError("planner route identity is incomplete")
-        cost_class = self._cost_class()
-        if cost_class == "unknown":
-            raise ValueError("planner cost class is not trusted")
-        return {**values, "cost_class": cost_class}
-
-    def _persisted_feature_spec(self, feature_id: str) -> FeatureAdmissionSpec:
-        row = self.ledger.connection.execute("SELECT contract_json,contract_hash FROM feature_contracts WHERE feature_id=?", (feature_id,)).fetchone()
-        if row is None:
-            raise ValueError("persisted feature contract authority is missing")
-        spec = decode_persisted_admission_envelope(row["contract_json"], expected_feature_id=feature_id, expected_contract_hash=row["contract_hash"])
-        return spec
-
-    def _authorized_repository_paths(self, feature_id: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        try:
-            spec = self._persisted_feature_spec(feature_id)
-            return (
-                tuple(file.path for file in spec.files if file.disposition == "modify"),
-                tuple(file.path for file in spec.files if file.disposition == "create"),
-            )
-        except ValueError as authority_error:
-            plan_row = self.ledger.connection.execute(
-                "SELECT plan_json FROM decomposition_plans WHERE feature_id=? ORDER BY created_at,id LIMIT 1",
-                (feature_id,),
-            ).fetchone()
-            if plan_row is None:
-                raise authority_error
-            try:
-                envelope = json.loads(str(plan_row["plan_json"]))
-                manifest = json.loads(str(envelope["plan"]["repo_snapshot_manifest_json"]))
-                modify = tuple(map(str, manifest["authorized_modify_paths"]))
-                create = tuple(map(str, manifest["authorized_create_paths"]))
-            except (KeyError, TypeError, json.JSONDecodeError) as exc:
-                raise ValueError("persisted repository authorization is malformed") from exc
-            if not modify and not create:
-                raise ValueError("persisted repository authorization is empty")
-            return modify, create
-
-    def _snapshot_for_feature(self, feature: FeatureContract, base_sha: str, *, feature_terms: tuple[str, ...] = ()) -> RepositorySnapshot:
-        repo = self.config.canonical_repository(self.config.repository)
-        modify, create = self._authorized_repository_paths(feature.id)
-        return snapshot(repo, base_sha, feature, feature_terms, authorized_modify_paths=modify, authorized_create_paths=create)
-
-    def _request_key(self, feature: FeatureContract, snap: RepositorySnapshot) -> str:
-        material = {
-            "architecture_purpose": PaidPurpose.ARCHITECTURE.value,
-            "planner_request_version": 2,
-            "feature_id": feature.id,
-            "contract_hash": feature.contract_hash,
-            "repo_base_sha": snap.base_sha,
-            "repo_snapshot_hash": snap.snapshot_hash,
-            "repository_identity": snap.repository_id,
-            "planner_identity": self.planner_identity,
-            "planner_route": self._route(),
-        }
-        return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-    def _artifact_dir(self, feature: FeatureContract, request_key: str) -> Path:
-        return self.artifact_root / feature.id / request_key
-
-    def _assert_prior_route(self, prior: Any) -> None:
-        route = self._route()
-        fields = {
-            "planner_role": route["role"],
-            "planner_provider": route["provider"],
-            "planner_model": route["model"],
-            "planner_profile": route["profile"],
-            "planner_routing_source": route["routing_source"],
-            "planner_contract_hash": route["planner_contract_hash"],
-        }
-        for field, expected in fields.items():
-            actual = prior[field]
-            if actual is None or str(actual) != expected:
-                raise ValueError("conflicting durable planner route provenance")
-        if str(prior["cost_class"]) != route["cost_class"]:
-            raise ValueError("conflicting durable planner route provenance")
-
-    @staticmethod
-    def _plan_json(plan: DecompositionPlan) -> str:
-        return json.dumps(asdict(plan), sort_keys=True, separators=(",", ":"))
-
-    def _record(self, request_key: str, feature: FeatureContract, snap: RepositorySnapshot, *, status: str, artifact: Path | None = None, structural: tuple[str, ...] = (), repository: tuple[str, ...] = (), plan_id: str | None = None, ticket_ids: tuple[str, ...] = ()) -> None:
-        now = self.ledger._now()
-        with self.ledger._transaction() as conn:
-            conn.execute(
-                """INSERT INTO planning_runs(request_key,feature_id,contract_hash,repo_base_sha,repo_snapshot_hash,planner_identity,cost_class,status,response_artifact,structural_reasons_json,repository_reasons_json,plan_id,ticket_ids_json,created_at,updated_at,repository_identity,repo_snapshot_manifest_json,planner_role,planner_provider,planner_model,planner_profile,planner_routing_source,planner_contract_hash)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(request_key) DO UPDATE SET status=excluded.status,response_artifact=excluded.response_artifact,structural_reasons_json=excluded.structural_reasons_json,repository_reasons_json=excluded.repository_reasons_json,plan_id=excluded.plan_id,ticket_ids_json=excluded.ticket_ids_json,updated_at=excluded.updated_at""",
-                (request_key, feature.id, feature.contract_hash, snap.base_sha, snap.snapshot_hash, self.planner_identity, self._cost_class(), status, str(artifact) if artifact else None, json.dumps(structural), json.dumps(repository), plan_id, json.dumps(ticket_ids), now, now, snap.repository_id, snap.manifest_json, self._route()["role"], self._route()["provider"], self._route()["model"], self._route()["profile"], self._route()["routing_source"], self._route()["planner_contract_hash"]),
-            )
-
-    def _existing_activated(self, feature: FeatureContract, snap: RepositorySnapshot) -> PlanningOutcome | None:
-        rows = self.ledger.connection.execute("SELECT * FROM decomposition_plans WHERE feature_id=? AND status='active' ORDER BY activated_at", (feature.id,)).fetchall()
-        for row in rows:
-            try:
-                stored = json.loads(row["plan_json"])
-                plan = parse(json.dumps(stored["plan"], sort_keys=True, separators=(",", ":")))
-            except (PlannerError, KeyError, TypeError, ValueError):
-                continue
-            run = self.ledger.connection.execute("SELECT * FROM planning_runs WHERE plan_id=? ORDER BY updated_at DESC LIMIT 1", (row["id"],)).fetchone()
-            if (run is not None and run["request_key"] == self._request_key(feature, snap) and plan.feature_contract_hash == feature.contract_hash and plan.repository_identity == snap.repository_id and plan.repo_base_sha == snap.base_sha and plan.repo_snapshot_hash == snap.snapshot_hash and plan.repo_snapshot_manifest_json == snap.manifest_json and row["repository_identity"] == snap.repository_id and row["repo_base_sha"] == snap.base_sha and row["repo_snapshot_hash"] == snap.snapshot_hash and row["repo_snapshot_manifest_json"] == snap.manifest_json):
-                self._assert_prior_route(run)
-                ids = tuple(r["id"] for r in self.ledger.connection.execute("SELECT t.id FROM tickets t JOIN tranches tr ON tr.id=t.tranche_id WHERE t.feature_id=? AND tr.ordinal=0 ORDER BY t.id", (feature.id,)))
-                return PlanningOutcome("already_activated", feature.id, snapshot_hash=snap.snapshot_hash, plan_id=str(row["id"]), activated_ticket_ids=ids)
-        return None
-
-    @staticmethod
-    def _proposal_text(value: dict[str, Any]) -> str:
-        candidate = value.get("plan", value)
-        return json.dumps(candidate, sort_keys=True, separators=(",", ":"))
-
-    def materialize_next_tranche(self, feature_id: str) -> PlanningOutcome:
-        """Complete the active tranche and materialize exactly the next coarse tranche."""
-        from .tranche_completion import TrancheNotComplete, completion_evidence
-        row = self.ledger.connection.execute("SELECT * FROM feature_contracts WHERE feature_id=?", (feature_id,)).fetchone()
-        stored_plan = self.ledger.connection.execute("SELECT * FROM decomposition_plans WHERE feature_id=? ORDER BY created_at LIMIT 1", (feature_id,)).fetchone()
-        if row is None or stored_plan is None: return PlanningOutcome("planner_failed", feature_id, reasons=("feature plan missing",))
-        try:
-            spec = decode_persisted_admission_envelope(row["contract_json"], expected_feature_id=feature_id, expected_contract_hash=row["contract_hash"])
-            feature = spec.contract
-        except ValueError:
-            raw_contract = json.loads(str(row["contract_json"]))
-            if type(raw_contract) is not dict or "spec" in raw_contract:
-                raise
-            try:
-                feature = FeatureContract(
-                    str(raw_contract["id"]),
-                    str(raw_contract["title"]),
-                    str(raw_contract["objective"]),
-                    tuple(Criterion(str(item["id"]), str(item["statement"]), str(item.get("verification_hint", ""))) for item in raw_contract["acceptance_criteria"]),
-                    tuple(map(str, raw_contract["non_goals"])),
-                    tuple(map(str, raw_contract["invariants"])),
-                    tuple(map(str, raw_contract["constraints"])),
-                    str(raw_contract["source_revision"]),
-                )
-            except (KeyError, TypeError) as exc:
-                raise ValueError("persisted feature contract is malformed") from exc
-            if feature.id != feature_id or feature.contract_hash != str(row["contract_hash"]):
-                raise ValueError("persisted feature contract identity conflicts")
-        stored = json.loads(stored_plan["plan_json"]); coarse_plan = parse(json.dumps(stored["plan"], sort_keys=True, separators=(",", ":")))
-        predecessor_row = self.ledger.connection.execute("SELECT * FROM tranches WHERE feature_id=? AND status='completed' AND EXISTS (SELECT 1 FROM tranche_landing_evidence l WHERE l.tranche_id=tranches.id) ORDER BY ordinal DESC LIMIT 1", (feature_id,)).fetchone()
-        if predecessor_row is None:
-            return PlanningOutcome("waiting_not_complete", feature_id, reasons=("predecessor completion authority requires durable tranche landing evidence",))
-        if self.ledger.connection.execute("SELECT 1 FROM tranches WHERE feature_id=? AND status='active' AND ordinal>?", (feature_id, predecessor_row["ordinal"])).fetchone() is not None:
-            return PlanningOutcome("already_materialized", feature_id, plan_id=str(stored_plan["id"]))
-        active = next(t for t in coarse_plan.tranches if t.id == predecessor_row["id"])
-        repository = self.config.canonical_repository(self.config.repository)
-        from .corrections import CorrectionService
-        authority = CorrectionService(self.ledger, repository).completion_authority(active.id)
-        if not authority["authorized"]:
-            return PlanningOutcome("waiting_not_complete", feature_id, reasons=(f"predecessor completion authority is {authority['status']}",))
-        try:
-            completion = authority["completion"]
-            if authority["kind"] == "h1":
-                completion = completion_evidence(self.ledger, repository, active.id)
-            if completion is None:
-                raise TrancheNotComplete("durable predecessor completion is missing")
-        except (TrancheNotComplete, OSError, subprocess.CalledProcessError) as exc: return PlanningOutcome("waiting_not_complete", feature_id, reasons=(str(exc),))
-        next_coarse = next((t for t in coarse_plan.tranches if t.ordinal == active.ordinal + 1), None)
-        if next_coarse is None:
-            self.ledger.record_tranche_completion(completion)
-            return PlanningOutcome("feature_complete_candidate", feature_id, reasons=("no later coarse tranche",))
-        final = authority["final_integration_sha"]
-        snap = self._snapshot_for_feature(feature, final)
-        artifact_dir = self._artifact_dir(feature, self._request_key(feature, snap) + "-" + next_coarse.id); artifact_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            proposer = getattr(self.planner, "propose_next", None) or getattr(self.planner, "propose")
-            proposal = proposer(feature, snap, coarse_tranche=next_coarse, completion_evidence=completion, artifact_dir=artifact_dir, repository=repository) if getattr(self.planner, "propose_next", None) else proposer(feature, snap, artifact_dir=artifact_dir, repository=repository)
-        except TypeError:
-            if isinstance(self.planner, LocalDecompositionPlanner):
-                raise PlannerError("protected planner signature mismatch")
-            proposal = self.planner.propose(feature, snap, artifact_dir=artifact_dir)  # type: ignore[attr-defined]
-        proposal = replace(proposal, feature_id=feature.id, feature_contract_hash=feature.contract_hash, repository_identity=snap.repository_id, repo_base_sha=snap.base_sha, repo_snapshot_hash=snap.snapshot_hash, repo_snapshot_manifest_json=snap.manifest_json, tranches=(replace(proposal.tranches[0], id=next_coarse.id, ordinal=0),))
-        validation = self.plan_validator.validate_tranche(feature, proposal.tranches[0], next_coarse)
-        repository_validation = self.repository_validator.validate(proposal, snap)
-        if not validation.passed: return PlanningOutcome("structural_rejected", feature_id, reasons=validation.reasons)
-        if not repository_validation.passed: return PlanningOutcome("repository_rejected", feature_id, reasons=repository_validation.reasons)
-        created = self.ledger.materialize_next_tranche(feature=feature, tranche=proposal.tranches[0], plan=proposal, completion=completion)
-        return PlanningOutcome("activated", feature_id, snapshot_hash=snap.snapshot_hash, plan_id=str(stored_plan["id"]), activated_ticket_ids=created)
-
-    def _load_plan(self, row: object) -> DecompositionPlan:
-        stored = json.loads(row["plan_json"])
-        return parse(json.dumps(stored["plan"], sort_keys=True, separators=(",", ":")))
-
-    def _plan_fingerprint(self, feature: FeatureContract, proposal: DecompositionPlan) -> tuple[str, str, str]:
-        raw = json.dumps({"feature": feature.__dict__, "plan": asdict(proposal)}, default=lambda x: x.__dict__ if hasattr(x, "__dict__") else list(x), sort_keys=True, separators=(",", ":"))
-        return "plan-" + hashlib.sha256(raw.encode()).hexdigest()[:16], hashlib.sha256(raw.encode()).hexdigest(), raw
-
-    def _existing_pending(self, feature: FeatureContract, snap: RepositorySnapshot, current_key: str) -> PlanningOutcome | None:
-        rows = self.ledger.connection.execute("SELECT * FROM decomposition_plans WHERE feature_id=? ORDER BY created_at", (feature.id,)).fetchall()
-        for row in rows:
-            if row["status"] != "validated_pending_activation":
-                continue
-            if (row["repository_identity"], row["repo_base_sha"], row["repo_snapshot_hash"], row["repo_snapshot_manifest_json"]) != (snap.repository_id, snap.base_sha, snap.snapshot_hash, snap.manifest_json):
-                raise ValueError("conflicting durable decomposition plan")
-            plan = self._load_plan(row)
-            if plan.feature_contract_hash != feature.contract_hash:
-                raise ValueError("conflicting durable decomposition plan")
-            run = self.ledger.connection.execute("SELECT * FROM planning_runs WHERE plan_id=? ORDER BY updated_at DESC LIMIT 1", (row["id"],)).fetchone()
-            if run is None or run["request_key"] != current_key:
-                continue
-            self._assert_prior_route(run)
-            return PlanningOutcome("validated_pending_activation", feature.id, request_key=current_key, snapshot_hash=snap.snapshot_hash, plan_id=str(row["id"]))
-        return None
-
-    def generate_plan_only(self, feature: FeatureContract, *, repository: Path | None = None, feature_terms: tuple[str, ...] = ()) -> PlanningOutcome:
-        """Generate, validate, and persist one plan without activation or tickets."""
-        if self._cost_class() == "unknown":
-            return PlanningOutcome("unknown_cost_class", feature.id, reasons=("planner cost class is not trusted",))
-        repo = self.config.canonical_repository(self.config.repository)
-        if repository is not None and self.config.canonical_repository(repository) != repo:
-            raise ValueError("repository is not the controller-approved canonical repository")
-        base = feature.source_revision.strip() or subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
-        snap = self._snapshot_for_feature(feature, base, feature_terms=feature_terms)
-        request_key = self._request_key(feature, snap)
-        active = self._existing_activated(feature, snap)
-        if active:
-            return active
-        pending = self._existing_pending(feature, snap, request_key)
-        if pending:
-            return pending
-        artifact_dir = self._artifact_dir(feature, request_key)
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        response_path = artifact_dir / "planner-response.json"
-        prior = self.ledger.connection.execute("SELECT * FROM planning_runs WHERE request_key=?", (request_key,)).fetchone()
-        try:
-            if prior is not None and prior["status"] in {"structural_rejected", "repository_rejected", "validated_pending_activation", "completed"} and prior["response_artifact"] and Path(prior["response_artifact"]).exists():
-                self._assert_prior_route(prior)
-                proposal = parse(Path(prior["response_artifact"]).read_text(encoding="utf-8"))
-            elif getattr(self.planner, "role", None) == "decomposition" and callable(getattr(self.planner, "propose", None)):
-                proposal = self.planner.propose(feature, snap, artifact_dir=artifact_dir, repository=repo)  # type: ignore[attr-defined]
-                if not response_path.exists():
-                    response_path.write_text(self._plan_json(proposal), encoding="utf-8")
-            else:
-                request_payload = {"feature_id": feature.id, "contract_hash": feature.contract_hash, "repo_base_sha": snap.base_sha, "repo_snapshot_hash": snap.snapshot_hash, "repository_identity": snap.repository_id, "repo_snapshot_manifest_json": snap.manifest_json, "planner_identity": self.planner_identity, "purpose": PaidPurpose.ARCHITECTURE.value}
-                result = self.planner.invoke(feature.id, PaidPurpose.ARCHITECTURE, request_key, {"request": request_payload, "prompt": packet(feature, snap)})  # type: ignore[attr-defined]
-                response_path.write_text(self._proposal_text(result), encoding="utf-8")
-                proposal = parse(response_path.read_text(encoding="utf-8"))
-        except PaidInvocationError as exc:
-            message = str(exc)
-            return PlanningOutcome("budget_exhausted" if "budget exhausted" in message else "planner_ambiguous", feature.id, request_key, snap.snapshot_hash, reasons=(message,))
-        except PlannerError as exc:
-            return PlanningOutcome("planner_timeout" if "timeout" in str(exc) else "planner_failed", feature.id, request_key, snap.snapshot_hash, reasons=(str(exc),))
-        except (OSError, TypeError, ValueError, KeyError, TimeoutError) as exc:
-            return PlanningOutcome("planner_failed", feature.id, request_key, snap.snapshot_hash, reasons=(str(exc),))
-        proposal = replace(proposal, repository_identity=snap.repository_id, repo_base_sha=snap.base_sha, repo_snapshot_hash=snap.snapshot_hash, repo_snapshot_manifest_json=snap.manifest_json)
-        structural = self.plan_validator.validate(feature, proposal)
-        if not structural.passed:
-            self._record(request_key, feature, snap, status="structural_rejected", artifact=response_path, structural=structural.reasons)
-            return PlanningOutcome("structural_rejected", feature.id, request_key, snap.snapshot_hash, reasons=structural.reasons)
-        repository_validation = self.repository_validator.validate(proposal, snap)
-        if not repository_validation.passed:
-            self._record(request_key, feature, snap, status="repository_rejected", artifact=response_path, repository=repository_validation.reasons)
-            return PlanningOutcome("repository_rejected", feature.id, request_key, snap.snapshot_hash, reasons=repository_validation.reasons)
-        plan_id, fingerprint, raw = self._plan_fingerprint(feature, proposal)
-        persisted = self.ledger.persist_validated_decomposition_plan(plan_id=plan_id, feature_id=feature.id, fingerprint=fingerprint, plan_json=json.dumps({"feature": feature.__dict__, "plan": asdict(proposal)}, default=lambda x: x.__dict__ if hasattr(x, "__dict__") else list(x), sort_keys=True, separators=(",", ":")), repository_identity=snap.repository_id, repo_base_sha=snap.base_sha, repo_snapshot_hash=snap.snapshot_hash, repo_snapshot_manifest_json=snap.manifest_json)
-        self._record(request_key, feature, snap, status="validated_pending_activation", artifact=response_path, plan_id=persisted)
-        return PlanningOutcome("validated_pending_activation", feature.id, request_key, snap.snapshot_hash, persisted)
-
-    def revalidate_feature_repository_snapshot(self, feature_id: str) -> dict[str, Any]:
-        feature = self._persisted_feature_spec(feature_id).contract
-        authority = self.ledger.feature_snapshot_authority(feature_id)
-        if not authority["repository_identity"] or not authority["repo_base_sha"] or not authority["snapshot_hash"]:
-            raise ValueError("feature snapshot authority is incomplete")
-        snap = self._snapshot_for_feature(feature, str(authority["repo_base_sha"]))
-        if (snap.repository_id, snap.base_sha) != (authority["repository_identity"], authority["repo_base_sha"]):
-            raise ValueError("repository identity or base SHA changed")
-        if snap.snapshot_hash == authority["snapshot_hash"]:
-            return {**authority, "status": "already_current", "target_snapshot_hash": snap.snapshot_hash}
-        generation = int(authority["generation"]) + 1
-        revalidation_hash = self.ledger.snapshot_revalidation_hash(feature_id=feature_id, feature_contract_hash=feature.contract_hash, repository_identity=snap.repository_id, repo_base_sha=snap.base_sha, source_snapshot_hash=authority["snapshot_hash"], target_snapshot_hash=snap.snapshot_hash, generation=generation)
-        row = self.ledger.append_feature_snapshot_revalidation(feature_id=feature_id, feature_contract_hash=feature.contract_hash, repository_identity=snap.repository_id, repo_base_sha=snap.base_sha, source_snapshot_hash=authority["snapshot_hash"], target_snapshot_hash=snap.snapshot_hash, generation=generation, revalidation_hash=revalidation_hash)
-        return {**row, "status": "revalidated"}
-
-    def activate_persisted_plan(self, feature: FeatureContract, *, request_key: str, plan_id: str) -> PlanningOutcome:
-        row = self.ledger.connection.execute("SELECT * FROM decomposition_plans WHERE id=?", (plan_id,)).fetchone()
-        if row is None: raise ValueError("persisted decomposition plan missing")
-        proposal = self._load_plan(row)
-        structural = self.plan_validator.validate(feature, proposal)
-        snap = self._snapshot_for_feature(feature, proposal.repo_base_sha)
-        repository_validation = self.repository_validator.validate(proposal, snap)
-        activated_id, ticket_ids = activate_validated_plan(self.ledger, feature, proposal, structural, repository_validation, request_key=request_key, expected_plan_id=plan_id)
-        return PlanningOutcome("activated", feature.id, request_key, snap.snapshot_hash, activated_id, ticket_ids)
-
-    def plan(self, feature: FeatureContract, *, repository: Path | None = None, feature_terms: tuple[str, ...] = ()) -> PlanningOutcome:
-        """Legacy combined planning path: generate/persist, then activate."""
-        outcome = self.generate_plan_only(feature, repository=repository, feature_terms=feature_terms)
-        if outcome.status == "already_activated":
-            return outcome
-        if outcome.status != "validated_pending_activation":
-            return outcome
-        return self.activate_persisted_plan(feature, request_key=str(outcome.request_key), plan_id=str(outcome.plan_id))
+def reconstruct_evidence(payload: Mapping[str, Any]) -> tuple[PlanningRequest, PlanProposal]:
+    if not isinstance(payload, Mapping) or set(payload) != {"schema_version", "request", "request_identity", "proposal", "proposal_hash", "planner"} or type(payload["schema_version"]) is not int or payload["schema_version"] != 1: raise ValueError("plan evidence shape/version invalid")
+    request = request_from_payload(payload["request"])
+    if payload["request_identity"] != request.identity: raise ValueError("stored request identity mismatch")
+    raw = json.dumps(payload["proposal"], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    proposal = parse_proposal(raw, request)
+    if payload["proposal_hash"] != proposal.proposal_hash: raise ValueError("stored proposal hash mismatch")
+    p = payload["planner"]
+    if not isinstance(p, Mapping) or set(p) != {"task_id", "run_id", "session_id", "profile"} or any(type(v) is not str or not v for v in p.values()): raise ValueError("stored planner provenance invalid")
+    return request, proposal

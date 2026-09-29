@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 from pathlib import Path
@@ -25,7 +26,7 @@ from .contracts import (
     validate_scope,
 )
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _TABLES = frozenset(
     {
         "schema_metadata",
@@ -37,6 +38,7 @@ _TABLES = frozenset(
         "budget_reconciliation_evidence",
         "effect_observations",
         "operator_intents",
+        "plan_proposals",
     }
 )
 _TABLE_COLUMNS = {
@@ -49,12 +51,17 @@ _TABLE_COLUMNS = {
     "budget_reconciliation_evidence": (("board_id", "TEXT", 1, 1), ("anchor_task_id", "TEXT", 1, 2), ("event_id", "TEXT", 1, 3), ("evidence_kind", "TEXT", 1, 4), ("evidence_json", "TEXT", 1, 0)),
     "effect_observations": (("board_id", "TEXT", 1, 1), ("anchor_task_id", "TEXT", 1, 2), ("operation_key", "TEXT", 1, 3), ("observation_identity", "TEXT", 1, 4), ("observation_json", "TEXT", 1, 0)),
     "operator_intents": (("board_id", "TEXT", 1, 1), ("anchor_task_id", "TEXT", 1, 2), ("intent_json", "TEXT", 1, 0)),
+    "plan_proposals": (("board_id", "TEXT", 1, 1), ("anchor_task_id", "TEXT", 1, 2), ("plan_id", "TEXT", 1, 3), ("evidence_json", "TEXT", 1, 0)),
 }
 _REVIEW_EVIDENCE_FOREIGN_KEYS = (
     ("candidates", "board_id", "board_id"),
     ("candidates", "anchor_task_id", "anchor_task_id"),
     ("candidates", "candidate_content_identity", "content_identity"),
 )
+_PLAN_TRIGGERS = {
+    "plan_proposals_immutable_update": "CREATE TRIGGER plan_proposals_immutable_update BEFORE UPDATE ON plan_proposals BEGIN SELECT RAISE(ABORT, 'plan evidence is immutable'); END",
+    "plan_proposals_immutable_delete": "CREATE TRIGGER plan_proposals_immutable_delete BEFORE DELETE ON plan_proposals BEGIN SELECT RAISE(ABORT, 'plan evidence is immutable'); END",
+}
 _RECONCILIATION_TRIGGER_SQL = {
     "budget_reconciliation_evidence_immutable_update": "CREATE TRIGGER budget_reconciliation_evidence_immutable_update BEFORE UPDATE ON budget_reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'budget reconciliation evidence is immutable'); END",
     "budget_reconciliation_evidence_immutable_delete": "CREATE TRIGGER budget_reconciliation_evidence_immutable_delete BEFORE DELETE ON budget_reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'budget reconciliation evidence is immutable'); END",
@@ -132,6 +139,41 @@ def _validate_indexes(connection: sqlite3.Connection) -> None:
             raise SchemaError("evidence-store schema indexes are unrecognized")
     if not found_native_source_index:
         raise SchemaError("evidence-store schema indexes are unrecognized")
+
+
+def _normalized_sql(sql: str) -> str:
+    """Normalize SQLite's harmless formatting/case differences, not semantics."""
+    compact = " ".join(sql.split()).casefold()
+    return re.sub(r"\s*([(),])\s*", r"\1", compact)
+
+
+def _canonical_table_sql(table: str) -> str:
+    columns = _TABLE_COLUMNS[table]
+    primary = tuple(name for name, _, _, position in columns if position)
+    definitions = []
+    for name, kind, notnull, position in columns:
+        definition = f"{name} {kind}"
+        if notnull:
+            definition += " NOT NULL"
+        if table == "schema_metadata" and position:
+            definition += " PRIMARY KEY"
+        definitions.append(definition)
+    if table != "schema_metadata":
+        definitions.append(f"PRIMARY KEY ({', '.join(primary)})")
+    if table == "review_evidence":
+        definitions.append("FOREIGN KEY (board_id, anchor_task_id, candidate_content_identity) REFERENCES candidates (board_id, anchor_task_id, content_identity)")
+    return f"CREATE TABLE {table} ({', '.join(definitions)})"
+
+
+def _validate_tables(connection: sqlite3.Connection, tables: frozenset[str]) -> None:
+    rows = {row["name"]: row["sql"] for row in connection.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+    if set(rows) != tables or any(rows[name] is None or _normalized_sql(rows[name]) != _normalized_sql(_canonical_table_sql(name)) for name in tables):
+        raise SchemaError("evidence-store schema table definitions, constraints, or foreign keys are unrecognized")
+
+
+def _validate_views(connection: sqlite3.Connection) -> None:
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='view' AND name NOT LIKE 'sqlite_%' LIMIT 1").fetchone():
+        raise SchemaError("evidence-store schema views are unrecognized")
 
 
 class EvidenceStore:
@@ -215,6 +257,8 @@ class EvidenceStore:
         }
         if names != _TABLES:
             raise SchemaError("evidence-store schema is missing or unrecognized")
+        _validate_views(self.connection)
+        _validate_tables(self.connection, _TABLES)
         for table, expected_columns in _TABLE_COLUMNS.items():
             columns = tuple(
                 (row["name"], row["type"].upper(), row["notnull"], row["pk"])
@@ -233,12 +277,13 @@ class EvidenceStore:
         if metadata != (("schema_version", str(_SCHEMA_VERSION)),):
             raise SchemaError("evidence-store schema version is unsupported")
         triggers = {row["name"]: row["sql"] for row in self.connection.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger'")}
-        if set(triggers) != set(_RECONCILIATION_TRIGGER_SQL) or any(" ".join(triggers[name].split()).upper() != " ".join(sql.split()).upper() for name, sql in _RECONCILIATION_TRIGGER_SQL.items()):
+        expected_triggers = {**_RECONCILIATION_TRIGGER_SQL, **_PLAN_TRIGGERS}
+        if set(triggers) != set(expected_triggers) or any(" ".join(triggers[name].split()).upper() != " ".join(sql.split()).upper() for name, sql in expected_triggers.items()):
             raise SchemaError("evidence-store schema reconciliation triggers are unrecognized")
         self._migrated = True
 
     def migrate(self) -> None:
-        """Create version one only for a newly created, empty database."""
+        """Validate historical schemas before atomically upgrading to version four."""
         names = {
             row[0]
             for row in self.connection.execute(
@@ -246,16 +291,21 @@ class EvidenceStore:
             )
         }
         if names:
+            metadata = tuple(tuple(row) for row in self.connection.execute("SELECT key, value FROM schema_metadata ORDER BY key")) if "schema_metadata" in names else ()
+            v1 = _TABLES - {"plan_proposals", "budget_reconciliation_evidence", "effect_observations"}
+            v2 = _TABLES - {"plan_proposals", "effect_observations"}
+            v3 = _TABLES - {"plan_proposals"}
+            versions = {1: v1, 2: v2, 3: v3}
+            version = next((number for number, expected_names in versions.items() if names == expected_names and metadata == (("schema_version", str(number)),)), None)
             if names == _TABLES:
                 self._require_schema()
                 return
-            v2_tables = _TABLES - {"effect_observations"}
-            v1_tables = v2_tables - {"budget_reconciliation_evidence"}
-            metadata = tuple(tuple(row) for row in self.connection.execute("SELECT key, value FROM schema_metadata ORDER BY key")) if "schema_metadata" in names else ()
-            if names == v2_tables and metadata == (("schema_version", "2"),):
-                # Validate every v2 invariant before any additive v3 write.
+            if version is not None:
+                expected_tables = versions[version]
+                _validate_views(self.connection)
+                _validate_tables(self.connection, expected_tables)
                 for table, columns in _TABLE_COLUMNS.items():
-                    if table == "effect_observations":
+                    if table not in expected_tables:
                         continue
                     actual = tuple((row["name"], row["type"].upper(), row["notnull"], row["pk"]) for row in self.connection.execute(f"PRAGMA table_info({table})"))
                     if actual != columns:
@@ -263,47 +313,40 @@ class EvidenceStore:
                 foreign_keys = tuple((row["table"], row["from"], row["to"]) for row in self.connection.execute("PRAGMA foreign_key_list(review_evidence)"))
                 if foreign_keys != _REVIEW_EVIDENCE_FOREIGN_KEYS:
                     raise SchemaError("evidence-store schema foreign keys are unrecognized")
+                expected_triggers = {}
+                if version >= 2:
+                    expected_triggers.update({name: sql for name, sql in _RECONCILIATION_TRIGGER_SQL.items() if name.startswith("budget_")})
+                if version >= 3:
+                    expected_triggers.update({name: sql for name, sql in _RECONCILIATION_TRIGGER_SQL.items() if name.startswith("effect_")})
                 triggers = {row["name"]: row["sql"] for row in self.connection.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger'")}
-                expected = {name: sql for name, sql in _RECONCILIATION_TRIGGER_SQL.items() if name.startswith("budget_")}
-                if set(triggers) != set(expected) or any(" ".join(triggers[name].split()).upper() != " ".join(sql.split()).upper() for name, sql in expected.items()):
-                    raise SchemaError("evidence-store schema reconciliation triggers are unrecognized")
+                if set(triggers) != set(expected_triggers) or any(" ".join(triggers[name].split()).upper() != " ".join(sql.split()).upper() for name, sql in expected_triggers.items()):
+                    raise SchemaError("evidence-store schema triggers are unrecognized")
                 _validate_indexes(self.connection)
                 try:
-                    with self.connection:
+                    self.connection.execute("BEGIN IMMEDIATE")
+                    if version == 1:
+                        self.connection.execute("CREATE TABLE budget_reconciliation_evidence (board_id TEXT NOT NULL, anchor_task_id TEXT NOT NULL, event_id TEXT NOT NULL, evidence_kind TEXT NOT NULL, evidence_json TEXT NOT NULL, PRIMARY KEY (board_id, anchor_task_id, event_id, evidence_kind))")
+                        for sql in _RECONCILIATION_TRIGGER_SQL.values():
+                            if sql.startswith("CREATE TRIGGER budget_"):
+                                self.connection.execute(sql)
+                    if version <= 2:
                         self.connection.execute("CREATE TABLE effect_observations (board_id TEXT NOT NULL, anchor_task_id TEXT NOT NULL, operation_key TEXT NOT NULL, observation_identity TEXT NOT NULL, observation_json TEXT NOT NULL, PRIMARY KEY (board_id, anchor_task_id, operation_key, observation_identity))")
-                        self.connection.execute("CREATE TRIGGER effect_observations_immutable_update BEFORE UPDATE ON effect_observations BEGIN SELECT RAISE(ABORT, 'effect observation evidence is immutable'); END")
-                        self.connection.execute("CREATE TRIGGER effect_observations_immutable_delete BEFORE DELETE ON effect_observations BEGIN SELECT RAISE(ABORT, 'effect observation evidence is immutable'); END")
-                        self.connection.execute("UPDATE schema_metadata SET value = '3' WHERE key = 'schema_version'")
-                except sqlite3.DatabaseError as error:
-                    raise SchemaError("could not migrate evidence-store") from error
-                self._migrated = False
-                self._require_schema()
+                        for name, sql in _RECONCILIATION_TRIGGER_SQL.items():
+                            if name.startswith("effect_"):
+                                self.connection.execute(sql)
+                    self.connection.execute("CREATE TABLE plan_proposals (board_id TEXT NOT NULL, anchor_task_id TEXT NOT NULL, plan_id TEXT NOT NULL, evidence_json TEXT NOT NULL, PRIMARY KEY (board_id, anchor_task_id, plan_id))")
+                    for sql in _PLAN_TRIGGERS.values():
+                        self.connection.execute(sql)
+                    self.connection.execute("UPDATE schema_metadata SET value='4' WHERE key='schema_version'")
+                    self._migrated = False
+                    self._require_schema()
+                    self.connection.commit()
+                except BaseException:
+                    self.connection.rollback()
+                    self._migrated = False
+                    raise
                 return
-            if names != v1_tables or metadata != (("schema_version", "1"),):
-                raise SchemaError("existing database has no recognized evidence-store schema")
-            # Validate v1 precisely before an additive, no-rewrite upgrade.
-            for table, columns in _TABLE_COLUMNS.items():
-                if table in {"budget_reconciliation_evidence", "effect_observations"}:
-                    continue
-                actual = tuple((row["name"], row["type"].upper(), row["notnull"], row["pk"]) for row in self.connection.execute(f"PRAGMA table_info({table})"))
-                if actual != columns:
-                    raise SchemaError("evidence-store schema columns or primary key are unrecognized")
-            foreign_keys = tuple((row["table"], row["from"], row["to"]) for row in self.connection.execute("PRAGMA foreign_key_list(review_evidence)"))
-            if foreign_keys != _REVIEW_EVIDENCE_FOREIGN_KEYS:
-                raise SchemaError("evidence-store schema foreign keys are unrecognized")
-            if tuple(self.connection.execute("SELECT name FROM sqlite_master WHERE type='trigger'")):
-                raise SchemaError("evidence-store schema triggers are unrecognized")
-            _validate_indexes(self.connection)
-            try:
-                with self.connection:
-                    self.connection.execute("CREATE TABLE budget_reconciliation_evidence (board_id TEXT NOT NULL, anchor_task_id TEXT NOT NULL, event_id TEXT NOT NULL, evidence_kind TEXT NOT NULL, evidence_json TEXT NOT NULL, PRIMARY KEY (board_id, anchor_task_id, event_id, evidence_kind))")
-                    self.connection.execute("CREATE TRIGGER budget_reconciliation_evidence_immutable_update BEFORE UPDATE ON budget_reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'budget reconciliation evidence is immutable'); END")
-                    self.connection.execute("CREATE TRIGGER budget_reconciliation_evidence_immutable_delete BEFORE DELETE ON budget_reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'budget reconciliation evidence is immutable'); END")
-                    self.connection.execute("UPDATE schema_metadata SET value = '2' WHERE key = 'schema_version'")
-            except sqlite3.DatabaseError as error:
-                raise SchemaError("could not migrate evidence-store") from error
-            self._migrated = False
-            return self.migrate()
+            raise SchemaError("existing database has no recognized evidence-store schema")
         if not self._created:
             raise SchemaError("existing database has no recognized evidence-store schema")
         try:
@@ -393,12 +436,68 @@ class EvidenceStore:
                     CREATE TRIGGER effect_observations_immutable_delete
                     BEFORE DELETE ON effect_observations
                     BEGIN SELECT RAISE(ABORT, 'effect observation evidence is immutable'); END;
-                    INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '3');
+                    CREATE TABLE plan_proposals (board_id TEXT NOT NULL, anchor_task_id TEXT NOT NULL, plan_id TEXT NOT NULL, evidence_json TEXT NOT NULL, PRIMARY KEY (board_id, anchor_task_id, plan_id));
+                    CREATE TRIGGER plan_proposals_immutable_update BEFORE UPDATE ON plan_proposals BEGIN SELECT RAISE(ABORT, 'plan evidence is immutable'); END;
+                    CREATE TRIGGER plan_proposals_immutable_delete BEFORE DELETE ON plan_proposals BEGIN SELECT RAISE(ABORT, 'plan evidence is immutable'); END;
+                    INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '4');
                     """
                 )
         except sqlite3.DatabaseError as error:
             raise SchemaError("could not migrate evidence-store") from error
         self._migrated = True
+
+    def record_plan(self, scope: Mapping[str, Any], evidence: Mapping[str, Any]) -> Mapping[str, Any]:
+        from .planning_coordinator import reconstruct_evidence
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        request, proposal = reconstruct_evidence(evidence)
+        if request.board_id != board or request.anchor_id != anchor:
+            raise ConflictError("plan evidence request scope does not match store scope")
+        payload = _json(dict(evidence))
+        plan_id = proposal.plan.plan_id
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT evidence_json FROM plan_proposals WHERE board_id=? AND anchor_task_id=? AND plan_id=?", (board, anchor, plan_id)).fetchone()
+            if row is not None:
+                if row[0] != payload:
+                    raise ConflictError("plan identity conflicts with existing immutable evidence")
+                self.connection.commit()
+                return dict(evidence)
+            self.connection.execute("INSERT INTO plan_proposals VALUES (?, ?, ?, ?)", (board, anchor, plan_id, payload))
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
+        return dict(evidence)
+
+    def read_plan(self, scope: Mapping[str, Any], plan_id: str) -> Mapping[str, Any]:
+        from .planning_coordinator import reconstruct_evidence
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        if not _nonempty_string(plan_id):
+            raise ValueError("plan_id must be non-empty")
+        row = self.connection.execute("SELECT evidence_json FROM plan_proposals WHERE board_id=? AND anchor_task_id=? AND plan_id=?", (board, anchor, plan_id)).fetchone()
+        if row is None:
+            raise KeyError("plan evidence is not recorded in this scope")
+        raw = row[0]
+        value = _decode(raw)
+        if _json(value) != raw:
+            raise SchemaError("stored plan evidence is not canonical")
+        try:
+            request, proposal = reconstruct_evidence(value)
+        except (ValueError, TypeError, UnicodeError) as error:
+            raise SchemaError("stored plan evidence failed reconstruction") from error
+        if request.board_id != board or request.anchor_id != anchor or proposal.plan.plan_id != plan_id:
+            raise SchemaError("stored plan evidence identity does not match its row")
+        return value
+
+    def plan_evidence(self, scope: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        rows = self.connection.execute("SELECT plan_id FROM plan_proposals WHERE board_id=? AND anchor_task_id=? ORDER BY plan_id LIMIT 65", (board, anchor)).fetchall()
+        if len(rows) > 64:
+            raise SchemaError("plan evidence list exceeds bounded limit; request an exact plan ID")
+        return tuple(self.read_plan(scope, row[0]) for row in rows)
 
     def register_member(self, member: ManagedMember) -> ManagedMember:
         self._require_schema()

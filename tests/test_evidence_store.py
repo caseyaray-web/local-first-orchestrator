@@ -112,7 +112,9 @@ def test_no_shadow_ticket_lifecycle_schema(store):
         "budget_reconciliation_evidence",
         "effect_observations",
         "operator_intents",
+        "plan_proposals",
     }
+    assert "plan_proposals" in tables
     assert not ({"status", "lane", "task_state", "board_snapshot", "dependencies", "runs"} & columns)
 
 
@@ -308,6 +310,7 @@ def test_migrate_valid_v1_to_v2_preserves_budget_evidence(tmp_path):
         saved = budget_event()
         opened.record_budget_event(SCOPE, saved)
     connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE plan_proposals")
     connection.execute("DROP TABLE budget_reconciliation_evidence")
     connection.execute("DROP TABLE effect_observations")
     connection.execute("UPDATE schema_metadata SET value='1' WHERE key='schema_version'")
@@ -316,7 +319,7 @@ def test_migrate_valid_v1_to_v2_preserves_budget_evidence(tmp_path):
     with EvidenceStore.open(database) as upgraded:
         upgraded.migrate()
         assert upgraded.read_scope(SCOPE)["budget_events"] == (saved,)
-        assert upgraded.connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "3"
+        assert upgraded.connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "4"
 
 
 def test_migrate_valid_v2_to_v3_preserves_operation_evidence(tmp_path):
@@ -325,6 +328,7 @@ def test_migrate_valid_v2_to_v3_preserves_operation_evidence(tmp_path):
         opened.migrate()
         saved = opened.reserve_operation(operation())
     connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE plan_proposals")
     connection.execute("DROP TABLE effect_observations")
     connection.execute("UPDATE schema_metadata SET value='2' WHERE key='schema_version'")
     connection.commit()
@@ -333,7 +337,32 @@ def test_migrate_valid_v2_to_v3_preserves_operation_evidence(tmp_path):
     with EvidenceStore.open(database) as upgraded:
         upgraded.migrate()
         assert upgraded.read_scope(SCOPE)["operations"] == (saved,)
-        assert upgraded.connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "3"
+        assert upgraded.connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "4"
+
+
+def test_migrate_valid_v3_to_v4_preserves_existing_records(tmp_path):
+    database = tmp_path / "v3.sqlite3"
+    with EvidenceStore.open(database, create_new=True) as opened:
+        opened.migrate()
+        saved = opened.reserve_operation(operation())
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE plan_proposals")
+    connection.execute("UPDATE schema_metadata SET value='3' WHERE key='schema_version'")
+    connection.commit()
+    connection.close()
+    with EvidenceStore.open(database) as upgraded:
+        upgraded.migrate()
+        assert upgraded.read_scope(SCOPE)["operations"] == (saved,)
+        assert upgraded.connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "4"
+
+
+def test_plan_evidence_update_and_delete_are_immutable(store):
+    opened, _ = store
+    opened.connection.execute("INSERT INTO plan_proposals VALUES ('board-a', 'anchor-a', 'plan-a', '{}')")
+    with pytest.raises(sqlite3.DatabaseError, match="immutable"):
+        opened.connection.execute("UPDATE plan_proposals SET evidence_json='{}'")
+    with pytest.raises(sqlite3.DatabaseError, match="immutable"):
+        opened.connection.execute("DELETE FROM plan_proposals")
 
 
 def test_migrate_rejects_malformed_v2_before_any_write(tmp_path):
@@ -341,6 +370,7 @@ def test_migrate_rejects_malformed_v2_before_any_write(tmp_path):
     with EvidenceStore.open(database, create_new=True) as opened:
         opened.migrate()
     connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE plan_proposals")
     connection.execute("DROP TABLE effect_observations")
     connection.execute("CREATE TRIGGER surplus_v2_trigger BEFORE INSERT ON budget_events BEGIN SELECT 1; END")
     connection.execute("UPDATE schema_metadata SET value='2' WHERE key='schema_version'")
@@ -363,6 +393,7 @@ def test_migrate_rejects_v1_with_malformed_review_foreign_key_before_any_write(t
     connection.execute("ALTER TABLE review_evidence RENAME TO old_review_evidence")
     connection.execute("CREATE TABLE review_evidence (board_id TEXT NOT NULL, anchor_task_id TEXT NOT NULL, candidate_content_identity TEXT NOT NULL, review_id TEXT NOT NULL, evidence_json TEXT NOT NULL, PRIMARY KEY (board_id, anchor_task_id, review_id))")
     connection.execute("DROP TABLE old_review_evidence")
+    connection.execute("DROP TABLE plan_proposals")
     connection.execute("DROP TABLE budget_reconciliation_evidence")
     connection.execute("DROP TABLE effect_observations")
     connection.execute("UPDATE schema_metadata SET value='1' WHERE key='schema_version'")
@@ -381,6 +412,7 @@ def test_migrate_rejects_v1_with_surplus_index_before_any_write(tmp_path):
     with EvidenceStore.open(database, create_new=True) as opened:
         opened.migrate()
     connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE plan_proposals")
     connection.execute("DROP TABLE budget_reconciliation_evidence")
     connection.execute("DROP TABLE effect_observations")
     connection.execute("CREATE INDEX surplus_v1_index ON budget_events (event_id)")
@@ -812,3 +844,184 @@ def test_store_rejects_stale_or_unproven_pause_clear_without_altering_active_int
             authorized_clear=True,
         )
     assert opened.read_scope(SCOPE)["operator_intent"] == active
+
+
+def _historical_database(tmp_path, version):
+    database = tmp_path / f"historical-v{version}.sqlite3"
+    with EvidenceStore.open(database, create_new=True) as opened:
+        opened.migrate()
+        opened.register_member(ManagedMember("board-a", "anchor-a", "implementation-1", "implementation", 0, ("finding-1",), "work-1"))
+        opened.record_candidate(SCOPE, candidate())
+        opened.record_review(SCOPE, candidate(), review())
+        opened.reserve_operation(operation())
+        opened.record_budget_event(SCOPE, budget_event())
+        opened.set_operator_intent(PauseIntent(SCOPE, "operator", 2, True, True))
+        opened.connection.execute("INSERT INTO budget_reconciliation_evidence VALUES (?, ?, ?, ?, ?)", ("board-a", "anchor-a", "event-1", "fixture", "{}"))
+        opened.connection.commit()
+        opened.record_effect_observation(SCOPE, "hold-1", outcome="unsupported", details="fixture", readback=None)
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE plan_proposals")
+    if version <= 2:
+        connection.execute("DROP TABLE effect_observations")
+    if version == 1:
+        connection.execute("DROP TABLE budget_reconciliation_evidence")
+    connection.execute("UPDATE schema_metadata SET value=? WHERE key='schema_version'", (str(version),))
+    connection.commit()
+    connection.close()
+    return database
+
+
+def _database_snapshot(connection):
+    master = tuple(tuple(row) for row in connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"))
+    tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+    rows = tuple((table, tuple(tuple(row) for row in connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))) for table in tables)
+    return master, rows
+
+
+class _FailingConnection:
+    def __init__(self, connection, failing_sql):
+        self.connection = connection
+        self.failing_sql = failing_sql
+        self.failed = False
+
+    def execute(self, sql, *args):
+        if not self.failed and sql == self.failing_sql:
+            self.failed = True
+            raise sqlite3.OperationalError("injected migration failure")
+        return self.connection.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
+def test_historical_migration_fault_rolls_back_exact_snapshot_then_same_database_retries(tmp_path, version):
+    database = _historical_database(tmp_path, version)
+    opened = EvidenceStore.open(database)
+    connection = opened.connection
+    before = _database_snapshot(connection)
+    from local_first_orchestrator.evidence_store import _PLAN_TRIGGERS
+    proxy = _FailingConnection(connection, _PLAN_TRIGGERS["plan_proposals_immutable_delete"])
+    opened.connection = proxy
+    with pytest.raises(sqlite3.OperationalError, match="injected"):
+        opened.migrate()
+    assert proxy.failed and not connection.in_transaction and opened._migrated is False
+    assert _database_snapshot(connection) == before
+    opened.connection = connection
+    opened.migrate()
+    assert opened._migrated is True
+    assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "4"
+    for table, old_rows in before[1]:
+        if table != "schema_metadata":
+            assert tuple(tuple(row) for row in connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')) == old_rows
+    opened.close()
+
+
+@pytest.mark.parametrize("version,kind", [(1,"trigger"),(2,"trigger"),(3,"trigger"),(1,"index"),(2,"index"),(3,"index")])
+def test_malformed_historical_trigger_or_index_rejected_without_mutation(tmp_path, version, kind):
+    database = _historical_database(tmp_path, version)
+    connection = sqlite3.connect(database)
+    if kind == "trigger":
+        connection.execute("CREATE TRIGGER surplus BEFORE INSERT ON budget_events BEGIN SELECT 1; END")
+    else:
+        connection.execute("CREATE INDEX surplus ON budget_events(event_id)")
+    connection.commit()
+    connection.close()
+    with EvidenceStore.open(database) as opened:
+        before = _database_snapshot(opened.connection)
+        with pytest.raises(SchemaError):
+            opened.migrate()
+        assert _database_snapshot(opened.connection) == before
+        assert opened._migrated is False and not opened.connection.in_transaction
+
+
+def test_final_schema_validation_failure_rolls_back_and_same_database_retries(tmp_path):
+    database = _historical_database(tmp_path, 3)
+    with EvidenceStore.open(database) as opened:
+        before = _database_snapshot(opened.connection)
+        validate = opened._require_schema
+        failed = False
+
+        def fail_after_validation():
+            nonlocal failed
+            validate()
+            if not failed:
+                failed = True
+                raise SchemaError("injected final validation failure")
+
+        opened._require_schema = fail_after_validation
+        with pytest.raises(SchemaError, match="injected final"):
+            opened.migrate()
+        assert failed and not opened.connection.in_transaction and opened._migrated is False
+        assert _database_snapshot(opened.connection) == before
+        opened._require_schema = validate
+        opened.migrate()
+        assert opened._migrated is True
+        assert opened.connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "4"
+        for table, rows in before[1]:
+            if table != "schema_metadata":
+                assert tuple(tuple(row) for row in opened.connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')) == rows
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("object_sql", [
+    "CREATE VIEW surplus_view AS SELECT 1",
+])
+def test_historical_migration_rejects_unexpected_views_before_write(tmp_path, version, object_sql):
+    database = _historical_database(tmp_path, version)
+    connection = sqlite3.connect(database)
+    connection.execute(object_sql)
+    connection.commit()
+    connection.close()
+    with EvidenceStore.open(database) as opened:
+        before = _database_snapshot(opened.connection)
+        with pytest.raises(SchemaError):
+            opened.migrate()
+        assert _database_snapshot(opened.connection) == before
+        assert opened._migrated is False
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("constraint", [
+    "CHECK (generation >= 0)",
+    "CHECK (role COLLATE NOCASE = role)",
+])
+def test_historical_migration_rejects_unrecognized_table_constraints_before_write(tmp_path, version, constraint):
+    database = _historical_database(tmp_path, version)
+    connection = sqlite3.connect(database)
+    sql = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='managed_members'").fetchone()[0]
+    connection.execute("PRAGMA writable_schema=ON")
+    connection.execute("UPDATE sqlite_master SET sql=? WHERE type='table' AND name='managed_members'", (sql[:-1] + ", " + constraint + ")",))
+    connection.execute("PRAGMA writable_schema=OFF")
+    connection.commit()
+    connection.close()
+    with EvidenceStore.open(database) as opened:
+        before = _database_snapshot(opened.connection)
+        with pytest.raises(SchemaError):
+            opened.migrate()
+        assert _database_snapshot(opened.connection) == before
+        assert opened._migrated is False
+
+
+def test_current_schema_read_rejects_unexpected_view_and_modified_table_ddl(tmp_path):
+    database = tmp_path / "malformed-current.sqlite3"
+    with EvidenceStore.open(database, create_new=True) as opened:
+        opened.migrate()
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE VIEW surplus_view AS SELECT 1")
+    connection.commit()
+    connection.close()
+    with EvidenceStore.open(database) as opened:
+        with pytest.raises(SchemaError):
+            opened.read_scope(SCOPE)
+    connection = sqlite3.connect(database)
+    connection.execute("DROP VIEW surplus_view")
+    sql = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='managed_members'").fetchone()[0]
+    connection.execute("PRAGMA writable_schema=ON")
+    connection.execute("UPDATE sqlite_master SET sql=? WHERE type='table' AND name='managed_members'", (sql[:-1] + ", CHECK (generation >= 0))",))
+    connection.execute("PRAGMA writable_schema=OFF")
+    connection.commit()
+    connection.close()
+    with EvidenceStore.open(database) as opened:
+        with pytest.raises(SchemaError):
+            opened.read_scope(SCOPE)
