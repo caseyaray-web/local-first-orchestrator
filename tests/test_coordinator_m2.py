@@ -262,6 +262,44 @@ def test_reserved_final_correction_releases_after_pause_when_root_budget_is_exha
     assert coordinator.pause()["outcome"] == "verified"
     assert coordinator.resume(authorized_clear=True)["outcome"] == "partial"
     assert board.snapshots["task"].native_task["status"] == "ready"
+    assert coordinator.resume(authorized_clear=True)["outcome"] == "verified"
+    final_intent = store.read_scope(SCOPE)["operator_intent"]
+    assert final_intent.active is False
+    assert final_intent.resuming is False
+
+
+@pytest.mark.parametrize("unsafe", ("unknown_effect", "human_edit"))
+def test_completed_reserved_release_refuses_finalization_on_unknown_effect_or_drift(tmp_path, unsafe):
+    store, board, lock_path = setup(tmp_path, state="held")
+    policy = BudgetPolicy(1, 1, 1, 0, 1)
+    coordinator = Coordinator(SCOPE, board=board, store=store, lock=instance_lock(lock_path), budget_policy=policy)
+    correction = Action("separate-review-correction:reserved", SCOPE, {
+        "task_id": "task", "correction_of": "separate-review", "association": "separate-review-correction:separate-review:content:1",
+    }, "create_held", board.snapshots["task"].digest)
+    event = {"event_id": f"{REVIEW_CORRECTIONS}:{correction.key}",
+             "lineage_id": f"anchor:{GENERAL_ATTEMPT}", "root_task_id": "anchor", "finding_id": GENERAL_ATTEMPT,
+             "generation": 0, "source_task_id": "task", "source_kind": "native_operation",
+             "native_source_id": correction.key, "count": 1}
+    reserved = admit_repair_operation(policy, store, SCOPE, coordinator._intent_for(correction), event)
+    store.ack_effect(SCOPE, reserved.key, readback=board.snapshots["task"].to_dict())
+
+    assert coordinator.pause()["outcome"] == "verified"
+    assert coordinator.resume(authorized_clear=True)["outcome"] == "partial"
+    if unsafe == "unknown_effect":
+        unresolved = Action("hold:task:unresolved", SCOPE, {"task_id": "task"}, "hold", "unresolved")
+        store.reserve_operation(coordinator._intent_for(unresolved))
+        store.begin_effect_attempt(SCOPE, unresolved.key)
+        expected_reason = "unknown_effects"
+    else:
+        board.snapshots["task"] = snap("task", "ready", digest="human-edit-after-release")
+        expected_reason = "unsafe_human_edits"
+
+    assert coordinator.resume(authorized_clear=True) == {
+        "outcome": "held", "reason": expected_reason, "actions_attempted": 0,
+    }
+    intent = store.read_scope(SCOPE)["operator_intent"]
+    assert intent.active is True
+    assert intent.resuming is True
 
 
 def test_exhausted_finding_lineage_stops_continued_resume_without_charging_controls(tmp_path):

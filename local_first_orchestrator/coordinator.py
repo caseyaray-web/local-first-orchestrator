@@ -415,8 +415,8 @@ class Coordinator:
             # action identities.  The stored key is the proof identity.
             if intent.resuming:
                 eligible = next((item for item in snapshots if self._state(item) == "blocked" and str(item.native_task["id"]) in state["operator_intent"].resuming_action_keys), None)
-                exhausted = self._resume_budget_exhausted(
-                    state, release_task_id=None if eligible is None else str(eligible.native_task["id"]),
+                exhausted = eligible is not None and self._resume_budget_exhausted(
+                    state, release_task_id=str(eligible.native_task["id"]),
                 )
                 if unknown or exhausted or reconciliation["outcome"] != "verified":
                     reason = "unknown_effects" if unknown else "budget_exhausted" if exhausted else "unsafe_human_edits"
