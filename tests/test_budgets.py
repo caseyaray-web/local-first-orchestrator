@@ -6,13 +6,15 @@ import threading
 from local_first_orchestrator.budgets import (
     BudgetPolicy,
     GENERAL_ATTEMPT,
+    WORKFLOW_REPAIRS,
+    admit_repair_operation,
     classify_run_start,
     explain_exhaustion,
     permit_action,
     record_once,
     remaining,
 )
-from local_first_orchestrator.contracts import ConflictError, ManagedMember
+from local_first_orchestrator.contracts import ConflictError, ManagedMember, OperationIntent
 from local_first_orchestrator.evidence_store import EvidenceStore
 
 
@@ -51,6 +53,35 @@ def event(*, event_id="implementation_attempts:run-1", source_task_id="implement
         "native_source_id": native_source_id,
         "count": 1,
         "run": {"status": "queued"},
+    }
+
+
+def repair_operation(*, key="repair:finding-1:1"):
+    return OperationIntent(
+        key=key,
+        scope=SCOPE,
+        target={"task_id": "implementation-1"},
+        effect="request_review",
+        expected_observed_identity="observed-1",
+        before_evidence={"digest": "before-1"},
+        outcome=None,
+        readback=None,
+        retry={"stable_marker": key},
+        phase="pending",
+    )
+
+
+def repair_event(*, key="repair:finding-1:1", finding_id=GENERAL_ATTEMPT, generation=0):
+    return {
+        "event_id": f"{WORKFLOW_REPAIRS}:{key}",
+        "lineage_id": f"anchor-a:{finding_id}",
+        "root_task_id": "anchor-a",
+        "finding_id": finding_id,
+        "generation": generation,
+        "source_task_id": "implementation-1",
+        "source_kind": "native_operation",
+        "native_source_id": key,
+        "count": 1,
     }
 
 
@@ -244,3 +275,71 @@ def test_per_finding_admission_caps_and_reconciled_charge_do_not_cross_findings(
     with EvidenceStore.open(database) as reopened:
         assert remaining(policy, reopened, SCOPE, "implementation_attempts", finding_id="f1") == 0
         assert remaining(policy, reopened, SCOPE, "implementation_attempts", finding_id="f2") == 0
+
+
+def test_budgeted_repair_operation_reserves_and_charges_once_across_restart(tmp_path):
+    database = tmp_path / "repair-operation.sqlite3"
+    policy = BudgetPolicy(1, 1, 1, 1, 1)
+    with EvidenceStore.open(database, create_new=True) as opened:
+        opened.migrate()
+        opened.register_member(ManagedMember("board-a", "anchor-a", "implementation-1", "implementation", 0, ("finding-1",), "work-1"))
+        reserved = admit_repair_operation(policy, opened, SCOPE, repair_operation(), repair_event(finding_id="finding-1"))
+        assert reserved.phase == "pending"
+        assert remaining(policy, opened, SCOPE, WORKFLOW_REPAIRS, finding_id="finding-1") == 0
+    with EvidenceStore.open(database) as reopened:
+        assert admit_repair_operation(policy, reopened, SCOPE, repair_operation(), repair_event(finding_id="finding-1")) == reserved
+        assert len(reopened.read_scope(SCOPE)["budget_events"]) == 1
+        assert remaining(policy, reopened, SCOPE, WORKFLOW_REPAIRS, finding_id="finding-1") == 0
+
+
+def test_existing_budgeted_repair_admission_is_idempotent_at_cap_but_new_repair_fails(store):
+    policy = BudgetPolicy(1, 1, 1, 1, 1)
+    original = admit_repair_operation(policy, store, SCOPE, repair_operation(), repair_event())
+
+    assert admit_repair_operation(policy, store, SCOPE, repair_operation(), repair_event()) == original
+    with pytest.raises(ConflictError, match="exhausted"):
+        admit_repair_operation(
+            policy, store, SCOPE, repair_operation(key="repair:finding-1:2"), repair_event(key="repair:finding-1:2"),
+        )
+    assert len(store.read_scope(SCOPE)["operations"]) == 1
+
+
+def test_atomic_repair_operation_admission_allows_only_one_new_key_at_cap(tmp_path):
+    database = tmp_path / "atomic-repair-operation.sqlite3"
+    policy = BudgetPolicy(1, 1, 1, 1, 1)
+    with EvidenceStore.open(database, create_new=True) as opened:
+        opened.migrate()
+        opened.register_member(ManagedMember("board-a", "anchor-a", "implementation-1", "implementation", 0, (), "work-1"))
+    barrier = threading.Barrier(2)
+    results: list[object] = []
+
+    def admit(key: str) -> None:
+        with EvidenceStore.open(database) as concurrent:
+            barrier.wait()
+            try:
+                results.append(admit_repair_operation(policy, concurrent, SCOPE, repair_operation(key=key), repair_event(key=key)))
+            except BaseException as error:
+                results.append(error)
+
+    threads = [threading.Thread(target=admit, args=(key,)) for key in ("repair:general:1", "repair:general:2")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert sum(isinstance(result, OperationIntent) for result in results) == 1
+    assert sum(isinstance(result, ConflictError) for result in results) == 1
+    with EvidenceStore.open(database) as reopened:
+        assert len(reopened.read_scope(SCOPE)["operations"]) == 1
+        assert len(reopened.read_scope(SCOPE)["budget_events"]) == 1
+
+
+def test_exhausted_repair_budget_does_not_block_unbudgeted_operator_containment(store):
+    policy = BudgetPolicy(1, 1, 1, 0, 1)
+    with pytest.raises(ConflictError, match="exhausted"):
+        admit_repair_operation(policy, store, SCOPE, repair_operation(), repair_event())
+
+    containment = OperationIntent(
+        **{**repair_operation(key="hold:implementation-1:observed-1").to_dict(), "effect": "hold_task"}
+    )
+    assert store.reserve_operation(containment) == containment
+    assert store.read_scope(SCOPE)["budget_events"] == ()

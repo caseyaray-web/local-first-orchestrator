@@ -4,7 +4,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from typing import Any, Callable, Mapping
 
-from .budgets import BudgetPolicy, WORKFLOW_REPAIRS, permit_action
+from .budgets import GENERAL_ATTEMPT, BudgetPolicy, WORKFLOW_REPAIRS, permit_action
 from .contracts import Action, ActionResult, BoardSnapshot, OperationIntent, PauseIntent, validate_scope
 from .daemon import InstanceLock
 from .operator_controls import (
@@ -125,6 +125,14 @@ class Coordinator:
     def _apply(self, action: Action) -> ActionResult:
         """Fence every durable write and acknowledge only an exact readback."""
         self._assert_lock()
+        if action.effect == "stop_run":
+            task_id, run_id = action.target.get("task_id"), action.target.get("run_id")
+            if isinstance(task_id, str) and isinstance(run_id, str):
+                observed = self.board.read_task(task_id)
+                matching = next((run for run in observed.runs if run.get("id") == run_id), None)
+                if (observed.digest != action.expected_observed_identity or matching is None
+                        or matching.get("stop_supported") in {False, "false"}):
+                    return ActionResult(action.key, "unsupported", "exact native stop capability is unavailable", observed.to_dict())
         try:
             stored = self.store.reserve_operation(self._intent_for(action))
         except Exception as error:
@@ -160,13 +168,95 @@ class Coordinator:
         return Action(intent.key, intent.scope, intent.target, intent.effect, intent.expected_observed_identity)
 
     def _verified_applied_digests(self, state: Mapping[str, Any]) -> dict[str, str]:
+        """Return exact native digests, including a verified partial hold.
+
+        A blocked task can still have an active worker, so that hold cannot ack as
+        full containment.  Its immutable verified readback nevertheless explains
+        the native digest and must not be mistaken for a human edit.
+        """
         digests: dict[str, str] = {}
-        for intent in state["operations"]:
+        operations = {intent.key: intent for intent in state["operations"]}
+        for intent in operations.values():
             snapshot = self._snapshot_from_readback(intent.readback)
             task_id = intent.target.get("task_id")
             if intent.phase == "applied" and snapshot is not None and isinstance(task_id, str) and snapshot.native_task.get("id") == task_id:
                 digests[task_id] = snapshot.digest
+        for observation in state["effect_observations"]:
+            intent = operations.get(observation.get("operation_key"))
+            snapshot = self._snapshot_from_readback(observation.get("readback"))
+            if (intent is not None and intent.effect == "hold" and observation.get("outcome") in {"verified", "no-op"}
+                    and snapshot is not None and snapshot.native_task.get("id") == intent.target.get("task_id")
+                    and self._state(snapshot) == "blocked"):
+                digests[str(intent.target["task_id"])] = snapshot.digest
         return digests
+
+    def _unresolved_action(self, action: Action) -> bool:
+        """Never replay an ambiguous target under a fresh observation key."""
+        return any(
+            intent.effect == action.effect and dict(intent.target) == dict(action.target)
+            for intent in self.store.pending_operations(self.scope)
+        )
+
+    def _next_unresolved_safe_action(self, actions: tuple[Action, ...]) -> Action | None:
+        return next((action for action in actions if not self._unresolved_action(action)), None)
+
+    def _resuming_phase_is_exact(self, state: Mapping[str, Any], snapshots: tuple[BoardSnapshot, ...],
+                                  intent: PauseIntent) -> bool:
+        """Accept only the persisted held/released mixture during a release phase."""
+        members = {member.task_id for member in state["members"]
+                   if member.board_id == self.scope["board_id"] and member.anchor_task_id == self.scope["anchor_task_id"]}
+        if not members or set(intent.managed_task_ids) != members or set(intent.baseline_digests) != members:
+            return False
+        if set(intent.resuming_task_ids) != members or set(intent.resuming_action_keys) != members:
+            return False
+        observed = {str(snapshot.native_task.get("id")): snapshot for snapshot in snapshots}
+        releases = {operation.key: operation for operation in state["operations"]
+                    if operation.effect == "release" and operation.phase == "applied"}
+        held_digests = {
+            str(operation.target["task_id"]): proof.digest
+            for operation in state["operations"]
+            if operation.effect == "hold" and operation.phase == "applied"
+            and operation.expected_observed_identity == intent.baseline_digests.get(str(operation.target.get("task_id")))
+            and (proof := self._snapshot_from_readback(operation.readback)) is not None
+            and proof.native_task.get("id") == operation.target.get("task_id")
+            and self._state(proof) == "blocked"
+        }
+        for task_id in members:
+            snapshot = observed.get(task_id)
+            if snapshot is None or any(
+                not isinstance(run.get("status"), str) or run.get("status") not in {
+                    "active", "claimed", "running", "stopping", "cancelled", "completed", "done", "stopped"
+                }
+                for run in snapshot.runs
+            ) or any(run.get("status") in {"active", "claimed", "running", "stopping"} for run in snapshot.runs):
+                return False
+            status = self._state(snapshot)
+            key = intent.resuming_action_keys[task_id]
+            operation = releases.get(key)
+            if status == "blocked":
+                if operation is not None or snapshot.digest != held_digests.get(task_id, intent.baseline_digests[task_id]):
+                    return False
+                continue
+            if status not in {"ready", "todo"} or operation is None or dict(operation.target) != {"task_id": task_id}:
+                return False
+            proof = self._snapshot_from_readback(operation.readback)
+            if proof is None or proof.native_task.get("id") != task_id or proof.digest != snapshot.digest:
+                return False
+        return True
+
+    def _resume_budget_exhausted(self, state: Mapping[str, Any]) -> bool:
+        """A release gate covers general and every managed finding lineage."""
+        if self.budget_policy is None:
+            return False
+        finding_ids = {GENERAL_ATTEMPT}
+        finding_ids.update(
+            finding_id
+            for member in state["members"]
+            if member.board_id == self.scope["board_id"] and member.anchor_task_id == self.scope["anchor_task_id"]
+            for finding_id in member.finding_ids
+        )
+        return any(not permit_action(self.budget_policy, self.store, self.scope, WORKFLOW_REPAIRS, finding_id=finding_id)
+                   for finding_id in finding_ids)
 
     def _reconcile_unknown_effects(self) -> None:
         verifier = getattr(self.board, "verify_effect", None)
@@ -200,15 +290,17 @@ class Coordinator:
             if not same_active:
                 self.store.set_operator_intent(intent)  # must precede any effect
             results: list[ActionResult] = []
-            if (not same_active or apply_existing) and planned.actions:
-                results.append(self._apply(planned.actions[0]))
+            action = self._next_unresolved_safe_action(planned.actions) if (not same_active or apply_existing) else None
+            if action is not None:
+                results.append(self._apply(action))
             if stop and results and results[0].outcome in {"unsupported", "unknown"}:
                 # Exact stop remains unproven.  Escalate only to an available hold;
                 # do not replay or describe the unsupported run stop as success.
                 fallback = plan_pause(self.scope, False, generation=generation, cancellation=cancellation,
                                       members=state["members"], snapshots=self._read()).actions
-                if fallback:
-                    results.append(self._apply(fallback[0]))
+                next_fallback = self._next_unresolved_safe_action(fallback)
+                if next_fallback is not None:
+                    results.append(self._apply(next_fallback))
             after = self._read()
             contained = verify_containment(self.scope, state["members"], after, (), pause_intent=intent,
                                            prior_snapshots=before, effect_results=tuple(results))
@@ -225,6 +317,17 @@ class Coordinator:
         self._reconcile_unknown_effects()
         state, snapshots = self.store.read_scope(self.scope), self._read()
         intent = state["operator_intent"]
+        if intent is not None and intent.resuming:
+            exact = self._resuming_phase_is_exact(state, snapshots, intent)
+            if not exact:
+                decision = reconcile_operator_edits(self.scope, state["members"], (), snapshots, (), review_evidence=state["reviews"], pause_intent=intent)
+                return {"outcome": "partial" if self.store.pending_operations(self.scope) else "conflict",
+                        "report": decision.report, "actions_attempted": 0, "operator_intent": intent}
+            decision = ReconciliationDecision("verified", (), reconcile_operator_edits(
+                self.scope, state["members"], (), snapshots, (), review_evidence=state["reviews"], pause_intent=intent,
+            ).report)
+            return {"outcome": "partial" if self.store.pending_operations(self.scope) else "verified",
+                    "report": decision.report, "actions_attempted": 0, "operator_intent": intent}
         if intent is not None and intent.active and native_digest_mismatches(
             self.scope, state["members"], snapshots, intent,
             verified_applied_digests=self._verified_applied_digests(state),
@@ -232,10 +335,7 @@ class Coordinator:
             decision = reconcile_operator_edits(self.scope, state["members"], (), snapshots, (), review_evidence=state["reviews"], pause_intent=intent)
             return {"outcome": "conflict", "report": decision.report, "actions_attempted": 0, "operator_intent": intent}
         decision = reconcile_operator_edits(self.scope, state["members"], (), snapshots, (), candidate_evidence=(), review_evidence=state["reviews"], pause_intent=intent)
-        # A durable resuming phase deliberately contains a mix of held and released
-        # members; exact baseline/readback checks above make that transition safe.
-        outcome = "verified" if intent is not None and intent.resuming and not self.store.pending_operations(self.scope) else decision.outcome
-        return {"outcome": "partial" if self.store.pending_operations(self.scope) else outcome,
+        return {"outcome": "partial" if self.store.pending_operations(self.scope) else decision.outcome,
                 "report": decision.report, "actions_attempted": 0, "operator_intent": intent}
 
     def reconcile(self) -> dict[str, Any]:
@@ -249,13 +349,19 @@ class Coordinator:
             self._assert_lock()
             reconciliation = self._reconcile_locked()
             state = self.store.read_scope(self.scope)
+            intent = state["operator_intent"]
+            if intent is None or not intent.active:
+                return {"outcome": "held", "reason": "no_active_pause_to_clear", "actions_attempted": 0}
             unknown = bool(self.store.pending_operations(self.scope))
-            exhausted = bool(self.budget_policy and not permit_action(self.budget_policy, self.store, self.scope, WORKFLOW_REPAIRS))
+            exhausted = self._resume_budget_exhausted(state)
             safe = ReconciliationDecision("verified", (), reconciliation["report"]) if reconciliation["outcome"] == "verified" else None
             snapshots = self._read()
             # Continue a persisted multi-member release without generating fresh
             # action identities.  The stored key is the proof identity.
-            if state["operator_intent"].resuming:
+            if intent.resuming:
+                if unknown or exhausted or reconciliation["outcome"] != "verified":
+                    reason = "unknown_effects" if unknown else "budget_exhausted" if exhausted else "unsafe_human_edits"
+                    return {"outcome": "held", "reason": reason, "actions_attempted": 0}
                 eligible = next((item for item in snapshots if self._state(item) == "blocked" and str(item.native_task["id"]) in state["operator_intent"].resuming_action_keys), None)
                 if eligible is not None:
                     task_id = str(eligible.native_task["id"])
@@ -306,8 +412,6 @@ class Coordinator:
                 reconciliation = self._reconcile_locked()
                 if reconciliation["outcome"] in {"conflict", "unknown"}:
                     return {"outcome": "held", "actions_attempted": 0, "reason": reconciliation["outcome"]}
-                if self.store.pending_operations(self.scope):
-                    return {"outcome": "partial", "actions_attempted": 0, "reason": "unresolved_effect_intent"}
                 if state["operator_intent"].resuming:
                     # A normal poll must not re-hold members released by an
                     # explicitly authorized, durable multi-member resume.

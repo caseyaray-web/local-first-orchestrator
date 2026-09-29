@@ -8,9 +8,9 @@ proven native effect may consume one configured unit.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
-from .contracts import ConflictError, validate_scope
+from .contracts import ConflictError, OperationIntent, validate_scope
 
 GENERAL_ATTEMPT = "__general_attempt__"
 IMPLEMENTATION_ATTEMPTS = "implementation_attempts"
@@ -61,6 +61,15 @@ class BudgetPolicy:
 
     def record_once(self, store: Any, scope: Mapping[str, Any], event: Mapping[str, Any]) -> bool:
         return record_once(store, scope, event, policy=self)
+
+    def admit_repair_operation(
+        self,
+        store: Any,
+        scope: Mapping[str, Any],
+        intent: OperationIntent,
+        event: Mapping[str, Any],
+    ) -> OperationIntent:
+        return admit_repair_operation(self, store, scope, intent, event)
 
     def permit_action(
         self,
@@ -177,6 +186,51 @@ def record_once(store: Any, scope: Mapping[str, Any], event: Mapping[str, Any], 
                 if previous["root_task_id"] == stored["root_task_id"] and previous["finding_id"] == stored["finding_id"] and _event_category(previous) == _event_category(stored):
                     return False
         raise error
+
+
+def admit_repair_operation(
+    policy: BudgetPolicy,
+    store: Any,
+    scope: Mapping[str, Any],
+    intent: OperationIntent,
+    event: Mapping[str, Any],
+) -> OperationIntent:
+    """Atomically reserve one future repair effect and consume its finite unit.
+
+    This is deliberately separate from :func:`record_once`: a repair operation
+    must be admitted before native I/O, whereas ``record_once`` records an
+    observed native run after its conservative start classification.  M2
+    containment, read-only reconciliation, and authorized resume do not call
+    this API and remain usable when repair capacity is exhausted.
+    """
+
+    if not isinstance(policy, BudgetPolicy):
+        raise ValueError("budgeted repair admission requires an explicit BudgetPolicy")
+    valid_scope = validate_scope(scope)
+    if not isinstance(intent, OperationIntent) or validate_scope(intent.scope) != valid_scope:
+        raise ValueError("budgeted repair operation must have the exact requested scope")
+    if not isinstance(event, Mapping):
+        raise ValueError("budgeted repair operation requires a budget event")
+    task_id = intent.target.get("task_id")
+    required = {
+        "event_id", "lineage_id", "root_task_id", "finding_id", "generation",
+        "source_task_id", "source_kind", "native_source_id", "count",
+    }
+    if set(event) != required or not isinstance(task_id, str) or not task_id:
+        raise ValueError("budgeted repair operation requires exact operation attribution")
+    if (
+        _event_category(event) != WORKFLOW_REPAIRS
+        or event["event_id"] != f"{WORKFLOW_REPAIRS}:{intent.key}"
+        or event["source_kind"] != "native_operation"
+        or event["native_source_id"] != intent.key
+        or event["source_task_id"] != task_id
+        or event["count"] != 1
+    ):
+        raise ValueError("budgeted repair operation event must exactly bind its operation key and task")
+    reserve = getattr(store, "reserve_budgeted_repair_operation", None)
+    if not callable(reserve):
+        raise ValueError("budgeted repair admission requires durable operation reservation")
+    return cast(OperationIntent, reserve(intent, dict(event), policy_limit=policy.limit(WORKFLOW_REPAIRS)))
 
 
 def remaining(

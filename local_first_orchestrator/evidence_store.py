@@ -548,6 +548,89 @@ class EvidenceStore:
             raise
         return intent
 
+    def reserve_budgeted_repair_operation(
+        self, intent: OperationIntent, event: Mapping[str, Any], *, policy_limit: int,
+    ) -> OperationIntent:
+        """Atomically reserve a classified repair operation and its one-unit charge."""
+        self._require_schema()
+        board, anchor = _scope_values(intent.scope)
+        if not isinstance(policy_limit, int) or isinstance(policy_limit, bool) or policy_limit < 0:
+            raise ValueError("budget policy limit must be a non-negative integer")
+        required = {"event_id", "lineage_id", "root_task_id", "finding_id", "generation", "source_task_id", "source_kind", "native_source_id", "count"}
+        if not isinstance(event, Mapping) or set(event) != required:
+            raise ValueError("budget event has an invalid attribution shape")
+        if not all(_nonempty_string(event[field]) for field in ("event_id", "lineage_id", "root_task_id", "finding_id", "source_task_id", "source_kind", "native_source_id")):
+            raise ValueError("budget event requires non-empty identity and source")
+        if event["source_kind"] != "native_operation" or event["count"] != 1:
+            raise ValueError("budgeted repair event requires one native operation source")
+        if not isinstance(event["generation"], int) or isinstance(event["generation"], bool) or event["generation"] < 0:
+            raise ValueError("budget event generation must be a non-negative integer")
+        if event["root_task_id"] != anchor or event["lineage_id"] != f"{anchor}:{event['finding_id']}":
+            raise ConflictError("budgeted repair event has conflicting root or lineage")
+        if event["native_source_id"] != intent.key:
+            raise ConflictError("budgeted repair event must bind the reserved operation key")
+        task_id = intent.target.get("task_id")
+        if not isinstance(task_id, str) or task_id != event["source_task_id"]:
+            raise ConflictError("budgeted repair event must bind the reserved operation task")
+        member = self.connection.execute(
+            "SELECT generation, finding_ids_json FROM managed_members WHERE board_id = ? AND anchor_task_id = ? AND task_id = ?",
+            (board, anchor, task_id),
+        ).fetchone()
+        if member is None or member["generation"] != event["generation"]:
+            raise ConflictError("budgeted repair event does not match a registered member generation")
+        if event["finding_id"] != "__general_attempt__" and event["finding_id"] not in _decode(member["finding_ids_json"]):
+            raise ConflictError("budgeted repair event finding is not associated with source member")
+        operation_payload, event_payload = _json(intent.to_dict()), _json(dict(event))
+        category = event["event_id"].split(":", 1)[0]
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT intent_json FROM operation_intents WHERE board_id = ? AND anchor_task_id = ? AND operation_key = ?",
+                (board, anchor, intent.key),
+            ).fetchone()
+            if row is not None:
+                stored = OperationIntent.from_dict(_decode(row[0]))
+                stored_identity, requested_identity = stored.to_dict(), intent.to_dict()
+                for field in ("outcome", "readback", "phase"):
+                    stored_identity.pop(field)
+                    requested_identity.pop(field)
+                if stored_identity != requested_identity:
+                    raise ConflictError("operation key conflicts with existing intent")
+                charge = self.connection.execute(
+                    "SELECT event_json FROM budget_events WHERE board_id = ? AND anchor_task_id = ? AND event_id = ?",
+                    (board, anchor, event["event_id"]),
+                ).fetchone()
+                if charge is None or charge["event_json"] != event_payload:
+                    raise ConflictError("existing repair operation lacks its exact budget admission")
+                self.connection.commit()
+                return stored
+            source = self.connection.execute(
+                "SELECT 1 FROM budget_events WHERE board_id = ? AND anchor_task_id = ? AND source_kind = ? AND native_source_id = ?",
+                (board, anchor, "native_operation", intent.key),
+            ).fetchone()
+            if source is not None:
+                raise ConflictError("budgeted repair operation key already has immutable source evidence")
+            category_events = tuple(
+                (stored["event_id"], stored)
+                for stored in (_decode(row[0]) for row in self.connection.execute("SELECT event_json FROM budget_events WHERE board_id = ? AND anchor_task_id = ?", (board, anchor)))
+                if stored["finding_id"] == event["finding_id"] and stored["event_id"].split(":", 1)[0] == category
+            )
+            reconciled_ids = {row[0] for row in self.connection.execute(
+                "SELECT event_id FROM budget_reconciliation_evidence WHERE board_id = ? AND anchor_task_id = ? AND evidence_kind = 'pre_start_proof'",
+                (board, anchor),
+            )}
+            charged = sum(stored["count"] for _, stored in category_events)
+            released = sum(stored["count"] for event_id, stored in category_events if event_id in reconciled_ids)
+            if charged - released + 1 > policy_limit:
+                raise ConflictError("budget policy limit is exhausted")
+            self.connection.execute("INSERT INTO operation_intents VALUES (?, ?, ?, ?)", (board, anchor, intent.key, operation_payload))
+            self.connection.execute("INSERT INTO budget_events VALUES (?, ?, ?, ?, ?, ?)", (board, anchor, event["event_id"], "native_operation", intent.key, event_payload))
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
+        return intent
+
     def _operation(self, scope: Mapping[str, Any], key: str) -> OperationIntent:
         board, anchor = _scope_values(scope)
         row = self.connection.execute(
