@@ -248,6 +248,25 @@ def test_create_held_accepts_exact_bounded_replacement_review_association(fake_r
     assert len([call for call in mutations(fake_runner) if call[4] == "create"]) == 1
 
 
+def test_create_held_accepts_only_exact_separate_review_correction_association(fake_runner, tmp_path):
+    fake_runner.add("anchor-1", status="ready")
+    board = adapter(fake_runner, tmp_path, create_lock_assertion=lambda *_: None)
+    target = {
+        "anchor_task_id": "anchor-1", "native_parent": False,
+        "source_task_id": "separate-review", "correction_of": "separate-review",
+        "candidate": {"content_identity": "candidate-content"},
+        "review_id": "review-1", "finding_id": "finding-1",
+        "association": "separate-review-correction:separate-review:candidate-content:finding-1",
+    }
+    valid = action(board, "correction", "create_held", target)
+    result = board.create_held(valid, title="correction", body="body", assignee="implementer",
+                               workspace="dir:/candidate", idempotency_key="correction")
+    assert result.outcome == "verified" and result.readback is not None and result.readback["parents"] == ()
+    invalid = action(board, "other-correction", "create_held", {**target, "finding_id": "other"})
+    assert board.create_held(invalid, title="correction", body="body", assignee="implementer",
+                             workspace="dir:/candidate", idempotency_key="other-correction").outcome == "conflict"
+
+
 def test_unknown_store_associated_create_reconciles_by_exact_marker_without_resend(fake_runner, tmp_path):
     fake_runner.add("anchor-1", status="ready")
     fake_runner.create_returncode_after_effect = 1

@@ -456,6 +456,8 @@ class Coordinator:
                 source = self.board.read_task(member.task_id)
                 if not isinstance(source, BoardSnapshot) or self._state(source) != "done":
                     continue
+                if not any(str(run.get("id")) == candidate.originating_run_id for run in source.runs):
+                    continue
                 # A completed card is only premature when the exact observed
                 # candidate has no recorded local approval.  Native done by
                 # itself is never proof, but a prior verified verdict must not
@@ -492,6 +494,51 @@ class Coordinator:
                 return {"outcome": "held", "actions_attempted": 1, "task_id": recovered["task_id"]}
             return {"outcome": "held", "actions_attempted": 0,
                     "reason": recovered.get("reason", "premature_done_recovery_unverified")}
+        for saved in state["reviews"]:
+            if saved.get("verdict") != "changes_requested" or saved.get("candidate_identity") != candidate.to_dict():
+                continue
+            native = saved.get("native_review")
+            review_task_id = native.get("task_id") if isinstance(native, Mapping) else None
+            if not isinstance(review_task_id, str) or self._separate_review_intent(review_task_id, candidate, reviewer) is None:
+                continue
+            created = self.create_separate_correction(review_task_id, candidate, saved, already_locked=True)
+            if created.get("task_id"):
+                return {"outcome": "held", "actions_attempted": 1, "task_id": created["task_id"]}
+            if created.get("reason") != "correction_already_registered":
+                return {"outcome": "held", "actions_attempted": 0, "reason": created.get("reason", "correction_unverified")}
+        for member in state["members"]:
+            if member.role != "local_review":
+                continue
+            create = self._separate_review_intent(member.task_id, candidate, reviewer)
+            if create is None:
+                continue
+            current = self.board.read_task(member.task_id)
+            if not isinstance(current, BoardSnapshot) or self._state(current) != "blocked":
+                continue
+            result = self.release_separate_review(member.task_id, candidate, reviewer_profile=reviewer,
+                                                  already_locked=True)
+            if result.get("outcome") == "released":
+                return {"outcome": "released", "actions_attempted": 1, "task_id": member.task_id}
+            return {"outcome": "held", "actions_attempted": 0, "reason": result.get("reason", "release_unverified")}
+        for member in state["members"]:
+            if member.role != "implementation" or not member.work_association.startswith("separate-review-correction:"):
+                continue
+            before = self.board.read_task(member.task_id)
+            if not isinstance(before, BoardSnapshot) or self._state(before) != "blocked":
+                continue
+            creates = [item for item in self.store.read_scope(self.scope)["operations"]
+                       if item.effect == "create_held" and item.phase == "applied"
+                       and item.target.get("association") == member.work_association
+                       and (proof := self._snapshot_from_readback(item.readback)) is not None
+                       and proof.native_task.get("id") == member.task_id]
+            if len(creates) != 1 or not self._trusted_candidate_observation(candidate):
+                return {"outcome": "held", "actions_attempted": 0, "reason": "correction_release_provenance_missing"}
+            action = Action(f"release-correction:{creates[0].key}", self.scope,
+                            {"task_id": member.task_id}, "release", before.digest)
+            result = self._apply(action)
+            if result.outcome not in {"verified", "no-op"} or not self._readback_proves(action, result):
+                return {"outcome": "held", "actions_attempted": 1, "reason": "correction_release_unverified"}
+            return {"outcome": "released", "actions_attempted": 1, "task_id": member.task_id}
         return None
 
     def tick(self) -> dict[str, Any]:
@@ -704,6 +751,112 @@ class Coordinator:
             self.store.register_member(review_member)
             return {"outcome": "held", "task_id": review_member.task_id}
 
+    def create_separate_correction(self, review_task_id: str, candidate: Any, review: Mapping[str, Any],
+                                   *, already_locked: bool = False) -> dict[str, Any]:
+        """Preserve a completed separate review's finding as one held implementation card."""
+        from .contracts import CandidateIdentity, ManagedMember
+        implementer, reviewer = self._local_review_roles()
+        if not isinstance(candidate, CandidateIdentity) or not isinstance(review, Mapping):
+            raise ValueError("candidate and stored separate review are required")
+        self._managed_task(review_task_id)
+        with (nullcontext() if already_locked else self.lock):
+            self._assert_lock()
+            pause = self.store.read_scope(self.scope)["operator_intent"]
+            if pause is not None and pause.active:
+                return {"outcome": "held", "reason": "operator_pause_or_cancellation_active"}
+            state = self.store.read_scope(self.scope)
+            if not any(saved == dict(review) for saved in state["reviews"]):
+                return {"outcome": "held", "reason": "recorded_separate_changes_missing"}
+            native = review.get("native_review")
+            findings = review.get("findings")
+            if (review.get("verdict") != "changes_requested" or not isinstance(native, Mapping)
+                    or native.get("task_id") != review_task_id or native.get("profile") != reviewer
+                    or not isinstance(native.get("run_id"), str) or not isinstance(native.get("session_id"), str)
+                    or review.get("candidate_identity") != candidate.to_dict()
+                    or not isinstance(findings, list) or not findings
+                    or not all(isinstance(item, Mapping) and isinstance(item.get("finding_id"), str)
+                               and item.get("finding_id") and isinstance(item.get("summary"), str) for item in findings)):
+                return {"outcome": "held", "reason": "exact_correction_finding_required"}
+            finding_ids = tuple(sorted(item["finding_id"] for item in findings))
+            if len(set(finding_ids)) != len(finding_ids):
+                return {"outcome": "held", "reason": "duplicate_correction_finding"}
+            finding_id = finding_ids[0]
+            association = f"separate-review-correction:{review_task_id}:{candidate.content_identity}:{finding_id}"
+            if any(member.work_association == association for member in state["members"]):
+                return {"outcome": "held", "reason": "correction_already_registered"}
+            if (self._separate_review_intent(review_task_id, candidate, reviewer) is None
+                    or not self._verified_separate_review(review_task_id, candidate, reviewer,
+                                                          native.get("run_id"), native.get("session_id"))
+                    or not self._frozen_candidate(candidate, review)):
+                return {"outcome": "held", "reason": "terminal_separate_review_or_freeze_missing"}
+            if self.budget_policy is None:
+                return {"outcome": "held", "reason": "finite_correction_budget_required"}
+            anchor = self.board.read_task(self.scope["anchor_task_id"])
+            if not isinstance(anchor, BoardSnapshot):
+                return {"outcome": "held", "reason": "anchor_read_unavailable"}
+            canonical = json.dumps({"scope": self.scope, "review_task_id": review_task_id,
+                                    "review_id": review["review_id"], "candidate": candidate.to_dict(),
+                                    "finding_id": finding_id}, sort_keys=True, separators=(",", ":"))
+            key = "separate-review-correction:" + hashlib.sha256(canonical.encode()).hexdigest()
+            action = Action(key, self.scope, {
+                "anchor_task_id": self.scope["anchor_task_id"], "task_id": review_task_id,
+                "source_task_id": review_task_id, "correction_of": review_task_id,
+                "candidate": candidate.to_dict(), "finding_id": finding_id,
+                "review_id": review["review_id"], "reviewer_profile": implementer,
+                "association": association, "native_parent": False,
+                "create_title": f"Correction: {review_task_id}",
+                "create_body": "\n".join(f"Finding {item['finding_id']}: {item['summary']}" for item in findings),
+                "create_workspace": candidate.worktree, "create_idempotency_key": key,
+            }, "create_held", anchor.digest)
+            member = next(member for member in state["members"] if member.task_id == review_task_id)
+            event = {"event_id": f"{REVIEW_CORRECTIONS}:{key}",
+                     "lineage_id": f"{self.scope['anchor_task_id']}:{GENERAL_ATTEMPT}",
+                     "root_task_id": self.scope["anchor_task_id"], "finding_id": GENERAL_ATTEMPT,
+                     "generation": member.generation, "source_task_id": review_task_id,
+                     "source_kind": "native_operation", "native_source_id": key, "count": 1}
+            try:
+                stored = admit_repair_operation(self.budget_policy, self.store, self.scope,
+                                                self._intent_for(action), event)
+            except Exception as error:
+                return {"outcome": "held", "reason": str(error)}
+            if stored.phase == "unknown":
+                verifier = getattr(self.board, "verify_effect", None)
+                possible = verifier(action) if callable(verifier) else None
+                result = possible if isinstance(possible, ActionResult) else ActionResult(key, "unsupported", "marker verifier unavailable", None)
+                readback = self._portable_readback(result.readback)
+                self.store.record_effect_observation(self.scope, key, outcome=result.outcome,
+                                                     details=result.details, readback=readback)
+                if result.outcome not in {"verified", "no-op"} or not self._readback_proves(action, result):
+                    return {"outcome": "held", "reason": "durable_correction_create_unknown"}
+                assert readback is not None
+                stored = self.store.ack_effect(self.scope, key, readback=readback, outcome=result.outcome)
+            if stored.phase == "applied":
+                created = self._snapshot_from_readback(stored.readback)
+            else:
+                if getattr(self.board, "is_fake", False):
+                    self.store.begin_effect_attempt(self.scope, key)
+                try:
+                    result = self.board.create_held(action, title=action.target["create_title"],
+                                                    body=action.target["create_body"], assignee=implementer,
+                                                    workspace=candidate.worktree, idempotency_key=key)
+                except Exception as error:
+                    result = ActionResult(key, "unknown", f"native correction create exception: {error}", None)
+                readback = self._portable_readback(result.readback)
+                self.store.record_effect_observation(self.scope, key, outcome=result.outcome,
+                                                     details=result.details, readback=readback)
+                created = self._snapshot_from_readback(readback)
+                if (result.outcome not in {"verified", "no-op"} or created is None
+                        or not self._readback_proves(action, result)):
+                    return {"outcome": "held", "reason": "correction_create_unverified"}
+                self.store.ack_effect(self.scope, key, readback=created.to_dict(), outcome=result.outcome)
+            if created is None or self._state(created) != "blocked" or created.parents:
+                return {"outcome": "held", "reason": "correction_create_readback_invalid"}
+            registered = ManagedMember(self.scope["board_id"], self.scope["anchor_task_id"],
+                                       str(created.native_task["id"]), "implementation", member.generation + 1,
+                                       finding_ids, association)
+            self.store.register_member(registered)
+            return {"outcome": "held", "task_id": registered.task_id}
+
     def _trusted_candidate_observation(self, candidate: Any) -> bool:
         if self.git_observer is None:
             return False
@@ -845,7 +998,8 @@ class Coordinator:
                    and item.target.get("native_parent") is False]
         return matches[0] if len(matches) == 1 else None
 
-    def release_separate_review(self, task_id: str, candidate: Any, *, reviewer_profile: str) -> dict[str, Any]:
+    def release_separate_review(self, task_id: str, candidate: Any, *, reviewer_profile: str,
+                                already_locked: bool = False) -> dict[str, Any]:
         """Release one exact held recovery review for native reviewer dispatch."""
         from .contracts import CandidateIdentity
         _, configured_reviewer = self._local_review_roles()
@@ -854,7 +1008,7 @@ class Coordinator:
         if reviewer_profile != configured_reviewer:
             raise ValueError("replacement review profile must match configured local-review role")
         self._managed_task(task_id)
-        with self.lock:
+        with (nullcontext() if already_locked else self.lock):
             self._assert_lock()
             pause = self.store.read_scope(self.scope)["operator_intent"]
             if pause is not None and pause.active:
@@ -872,7 +1026,7 @@ class Coordinator:
             return {"outcome": "released", "task_id": task_id}
 
     def _verified_separate_review(self, task_id: str, candidate: Any, expected_profile: str,
-                                  run_id: str, session_id: str) -> bool:
+                                  run_id: str, session_id: str, *, changes_requested: bool = False) -> bool:
         try:
             configured_implementation, configured_reviewer = self._local_review_roles()
         except ValueError:
@@ -891,7 +1045,8 @@ class Coordinator:
             reviewed = self.board.read_task(task_id)
         except Exception:
             return False
-        if (not isinstance(reviewed, BoardSnapshot) or self._state(reviewed) != "done"
+        expected_state = "running" if changes_requested else "done"
+        if (not isinstance(reviewed, BoardSnapshot) or self._state(reviewed) != expected_state
                 or reviewed.native_task.get("assignee") != expected_profile
                 or source_run.get("profile") != configured_implementation
                 or create.target.get("source_profile") != configured_implementation
@@ -902,9 +1057,14 @@ class Coordinator:
                   and str(event.get("run_id")) == run_id and isinstance(event.get("payload"), Mapping)
                   and event["payload"].get("source_status") == "ready"]
         completions = [event for event in reviewed.events if event.get("kind") == "completed" and str(event.get("run_id")) == run_id]
+        reviewer_session = (self._active_worker_session(task_id, run_id) if changes_requested
+                            else self._worker_session(run)) if isinstance(run, Mapping) else None
         return (isinstance(run, Mapping) and run.get("profile") == expected_profile
-                and run.get("status") in {"completed", "done"} and self._worker_session(run) == session_id
-                and len(claims) == 1 and len(completions) == 1)
+                and (run.get("status") == "running" if changes_requested else run.get("status") in {"completed", "done"})
+                and reviewer_session == session_id
+                and isinstance(session_id, str) and bool(session_id)
+                and session_id != self._worker_session(source_run)
+                and len(claims) == 1 and len(completions) == (0 if changes_requested else 1))
 
     def submit_review(self, task_id: str, candidate: Any, review: Mapping[str, Any], *,
                       expected_profile: str) -> dict[str, Any]:
@@ -931,6 +1091,13 @@ class Coordinator:
             intent = self.store.read_scope(self.scope)["operator_intent"]
             if intent is not None and intent.active:
                 return {"outcome": "held", "reason": "operator_pause_or_cancellation_active"}
+            for prior in self.store.read_scope(self.scope)["reviews"]:
+                prior_native = prior.get("native_review")
+                if (prior.get("candidate_identity") == candidate.to_dict()
+                        and isinstance(prior_native, Mapping)
+                        and prior_native.get("task_id") == task_id and prior_native.get("run_id") == run_id
+                        and prior != dict(review)):
+                    return {"outcome": "held", "reason": "review_run_verdict_conflict"}
             separate = self._separate_review_intent(task_id, candidate, expected_profile)
             handoff = None if separate is not None else self._verified_handoff(task_id, candidate, expected_profile)
             if handoff is None and separate is None:
@@ -979,7 +1146,8 @@ class Coordinator:
             final_handoff = None if separate is not None else self._verified_handoff(task_id, candidate, expected_profile)
             if (separate is None and (final_handoff is None or final_handoff.get("implementation_session_id") != implementation_session)):
                 return {"outcome": "held", "reason": "verified_local_review_handoff_missing"}
-            if separate is not None and not self._verified_separate_review(task_id, candidate, expected_profile, run_id, session_id):
+            if separate is not None and not self._verified_separate_review(task_id, candidate, expected_profile, run_id,
+                                                                            session_id, changes_requested=verdict == "changes_requested"):
                 return {"outcome": "held", "reason": "verified_separate_review_provenance_missing"}
             reviewer_claims = [event for event in task_snapshot.events
                                if event.get("kind") == "claimed" and str(event.get("run_id")) == run_id

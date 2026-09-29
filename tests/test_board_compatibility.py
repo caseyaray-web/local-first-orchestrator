@@ -117,6 +117,21 @@ def test_held_creation_does_not_dispatch_or_touch_real_home(native):
     assert task in str(listed)
 
 
+def test_held_correction_creation_is_parentless_and_releases_on_isolated_board(native):
+    run, _ = native
+    source = create(native, "completed piece", held=True)
+    run("complete", source, "--result", "fixture source only")
+    review = create(native, "completed separate review", held=True)
+    run("complete", review, "--result", "fixture finding only")
+    correction = json.loads(run("create", "correction", "--body", "finding-1: repair", "--assignee", "implementer",
+                                "--initial-status", "blocked", "--idempotency-key", "correction-fixture", "--json").stdout)["id"]
+    held = read(native, correction)
+    assert held["parents"] == [] and held["task"]["status"] == "blocked"
+    run("unblock", correction, "--reason", "exact fixture release")
+    released = read(native, correction)
+    assert released["parents"] == [] and released["task"]["status"] == "ready"
+
+
 def test_done_and_archive_release_native_dependents(native):
     run, _ = native
     done_parent = create(native, "done parent", held=True)

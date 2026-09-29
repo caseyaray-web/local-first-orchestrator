@@ -177,7 +177,7 @@ Build supported board adapter, operation records, singleton lock and durable int
 
 ### M3 — One piece with local review
 
-Native implementer run → request review → new local reviewer → correction → repeat → accepted candidate. Also prove accidental done is recovered by separate review. Add role pre-tool guidance without relying on it for acceptance. Verify profile/session/candidate attribution.
+Native implementer run → request review → new local reviewer → correction → repeat → accepted candidate. Also prove accidental done is recovered by a separate review that is released by a locked, evidence-checked poll; a negative separate verdict creates bounded parentless correction work charged to the root review-correction budget with the exact finding identity preserved, then requires fresh implementation and local review. Add role pre-tool guidance without relying on it for acceptance. Verify profile/session/candidate attribution.
 
 For a running implementation, the coordinator may only register and later reconcile a handoff intent. The implementation worker must call `kanban_request_review` on its own run; reconciliation reads the public `show --json`/`runs --json` implementation-run metadata (`local_first_review`, `worker_session_id`) and the bound `review_requested` event. Do not substitute a coordinator CLI call or task-level reviewer/session fields. A reviewer must be a distinct profile and a fresh run/session claimed from `review`; acceptance remains blocked without trusted Git/candidate evidence or while paused/cancelled.
 

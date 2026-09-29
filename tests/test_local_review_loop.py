@@ -24,6 +24,7 @@ def snapshot(task_id: str, status: str, runs=(), events=(), *, assignee="impleme
 class ReviewBoard:
     task: BoardSnapshot
     source_task: BoardSnapshot | None = None
+    review_task: BoardSnapshot | None = None
     is_fake: bool = True
     calls: list[str] = field(default_factory=list)
 
@@ -32,19 +33,21 @@ class ReviewBoard:
             return snapshot("anchor", "ready")
         if task_id == "piece" and self.source_task is not None:
             return self.source_task
-        assert task_id in {"piece", "separate-review", "replacement-review"}
+        if task_id == "separate-review" and self.review_task is not None:
+            return self.review_task
+        assert task_id in {"piece", "separate-review", "replacement-review", "correction-task"}
         return self.task
 
     def read_scoped_run(self, scope, task_id: str, run_id: str):
-        assert scope == SCOPE and task_id in {"piece", "separate-review"}
+        assert scope == SCOPE and task_id in {"piece", "separate-review", "correction-task"}
         observed = self.read_task(task_id)
         return next(run for run in observed.runs if run["id"] == run_id)
 
     def hold(self, *_): raise AssertionError("M2 control must not run")
     def release(self, action, task_id, _reason):
-        assert task_id == "separate-review"
+        assert task_id in {"separate-review", "replacement-review", "correction-task"}
         self.calls.append("release")
-        self.task = snapshot("separate-review", "ready", assignee="local-review")
+        self.task = snapshot(task_id, "ready", assignee="implementer" if task_id == "correction-task" else "local-review")
         return ActionResult(action.key, "verified", "fixture release", self.task.to_dict())
     def stop_run(self, *_): raise AssertionError("M2 control must not run")
     def request_review(self, *_):
@@ -54,10 +57,15 @@ class ReviewBoard:
     def create_held(self, action, *, title, body, assignee, workspace, idempotency_key):
         self.calls.append("create-held")
         assert action.target["native_parent"] is False
-        assert assignee == "local-review" and workspace == "/candidate"
-        created_id = "separate-review" if len(self.calls) == 1 else "replacement-review"
+        assert assignee in {"local-review", "implementer"} and workspace == "/candidate"
+        created_id = ("correction-task" if action.target.get("correction_of") else
+                      "separate-review" if len(self.calls) == 1 else "replacement-review")
         created = snapshot(created_id, "blocked", assignee=assignee)
-        self.source_task, self.task = self.task, created
+        if self.source_task is None:
+            self.source_task = self.task
+        elif action.target.get("correction_of"):
+            self.review_task = self.task
+        self.task = created
         return ActionResult(action.key, "verified", "fixture held create", created.to_dict())
 
 
@@ -368,7 +376,7 @@ def test_repeated_same_card_changes_are_worker_proposed_then_reconciled_before_f
     assert controller.request_corrections("piece", candidate(), rejected, implementation_profile="implementer",
                                           operation_key="changes-1") == {"outcome": "verified", "operation_key": "changes-1"}
     assert controller.submit_review("piece", candidate(), review(), expected_profile="local-review") == {
-        "outcome": "held", "reason": "verified_local_review_handoff_missing",
+        "outcome": "held", "reason": "review_run_verdict_conflict",
     }
     fresh = next_candidate()
     board.task = snapshot("piece", "running", (*board.task.runs,
@@ -478,8 +486,9 @@ def test_tick_recovers_exact_done_candidate_once_without_operator_pause(tmp_path
          "metadata": {"worker_session_id": "implement-session"}},
     ))
     assert controller.tick() == {"outcome": "held", "actions_attempted": 1, "task_id": "separate-review"}
+    assert controller.tick() == {"outcome": "released", "actions_attempted": 1, "task_id": "separate-review"}
     assert controller.tick() == {"outcome": "no-op", "actions_attempted": 0}
-    assert board.calls == ["create-held"]
+    assert board.calls == ["create-held", "release"]
 
 
 def test_tick_replaces_done_local_review_without_verdict_once(tmp_path):
@@ -494,5 +503,134 @@ def test_tick_replaces_done_local_review_without_verdict_once(tmp_path):
          "metadata": {"worker_session_id": "review-session"}},
     ), assignee="local-review")
     assert controller.tick() == {"outcome": "held", "actions_attempted": 1, "task_id": "replacement-review"}
+    assert controller.tick() == {"outcome": "released", "actions_attempted": 1, "task_id": "replacement-review"}
+    assert board.calls == ["create-held", "create-held", "release"]
+
+def test_tick_releases_exact_held_recovery_review_on_following_poll(tmp_path):
+    controller, board, _ = coordinator(tmp_path)
+    board.task = snapshot("piece", "done", (
+        {"id": "implement-run", "status": "done", "outcome": "completed", "profile": "implementer",
+         "metadata": {"worker_session_id": "implement-session"}},
+    ))
+    assert controller.tick()["task_id"] == "separate-review"
+    assert controller.tick() == {"outcome": "released", "actions_attempted": 1, "task_id": "separate-review"}
+    assert board.calls == ["create-held", "release"]
+
+def test_separate_approval_requires_fresh_session_from_source_implementation(tmp_path):
+    controller, board, _ = coordinator(tmp_path)
+    board.task = snapshot("piece", "done", (
+        {"id": "implement-run", "status": "done", "outcome": "completed", "profile": "implementer",
+         "metadata": {"worker_session_id": "implement-session"}},
+    ))
+    controller.recover_premature_done("piece", candidate(), reviewer_profile="local-review")
+    controller.release_separate_review("separate-review", candidate(), reviewer_profile="local-review")
+    board.task = snapshot("separate-review", "done", (
+        {"id": "review-run", "status": "done", "outcome": "completed", "profile": "local-review",
+         "metadata": {"worker_session_id": "implement-session"}},
+    ), (
+        {"kind": "claimed", "run_id": "review-run", "payload": {"source_status": "ready"}},
+        {"kind": "completed", "run_id": "review-run", "payload": {}},
+    ), assignee="local-review")
+    evidence = review(session_id="implement-session")
+    evidence["native_review"]["task_id"] = "separate-review"
+    assert controller.submit_review("separate-review", candidate(), evidence, expected_profile="local-review")["outcome"] == "held"
+
+def test_separate_review_records_changes_from_active_fresh_reviewer(tmp_path, monkeypatch):
+    controller, board, store = coordinator(tmp_path)
+    board.task = snapshot("piece", "done", (
+        {"id": "implement-run", "status": "done", "outcome": "completed", "profile": "implementer",
+         "metadata": {"worker_session_id": "implement-session"}},
+    ))
+    controller.recover_premature_done("piece", candidate(), reviewer_profile="local-review")
+    controller.release_separate_review("separate-review", candidate(), reviewer_profile="local-review")
+    board.task = snapshot("separate-review", "running", (
+        {"id": "review-run", "status": "running", "profile": "local-review", "metadata": None},
+    ), ({"kind": "claimed", "run_id": "review-run", "payload": {"source_status": "ready"}},), assignee="local-review")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "separate-review")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "review-run")
+    monkeypatch.setenv("HERMES_SESSION_ID", "review-session")
+    evidence = changes_review()
+    evidence["native_review"]["task_id"] = "separate-review"
+    assert controller.submit_review("separate-review", candidate(), evidence, expected_profile="local-review") == {
+        "outcome": "changes_requested", "candidate": "content", "review_id": "review-1",
+    }
+    assert store.read_scope(SCOPE)["reviews"] == (evidence,)
+    board.task = snapshot("separate-review", "done", (
+        {"id": "review-run", "status": "done", "outcome": "completed", "profile": "local-review",
+         "metadata": {"worker_session_id": "review-session"}},
+    ), (
+        {"kind": "claimed", "run_id": "review-run", "payload": {"source_status": "ready"}},
+        {"kind": "completed", "run_id": "review-run", "payload": {}},
+    ), assignee="local-review")
+    conflicting = review()
+    conflicting["native_review"]["task_id"] = "separate-review"
+    conflicting["review_id"] = "conflicting-approval"
+    assert controller.submit_review("separate-review", candidate(), conflicting,
+                                    expected_profile="local-review") == {"outcome": "held", "reason": "review_run_verdict_conflict"}
+
+def test_separate_changes_create_and_release_bounded_correction_work(tmp_path, monkeypatch):
+    controller, board, store = coordinator(tmp_path)
+    board.task = snapshot("piece", "done", (
+        {"id": "implement-run", "status": "done", "outcome": "completed", "profile": "implementer",
+         "metadata": {"worker_session_id": "implement-session"}},
+    ))
+    controller.recover_premature_done("piece", candidate(), reviewer_profile="local-review")
+    controller.release_separate_review("separate-review", candidate(), reviewer_profile="local-review")
+    board.task = snapshot("separate-review", "running", (
+        {"id": "review-run", "status": "running", "profile": "local-review", "metadata": None},
+    ), ({"kind": "claimed", "run_id": "review-run", "payload": {"source_status": "ready"}},), assignee="local-review")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "separate-review")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "review-run")
+    monkeypatch.setenv("HERMES_SESSION_ID", "review-session")
+    evidence = changes_review()
+    evidence["native_review"]["task_id"] = "separate-review"
+    evidence["criterion_evidence"].insert(0, {"criterion_id": "edge", "outcome": "fail", "evidence": "missing boundary"})
+    evidence["findings"].append({"finding_id": "finding-2", "criterion_id": "edge", "severity": "major", "summary": "cover boundary"})
+    controller.git_observer = lambda _scope: {**trusted_observation(), "criterion_ids": ["edge", "tests"]}
+    assert controller.submit_review("separate-review", candidate(), evidence, expected_profile="local-review")["outcome"] == "changes_requested"
+    board.task = snapshot("separate-review", "done", (
+        {"id": "review-run", "status": "done", "outcome": "completed", "profile": "local-review",
+         "metadata": {"worker_session_id": "review-session"}},
+    ), (
+        {"kind": "claimed", "run_id": "review-run", "payload": {"source_status": "ready"}},
+        {"kind": "completed", "run_id": "review-run", "payload": {}},
+    ), assignee="local-review")
+    assert controller.tick() == {"outcome": "held", "actions_attempted": 1, "task_id": "correction-task"}
+    correction = next(m for m in store.read_scope(SCOPE)["members"] if m.task_id == "correction-task")
+    assert correction.role == "implementation" and correction.finding_ids == ("finding-1", "finding-2")
+    assert controller.tick() == {"outcome": "released", "actions_attempted": 1, "task_id": "correction-task"}
     assert controller.tick() == {"outcome": "no-op", "actions_attempted": 0}
-    assert board.calls == ["create-held", "create-held"]
+    assert board.calls == ["create-held", "release", "create-held", "release"]
+    assert len([event for event in store.read_scope(SCOPE)["budget_events"]
+                if event["event_id"].startswith("review_corrections:")]) == 1
+    # The correction is a real managed implementation card, not merely a
+    # finding record: it can enter the same native worker-owned review loop.
+    fresh = CandidateIdentity("repo", "/candidate", "head", "head-2", "content-2", "diff-2", "correction-run", "contract")
+    board.task = snapshot("correction-task", "running", (
+        {"id": "correction-run", "status": "running", "profile": "implementer", "metadata": None},
+    ), assignee="implementer")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "correction-task")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "correction-run")
+    monkeypatch.setenv("HERMES_SESSION_ID", "correction-session")
+    controller.git_observer = lambda _scope: trusted_observation(fresh)
+    assert controller.request_local_review("correction-task", fresh, implementation_profile="implementer",
+                                           reviewer_profile="local-review", summary="review correction",
+                                           operation_key="correction-review") == {"outcome": "proposed", "operation_key": "correction-review"}
+    marker = next(item.target["review_marker"] for item in store.read_scope(SCOPE)["operations"]
+                  if item.key == "correction-review")
+    board.task = snapshot("correction-task", "done", (
+        {"id": "correction-run", "status": "completed", "outcome": "review_requested", "profile": "implementer",
+         "metadata": {"local_first_review": marker, "worker_session_id": "correction-session"}},
+        {"id": "correction-review-run", "status": "done", "outcome": "completed", "profile": "local-review",
+         "metadata": {"worker_session_id": "fresh-review-session"}},
+    ), (
+        {"kind": "review_requested", "run_id": "correction-run", "payload": {"implementer": "implementer", "reviewer": "local-review"}},
+        {"kind": "claimed", "run_id": "correction-review-run", "payload": {"source_status": "review"}},
+        {"kind": "completed", "run_id": "correction-review-run", "payload": {}},
+    ), assignee="local-review")
+    approval = review(run_id="correction-review-run", session_id="fresh-review-session")
+    approval["review_id"] = "correction-approval"
+    approval["candidate_identity"] = fresh.to_dict()
+    approval["native_review"]["task_id"] = "correction-task"
+    assert controller.submit_review("correction-task", fresh, approval, expected_profile="local-review")["outcome"] == "accepted"
+    assert controller.tick() == {"outcome": "no-op", "actions_attempted": 0}

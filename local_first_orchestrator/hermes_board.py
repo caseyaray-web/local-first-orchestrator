@@ -388,9 +388,14 @@ class HermesBoardAdapter:
             association = action.target.get("association")
             replacement_for = action.target.get("replacement_for")
             content = candidate.get("content_identity") if isinstance(candidate, Mapping) else None
-            expected_association = (f"premature-done:{source_task}:{content}" if replacement_for is None
+            expected_association = (f"separate-review-correction:{source_task}:{content}:{action.target.get('finding_id')}"
+                                    if action.target.get("correction_of") == source_task
+                                    and isinstance(action.target.get("finding_id"), str) and action.target.get("finding_id")
+                                    and isinstance(action.target.get("review_id"), str) and action.target.get("review_id")
+                                    else f"premature-done:{source_task}:{content}" if replacement_for is None
                                     else f"premature-done-replacement:{replacement_for}:{content}")
             if (not isinstance(source_task, str) or not source_task or not isinstance(content, str) or not content
+                    or (action.target.get("correction_of") is not None and action.target.get("correction_of") != source_task)
                     or (replacement_for is not None and (not isinstance(replacement_for, str)
                         or not replacement_for or replacement_for == source_task))
                     or association != expected_association):
