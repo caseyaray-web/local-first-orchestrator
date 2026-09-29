@@ -82,6 +82,8 @@ ready -> running (implementation) -> review
 
 If a ticket is already done without adequate local review, leave its history intact and create a separate review ticket against the preserved candidate. If that review finds problems, create correction tickets. The plugin must still verify evidence before integration or downstream release.
 
+The separate review starts held without a native parent. Before creating it, the plugin must retain or independently freeze the exact candidate and prove the completed source task's originating run, profile, and worker session. It consumes a finite workflow-repair unit atomically with its immutable create intent; a distinct candidate or replacement ticket does not replenish that root budget. Release is an explicit locked operation only after the exact store association and frozen candidate still match. The native reviewer must then claim the ready replacement and complete a distinct reviewer run. Acceptance requires that claim/completion, reviewer profile/session, exact source association, and trusted Git checks; a same-card `request_review` handoff is neither available nor substituted. A crash after native create is reconciled by its immutable marker before registering the one managed member, never by resending create.
+
 ## Plugin extension strategy and limits
 
 Use plugin CLI/tools/dashboard routes for operator controls and structured review findings. Use `pre_tool_call` to catch normal mistakes, such as implementation-side completion that should request review. Keep native dispatcher ownership of claims and profile launches.

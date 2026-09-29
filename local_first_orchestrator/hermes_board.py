@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,9 @@ from .contracts import Action, ActionResult, BoardSnapshot, validate_scope
 _AUTHOR = "local-first-orchestrator"
 _MAX_FIELD = 16_384
 _MAX_MARKER_SEARCH_ROWS = 1_000
+_MAX_MARKER_SEARCH_CLI_CALLS = 3
+_MAX_NATIVE_MARKER_DEPTH = 64
+_MAX_NATIVE_MARKER_NODES = 1_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,10 +74,16 @@ class HermesBoardAdapter:
         env.update({"HERMES_HOME": str(self.hermes_home), "HERMES_KANBAN_HOME": str(self.kanban_home), "NO_COLOR": "1", "GIT_TERMINAL_PROMPT": "0"})
         return env
 
-    def _invoke(self, *args: str, json_output: bool = False) -> Any:
+    def _invoke(self, *args: str, json_output: bool = False, deadline: float | None = None) -> Any:
         if not all(isinstance(x, str) and len(x) <= _MAX_FIELD for x in args): raise ValueError("bounded string argv required")
         argv = (self.executable, "kanban", "--board", self.board, *args)
-        try: completed = self.runner(argv, text=True, capture_output=True, timeout=self.timeout_seconds, check=False, shell=False, env=self._env())
+        timeout = self.timeout_seconds
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _BoardUnavailable("bounded marker search exceeded cumulative deadline")
+            timeout = min(timeout, remaining)
+        try: completed = self.runner(argv, text=True, capture_output=True, timeout=timeout, check=False, shell=False, env=self._env())
         except (OSError, subprocess.TimeoutExpired) as exc: raise _BoardUnavailable("Hermes Kanban CLI unavailable") from exc
         stdout, stderr = completed.stdout or "", completed.stderr or ""
         if len(stdout) > self.output_limit or len(stderr) > self.output_limit: raise _BoardUnavailable("Hermes Kanban output exceeded bound")
@@ -86,11 +96,11 @@ class HermesBoardAdapter:
     def _digest(payload: Mapping[str, Any]) -> str:
         return "sha256:" + hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
 
-    def _snapshot(self, task_id: str) -> BoardSnapshot:
+    def _snapshot(self, task_id: str, *, deadline: float | None = None) -> BoardSnapshot:
         if not isinstance(task_id, str) or not task_id: raise ValueError("task_id must be non-empty")
-        payload = self._invoke("show", task_id, "--json", json_output=True)
+        payload = self._invoke("show", task_id, "--json", json_output=True, deadline=deadline)
         if not isinstance(payload, dict) or not isinstance(payload.get("task"), dict) or payload["task"].get("id") != task_id: raise _BoardUnavailable("exact task read identity mismatch")
-        runs = self._invoke("runs", task_id, "--json", json_output=True)
+        runs = self._invoke("runs", task_id, "--json", json_output=True, deadline=deadline)
         if not isinstance(runs, list) or not all(isinstance(x, dict) for x in runs): raise _BoardUnavailable("exact run read malformed")
         def records(name: str) -> tuple[Mapping[str, Any], ...]:
             value = payload.get(name, [])
@@ -125,7 +135,7 @@ class HermesBoardAdapter:
         if task_id != self.anchor_task_id and not self._trusted_member(valid, task_id):
             raise ValueError("native run task is not a trusted managed member")
         run = self.read_run(task_id, run_id)
-        if run.get("id") != run_id:
+        if str(run.get("id")) != run_id:
             raise ValueError("native run identity is not exact")
         for field, expected in (("task_id", task_id), ("board_id", self.board), ("anchor_task_id", self.anchor_task_id)):
             if field in run and run[field] != expected:
@@ -194,19 +204,42 @@ class HermesBoardAdapter:
             return False
 
     def _marked_create_matches(self, marker: str) -> tuple[int, tuple[BoardSnapshot, ...]]:
-        rows = self._invoke("list", "--archived", "--json", json_output=True)
+        deadline = time.monotonic() + self.timeout_seconds
+        calls = 0
+
+        def invoke(*args: str) -> Any:
+            nonlocal calls
+            if calls >= _MAX_MARKER_SEARCH_CLI_CALLS:
+                raise _BoardUnavailable("bounded create marker search exceeded CLI call limit")
+            calls += 1
+            return self._invoke(*args, json_output=True, deadline=deadline)
+
+        rows = invoke("list", "--archived", "--json")
         if not isinstance(rows, list) or len(rows) > _MAX_MARKER_SEARCH_ROWS:
             raise _BoardUnavailable("bounded create marker search malformed or exceeded row limit")
-        ids: list[str] = []
+        matches: list[str] = []
         for row in rows:
             if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
                 raise _BoardUnavailable("bounded create marker search row malformed")
-            ids.append(row["id"])
-        matches = tuple(snapshot for snapshot in (self._snapshot(task_id) for task_id in ids)
-                        if isinstance(snapshot.native_task.get("body"), str) and marker in snapshot.native_task["body"])
-        if len(matches) > 1:
-            return len(matches), tuple()
-        return len(matches), matches
+            # Native M0 list --archived exposes task.body.  Refuse to scan
+            # opaque rows: a show/runs fan-out would turn one reconciliation
+            # into thousands of independent 15-second calls.
+            if not isinstance(row.get("body"), str):
+                raise _BoardUnavailable("bounded create marker search row lacks native body")
+            if marker in row["body"]:
+                matches.append(row["id"])
+                if len(matches) > 1:
+                    return len(matches), tuple()
+        if not matches:
+            return 0, tuple()
+        # list plus this exact show/runs read is the entire bounded search.
+        if calls + 2 > _MAX_MARKER_SEARCH_CLI_CALLS:
+            raise _BoardUnavailable("bounded create marker search exceeded CLI call limit")
+        snapshot = self._snapshot(matches[0], deadline=deadline)
+        calls += 2
+        if not isinstance(snapshot.native_task.get("body"), str) or marker not in snapshot.native_task["body"]:
+            raise _BoardUnavailable("native marker shortlist contradicted exact task read")
+        return 1, (snapshot,)
 
     @staticmethod
     def _create_marker(action: Action) -> str:
@@ -229,9 +262,21 @@ class HermesBoardAdapter:
 
     @staticmethod
     def _contains_marker(value: Any, marker: str) -> bool:
-        if isinstance(value, str): return marker in value
-        if isinstance(value, Mapping): return any(HermesBoardAdapter._contains_marker(item, marker) for item in value.values())
-        if isinstance(value, (list, tuple)): return any(HermesBoardAdapter._contains_marker(item, marker) for item in value)
+        """Bounded non-recursive scan of untrusted native JSON-like values."""
+        stack: list[tuple[Any, int]] = [(value, 0)]
+        nodes = 0
+        while stack:
+            item, depth = stack.pop()
+            nodes += 1
+            if nodes > _MAX_NATIVE_MARKER_NODES or depth > _MAX_NATIVE_MARKER_DEPTH:
+                raise _BoardUnavailable("native marker evidence exceeded traversal bounds")
+            if isinstance(item, str):
+                if marker in item:
+                    return True
+            elif isinstance(item, Mapping):
+                stack.extend((child, depth + 1) for child in item.values())
+            elif isinstance(item, (list, tuple)):
+                stack.extend((child, depth + 1) for child in item)
         return False
 
     def _verify_native_hold_release(self, action: Action, snapshot: BoardSnapshot) -> str | None:
@@ -242,16 +287,19 @@ class HermesBoardAdapter:
         retain a reason, so release requires the exact UNBLOCK comment instead
         of inventing an event-to-marker linkage.
         """
-        marker = self._native_marker(action)
-        is_hold = action.effect == "hold"
-        expected_comment = f"BLOCKED: {marker}" if is_hold else f"UNBLOCK: {marker}"
-        marked_comments = [item for item in snapshot.comments if self._contains_marker(item, marker)]
-        exact_comments = [item for item in marked_comments if item.get("body") == expected_comment]
-        if len(marked_comments) > 1 or len(exact_comments) > 1:
-            return "conflict"
-        if marked_comments and not exact_comments:
-            return "conflict"
-        marked_events = [item for item in snapshot.events if self._contains_marker(item, marker)]
+        try:
+            marker = self._native_marker(action)
+            is_hold = action.effect == "hold"
+            expected_comment = f"BLOCKED: {marker}" if is_hold else f"UNBLOCK: {marker}"
+            marked_comments = [item for item in snapshot.comments if self._contains_marker(item, marker)]
+            exact_comments = [item for item in marked_comments if item.get("body") == expected_comment]
+            if len(marked_comments) > 1 or len(exact_comments) > 1:
+                return "conflict"
+            if marked_comments and not exact_comments:
+                return "conflict"
+            marked_events = [item for item in snapshot.events if self._contains_marker(item, marker)]
+        except _BoardUnavailable:
+            return "unknown"
         if not is_hold:
             # Native unblock events have no reason payload, so on a later
             # read they cannot be tied to this operation. The exact UNBLOCK
@@ -284,7 +332,31 @@ class HermesBoardAdapter:
         if self._running(snapshot) or snapshot.native_task.get("status") not in {"blocked"}: return "partial"
         return "unknown"
 
-    def _verify_existing_create(self, action: Action, snapshot: BoardSnapshot, *, title: str, body: str, assignee: str, workspace: str, idempotency_key: str) -> ActionResult:
+    @staticmethod
+    def _verify_review_marker(action: Action, snapshot: BoardSnapshot) -> str | None:
+        """Prove a handoff from public run metadata and its bound native event."""
+        marker = action.target.get("review_marker")
+        reviewer = action.target.get("reviewer_profile")
+        if not isinstance(marker, Mapping):
+            return "unsupported"
+        if (not isinstance(reviewer, str) or snapshot.native_task.get("status") not in {"review", "done"}
+                or snapshot.native_task.get("assignee") != reviewer):
+            return "unsupported"
+        runs = [run for run in snapshot.runs if isinstance(run.get("metadata"), Mapping)
+                and run["metadata"].get("local_first_review") == dict(marker)]
+        if len(runs) != 1:
+            return "conflict" if runs else "unsupported"
+        run = runs[0]
+        if run.get("outcome") != "review_requested" or not isinstance(run.get("profile"), str):
+            return "conflict"
+        events = [event for event in snapshot.events
+                  if event.get("kind") == "review_requested" and str(event.get("run_id")) == str(run.get("id"))
+                  and isinstance(event.get("payload"), Mapping)
+                  and event["payload"].get("implementer") == run.get("profile")
+                  and event["payload"].get("reviewer") == reviewer]
+        return None if len(events) == 1 else "conflict" if events else "unsupported"
+
+    def _verify_existing_create(self, action: Action, snapshot: BoardSnapshot, *, title: str, body: str, assignee: str, workspace: str, idempotency_key: str, native_parent: bool) -> ActionResult:
         task = snapshot.native_task
         if self._running(snapshot):
             return self._result(action, "partial", "marked create has active work and is not safely held", snapshot)
@@ -296,8 +368,10 @@ class HermesBoardAdapter:
             return self._result(action, "conflict", "marked create identity fields differ from action", snapshot)
         if task.get("status") != "blocked":
             return self._result(action, "conflict", "marked create is not held", snapshot)
-        if not any(parent.get("id") == self.anchor_task_id for parent in snapshot.parents):
+        if native_parent and not any(parent.get("id") == self.anchor_task_id for parent in snapshot.parents):
             return self._result(action, "conflict", "marked create is not associated with anchor", snapshot)
+        if not native_parent and snapshot.parents:
+            return self._result(action, "conflict", "store-associated create unexpectedly has native dependencies", snapshot)
         return self._result(action, "no-op", "exact marked held creation already present", snapshot)
 
     def create_held(self, action: Action, *, title: str, body: str, assignee: str, workspace: str, idempotency_key: str) -> ActionResult:
@@ -305,6 +379,22 @@ class HermesBoardAdapter:
         if error or action.target.get("anchor_task_id") != self.anchor_task_id: return self._result(action, "conflict", error or "create target must name exact anchor", None)
         if not all(isinstance(x, str) and x and len(x) <= _MAX_FIELD for x in (title, body, assignee, workspace, idempotency_key)): raise ValueError("bounded non-empty creation values required")
         marker = self._create_marker(action)
+        native_parent = action.target.get("native_parent", True)
+        if not isinstance(native_parent, bool):
+            return self._result(action, "conflict", "native_parent must be a boolean when supplied", None)
+        if not native_parent:
+            source_task = action.target.get("source_task_id")
+            candidate = action.target.get("candidate")
+            association = action.target.get("association")
+            replacement_for = action.target.get("replacement_for")
+            content = candidate.get("content_identity") if isinstance(candidate, Mapping) else None
+            expected_association = (f"premature-done:{source_task}:{content}" if replacement_for is None
+                                    else f"premature-done-replacement:{replacement_for}:{content}")
+            if (not isinstance(source_task, str) or not source_task or not isinstance(content, str) or not content
+                    or (replacement_for is not None and (not isinstance(replacement_for, str)
+                        or not replacement_for or replacement_for == source_task))
+                    or association != expected_association):
+                return self._result(action, "conflict", "parentless create requires exact scoped source candidate association", None)
         created_body = body if marker in body else f"{body}\n\n{marker}"
         if len(created_body) > _MAX_FIELD: raise ValueError("creation body plus stable marker exceeds bound")
         if not self._assert_create_lock(action):
@@ -320,13 +410,17 @@ class HermesBoardAdapter:
             return self._result(action, "conflict", "multiple exact stable create markers found", None)
         if marker_count == 1:
             assert len(matches) == 1
-            return self._verify_existing_create(action, matches[0], title=title, body=created_body, assignee=assignee, workspace=workspace, idempotency_key=idempotency_key)
+            return self._verify_existing_create(action, matches[0], title=title, body=created_body, assignee=assignee, workspace=workspace, idempotency_key=idempotency_key, native_parent=native_parent)
         if not self._claim_create_attempt(action):
             outcome = "unsupported" if self.claim_create_attempt is None else "unknown"
             return self._result(action, outcome, "durable create attempt claim is required and must succeed before native create", before)
         if not self._assert_create_lock(action):
             return self._result(action, "unsupported", "trusted singleton create lock was not held immediately before native create", before)
-        try: payload = self._invoke("create", title, "--body", created_body, "--assignee", assignee, "--workspace", workspace, "--parent", self.anchor_task_id, "--idempotency-key", idempotency_key, "--initial-status", "blocked", "--json", json_output=True)
+        argv = ("create", title, "--body", created_body, "--assignee", assignee, "--workspace", workspace)
+        if native_parent:
+            argv += ("--parent", self.anchor_task_id)
+        argv += ("--idempotency-key", idempotency_key, "--initial-status", "blocked", "--json")
+        try: payload = self._invoke(*argv, json_output=True)
         except (_BoardUnavailable, ValueError) as exc: return self._result(action, "unknown", f"native create outcome unknown: {exc}", before)
         task_id = payload.get("id") if isinstance(payload, dict) else None
         if not isinstance(task_id, str) or not task_id: return self._result(action, "unknown", "native create returned no exact task identity", None)
@@ -339,7 +433,8 @@ class HermesBoardAdapter:
         missing = [field for field in expected_fields if field not in task]
         if missing: return self._result(action, "partial", f"native create readback cannot expose identity fields: {', '.join(missing)}", after)
         if any(task.get(k) != v for k, v in expected_fields.items()): return self._result(action, "conflict", "created task identity fields differ from action", after)
-        if not any(x.get("id") == self.anchor_task_id for x in after.parents): return self._result(action, "conflict", "created task is not associated with anchor", after)
+        if native_parent and not any(x.get("id") == self.anchor_task_id for x in after.parents): return self._result(action, "conflict", "created task is not associated with anchor", after)
+        if not native_parent and after.parents: return self._result(action, "conflict", "store-associated create unexpectedly has native dependencies", after)
         return self._result(action, "verified", "held creation verified by exact readback", after)
 
     def comment(self, action: Action, task_id: str, text: str) -> ActionResult:
@@ -367,13 +462,10 @@ class HermesBoardAdapter:
         assert before is not None
         if before.native_task.get("status") not in {"ready", "todo"}: return self._result(action, "conflict", "review request requires exact waiting task", before)
         if reviewer == before.native_task.get("assignee"): return self._result(action, "conflict", "reviewer must differ from implementation assignee", before)
-        encoded = None
-        if metadata is not None:
-            try: encoded = json.dumps(dict(metadata), sort_keys=True, separators=(",", ":"))
-            except (TypeError, ValueError) as exc: raise ValueError("review metadata must be bounded JSON") from exc
-            if len(encoded) > _MAX_FIELD: raise ValueError("review metadata exceeds bound")
-        argv = ("request-review", task_id, "--summary", summary, "--reviewer", reviewer, *( () if encoded is None else ("--metadata", encoded)))
-        return self._mutate(action, task_id=task_id, argv=argv, verifier=lambda _b, a: None if a.native_task.get("status") == "review" and a.native_task.get("reviewer") == reviewer else "partial", description="request-review")
+        # A generic CLI invocation cannot safely mutate a run owned by the
+        # implementation worker.  That worker must use its native handoff;
+        # this adapter retains only read-only marker reconciliation below.
+        return self._result(action, "unsupported", "direct request-review is unsupported; only the owning native worker may hand off review", before)
 
     def request_changes(self, action: Action, task_id: str, reason: str, run_id: str) -> ActionResult:
         before, result = self._preflight(action, "request_changes", task_id)
@@ -427,17 +519,40 @@ class HermesBoardAdapter:
         if not accepted: return self._result(action, "conflict", "trusted verifier rejected acceptance evidence", before)
         return self._mutate(action, task_id=task_id, argv=("complete", task_id, "--result", approval_evidence), verifier=lambda _b,a: None if a.native_task.get("status") == "done" else "conflict", description="anchor completion")
     def verify_effect(self, action: Action) -> ActionResult:
+        if action.effect == "create_held":
+            error = self._scope_and_target(action, "create_held")
+            if error:
+                return self._result(action, "conflict", error, None)
+            fields = ("create_title", "create_body", "reviewer_profile", "create_workspace", "create_idempotency_key")
+            if not all(isinstance(action.target.get(field), str) and action.target[field] for field in fields):
+                return self._result(action, "unsupported", "create recovery requires exact persisted create identity", None)
+            try:
+                count, matches = self._marked_create_matches(self._create_marker(action))
+            except _BoardUnavailable as exc:
+                return self._result(action, "unknown", f"create marker reconciliation unavailable: {exc}", None)
+            if count != 1:
+                return self._result(action, "conflict" if count > 1 else "unsupported", "exact marked create is not uniquely present", None)
+            body = action.target["create_body"]
+            marker = self._create_marker(action)
+            created_body = body if marker in body else f"{body}\n\n{marker}"
+            return self._verify_existing_create(
+                action, matches[0], title=action.target["create_title"], body=created_body,
+                assignee=action.target["reviewer_profile"], workspace=action.target["create_workspace"],
+                idempotency_key=action.target["create_idempotency_key"], native_parent=action.target.get("native_parent", True),
+            )
         task_id = action.target.get("task_id")
         if not isinstance(task_id, str) or not task_id: raise ValueError("verify_effect requires exact task target")
-        if action.effect not in {"hold", "release"}:
-            return self._result(action, "unsupported", "standalone readback is only supported for exact native hold/release markers", None)
+        if action.effect not in {"hold", "release", "request_review"}:
+            return self._result(action, "unsupported", "standalone readback is only supported for exact native effect markers", None)
         error = self._scope_and_target(action, action.effect, task_id)
         if error: return self._result(action, "conflict", error, None)
         try: before = self._snapshot(task_id)
         except (_BoardUnavailable, ValueError) as exc: return self._result(action, "unknown", f"read-only effect verification unavailable: {exc}", None)
-        outcome = self._verify_native_hold_release(action, before)
+        outcome = self._verify_review_marker(action, before) if action.effect == "request_review" else self._verify_native_hold_release(action, before)
         if outcome is None:
-            evidence = "exact scoped native marker, event, and target status" if action.effect == "hold" else "exact scoped UNBLOCK marker and target status"
+            evidence = ("exact scoped native marker, event, and target status" if action.effect == "hold"
+                        else "exact scoped UNBLOCK marker and target status" if action.effect == "release"
+                        else "exact scoped request-review metadata marker, reviewer, and target status")
             return self._result(action, "verified", f"{evidence} verified read-only", before)
         if outcome == "unsupported": return self._result(action, outcome, "native hold/release marker and event are absent; lane alone cannot prove an effect", before)
         if outcome == "partial": return self._result(action, outcome, "native marker is present but target has active or advanced beyond-ready work", before)

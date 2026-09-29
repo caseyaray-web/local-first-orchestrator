@@ -22,7 +22,7 @@ def native(tmp_path):
                HERMES_KANBAN_BOARD="m0-fixture")
     for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT",
                 "HERMES_KANBAN_ATTACHMENTS_ROOT", "HERMES_KANBAN_LOGS_ROOT",
-                "HERMES_PROFILE", "HERMES_KANBAN_TASK"):
+                "HERMES_PROFILE", "HERMES_KANBAN_TASK", "HERMES_DELEGATED_CHILD_CONTEXT"):
         env.pop(key, None)
     def run(*args, ok=True):
         p = subprocess.run([binary, "kanban", *args], env=env,
@@ -38,6 +38,11 @@ def native(tmp_path):
 
 def run_probe(python, script, env, *, timeout=30.0):
     """Run a fixture probe in a killable session, including its stub descendants."""
+    # These are isolated board fixtures, not delegated workers.  A test runner
+    # may itself be an agent child; do not leak that unrelated guard into the
+    # native process whose lifecycle this fixture characterizes.
+    env = dict(env)
+    env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
     command = [python, "-c", script]
     process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -256,6 +261,85 @@ with kbc.connect(board="m0-fixture") as conn:
                for e in observed["events"])
 
 
+def test_worker_review_handoff_publicly_exposes_stamped_run_metadata_and_event(native):
+    """Parity fixture for the only supported running-worker handoff surface."""
+    run, home = native
+    task = json.loads(run("create", "worker handoff", "--assignee", "implementer", "--json").stdout)["id"]
+    binary = os.environ["HERMES_M0_CLI"]
+    env = os.environ.copy()
+    env.update(HERMES_HOME=str(home), HERMES_KANBAN_HOME=str(home), HERMES_KANBAN_BOARD="m0-fixture")
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_ATTACHMENTS_ROOT", "HERMES_KANBAN_LOGS_ROOT"):
+        env.pop(key, None)
+    env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+    env["PYTHONPATH"] = str(Path(binary).resolve().parents[2])
+    marker = {"operation_key": "fixture-worker-handoff", "candidate": {"content_identity": "fixture-content"}}
+    script = f'''import os
+from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+from tools.kanban_tools import _handle_request_review
+task = {task!r}
+with kbc.connect(board="m0-fixture") as conn:
+    claimed = kb.claim_task(conn, task, claimer="fixture-worker")
+    assert claimed and claimed.current_run_id is not None
+    run_id = claimed.current_run_id
+os.environ.update(HERMES_KANBAN_TASK=task, HERMES_KANBAN_RUN_ID=str(run_id), HERMES_SESSION_ID="fixture-implementation-session")
+_handle_request_review({{"task_id": task, "summary": "fixture implementation", "metadata": {marker!r}}})
+'''
+    probe = run_probe(str(Path(binary).with_name("python")), script, env, timeout=30)
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    shown = read(native, task)
+    handoffs = [entry for entry in shown["runs"] if entry["outcome"] == "review_requested"]
+    assert len(handoffs) == 1
+    handoff = handoffs[0]
+    assert handoff["profile"] == "implementer"
+    assert handoff["metadata"] == {**marker, "worker_session_id": "fixture-implementation-session"}
+    events = [event for event in shown["events"] if event["kind"] == "review_requested"]
+    assert len(events) == 1
+    assert events[0]["run_id"] == handoff["id"]
+    assert events[0]["payload"]["implementer"] == "implementer"
+
+
+def test_worker_handoff_then_reviewer_completion_exposes_terminal_history(native):
+    """Native parity for the complete M3 handoff-to-done lifecycle."""
+    run, home = native
+    task = json.loads(run("create", "worker handoff terminal", "--assignee", "default", "--json").stdout)["id"]
+    binary = os.environ["HERMES_M0_CLI"]
+    env = os.environ.copy()
+    env.update(HERMES_HOME=str(home), HERMES_KANBAN_HOME=str(home), HERMES_KANBAN_BOARD="m0-fixture")
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_ATTACHMENTS_ROOT", "HERMES_KANBAN_LOGS_ROOT"):
+        env.pop(key, None)
+    env["PYTHONPATH"] = str(Path(binary).resolve().parents[2])
+    marker = {"operation_key": "fixture-terminal-handoff", "candidate": {"content_identity": "fixture-content"},
+              "implementation_session_id": "fixture-implementation-session"}
+    script = f'''import os
+from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+from tools.kanban_tools import _handle_complete, _handle_request_review
+task = {task!r}
+with kbc.connect(board="m0-fixture") as conn:
+    claimed = kb.claim_task(conn, task, claimer="fixture-implementation")
+    assert claimed and claimed.current_run_id is not None
+    implementation_run = claimed.current_run_id
+os.environ.update(HERMES_KANBAN_TASK=task, HERMES_KANBAN_RUN_ID=str(implementation_run), HERMES_SESSION_ID="fixture-implementation-session")
+_handle_request_review({{"task_id": task, "summary": "fixture implementation", "reviewer": "default", "metadata": {marker!r}}})
+with kbc.connect(board="m0-fixture") as conn:
+    claimed = kb.claim_review_task(conn, task, claimer="fixture-review")
+    assert claimed and claimed.current_run_id is not None
+    reviewer_run = claimed.current_run_id
+os.environ.update(HERMES_KANBAN_RUN_ID=str(reviewer_run), HERMES_SESSION_ID="fixture-review-session")
+_handle_complete({{"task_id": task, "summary": "fixture review approved"}})
+'''
+    probe = run_probe(str(Path(binary).with_name("python")), script, env, timeout=30)
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    shown = read(native, task)
+    assert shown["task"]["status"] == "done"
+    handoff = next(entry for entry in shown["runs"] if entry["outcome"] == "review_requested")
+    completed = next(entry for entry in shown["runs"] if entry["id"] != handoff["id"] and entry["outcome"] == "completed")
+    assert handoff["metadata"] == {**marker, "worker_session_id": "fixture-implementation-session"}
+    assert completed["status"] == "done" and completed["metadata"]["worker_session_id"] == "fixture-review-session"
+    assert any(event["kind"] == "review_requested" and event["run_id"] == handoff["id"] for event in shown["events"])
+    assert any(event["kind"] == "claimed" and event["run_id"] == completed["id"] and event["payload"]["source_status"] == "review" for event in shown["events"])
+    assert any(event["kind"] == "completed" and event["run_id"] == completed["id"] for event in shown["events"])
+
+
 def test_concurrent_create_idempotency_key_does_not_serialize(native):
     _, home = native
     binary = os.environ["HERMES_M0_CLI"]
@@ -455,6 +539,48 @@ with kbc.connect(board="m0-fixture") as conn:
 '''
     p = run_probe(str(Path(binary).with_name("python")), script, env, timeout=30)
     assert p.returncode == 0, p.stdout + p.stderr
+
+
+def test_worker_owned_request_changes_restores_implementer_and_exposes_exact_event(native):
+    """Parity fixture for the M3 reviewer-owned same-card correction operation."""
+    run, home = native
+    task = json.loads(run("create", "same card correction", "--assignee", "implementer", "--json").stdout)["id"]
+    binary = os.environ["HERMES_M0_CLI"]
+    env = os.environ.copy()
+    env.update(HERMES_HOME=str(home), HERMES_KANBAN_HOME=str(home), HERMES_KANBAN_BOARD="m0-fixture")
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_ATTACHMENTS_ROOT", "HERMES_KANBAN_LOGS_ROOT"):
+        env.pop(key, None)
+    env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+    env["PYTHONPATH"] = str(Path(binary).resolve().parents[2])
+    script = f'''import os
+from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+from tools.kanban_tools import _handle_request_changes, _handle_request_review
+task = {task!r}
+with kbc.connect(board="m0-fixture") as conn:
+    claimed = kb.claim_task(conn, task, claimer="fixture-implementation")
+    assert claimed and claimed.current_run_id is not None
+    implementation_run = claimed.current_run_id
+os.environ.update(HERMES_KANBAN_TASK=task, HERMES_KANBAN_RUN_ID=str(implementation_run), HERMES_SESSION_ID="fixture-implementation-session")
+_handle_request_review({{"task_id": task, "summary": "candidate", "reviewer": "default", "metadata": {{"local_first_review": "fixture"}}}})
+with kbc.connect(board="m0-fixture") as conn:
+    claimed = kb.claim_review_task(conn, task, claimer="fixture-review")
+    assert claimed and claimed.current_run_id is not None
+    review_run = claimed.current_run_id
+os.environ.update(HERMES_KANBAN_RUN_ID=str(review_run), HERMES_SESSION_ID="fixture-review-session")
+_handle_request_changes({{"task_id": task, "reason": "cover edge case"}})
+'''
+    probe = run_probe(str(Path(binary).with_name("python")), script, env, timeout=30)
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    shown = read(native, task)
+    assert shown["task"]["status"] == "ready" and shown["task"]["assignee"] == "implementer"
+    changed = [entry for entry in shown["runs"] if entry["outcome"] == "changes_requested"]
+    assert len(changed) == 1 and changed[0]["profile"] == "default"
+    # Hermes v0.21.5 has no terminal run session stamp for request-changes;
+    # coordinator provenance must use its pre-call active-session receipt.
+    assert changed[0].get("metadata") is None
+    event = next(entry for entry in shown["events"] if entry["kind"] == "changes_requested")
+    assert event["run_id"] == changed[0]["id"]
+    assert event["payload"] == {"reason": "cover edge case", "implementer": "implementer", "reviewer": "default", "status": "ready"}
 
 
 def test_dispatcher_spawns_fresh_review_stub_run(native):

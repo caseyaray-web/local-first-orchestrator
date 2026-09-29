@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import hashlib
+import json
+import os
+from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
-from .budgets import GENERAL_ATTEMPT, BudgetPolicy, WORKFLOW_REPAIRS, permit_action
+from .budgets import GENERAL_ATTEMPT, REVIEW_CORRECTIONS, BudgetPolicy, WORKFLOW_REPAIRS, admit_repair_operation, permit_action
 from .contracts import Action, ActionResult, BoardSnapshot, OperationIntent, PauseIntent, validate_scope
 from .daemon import InstanceLock
 from .operator_controls import (
@@ -18,7 +22,8 @@ class Coordinator:
 
     def __init__(self, scope: Mapping[str, Any], *, board: Any, store: Any,
                  lock: InstanceLock, git_observer: Callable[[Mapping[str, str]], Mapping[str, Any]] | None = None,
-                 budget_policy: BudgetPolicy | None = None) -> None:
+                 budget_policy: BudgetPolicy | None = None,
+                 configured_roles: Mapping[str, str] | None = None) -> None:
         self.scope = validate_scope(scope)
         if board is None or store is None or not isinstance(lock, InstanceLock):
             raise ValueError("explicit board, store, and InstanceLock are required")
@@ -28,12 +33,35 @@ class Coordinator:
             # Never trust a caller-supplied no-op callback as the mutation fence.
             # The adapter and coordinator must share this exact lock instance.
             board.create_lock_assertion = self._assert_native_lock
+            board.claim_create_attempt = self._claim_native_create_attempt
+        if configured_roles is not None and not isinstance(configured_roles, Mapping):
+            raise ValueError("configured roles must be a mapping")
+        self.configured_roles = MappingProxyType(dict(configured_roles or {}))
         self.git_observer, self.budget_policy = git_observer, budget_policy
+
+    def _local_review_roles(self) -> tuple[str, str]:
+        """Return immutable operator-selected roles or fail closed for M3 work."""
+        roles = self.configured_roles
+        if set(roles) != {"implementation_profile", "local_review_profile"}:
+            raise ValueError("configured implementation and local-review roles are required")
+        implementation, reviewer = roles["implementation_profile"], roles["local_review_profile"]
+        if (not isinstance(implementation, str) or not implementation
+                or not isinstance(reviewer, str) or not reviewer
+                or implementation == reviewer):
+            raise ValueError("configured implementation and local-review roles must be distinct non-empty profiles")
+        return implementation, reviewer
 
     def _assert_native_lock(self, scope: Mapping[str, str], anchor_task_id: str) -> None:
         if validate_scope(scope) != self.scope or anchor_task_id != self.scope["anchor_task_id"]:
             raise ValueError("native mutation lock assertion has wrong scope")
         self.lock.assert_held()
+
+    def _claim_native_create_attempt(self, scope: Mapping[str, str], operation_key: str) -> None:
+        """The adapter invokes this immediately before its one native create."""
+        if validate_scope(scope) != self.scope:
+            raise ValueError("native create attempt has wrong scope")
+        self._assert_lock()
+        self.store.begin_effect_attempt(self.scope, operation_key)
 
     def _validate_board(self, board: Any) -> None:
         required = ("read_task", "hold", "release", "stop_run")
@@ -105,7 +133,9 @@ class Coordinator:
 
     def _readback_proves(self, action: Action, result: ActionResult) -> bool:
         snapshot = self._snapshot_from_readback(result.readback)
-        if snapshot is None or snapshot.native_task.get("id") != action.target.get("task_id"):
+        if snapshot is None:
+            return False
+        if action.effect != "create_held" and snapshot.native_task.get("id") != action.target.get("task_id"):
             return False
         status = self._state(snapshot)
         if action.effect == "hold":
@@ -115,6 +145,9 @@ class Coordinator:
         if action.effect == "stop_run":
             run_id = action.target.get("run_id")
             return isinstance(run_id, str) and any(run.get("id") == run_id and run.get("status") in {"cancelled", "completed", "done", "stopped"} for run in snapshot.runs)
+        if action.effect == "create_held":
+            return (status == "blocked" and not snapshot.parents
+                    and not any(run.get("status") in {"active", "claimed", "running", "stopping"} for run in snapshot.runs))
         return False
 
     def _portable_readback(self, readback: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
@@ -401,6 +434,66 @@ class Coordinator:
     def reject_late_result(self, run_id: str, *, run_generation: int | None = None) -> Any:
         return reject_late_result(self.scope, run_id, pause_intent=self.store.read_scope(self.scope)["operator_intent"], run_generation=run_generation)
 
+    def _recover_one_observed_premature_done(self) -> dict[str, Any] | None:
+        """At most once per tick, replace a proven done implementation with review.
+
+        The candidate is decoded only from the trusted Git observer and must
+        retain the exact native source run required by ``recover_premature_done``.
+        This never pauses, adopts, releases, or mutates an unrelated card.
+        """
+        try:
+            _, reviewer = self._local_review_roles()
+            observed = self.git_observer(dict(self.scope)) if self.git_observer is not None else None
+            from .contracts import CandidateIdentity
+            candidate = CandidateIdentity.from_dict(observed["candidate"]) if isinstance(observed, Mapping) else None
+        except (KeyError, TypeError, ValueError):
+            return None
+        if candidate is None or not self._trusted_candidate_observation(candidate):
+            return None
+        state = self.store.read_scope(self.scope)
+        for member in state["members"]:
+            if member.role == "implementation":
+                source = self.board.read_task(member.task_id)
+                if not isinstance(source, BoardSnapshot) or self._state(source) != "done":
+                    continue
+                # A completed card is only premature when the exact observed
+                # candidate has no recorded local approval.  Native done by
+                # itself is never proof, but a prior verified verdict must not
+                # generate another recovery review on each polling tick.
+                if any(saved.get("reviewer_role") == "local"
+                       and saved.get("verdict") == "approved"
+                       and saved.get("candidate_identity") == candidate.to_dict()
+                       and isinstance(saved.get("native_review"), Mapping)
+                       and saved["native_review"].get("task_id") == member.task_id
+                       for saved in state["reviews"]):
+                    continue
+                association = f"premature-done:{member.task_id}:{candidate.content_identity}"
+                if any(existing.work_association == association for existing in state["members"]):
+                    continue
+                recovered = self.recover_premature_done(member.task_id, candidate, reviewer_profile=reviewer,
+                                                         already_locked=True)
+            elif member.role == "local_review":
+                reviewed = self.board.read_task(member.task_id)
+                if (not isinstance(reviewed, BoardSnapshot) or self._state(reviewed) != "done"
+                        or any(saved.get("candidate_identity") == candidate.to_dict() for saved in state["reviews"])):
+                    continue
+                replacement_association = f"premature-done-replacement:{member.task_id}:{candidate.content_identity}"
+                if any(existing.work_association == replacement_association for existing in state["members"]):
+                    continue
+                create = self._separate_review_intent(member.task_id, candidate, reviewer)
+                source_task = None if create is None else create.target.get("source_task_id")
+                if not isinstance(source_task, str):
+                    continue
+                recovered = self.recover_premature_done(source_task, candidate, reviewer_profile=reviewer,
+                                                         replacement_for=member.task_id, already_locked=True)
+            else:
+                continue
+            if recovered.get("outcome") == "held" and recovered.get("task_id"):
+                return {"outcome": "held", "actions_attempted": 1, "task_id": recovered["task_id"]}
+            return {"outcome": "held", "actions_attempted": 0,
+                    "reason": recovered.get("reason", "premature_done_recovery_unverified")}
+        return None
+
     def tick(self) -> dict[str, Any]:
         """Acquire the singleton before every read, reconciliation, decision, and effect."""
         try:
@@ -408,6 +501,9 @@ class Coordinator:
                 self._assert_lock()
                 state = self.store.read_scope(self.scope)
                 if state["operator_intent"] is None or not state["operator_intent"].active:
+                    recovered = self._recover_one_observed_premature_done()
+                    if recovered is not None:
+                        return recovered
                     return {"outcome": "no-op", "actions_attempted": 0}
                 reconciliation = self._reconcile_locked()
                 if reconciliation["outcome"] in {"conflict", "unknown"}:
@@ -426,8 +522,601 @@ class Coordinator:
     def enroll(self, *args: Any, **kwargs: Any) -> None: raise NotImplementedError("M2 enrollment is not implemented")
     def report_issue(self, *args: Any, **kwargs: Any) -> None: raise NotImplementedError("M2 recovery reporting is not implemented")
     def submit_plan(self, *args: Any, **kwargs: Any) -> None: raise NotImplementedError("M3 planning is not implemented")
-    def submit_review(self, *args: Any, **kwargs: Any) -> None: raise NotImplementedError("M3 review is not implemented")
-    def request_corrections(self, *args: Any, **kwargs: Any) -> None: raise NotImplementedError("M3 corrections are not implemented")
+    def _managed_task(self, task_id: str) -> None:
+        if not isinstance(task_id, str) or task_id not in {member.task_id for member in self._members()}:
+            raise ValueError("task must be an exact managed member")
+
+    @staticmethod
+    def _exact_run(run: Mapping[str, Any], *, run_id: str, profile: str) -> None:
+        if str(run.get("id")) != run_id or run.get("profile") != profile:
+            raise ValueError("native run/profile attribution does not match")
+
+    @staticmethod
+    def _worker_session(run: Mapping[str, Any]) -> str | None:
+        metadata = run.get("metadata")
+        session_id = metadata.get("worker_session_id") if isinstance(metadata, Mapping) else None
+        return session_id if isinstance(session_id, str) and session_id else None
+
+    @staticmethod
+    def _active_worker_session(task_id: str, run_id: str) -> str:
+        """Read the native tool's own worker context, never caller payload.
+
+        Hermes exposes the session only to the active worker until
+        ``kanban_request_review`` closes the run and stamps its metadata.  The
+        same task/run environment is the native lifecycle ownership fence, so a
+        controller process or a sibling worker cannot nominate a session here.
+        """
+        task = os.environ.get("HERMES_KANBAN_TASK")
+        active_run = os.environ.get("HERMES_KANBAN_RUN_ID")
+        session = os.environ.get("HERMES_SESSION_ID")
+        if task != task_id or active_run != run_id or not isinstance(session, str) or not session:
+            raise ValueError("local-review handoff reservation requires the active worker-owned tool session")
+        return session
+
+    def _scoped_run(self, task_id: str, run_id: str) -> Mapping[str, Any]:
+        reader = getattr(self.board, "read_scoped_run", None)
+        if not callable(reader):
+            raise ValueError("board cannot verify exact native run attribution")
+        result = reader(self.scope, task_id, run_id)
+        if not isinstance(result, Mapping):
+            raise ValueError("board returned malformed native run attribution")
+        return result
+
+    def request_local_review(self, task_id: str, candidate: Any, *, implementation_profile: str,
+                             reviewer_profile: str, summary: str, operation_key: str) -> dict[str, Any]:
+        """Durably propose a handoff which only the implementation worker can send."""
+        from .contracts import CandidateIdentity
+        configured_implementation, configured_reviewer = self._local_review_roles()
+        if not isinstance(candidate, CandidateIdentity):
+            raise ValueError("candidate must be a CandidateIdentity")
+        if not all(isinstance(value, str) and value for value in (implementation_profile, reviewer_profile, summary, operation_key)):
+            raise ValueError("bounded non-empty handoff values are required")
+        if (implementation_profile, reviewer_profile) != (configured_implementation, configured_reviewer):
+            raise ValueError("local-review handoff profiles must match configured roles")
+        self._managed_task(task_id)
+        implementation = self._scoped_run(task_id, candidate.originating_run_id)
+        self._exact_run(implementation, run_id=candidate.originating_run_id, profile=implementation_profile)
+        if implementation.get("status") != "running":
+            raise ValueError("worker-owned implementation run must be active")
+        implementation_session = self._active_worker_session(task_id, candidate.originating_run_id)
+        before = self.board.read_task(task_id)
+        if not isinstance(before, BoardSnapshot):
+            raise ValueError("board adapter must return BoardSnapshot")
+        marker = {"operation_key": operation_key, "candidate": candidate.to_dict(),
+                  "implementation_run_id": candidate.originating_run_id,
+                  "implementation_profile": implementation_profile,
+                  "implementation_session_id": implementation_session,
+                  "reviewer_profile": reviewer_profile}
+        action = Action(operation_key, self.scope, {
+            "task_id": task_id, "reviewer_profile": reviewer_profile, "summary": summary,
+            "candidate_content_identity": candidate.content_identity,
+            "review_marker": marker,
+        }, "request_review", before.digest)
+        with self.lock:
+            self._assert_lock()
+            intent = self.store.read_scope(self.scope)["operator_intent"]
+            if intent is not None and intent.active:
+                return {"outcome": "held", "details": "operator pause or cancellation is active", "operation_key": operation_key}
+            stored = self.store.reserve_operation(self._intent_for(action))
+            if stored.phase == "applied":
+                return {"outcome": "verified", "operation_key": operation_key}
+            return {"outcome": "proposed", "operation_key": operation_key}
+
+    def recover_premature_done(self, task_id: str, candidate: Any, *, reviewer_profile: str,
+                               already_locked: bool = False, replacement_for: str | None = None) -> dict[str, Any]:
+        """Create one held replacement review without linking it to a done card."""
+        from .contracts import CandidateIdentity, ManagedMember
+        configured_implementation, configured_reviewer = self._local_review_roles()
+        if not isinstance(candidate, CandidateIdentity) or not isinstance(reviewer_profile, str) or not reviewer_profile:
+            raise ValueError("candidate and local reviewer profile are required")
+        if reviewer_profile != configured_reviewer:
+            raise ValueError("replacement review profile must match configured local-review role")
+        self._managed_task(task_id)
+        if replacement_for is not None:
+            self._managed_task(replacement_for)
+            if not any(member.task_id == replacement_for and member.role == "local_review" for member in self._members()):
+                raise ValueError("replacement source must be an exact managed local-review member")
+        source = self.board.read_task(task_id)
+        anchor = self.board.read_task(self.scope["anchor_task_id"])
+        if not isinstance(source, BoardSnapshot) or not isinstance(anchor, BoardSnapshot):
+            raise ValueError("board adapter must return BoardSnapshot")
+        if self._state(source) != "done":
+            return {"outcome": "held", "reason": "source_not_premature_done"}
+        # A completed card has no worker-owned review handoff.  Preserve only a
+        # candidate independently observed from Git and tied to its exact source
+        # run before creating a replacement review.
+        source_run = self._scoped_run(task_id, candidate.originating_run_id)
+        source_profile = source_run.get("profile")
+        source_session = self._worker_session(source_run)
+        if (source_profile != configured_implementation or source_session is None
+                or source_run.get("status") not in {"completed", "done"}):
+            return {"outcome": "held", "reason": "premature_done_source_provenance_missing"}
+        if not self._trusted_candidate_observation(candidate):
+            return {"outcome": "held", "reason": "trusted_git_freeze_unavailable"}
+        canonical = json.dumps({"scope": self.scope, "source_task_id": task_id,
+                                "candidate": candidate.to_dict(), "action": "premature_done_review",
+                                "replacement_for": replacement_for},
+                               sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        key = "premature-done-review:" + hashlib.sha256(canonical.encode()).hexdigest()
+        association = (f"premature-done:{task_id}:{candidate.content_identity}" if replacement_for is None
+                       else f"premature-done-replacement:{replacement_for}:{candidate.content_identity}")
+        action = Action(key, self.scope, {
+            "anchor_task_id": self.scope["anchor_task_id"], "source_task_id": task_id,
+            "candidate": candidate.to_dict(), "reviewer_profile": reviewer_profile,
+            "association": association, "replacement_for": replacement_for, "native_parent": False,
+            "task_id": task_id, "source_run_id": candidate.originating_run_id,
+            "source_profile": source_profile, "source_session_id": source_session,
+            "create_title": f"Local review: {task_id}",
+            "create_body": f"Preserved candidate {candidate.content_identity} for completed source {task_id}.",
+            "create_workspace": candidate.worktree, "create_idempotency_key": key,
+        }, "create_held", anchor.digest)
+        with (nullcontext() if already_locked else self.lock):
+            self._assert_lock()
+            pause = self.store.read_scope(self.scope)["operator_intent"]
+            if pause is not None and pause.active:
+                return {"outcome": "held", "reason": "operator_pause_or_cancellation_active"}
+            try:
+                if self.budget_policy is None:
+                    return {"outcome": "held", "reason": "finite_workflow_repair_budget_required"}
+                source_member = next(member for member in self._members() if member.task_id == task_id)
+                event = {"event_id": f"{WORKFLOW_REPAIRS}:{key}",
+                         "lineage_id": f"{self.scope['anchor_task_id']}:{GENERAL_ATTEMPT}",
+                         "root_task_id": self.scope["anchor_task_id"], "finding_id": GENERAL_ATTEMPT,
+                         "generation": source_member.generation, "source_task_id": task_id,
+                         "source_kind": "native_operation", "native_source_id": key, "count": 1}
+                stored = admit_repair_operation(self.budget_policy, self.store, self.scope, self._intent_for(action), event)
+            except Exception as error:
+                return {"outcome": "held", "reason": str(error)}
+            if stored.phase == "unknown":
+                verifier = getattr(self.board, "verify_effect", None)
+                result = verifier(action) if callable(verifier) else ActionResult(key, "unsupported", "create marker verifier unavailable", None)
+                readback = self._portable_readback(result.readback)
+                self.store.record_effect_observation(self.scope, key, outcome=result.outcome, details=result.details, readback=readback)
+                if result.outcome not in {"verified", "no-op"} or not self._readback_proves(action, result):
+                    return {"outcome": "held", "reason": "durable_create_outcome_unknown"}
+                assert readback is not None
+                stored = self.store.ack_effect(self.scope, key, readback=readback, outcome=result.outcome)
+            if stored.phase == "applied":
+                created = self._snapshot_from_readback(stored.readback)
+                if created is None:
+                    return {"outcome": "held", "reason": "durable_create_readback_invalid"}
+            else:
+                if getattr(self.board, "is_fake", False):
+                    self.store.begin_effect_attempt(self.scope, key)
+                try:
+                    result = self.board.create_held(
+                        action, title=action.target["create_title"], body=action.target["create_body"],
+                        assignee=reviewer_profile, workspace=candidate.worktree, idempotency_key=key,
+                    )
+                except Exception as error:
+                    result = ActionResult(key, "unknown", f"native create exception: {error}", None)
+                readback = self._portable_readback(result.readback)
+                self.store.record_effect_observation(self.scope, key, outcome=result.outcome,
+                                                     details=result.details, readback=readback)
+                created = self._snapshot_from_readback(readback)
+                if (result.outcome not in {"verified", "no-op"} or created is None
+                        or self._state(created) != "blocked" or created.parents):
+                    return {"outcome": "held", "reason": "separate_review_create_unverified"}
+                self.store.ack_effect(self.scope, key, readback=created.to_dict(), outcome=result.outcome)
+            review_member = ManagedMember(self.scope["board_id"], self.scope["anchor_task_id"],
+                                          str(created.native_task["id"]), "local_review",
+                                          source_member.generation, source_member.finding_ids, association)
+            self.store.register_member(review_member)
+            return {"outcome": "held", "task_id": review_member.task_id}
+
+    def _trusted_candidate_observation(self, candidate: Any) -> bool:
+        if self.git_observer is None:
+            return False
+        try:
+            observed = self.git_observer(dict(self.scope))
+        except Exception:
+            return False
+        if not isinstance(observed, Mapping) or observed.get("candidate") != candidate.to_dict():
+            return False
+        checks = observed.get("checks")
+        return isinstance(checks, list) and bool(checks) and all(
+            isinstance(check, Mapping) and check.get("outcome") == "passed" for check in checks
+        )
+
+    def _frozen_candidate(self, candidate: Any, review: Mapping[str, Any]) -> bool:
+        """Bind a verdict to observer-owned candidate, checks, and contract scope.
+
+        ``git_observer`` is a composition-root trust boundary: it must read the
+        frozen candidate and deterministic validation output itself.  Reviewer
+        text can attest to neither.  There is intentionally no fallback when a
+        trusted observer is unavailable.
+        """
+        if self.git_observer is None:
+            return False
+        try:
+            observed = self.git_observer(dict(self.scope))
+        except Exception:
+            return False
+        if not isinstance(observed, Mapping):
+            return False
+        frozen, checks, criterion_ids = (observed.get("candidate"), observed.get("checks"),
+                                         observed.get("criterion_ids"))
+        if not isinstance(frozen, Mapping) or dict(frozen) != candidate.to_dict():
+            return False
+        if (not isinstance(checks, list) or not checks or not isinstance(criterion_ids, list) or not criterion_ids
+                or not all(isinstance(item, str) and item for item in criterion_ids)
+                or criterion_ids != sorted(set(criterion_ids))):
+            return False
+        try:
+            from .evidence_store import _canonical_identity
+            checks_identity = _canonical_identity(checks)
+        except (TypeError, ValueError):
+            return False
+        if (observed.get("checks_identity") != checks_identity
+                or review.get("checks") != checks
+                or review.get("checks_identity") != checks_identity):
+            return False
+        if any(not isinstance(check, Mapping) or set(check) != {"check_id", "outcome", "evidence"}
+               or not all(isinstance(check.get(field), str) and check[field] for field in ("check_id", "outcome", "evidence"))
+               or check.get("outcome") != "passed" for check in checks):
+            return False
+        criteria = review.get("criterion_evidence")
+        if not isinstance(criteria, list) or len(criteria) != len(criterion_ids):
+            return False
+        if any(not isinstance(item, Mapping) or set(item) != {"criterion_id", "outcome", "evidence"}
+               or not all(isinstance(item.get(field), str) and item[field] for field in ("criterion_id", "outcome", "evidence"))
+               or item.get("outcome") not in {"pass", "fail"} for item in criteria):
+            return False
+        return [item["criterion_id"] for item in criteria] == criterion_ids
+
+    def _verified_handoff(self, task_id: str, candidate: Any, expected_profile: str) -> Mapping[str, Any] | None:
+        """Read native worker-owned run/event evidence; never replay its handoff."""
+        try:
+            configured_implementation, configured_reviewer = self._local_review_roles()
+        except ValueError:
+            return None
+        if expected_profile != configured_reviewer:
+            return None
+        state = self.store.read_scope(self.scope)
+        matches = [operation for operation in state["operations"]
+                   if operation.effect == "request_review"
+                   and operation.target.get("task_id") == task_id
+                   and operation.target.get("reviewer_profile") == expected_profile
+                   and operation.target.get("candidate_content_identity") == candidate.content_identity]
+        if len(matches) != 1:
+            return None
+        marker = matches[0].target.get("review_marker")
+        if (not isinstance(marker, Mapping) or marker.get("candidate") != candidate.to_dict()
+                or marker.get("implementation_profile") != configured_implementation
+                or marker.get("reviewer_profile") != configured_reviewer):
+            return None
+        try:
+            observed = self.board.read_task(task_id)
+        except Exception:
+            return None
+        if not isinstance(observed, BoardSnapshot):
+            return None
+        implementation = next((run for run in observed.runs if str(run.get("id")) == candidate.originating_run_id), None)
+        if not isinstance(implementation, Mapping):
+            return None
+        if (observed.native_task.get("status") not in {"review", "running", "done"}
+                or observed.native_task.get("assignee") != expected_profile
+                or implementation.get("profile") != marker.get("implementation_profile")
+                or implementation.get("status") not in {"completed", "done"}
+                or implementation.get("outcome") != "review_requested"):
+            return None
+        metadata = implementation.get("metadata")
+        if not isinstance(metadata, Mapping) or metadata.get("local_first_review") != dict(marker):
+            return None
+        implementation_session = self._worker_session(implementation)
+        if implementation_session is None or marker.get("implementation_session_id") != implementation_session:
+            return None
+        handoff_events = [event for event in observed.events
+                          if event.get("kind") == "review_requested" and str(event.get("run_id")) == candidate.originating_run_id
+                          and isinstance(event.get("payload"), Mapping)
+                          and event["payload"].get("implementer") == marker.get("implementation_profile")
+                          and event["payload"].get("reviewer") == expected_profile]
+        if len(handoff_events) != 1:
+            return None
+        handoff_index = next(index for index, event in enumerate(observed.events) if event is handoff_events[0])
+        # Hermes returns task events in historical order.  A later review
+        # request is a later candidate revision, so this candidate's completed
+        # reviewer verdict cannot be accepted through the old handoff.
+        if any(event.get("kind") == "review_requested" for event in observed.events[handoff_index + 1:]):
+            return None
+        intent = matches[0]
+        if intent.phase == "pending":
+            try:
+                self.store.ack_effect(self.scope, intent.key, readback=observed.to_dict())
+                self.store.record_candidate(self.scope, candidate)
+            except Exception:
+                return None
+        elif intent.phase != "applied":
+            return None
+        return {"marker": marker, "implementation_session_id": implementation_session}
+
+    def _separate_review_intent(self, task_id: str, candidate: Any, profile: str) -> OperationIntent | None:
+        state = self.store.read_scope(self.scope)
+        member = next((item for item in state["members"] if item.task_id == task_id and item.role == "local_review"), None)
+        if member is None:
+            return None
+        matches = [item for item in state["operations"] if item.effect == "create_held"
+                   and item.phase == "applied" and item.readback is not None
+                   and self._snapshot_from_readback(item.readback) is not None
+                   and self._snapshot_from_readback(item.readback).native_task.get("id") == task_id
+                   and item.target.get("candidate") == candidate.to_dict()
+                   and item.target.get("reviewer_profile") == profile
+                   and item.target.get("association") == member.work_association
+                   and item.target.get("native_parent") is False]
+        return matches[0] if len(matches) == 1 else None
+
+    def release_separate_review(self, task_id: str, candidate: Any, *, reviewer_profile: str) -> dict[str, Any]:
+        """Release one exact held recovery review for native reviewer dispatch."""
+        from .contracts import CandidateIdentity
+        _, configured_reviewer = self._local_review_roles()
+        if not isinstance(candidate, CandidateIdentity) or not isinstance(reviewer_profile, str) or not reviewer_profile:
+            raise ValueError("candidate and local reviewer profile are required")
+        if reviewer_profile != configured_reviewer:
+            raise ValueError("replacement review profile must match configured local-review role")
+        self._managed_task(task_id)
+        with self.lock:
+            self._assert_lock()
+            pause = self.store.read_scope(self.scope)["operator_intent"]
+            if pause is not None and pause.active:
+                return {"outcome": "held", "reason": "operator_pause_or_cancellation_active"}
+            create = self._separate_review_intent(task_id, candidate, reviewer_profile)
+            if create is None or not self._trusted_candidate_observation(candidate):
+                return {"outcome": "held", "reason": "separate_review_association_or_freeze_missing"}
+            before = self.board.read_task(task_id)
+            if not isinstance(before, BoardSnapshot) or self._state(before) != "blocked" or before.parents or before.runs:
+                return {"outcome": "held", "reason": "separate_review_not_held_and_idle"}
+            action = Action(f"release-separate-review:{create.key}", self.scope, {"task_id": task_id}, "release", before.digest)
+            result = self._apply(action)
+            if result.outcome not in {"verified", "no-op"} or not self._readback_proves(action, result):
+                return {"outcome": "held", "reason": "separate_review_release_unverified"}
+            return {"outcome": "released", "task_id": task_id}
+
+    def _verified_separate_review(self, task_id: str, candidate: Any, expected_profile: str,
+                                  run_id: str, session_id: str) -> bool:
+        try:
+            configured_implementation, configured_reviewer = self._local_review_roles()
+        except ValueError:
+            return False
+        if expected_profile != configured_reviewer:
+            return False
+        create = self._separate_review_intent(task_id, candidate, expected_profile)
+        if create is None:
+            return False
+        source_task = create.target.get("source_task_id")
+        source_run_id = create.target.get("source_run_id")
+        if not isinstance(source_task, str) or source_run_id != candidate.originating_run_id:
+            return False
+        try:
+            source_run = self._scoped_run(source_task, source_run_id)
+            reviewed = self.board.read_task(task_id)
+        except Exception:
+            return False
+        if (not isinstance(reviewed, BoardSnapshot) or self._state(reviewed) != "done"
+                or reviewed.native_task.get("assignee") != expected_profile
+                or source_run.get("profile") != configured_implementation
+                or create.target.get("source_profile") != configured_implementation
+                or self._worker_session(source_run) != create.target.get("source_session_id")):
+            return False
+        run = next((item for item in reviewed.runs if str(item.get("id")) == run_id), None)
+        claims = [event for event in reviewed.events if event.get("kind") == "claimed"
+                  and str(event.get("run_id")) == run_id and isinstance(event.get("payload"), Mapping)
+                  and event["payload"].get("source_status") == "ready"]
+        completions = [event for event in reviewed.events if event.get("kind") == "completed" and str(event.get("run_id")) == run_id]
+        return (isinstance(run, Mapping) and run.get("profile") == expected_profile
+                and run.get("status") in {"completed", "done"} and self._worker_session(run) == session_id
+                and len(claims) == 1 and len(completions) == 1)
+
+    def submit_review(self, task_id: str, candidate: Any, review: Mapping[str, Any], *,
+                      expected_profile: str) -> dict[str, Any]:
+        """Persist a local verdict only after independent native provenance readback."""
+        from .contracts import CandidateIdentity
+        configured_implementation, configured_reviewer = self._local_review_roles()
+        if not isinstance(candidate, CandidateIdentity) or not isinstance(expected_profile, str) or not expected_profile:
+            raise ValueError("candidate and expected local-review profile are required")
+        if expected_profile != configured_reviewer:
+            raise ValueError("local-review verdict profile must match configured role")
+        self._managed_task(task_id)
+        if not isinstance(review, Mapping) or review.get("reviewer_role") != "local":
+            raise ValueError("only structured local review evidence is accepted")
+        native = review.get("native_review")
+        if not isinstance(native, Mapping) or native.get("task_id") != task_id:
+            raise ValueError("review must name the exact managed task")
+        run_id, session_id = native.get("run_id"), native.get("session_id")
+        if not isinstance(run_id, str) or not isinstance(session_id, str):
+            raise ValueError("review requires exact native run and session")
+        if native.get("profile") != expected_profile:
+            return {"outcome": "held", "reason": "review_payload_profile_mismatch"}
+        with self.lock:
+            self._assert_lock()
+            intent = self.store.read_scope(self.scope)["operator_intent"]
+            if intent is not None and intent.active:
+                return {"outcome": "held", "reason": "operator_pause_or_cancellation_active"}
+            separate = self._separate_review_intent(task_id, candidate, expected_profile)
+            handoff = None if separate is not None else self._verified_handoff(task_id, candidate, expected_profile)
+            if handoff is None and separate is None:
+                return {"outcome": "held", "reason": "verified_local_review_handoff_missing"}
+            if not self._frozen_candidate(candidate, review):
+                return {"outcome": "held", "reason": "trusted_git_freeze_unavailable"}
+            observed = self._scoped_run(task_id, run_id)
+            self._exact_run(observed, run_id=run_id, profile=expected_profile)
+            implementation = None if separate is not None else self._scoped_run(task_id, candidate.originating_run_id)
+            implementation_session = None if implementation is None else self._worker_session(implementation)
+            if implementation is not None and implementation.get("profile") != configured_implementation:
+                return {"outcome": "held", "reason": "implementation_native_profile_mismatch"}
+            if run_id == candidate.originating_run_id:
+                raise ValueError("review requires a fresh native run")
+            verdict = review.get("verdict")
+            if verdict == "changes_requested":
+                # Hermes only writes worker_session_id when the reviewer-owned
+                # request-changes call closes this run.  Bind the verdict to the
+                # active worker tool receipt now, while the run is still owned.
+                reviewer_session = self._active_worker_session(task_id, run_id)
+            elif verdict == "approved":
+                # Approval is terminal evidence, so native run metadata must
+                # already carry the reviewer session receipt.
+                reviewer_session = self._worker_session(observed)
+            else:
+                return {"outcome": "held", "reason": "review_verdict_invalid"}
+            if reviewer_session != session_id:
+                return {"outcome": "held", "reason": "review_session_attribution_mismatch"}
+            if separate is None and (not isinstance(implementation_session, str) or session_id == implementation_session):
+                raise ValueError("review requires a fresh session")
+            if handoff is not None and handoff.get("implementation_session_id") != implementation_session:
+                return {"outcome": "held", "reason": "handoff_implementation_session_mismatch"}
+            if verdict == "approved":
+                permitted_run_states = {"completed", "done"}
+            else:
+                # A reviewer must record its structured findings before its own
+                # native tool ends the active review run.
+                permitted_run_states = {"running"}
+            if observed.get("status") not in permitted_run_states:
+                return {"outcome": "held", "reason": "review_native_run_incomplete"}
+            # Re-read the terminal card and source run immediately before the
+            # durable verdict write; status alone is never handoff proof.
+            task_snapshot = self.board.read_task(task_id)
+            if not isinstance(task_snapshot, BoardSnapshot):
+                raise ValueError("board adapter must return BoardSnapshot")
+            final_handoff = None if separate is not None else self._verified_handoff(task_id, candidate, expected_profile)
+            if (separate is None and (final_handoff is None or final_handoff.get("implementation_session_id") != implementation_session)):
+                return {"outcome": "held", "reason": "verified_local_review_handoff_missing"}
+            if separate is not None and not self._verified_separate_review(task_id, candidate, expected_profile, run_id, session_id):
+                return {"outcome": "held", "reason": "verified_separate_review_provenance_missing"}
+            reviewer_claims = [event for event in task_snapshot.events
+                               if event.get("kind") == "claimed" and str(event.get("run_id")) == run_id
+                               and isinstance(event.get("payload"), Mapping)
+                               and event["payload"].get("source_status") == ("ready" if separate is not None else "review")]
+            if len(reviewer_claims) != 1:
+                return {"outcome": "held", "reason": "review_run_not_claimed_from_native_review" if separate is None else "separate_review_run_not_claimed_from_ready"}
+            if verdict == "approved":
+                if task_snapshot.native_task.get("status") != "done":
+                    return {"outcome": "held", "reason": "review_approval_not_terminal_done"}
+                completions = [event for event in task_snapshot.events
+                               if event.get("kind") == "completed" and str(event.get("run_id")) == run_id]
+                if len(completions) != 1:
+                    return {"outcome": "held", "reason": "review_done_without_exact_completion_event"}
+            stored = self.store.record_review(self.scope, candidate, review)
+            if stored["verdict"] == "approved":
+                return {"outcome": "accepted", "candidate": candidate.content_identity, "review_id": stored["review_id"]}
+            return {"outcome": "changes_requested", "candidate": candidate.content_identity, "review_id": stored["review_id"]}
+
+    def request_corrections(self, task_id: str, candidate: Any, review: Mapping[str, Any], *,
+                            implementation_profile: str, operation_key: str, reason: str = "cover edge case") -> dict[str, Any]:
+        """Reserve, but never send, a reviewer-owned native request-changes call."""
+        from .contracts import CandidateIdentity
+        configured_implementation, configured_reviewer = self._local_review_roles()
+        if not isinstance(candidate, CandidateIdentity) or not isinstance(review, Mapping):
+            raise ValueError("candidate and structured review are required")
+        if not all(isinstance(value, str) and value for value in (implementation_profile, operation_key, reason)):
+            raise ValueError("bounded correction values are required")
+        if implementation_profile != configured_implementation:
+            raise ValueError("correction implementation profile must match configured role")
+        self._managed_task(task_id)
+        native = review.get("native_review")
+        if not isinstance(native, Mapping):
+            raise ValueError("changes require a distinct local reviewer and exact native provenance")
+        reviewer = native.get("profile")
+        run_id = native.get("run_id")
+        session_id = native.get("session_id")
+        if (review.get("verdict") != "changes_requested" or native.get("task_id") != task_id
+                or not all(isinstance(value, str) and value for value in (reviewer, run_id, session_id))
+                or reviewer != configured_reviewer):
+            raise ValueError("changes require a distinct local reviewer and exact native provenance")
+        assert isinstance(reviewer, str) and isinstance(run_id, str) and isinstance(session_id, str)
+        state = self.store.read_scope(self.scope)
+        if not any(saved == dict(review) for saved in state["reviews"]):
+            return {"outcome": "held", "reason": "recorded_changes_review_missing"}
+        existing = [operation for operation in state["operations"]
+                    if operation.key == operation_key and operation.effect == "request_changes"]
+        if len(existing) == 1 and existing[0].phase == "applied":
+            return {"outcome": "verified", "operation_key": operation_key}
+        if len(existing) > 1:
+            return {"outcome": "held", "reason": "correction_operation_ambiguous"}
+        reviewer_run = self._scoped_run(task_id, run_id)
+        self._exact_run(reviewer_run, run_id=run_id, profile=reviewer)
+        if reviewer_run.get("status") != "running":
+            return {"outcome": "held", "reason": "reviewer_owned_native_run_missing"}
+        active_session = self._active_worker_session(task_id, run_id)
+        if active_session != session_id:
+            return {"outcome": "held", "reason": "reviewer_active_session_mismatch"}
+        handoff = self._verified_handoff(task_id, candidate, reviewer)
+        if handoff is None or handoff["marker"].get("implementation_profile") != implementation_profile:
+            return {"outcome": "held", "reason": "verified_local_review_handoff_missing"}
+        findings = review.get("findings")
+        finding_ids: list[str] = []
+        if isinstance(findings, list):
+            finding_ids = sorted({item["finding_id"] for item in findings if isinstance(item, Mapping)
+                                  and isinstance(item.get("finding_id"), str) and item["finding_id"]})
+        if len(finding_ids) != 1:
+            return {"outcome": "held", "reason": "correction_finding_lineage_ambiguous"}
+        finding_id = finding_ids[0]
+        before = self.board.read_task(task_id)
+        if (not isinstance(before, BoardSnapshot) or before.native_task.get("status") != "running"
+                or before.native_task.get("assignee") != reviewer):
+            return {"outcome": "held", "reason": "reviewer_owned_native_run_missing"}
+        action = Action(operation_key, self.scope, {
+            "task_id": task_id, "candidate": candidate.to_dict(), "review_id": review.get("review_id"),
+            "review_run_id": run_id, "reviewer_profile": reviewer, "reviewer_session_id": session_id,
+            "reviewer_session_receipt": active_session,
+            "implementation_profile": implementation_profile, "reason": reason,
+        }, "request_changes", before.digest)
+        with self.lock:
+            self._assert_lock()
+            intent = self.store.read_scope(self.scope)["operator_intent"]
+            if intent is not None and intent.active:
+                return {"outcome": "held", "reason": "operator_pause_or_cancellation_active"}
+            if self.budget_policy is None:
+                return {"outcome": "held", "reason": "finite_correction_budget_required"}
+            member = next(member for member in self._members() if member.task_id == task_id)
+            event = {"event_id": f"{REVIEW_CORRECTIONS}:{operation_key}",
+                     "lineage_id": f"{self.scope['anchor_task_id']}:{finding_id}",
+                     "root_task_id": self.scope["anchor_task_id"], "finding_id": finding_id,
+                     "generation": member.generation, "source_task_id": task_id,
+                     "source_kind": "native_operation", "native_source_id": operation_key, "count": 1}
+            stored = admit_repair_operation(self.budget_policy, self.store, self.scope, self._intent_for(action), event)
+            return {"outcome": "verified" if stored.phase == "applied" else "proposed", "operation_key": operation_key}
+
+    def reconcile_local_corrections(self, task_id: str, candidate: Any, *, operation_key: str) -> dict[str, Any]:
+        """Read back one exact reviewer-owned request-changes transition."""
+        from .contracts import CandidateIdentity
+        configured_implementation, configured_reviewer = self._local_review_roles()
+        if not isinstance(candidate, CandidateIdentity) or not isinstance(operation_key, str) or not operation_key:
+            raise ValueError("candidate and correction operation key are required")
+        self._managed_task(task_id)
+        with self.lock:
+            self._assert_lock()
+            operations = [operation for operation in self.store.read_scope(self.scope)["operations"]
+                          if operation.key == operation_key and operation.effect == "request_changes"]
+            if len(operations) != 1:
+                return {"outcome": "held", "reason": "correction_operation_missing"}
+            operation = operations[0]
+            target = operation.target
+            if target.get("task_id") != task_id or target.get("candidate") != candidate.to_dict():
+                return {"outcome": "held", "reason": "correction_operation_identity_mismatch"}
+            if (target.get("implementation_profile") != configured_implementation
+                    or target.get("reviewer_profile") != configured_reviewer):
+                return {"outcome": "held", "reason": "correction_configured_role_mismatch"}
+            if operation.phase == "applied":
+                return {"outcome": "verified", "operation_key": operation_key}
+            observed = self.board.read_task(task_id)
+            if not isinstance(observed, BoardSnapshot):
+                return {"outcome": "held", "reason": "native_correction_readback_unavailable"}
+            run_id = target.get("review_run_id")
+            events = [event for event in observed.events if event.get("kind") == "changes_requested"
+                      and str(event.get("run_id")) == run_id and isinstance(event.get("payload"), Mapping)
+                      and event["payload"].get("reason") == target.get("reason")
+                      and event["payload"].get("implementer") == target.get("implementation_profile")
+                      and event["payload"].get("reviewer") == target.get("reviewer_profile")
+                      and event["payload"].get("status") == observed.native_task.get("status")]
+            run = next((item for item in observed.runs if str(item.get("id")) == run_id), None)
+            if (len(events) != 1 or not isinstance(run, Mapping) or str(run.get("id")) != run_id
+                    or run.get("profile") != target.get("reviewer_profile")
+                    or run.get("outcome") != "changes_requested" or run.get("status") != observed.native_task.get("status")
+                    or target.get("reviewer_session_receipt") != target.get("reviewer_session_id")
+                    or observed.native_task.get("status") not in {"ready", "todo"}
+                    or observed.native_task.get("assignee") != target.get("implementation_profile")):
+                return {"outcome": "held", "reason": "verified_native_correction_missing"}
+            self.store.ack_effect(self.scope, operation_key, readback=observed.to_dict())
+            return {"outcome": "verified", "operation_key": operation_key}
 
 
 __all__ = ["Coordinator"]

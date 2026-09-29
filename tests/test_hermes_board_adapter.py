@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +27,7 @@ class FakeKanban:
     create_returncode_after_effect: int | None = None
     native_returncode_after_effect: dict[str, int] = field(default_factory=dict)
     expose_reviewer: bool = False
+
     archived_task_ids: set[str] = field(default_factory=set)
 
     def add(self, task_id: str, *, status: str = "blocked", runs: list[dict[str, Any]] | None = None,
@@ -55,8 +57,8 @@ class FakeKanban:
             self.add(task_id, title=args[1], body=get("--body"), assignee=get("--assignee"), workspace=get("--workspace"),
                      runs=list(self.create_runs))
             self.tasks[task_id]["task"]["idempotency_key"] = get("--idempotency-key")
-            parent = get("--parent")
-            self.tasks[task_id]["parents"].append(parent)
+            if "--parent" in args:
+                self.tasks[task_id]["parents"].append(get("--parent"))
             if self.create_returncode_after_effect is not None:
                 code = self.create_returncode_after_effect
                 self.create_returncode_after_effect = None
@@ -68,6 +70,7 @@ class FakeKanban:
             self.tasks[args[1]]["task"]["status"] = "review"
             if self.expose_reviewer and "--reviewer" in args:
                 self.tasks[args[1]]["task"]["reviewer"] = args[args.index("--reviewer") + 1]
+
         elif args[0] == "reopen-review": self.tasks[args[1]]["task"]["status"] = "ready"
         elif args[0] == "block":
             source_status = self.tasks[args[1]]["task"]["status"]
@@ -202,6 +205,110 @@ def test_create_held_pre_reads_anchor_and_verifies_all_supported_identity_fields
     assert "--parent" in call and call[call.index("--parent") + 1] == "anchor-1"
 
 
+def test_create_held_can_use_store_association_without_a_native_anchor_dependency(fake_runner, tmp_path):
+    """A done source must not make its recovery review wait on the anchor."""
+    fake_runner.add("anchor-1", status="ready")
+    board = adapter(fake_runner, tmp_path, create_lock_assertion=lambda *_: None)
+    create_action = action(board, "recovery", "create_held", {
+        "anchor_task_id": "anchor-1", "native_parent": False,
+        "source_task_id": "piece", "candidate": {"content_identity": "candidate-content"},
+        "association": "premature-done:piece:candidate-content",
+    })
+    result = board.create_held(create_action, title="review preserved candidate", body="body",
+                               assignee="local-review", workspace="dir:/candidate", idempotency_key="recovery")
+    assert result.outcome == "verified"
+    assert result.readback["parents"] == ()
+    call = next(call for call in mutations(fake_runner) if call[4] == "create")
+    assert "--parent" not in call
+
+
+def test_create_held_accepts_exact_bounded_replacement_review_association(fake_runner, tmp_path):
+    fake_runner.add("anchor-1", status="ready")
+    board = adapter(fake_runner, tmp_path, create_lock_assertion=lambda *_: None)
+    replacement = action(board, "replacement", "create_held", {
+        "anchor_task_id": "anchor-1", "native_parent": False,
+        "source_task_id": "piece", "replacement_for": "finished-local-review",
+        "candidate": {"content_identity": "candidate-content"},
+        "association": "premature-done-replacement:finished-local-review:candidate-content",
+    })
+    result = board.create_held(replacement, title="replacement review", body="body",
+                               assignee="local-review", workspace="dir:/candidate", idempotency_key="replacement")
+    assert result.outcome == "verified"
+    assert result.readback is not None and result.readback["parents"] == ()
+    assert len([call for call in mutations(fake_runner) if call[4] == "create"]) == 1
+
+    malformed = action(board, "bad-replacement", "create_held", {
+        "anchor_task_id": "anchor-1", "native_parent": False,
+        "source_task_id": "piece", "replacement_for": "other-review",
+        "candidate": {"content_identity": "candidate-content"},
+        "association": "premature-done-replacement:finished-local-review:candidate-content",
+    })
+    assert board.create_held(malformed, title="bad", body="body", assignee="local-review",
+                             workspace="dir:/candidate", idempotency_key="bad-replacement").outcome == "conflict"
+    assert len([call for call in mutations(fake_runner) if call[4] == "create"]) == 1
+
+
+def test_unknown_store_associated_create_reconciles_by_exact_marker_without_resend(fake_runner, tmp_path):
+    fake_runner.add("anchor-1", status="ready")
+    fake_runner.create_returncode_after_effect = 1
+    board = adapter(fake_runner, tmp_path, create_lock_assertion=lambda *_: None)
+    target = {
+        "anchor_task_id": "anchor-1", "native_parent": False,
+        "source_task_id": "piece", "candidate": {"content_identity": "candidate-content"},
+        "association": "premature-done:piece:candidate-content",
+        "create_title": "review preserved candidate", "create_body": "body",
+        "reviewer_profile": "local-review", "create_workspace": "dir:/candidate",
+        "create_idempotency_key": "recovery",
+    }
+    create_action = action(board, "recovery", "create_held", target)
+    first = board.create_held(create_action, title=target["create_title"], body=target["create_body"],
+                              assignee=target["reviewer_profile"], workspace=target["create_workspace"],
+                              idempotency_key=target["create_idempotency_key"])
+    recovered = board.verify_effect(create_action)
+    assert first.outcome == "unknown" and recovered.outcome == "no-op"
+    assert len([call for call in mutations(fake_runner) if call[4] == "create"]) == 1
+    assert recovered.readback["parents"] == ()
+
+
+def test_native_parentless_held_card_preserves_marker_and_releases_without_a_prior_run(tmp_path):
+    binary = os.environ.get("HERMES_M0_CLI")
+    if not binary or not Path(binary).is_file():
+        pytest.skip("Set HERMES_M0_CLI to the installed Hermes executable")
+    assert binary is not None
+    home = tmp_path / "isolated-hermes"
+    home.mkdir()
+    env = os.environ.copy()
+    env.update(HERMES_HOME=str(home), HERMES_KANBAN_HOME=str(home), HERMES_KANBAN_BOARD="adapter-native")
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_ATTACHMENTS_ROOT",
+                "HERMES_KANBAN_LOGS_ROOT", "HERMES_PROFILE", "HERMES_KANBAN_TASK", "HERMES_DELEGATED_CHILD_CONTEXT"):
+        env.pop(key, None)
+
+    def run(*args: str) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run([binary, "kanban", "--board", "adapter-native", *args], env=env,
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        return result
+
+    result = subprocess.run([binary, "kanban", "boards", "create", "adapter-native"], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    marker = "<!-- local-first-create:v1:native-parentless-parity -->"
+    created = json.loads(run("create", "recovery review", "--body", f"candidate\n\n{marker}",
+                             "--assignee", "local-review", "--initial-status", "blocked", "--json").stdout)
+    task_id = created["id"]
+    before = json.loads(run("show", task_id, "--json").stdout)
+    assert before["task"]["status"] == "blocked"
+    assert before["task"]["body"].endswith(marker)
+    assert before["parents"] == []
+    assert json.loads(run("runs", task_id, "--json").stdout) == []
+    listed = json.loads(run("list", "--archived", "--json").stdout)
+    assert next(row for row in listed if row["id"] == task_id)["body"].endswith(marker)
+    run("unblock", task_id, "--reason", "native-parentless-release")
+    after = json.loads(run("show", task_id, "--json").stdout)
+    assert after["task"]["status"] == "ready"
+    assert json.loads(run("runs", task_id, "--json").stdout) == []
+
+
 def test_create_held_with_running_run_is_partial_not_verified(fake_runner, tmp_path):
     fake_runner.add("anchor-1"); fake_runner.create_runs = [{"id": "r", "status": "running"}]
     board = adapter(fake_runner, tmp_path, create_lock_assertion=lambda *_: True)
@@ -281,6 +388,33 @@ def test_create_held_conflicts_on_duplicate_exact_markers_without_a_create(fake_
     assert not [call for call in mutations(fake_runner) if call[4] == "create"]
 
 
+def test_create_marker_search_over_a_thousand_unmarked_rows_uses_a_small_bounded_cli_budget(fake_runner, tmp_path):
+    fake_runner.add("anchor-1")
+    for index in range(999):
+        fake_runner.add(f"unmarked-{index}", body="unrelated body")
+    board = adapter(fake_runner, tmp_path, claim_create_attempt=None)
+    create_action = action(board, "bounded-search", "create_held", {"anchor_task_id": "anchor-1"})
+    calls_before_create = len(fake_runner.calls)
+    result = board.create_held(create_action, title="new", body="body", assignee="worker", workspace="dir:/repo",
+                               idempotency_key="bounded-search")
+    assert result.outcome == "unsupported"
+    # The anchor pre-read plus one archived list are enough when native list
+    # rows expose bodies.  Never fan out to one show/runs pair per row.
+    assert len(fake_runner.calls) - calls_before_create <= 3
+    assert sum(call[4:] == ("list", "--archived", "--json") for call in fake_runner.calls) == 1
+
+
+def test_marker_reconciliation_fails_closed_on_excessively_nested_native_json(fake_runner, tmp_path):
+    fake_runner.add("anchor-1", status="blocked")
+    board = adapter(fake_runner, tmp_path)
+    act = action(board, "nested-marker", "hold", {"task_id": "anchor-1"})
+    nested: Any = board._native_marker(act)
+    for _ in range(1_100):
+        nested = {"nested": nested}
+    fake_runner.tasks["anchor-1"]["comments"] = [nested]
+    assert board.verify_effect(act).outcome == "unknown"
+
+
 def test_create_held_unknown_result_is_not_retried_and_later_reconciles_by_marker(fake_runner, tmp_path):
     fake_runner.add("anchor-1")
     fake_runner.create_returncode_after_effect = 1
@@ -312,7 +446,34 @@ def test_request_review_requires_waiting_lane_and_observed_requested_distinct_re
     fake_runner.add("anchor-1", status="ready", assignee="implementer")
     board = adapter(fake_runner, tmp_path)
     assert board.request_review(action(board, "review", "request_review", {"task_id": "anchor-1"}), "anchor-1", "checks", reviewer="implementer").outcome == "conflict"
-    assert board.request_review(action(board, "review", "request_review", {"task_id": "anchor-1"}), "anchor-1", "checks", reviewer="reviewer").outcome == "partial"
+    writes = len(mutations(fake_runner))
+    assert board.request_review(action(board, "review", "request_review", {"task_id": "anchor-1"}), "anchor-1", "checks", reviewer="reviewer").outcome == "unsupported"
+    assert len(mutations(fake_runner)) == writes
+
+
+def test_unknown_request_review_reconciles_only_with_public_native_run_and_event(fake_runner, tmp_path):
+    fake_runner.add("anchor-1", status="ready", assignee="implementer")
+    board = adapter(fake_runner, tmp_path)
+    marker = {"operation_key": "review-marker", "candidate": {"content_identity": "content"}}
+    act = action(board, "review-marker", "request_review", {"task_id": "anchor-1", "reviewer_profile": "reviewer", "review_marker": marker})
+    fake_runner.tasks["anchor-1"]["task"].update({"status": "review", "assignee": "reviewer"})
+    fake_runner.tasks["anchor-1"]["runs"] = [{"id": 17, "profile": "implementer", "status": "completed", "outcome": "review_requested", "metadata": {"local_first_review": marker, "worker_session_id": "implementation-session"}}]
+    fake_runner.tasks["anchor-1"]["events"] = [{"kind": "review_requested", "run_id": 17, "payload": {"implementer": "implementer", "reviewer": "reviewer"}}]
+    writes = len(mutations(fake_runner))
+    assert board.verify_effect(act).outcome == "verified"
+    assert len(mutations(fake_runner)) == writes
+
+
+def test_unknown_request_review_reconciles_read_only_after_terminal_done(fake_runner, tmp_path):
+    fake_runner.add("anchor-1", status="done", assignee="reviewer")
+    board = adapter(fake_runner, tmp_path)
+    marker = {"operation_key": "review-marker", "candidate": {"content_identity": "content"}}
+    act = action(board, "review-marker", "request_review", {"task_id": "anchor-1", "reviewer_profile": "reviewer", "review_marker": marker})
+    fake_runner.tasks["anchor-1"]["runs"] = [{"id": 17, "profile": "implementer", "status": "completed", "outcome": "review_requested", "metadata": {"local_first_review": marker, "worker_session_id": "implementation-session"}}]
+    fake_runner.tasks["anchor-1"]["events"] = [{"kind": "review_requested", "run_id": 17, "payload": {"implementer": "implementer", "reviewer": "reviewer"}}]
+    writes = len(mutations(fake_runner))
+    assert board.verify_effect(act).outcome == "verified"
+    assert len(mutations(fake_runner)) == writes
 
 
 def test_complete_anchor_is_unsupported_without_trusted_evidence_and_verified_with_it(fake_runner, tmp_path):

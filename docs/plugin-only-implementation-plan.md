@@ -179,6 +179,10 @@ Build supported board adapter, operation records, singleton lock and durable int
 
 Native implementer run → request review → new local reviewer → correction → repeat → accepted candidate. Also prove accidental done is recovered by separate review. Add role pre-tool guidance without relying on it for acceptance. Verify profile/session/candidate attribution.
 
+For a running implementation, the coordinator may only register and later reconcile a handoff intent. The implementation worker must call `kanban_request_review` on its own run; reconciliation reads the public `show --json`/`runs --json` implementation-run metadata (`local_first_review`, `worker_session_id`) and the bound `review_requested` event. Do not substitute a coordinator CLI call or task-level reviewer/session fields. A reviewer must be a distinct profile and a fresh run/session claimed from `review`; acceptance remains blocked without trusted Git/candidate evidence or while paused/cancelled.
+
+For reviewer-owned `kanban_request_changes`, Hermes v0.21.5 does not retain `worker_session_id` in the terminal run metadata. While that review run is active, require the tool-owned `HERMES_KANBAN_TASK`, `HERMES_KANBAN_RUN_ID`, and `HERMES_SESSION_ID` to match the already-recorded review provenance, then durably receipt that session in the correction operation before the worker calls native request-changes. Reconciliation verifies the immutable run ID/profile, `changes_requested` outcome/event, and original implementer restoration without fabricating missing native metadata. Same-user process access is not independent authority: never accept a caller-supplied session value.
+
 ### M4 — Tranche planning, Git integration and paid review
 
 Add paid structured planning, finite generated work, serial integration, combined tests, paid review, correction generation and repeated re-review. Verify future tranches do not exist until release. Prove a review round ending in changes does not release acceptance.

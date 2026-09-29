@@ -218,9 +218,10 @@ def admit_repair_operation(
     }
     if set(event) != required or not isinstance(task_id, str) or not task_id:
         raise ValueError("budgeted repair operation requires exact operation attribution")
+    category = _event_category(event)
     if (
-        _event_category(event) != WORKFLOW_REPAIRS
-        or event["event_id"] != f"{WORKFLOW_REPAIRS}:{intent.key}"
+        category not in {WORKFLOW_REPAIRS, REVIEW_CORRECTIONS}
+        or event["event_id"] != f"{category}:{intent.key}"
         or event["source_kind"] != "native_operation"
         or event["native_source_id"] != intent.key
         or event["source_task_id"] != task_id
@@ -230,7 +231,7 @@ def admit_repair_operation(
     reserve = getattr(store, "reserve_budgeted_repair_operation", None)
     if not callable(reserve):
         raise ValueError("budgeted repair admission requires durable operation reservation")
-    return cast(OperationIntent, reserve(intent, dict(event), policy_limit=policy.limit(WORKFLOW_REPAIRS)))
+    return cast(OperationIntent, reserve(intent, dict(event), policy_limit=policy.limit(category)))
 
 
 def remaining(

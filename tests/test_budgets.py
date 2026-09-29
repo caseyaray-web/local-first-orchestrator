@@ -6,6 +6,7 @@ import threading
 from local_first_orchestrator.budgets import (
     BudgetPolicy,
     GENERAL_ATTEMPT,
+    REVIEW_CORRECTIONS,
     WORKFLOW_REPAIRS,
     admit_repair_operation,
     classify_run_start,
@@ -290,6 +291,17 @@ def test_budgeted_repair_operation_reserves_and_charges_once_across_restart(tmp_
         assert admit_repair_operation(policy, reopened, SCOPE, repair_operation(), repair_event(finding_id="finding-1")) == reserved
         assert len(reopened.read_scope(SCOPE)["budget_events"]) == 1
         assert remaining(policy, reopened, SCOPE, WORKFLOW_REPAIRS, finding_id="finding-1") == 0
+
+
+def test_atomic_correction_admission_charges_review_corrections_not_workflow_repairs(store):
+    policy = BudgetPolicy(1, 1, 1, 0, 1)
+    event = {**repair_event(key="changes:1"), "event_id": f"{REVIEW_CORRECTIONS}:changes:1"}
+
+    reserved = admit_repair_operation(policy, store, SCOPE, repair_operation(key="changes:1"), event)
+
+    assert reserved.phase == "pending"
+    assert remaining(policy, store, SCOPE, REVIEW_CORRECTIONS) == 0
+    assert remaining(policy, store, SCOPE, WORKFLOW_REPAIRS) == 0
 
 
 def test_existing_budgeted_repair_admission_is_idempotent_at_cap_but_new_repair_fails(store):
