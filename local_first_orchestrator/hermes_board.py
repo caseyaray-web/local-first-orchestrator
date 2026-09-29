@@ -20,8 +20,8 @@ from .contracts import Action, ActionResult, BoardSnapshot, validate_scope
 
 _AUTHOR = "local-first-orchestrator"
 _MAX_FIELD = 16_384
-_MAX_MARKER_SEARCH_ROWS = 1_000
-_MAX_MARKER_SEARCH_CLI_CALLS = 3
+_MAX_MARKER_SEARCH_ROWS = 30
+_MAX_MARKER_SEARCH_CLI_CALLS = 64
 _MAX_NATIVE_MARKER_DEPTH = 64
 _MAX_NATIVE_MARKER_NODES = 1_000
 
@@ -218,6 +218,7 @@ class HermesBoardAdapter:
         if not isinstance(rows, list) or len(rows) > _MAX_MARKER_SEARCH_ROWS:
             raise _BoardUnavailable("bounded create marker search malformed or exceeded row limit")
         matches: list[str] = []
+        opaque_ids: list[str] = []
         for row in rows:
             if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
                 raise _BoardUnavailable("bounded create marker search row malformed")
@@ -230,10 +231,36 @@ class HermesBoardAdapter:
                 # idempotency key is a bounded shortlist, then show verifies
                 # the stable marker before accepting it.
                 matches.append(row["id"])
+            elif not isinstance(body, str):
+                # A list row without a supported marker-bearing field is not
+                # evidence of absence.  A bounded query cannot safely rule
+                # out an archived prior effect, so do not issue another send.
+                opaque_ids.append(row["id"])
             if len(matches) > 1:
                 return len(matches), tuple()
         if not matches:
-            return 0, tuple()
+            # The native list serializer may omit both body and idempotency
+            # key.  Read each bounded opaque row exactly; absence is proved
+            # only after this complete fan-out, never inferred from the list.
+            for task_id in opaque_ids:
+                shown = invoke("show", task_id, "--json")
+                task = shown.get("task") if isinstance(shown, Mapping) else None
+                if not isinstance(task, Mapping) or task.get("id") != task_id:
+                    raise _BoardUnavailable("opaque marker row exact read malformed")
+                body = task.get("body")
+                # A native null body is an explicit empty body, not an opaque
+                # value that could retain a marker. Any other non-string shape
+                # remains malformed and blocks a resend.
+                if body is None:
+                    continue
+                if not isinstance(body, str):
+                    raise _BoardUnavailable("opaque marker row exact read lacks body")
+                if marker in body:
+                    matches.append(task_id)
+                    if len(matches) > 1:
+                        return len(matches), tuple()
+            if not matches:
+                return 0, tuple()
         # list plus this exact show/runs read is the entire bounded search.
         if calls + 2 > _MAX_MARKER_SEARCH_CLI_CALLS:
             raise _BoardUnavailable("bounded create marker search exceeded CLI call limit")
@@ -358,16 +385,42 @@ class HermesBoardAdapter:
                   and event["payload"].get("reviewer") == reviewer]
         return None if len(events) == 1 else "conflict" if events else "unsupported"
 
+    @staticmethod
+    def _workspace_routing(task: Mapping[str, Any], workspace: str) -> str | None:
+        """Verify the exact native workspace representation without inventing defaults."""
+        if "workspace" in task:
+            return None if task.get("workspace") == workspace else "conflict"
+        kind, separator, path = workspace.partition(":")
+        if not kind or (kind in {"dir", "worktree"} and (not separator or not path)):
+            return "unsupported"
+        if "workspace_kind" not in task or task.get("workspace_kind") != kind:
+            return "partial" if "workspace_kind" not in task else "conflict"
+        if kind in {"dir", "worktree"}:
+            if "workspace_path" not in task:
+                return "partial"
+            return None if task.get("workspace_path") == path else "conflict"
+        # scratch is a complete route by kind; native has no required path.
+        return None if kind == "scratch" else "unsupported"
+
     def _verify_existing_create(self, action: Action, snapshot: BoardSnapshot, *, title: str, body: str, assignee: str, workspace: str, idempotency_key: str, native_parent: bool) -> ActionResult:
         task = snapshot.native_task
         if self._running(snapshot):
             return self._result(action, "partial", "marked create has active work and is not safely held", snapshot)
-        expected = {"title": title, "body": body, "assignee": assignee, "workspace": workspace, "idempotency_key": idempotency_key}
+        # ``idempotency_key`` is accepted by native create but deliberately
+        # omitted by the installed read serializer.  The generated marker in
+        # the exact body binds it to this action; require only observable
+        # identity/routing fields and validate optional fields when exposed.
+        expected = {"title": title, "body": body, "assignee": assignee}
         missing = [field for field in expected if field not in task]
         if missing:
             return self._result(action, "partial", f"marked create readback cannot expose identity fields: {', '.join(missing)}", snapshot)
         if any(task.get(field) != value for field, value in expected.items()):
             return self._result(action, "conflict", "marked create identity fields differ from action", snapshot)
+        workspace_outcome = self._workspace_routing(task, workspace)
+        if workspace_outcome is not None:
+            return self._result(action, workspace_outcome, "marked create workspace routing differs from action" if workspace_outcome == "conflict" else "marked create readback cannot prove workspace routing", snapshot)
+        if "idempotency_key" in task and task.get("idempotency_key") != idempotency_key:
+            return self._result(action, "conflict", "marked create idempotency key differs from action", snapshot)
         if task.get("status") != "blocked":
             return self._result(action, "conflict", "marked create is not held", snapshot)
         if native_parent and not any(parent.get("id") == self.anchor_task_id for parent in snapshot.parents):
@@ -457,10 +510,15 @@ class HermesBoardAdapter:
         task = after.native_task
         if self._running(after): return self._result(action, "partial", "created card has active work and is not safely held", after)
         if task.get("status") != "blocked": return self._result(action, "conflict", "create did not leave exact task held", after)
-        expected_fields = {"id": task_id, "title": title, "body": created_body, "assignee": assignee, "workspace": workspace, "idempotency_key": idempotency_key}
+        expected_fields = {"id": task_id, "title": title, "body": created_body, "assignee": assignee}
         missing = [field for field in expected_fields if field not in task]
         if missing: return self._result(action, "partial", f"native create readback cannot expose identity fields: {', '.join(missing)}", after)
         if any(task.get(k) != v for k, v in expected_fields.items()): return self._result(action, "conflict", "created task identity fields differ from action", after)
+        workspace_outcome = self._workspace_routing(task, workspace)
+        if workspace_outcome is not None:
+            return self._result(action, workspace_outcome, "created task workspace routing differs from action" if workspace_outcome == "conflict" else "native create readback cannot prove workspace routing", after)
+        if "idempotency_key" in task and task.get("idempotency_key") != idempotency_key:
+            return self._result(action, "conflict", "created task idempotency key differs from action", after)
         if native_parent and not any(x.get("id") == self.anchor_task_id for x in after.parents): return self._result(action, "conflict", "created task is not associated with anchor", after)
         if not native_parent and after.parents: return self._result(action, "conflict", "store-associated create unexpectedly has native dependencies", after)
         return self._result(action, "verified", "held creation verified by exact readback", after)

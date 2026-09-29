@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 
@@ -57,7 +57,7 @@ class ReviewBoard:
     def create_held(self, action, *, title, body, assignee, workspace, idempotency_key):
         self.calls.append("create-held")
         assert action.target["native_parent"] is False
-        assert assignee in {"local-review", "implementer"} and workspace == "/candidate"
+        assert assignee in {"local-review", "implementer"} and workspace == "dir:/candidate"
         created_id = ("correction-task" if action.target.get("correction_of") else
                       "separate-review" if len(self.calls) == 1 else "replacement-review")
         created = snapshot(created_id, "blocked", assignee=assignee)
@@ -674,6 +674,7 @@ def test_separate_changes_create_and_release_bounded_correction_work(tmp_path, m
     assert correction.role == "implementation" and correction.finding_ids == ("finding-1", "finding-2")
     correction_create = next(item for item in store.read_scope(SCOPE)["operations"]
                              if item.effect == "create_held" and item.target.get("correction_of") == "separate-review")
+    assert correction_create.target["generation"] == 1
     assert correction_create.target["finding_ids"] == ("finding-1", "finding-2")
     assert tuple(dict(finding) for finding in correction_create.target["findings"]) == tuple(evidence["findings"])
     assert remaining(controller.budget_policy, store, SCOPE, REVIEW_CORRECTIONS, finding_id=GENERAL_ATTEMPT) == 0
@@ -723,3 +724,28 @@ def test_separate_changes_create_and_release_bounded_correction_work(tmp_path, m
     approval["native_review"]["task_id"] = "correction-task"
     assert controller.submit_review("correction-task", fresh, approval, expected_profile="local-review")["outcome"] == "accepted"
     assert controller.tick() == {"outcome": "no-op", "actions_attempted": 0}
+
+
+def test_prior_changes_reconciliation_normalizes_full_reversed_findings_but_rejects_altered_content(tmp_path, monkeypatch):
+    controller, board, store = coordinator(tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "piece")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "implement-run")
+    monkeypatch.setenv("HERMES_SESSION_ID", "implement-session")
+    assert propose(controller)["outcome"] == "proposed"
+    marker = store.read_scope(SCOPE)["operations"][0].target["review_marker"]
+    active_reviewer(board, marker)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "review-run")
+    monkeypatch.setenv("HERMES_SESSION_ID", "review-session")
+    rejected = changes_review()
+    rejected["findings"].append({"finding_id": "finding-2", "criterion_id": "tests", "severity": "major", "summary": "second"})
+    rejected["findings"].reverse()
+    assert controller.submit_review("piece", candidate(), rejected, expected_profile="local-review")["outcome"] == "changes_requested"
+    assert controller.request_corrections("piece", candidate(), rejected, implementation_profile="implementer", operation_key="reversed")["outcome"] == "proposed"
+    board.task = snapshot("piece", "ready", (board.task.runs[0], {"id": "review-run", "status": "ready", "outcome": "changes_requested", "profile": "local-review", "metadata": None}),
+                          (*board.task.events, {"kind": "changes_requested", "run_id": "review-run", "payload": {"reason": "cover edge case", "implementer": "implementer", "reviewer": "local-review", "status": "ready"}}), assignee="implementer")
+    assert controller.reconcile_local_corrections("piece", candidate(), operation_key="reversed")["outcome"] == "verified"
+    state = store.read_scope(SCOPE)
+    assert controller._prior_changes_are_reconciled("piece", state)
+    operation = next(item for item in state["operations"] if item.key == "reversed")
+    altered = replace(operation, target={**operation.target, "findings": ({**operation.target["findings"][0], "summary": "altered"}, *operation.target["findings"][1:])})
+    assert not controller._prior_changes_are_reconciled("piece", {**state, "operations": tuple(altered if item.key == "reversed" else item for item in state["operations"])})

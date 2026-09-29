@@ -125,6 +125,14 @@ class Coordinator:
                 "native_runs": tuple(run for item in native_tasks.values() for run in item.runs),
                 "git_observation": git}
 
+    @staticmethod
+    def _native_workspace(worktree: str) -> str:
+        if not isinstance(worktree, str) or not worktree:
+            raise ValueError("candidate worktree is required")
+        if worktree == "scratch" or worktree.startswith(("dir:", "worktree:")):
+            return worktree
+        return f"dir:{worktree}"
+
     def _intent_for(self, action: Action) -> OperationIntent:
         return OperationIntent(action.key, action.scope, action.target, action.effect,
             action.expected_observed_identity,
@@ -725,7 +733,7 @@ class Coordinator:
             "source_profile": source_profile, "source_session_id": source_session,
             "create_title": f"Local review: {task_id}",
             "create_body": f"Preserved candidate {candidate.content_identity} for completed source {task_id}.",
-            "create_workspace": candidate.worktree, "create_idempotency_key": key,
+            "create_workspace": self._native_workspace(candidate.worktree), "create_idempotency_key": key,
         }, "create_held", anchor.digest)
         with (nullcontext() if already_locked else self.lock):
             self._assert_lock()
@@ -763,7 +771,7 @@ class Coordinator:
                 try:
                     result = self.board.create_held(
                         action, title=action.target["create_title"], body=action.target["create_body"],
-                        assignee=reviewer_profile, workspace=candidate.worktree, idempotency_key=key,
+                        assignee=reviewer_profile, workspace=action.target["create_workspace"], idempotency_key=key,
                     )
                 except Exception as error:
                     result = ActionResult(key, "unknown", f"native create exception: {error}", None)
@@ -836,11 +844,12 @@ class Coordinator:
                 "anchor_task_id": self.scope["anchor_task_id"], "task_id": review_task_id,
                 "source_task_id": review_task_id, "correction_of": review_task_id,
                 "candidate": candidate.to_dict(), "finding_ids": finding_ids, "findings": structured_findings,
+                "generation": member.generation + 1,
                 "review_id": review["review_id"], "reviewer_profile": implementer,
                 "association": association, "native_parent": False,
                 "create_title": f"Correction: {review_task_id}",
                 "create_body": "\n".join(f"Finding {item['finding_id']}: {item['summary']}" for item in structured_findings),
-                "create_workspace": candidate.worktree, "create_idempotency_key": key,
+                "create_workspace": self._native_workspace(candidate.worktree), "create_idempotency_key": key,
             }, "create_held", anchor.digest)
             event = {"event_id": f"{REVIEW_CORRECTIONS}:{key}",
                      "lineage_id": f"{self.scope['anchor_task_id']}:{GENERAL_ATTEMPT}",
@@ -871,7 +880,7 @@ class Coordinator:
                 try:
                     result = self.board.create_held(action, title=action.target["create_title"],
                                                     body=action.target["create_body"], assignee=implementer,
-                                                    workspace=candidate.worktree, idempotency_key=key)
+                                                    workspace=action.target["create_workspace"], idempotency_key=key)
                 except Exception as error:
                     result = ActionResult(key, "unknown", f"native correction create exception: {error}", None)
                 readback = self._portable_readback(result.readback)
@@ -1131,7 +1140,11 @@ class Coordinator:
                           and operation.target.get("reviewer_session_id") == session_id
                           and operation.target.get("reviewer_session_receipt") == session_id
                           and operation.target.get("finding_ids") == finding_ids
-                          and tuple(operation.target.get("findings", ())) == tuple(findings)]
+                          # Review record order is presentation order.  The
+                          # immutable correction intent canonicalizes the full
+                          # finding records by ID, so compare that same form.
+                          and tuple(operation.target.get("findings", ()))
+                          == tuple(sorted((dict(item) for item in findings), key=lambda item: item["finding_id"]))]
             if len(operations) != 1:
                 return False
             operation = operations[0]

@@ -205,6 +205,47 @@ def test_create_held_pre_reads_anchor_and_verifies_all_supported_identity_fields
     assert "--parent" in call and call[call.index("--parent") + 1] == "anchor-1"
 
 
+def test_create_held_verifies_supported_payload_identity_when_show_omits_idempotency_key(fake_runner, tmp_path):
+    """The installed serializer omits the create-only idempotency key."""
+    class NoIdempotencyShowKanban(FakeKanban):
+        def __call__(self, argv, **kwargs):
+            result = super().__call__(argv, **kwargs)
+            if tuple(argv[4:])[0] == "show" and result.returncode == 0:
+                payload = json.loads(result.stdout)
+                payload.get("task", {}).pop("idempotency_key", None)
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            return result
+
+    fake = NoIdempotencyShowKanban(); fake.add("anchor-1")
+    board = adapter(fake, tmp_path)
+    result = board.create_held(action(board, "normal-create", "create_held", {"anchor_task_id": "anchor-1"}),
+                               title="new", body="body", assignee="worker", workspace="dir:/repo",
+                               idempotency_key="normal-create")
+    assert result.outcome == "verified", result.details
+    assert len([call for call in mutations(fake) if call[4] == "create"]) == 1
+
+
+def test_create_held_requires_native_workspace_kind_and_path_to_match_when_workspace_string_is_not_serialized(fake_runner, tmp_path):
+    class NativeWorkspaceKanban(FakeKanban):
+        def __call__(self, argv, **kwargs):
+            result = super().__call__(argv, **kwargs)
+            if tuple(argv[4:])[0] == "show" and result.returncode == 0:
+                payload = json.loads(result.stdout)
+                task = payload.get("task", {})
+                workspace = task.pop("workspace", None)
+                if workspace == "dir:/repo":
+                    task.update({"workspace_kind": "dir", "workspace_path": "/wrong-route"})
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            return result
+
+    fake = NativeWorkspaceKanban(); fake.add("anchor-1")
+    board = adapter(fake, tmp_path)
+    result = board.create_held(action(board, "workspace-route", "create_held", {"anchor_task_id": "anchor-1"}),
+                               title="new", body="body", assignee="worker", workspace="dir:/repo",
+                               idempotency_key="workspace-route")
+    assert result.outcome == "conflict", result.details
+
+
 def test_create_held_can_use_store_association_without_a_native_anchor_dependency(fake_runner, tmp_path):
     """A done source must not make its recovery review wait on the anchor."""
     fake_runner.add("anchor-1", status="ready")
@@ -398,10 +439,9 @@ def test_native_adapter_accepts_coordinator_shaped_multi_finding_correction_and_
                                 workspace="dir:/candidate", idempotency_key="native-correction")
     replay = adapter.verify_effect(action)
     assert first.outcome == "unknown", first.details
-    # The installed CLI does not expose workspace/idempotency on show, so replay
-    # is conservatively partial rather than a fabricated verification; it found
-    # the exact marker without issuing another create.
-    assert replay.outcome == "partial", replay.details
+    # Idempotency is create-only.  The exact marker, task identity, held state,
+    # assignee, and parentless routing are observable native proof.
+    assert replay.outcome == "no-op", replay.details
     assert replay.readback is not None and replay.readback["parents"] == ()
 
 
@@ -469,6 +509,28 @@ def test_create_held_reconciles_archived_marker_as_conflict_without_a_create(fak
     assert any(call[4:] == ("list", "--archived", "--json") for call in fake_runner.calls)
 
 
+def test_opaque_marker_list_rows_fail_closed_without_repeating_create(fake_runner, tmp_path):
+    class OpaqueListKanban(FakeKanban):
+        def __call__(self, argv, **kwargs):
+            result = super().__call__(argv, **kwargs)
+            if tuple(argv[4:])[0] == "list" and result.returncode == 0:
+                rows = json.loads(result.stdout)
+                for row in rows:
+                    row.pop("body", None); row.pop("idempotency_key", None)
+                return subprocess.CompletedProcess(argv, 0, json.dumps(rows), "")
+            return result
+
+    fake = OpaqueListKanban(); fake.add("anchor-1")
+    board = adapter(fake, tmp_path)
+    create_action = action(board, "opaque-replay", "create_held", {"anchor_task_id": "anchor-1"})
+    fake.add("archived-original", title="new", body=f"body\n\n{board._create_marker(create_action)}",
+             assignee="worker", workspace="dir:/repo", archived=True)
+    result = board.create_held(create_action, title="new", body="body", assignee="worker", workspace="dir:/repo",
+                               idempotency_key="opaque-replay")
+    assert result.outcome == "conflict", result.details
+    assert not [call for call in mutations(fake) if call[4] == "create"]
+
+
 def test_create_held_conflicts_on_duplicate_exact_markers_without_a_create(fake_runner, tmp_path):
     fake_runner.add("anchor-1")
     body = "body <!-- local-first-action:create -->"
@@ -484,7 +546,7 @@ def test_create_held_conflicts_on_duplicate_exact_markers_without_a_create(fake_
     assert not [call for call in mutations(fake_runner) if call[4] == "create"]
 
 
-def test_create_marker_search_over_a_thousand_unmarked_rows_uses_a_small_bounded_cli_budget(fake_runner, tmp_path):
+def test_create_marker_search_over_row_bound_fails_closed_before_any_create(fake_runner, tmp_path):
     fake_runner.add("anchor-1")
     for index in range(999):
         fake_runner.add(f"unmarked-{index}", body="unrelated body")
@@ -493,9 +555,10 @@ def test_create_marker_search_over_a_thousand_unmarked_rows_uses_a_small_bounded
     calls_before_create = len(fake_runner.calls)
     result = board.create_held(create_action, title="new", body="body", assignee="worker", workspace="dir:/repo",
                                idempotency_key="bounded-search")
-    assert result.outcome == "unsupported"
-    # The anchor pre-read plus one archived list are enough when native list
-    # rows expose bodies.  Never fan out to one show/runs pair per row.
+    assert result.outcome == "unknown"
+    assert not [call for call in mutations(fake_runner) if call[4] == "create"]
+    # The anchor pre-read plus one archived list are enough to reject an
+    # unbounded reconciliation scan; never fan out over arbitrary rows.
     assert len(fake_runner.calls) - calls_before_create <= 3
     assert sum(call[4:] == ("list", "--archived", "--json") for call in fake_runner.calls) == 1
 
