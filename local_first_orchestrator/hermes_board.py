@@ -203,7 +203,7 @@ class HermesBoardAdapter:
         except Exception:
             return False
 
-    def _marked_create_matches(self, marker: str) -> tuple[int, tuple[BoardSnapshot, ...]]:
+    def _marked_create_matches(self, marker: str, *, idempotency_key: str | None = None) -> tuple[int, tuple[BoardSnapshot, ...]]:
         deadline = time.monotonic() + self.timeout_seconds
         calls = 0
 
@@ -221,15 +221,17 @@ class HermesBoardAdapter:
         for row in rows:
             if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
                 raise _BoardUnavailable("bounded create marker search row malformed")
-            # Native M0 list --archived exposes task.body.  Refuse to scan
-            # opaque rows: a show/runs fan-out would turn one reconciliation
-            # into thousands of independent 15-second calls.
-            if not isinstance(row.get("body"), str):
-                raise _BoardUnavailable("bounded create marker search row lacks native body")
-            if marker in row["body"]:
+            body = row.get("body")
+            if isinstance(body, str) and marker in body:
                 matches.append(row["id"])
-                if len(matches) > 1:
-                    return len(matches), tuple()
+            elif (not isinstance(body, str) and isinstance(idempotency_key, str)
+                  and row.get("idempotency_key") == idempotency_key):
+                # Current native list rows may omit bodies.  The exact native
+                # idempotency key is a bounded shortlist, then show verifies
+                # the stable marker before accepting it.
+                matches.append(row["id"])
+            if len(matches) > 1:
+                return len(matches), tuple()
         if not matches:
             return 0, tuple()
         # list plus this exact show/runs read is the entire bounded search.
@@ -388,17 +390,38 @@ class HermesBoardAdapter:
             association = action.target.get("association")
             replacement_for = action.target.get("replacement_for")
             content = candidate.get("content_identity") if isinstance(candidate, Mapping) else None
-            expected_association = (f"separate-review-correction:{source_task}:{content}:{action.target.get('finding_id')}"
-                                    if action.target.get("correction_of") == source_task
-                                    and isinstance(action.target.get("finding_id"), str) and action.target.get("finding_id")
-                                    and isinstance(action.target.get("review_id"), str) and action.target.get("review_id")
-                                    else f"premature-done:{source_task}:{content}" if replacement_for is None
-                                    else f"premature-done-replacement:{replacement_for}:{content}")
+            if action.target.get("correction_of") == source_task:
+                generation = action.target.get("generation")
+                finding_ids = action.target.get("finding_ids")
+                findings = action.target.get("findings")
+                valid_findings = (
+                    isinstance(finding_ids, (tuple, list)) and bool(finding_ids)
+                    and all(isinstance(finding_id, str) and finding_id for finding_id in finding_ids)
+                    and len(set(finding_ids)) == len(finding_ids)
+                    and isinstance(findings, (tuple, list)) and len(findings) == len(finding_ids)
+                    and all(isinstance(finding, Mapping)
+                            and set(finding) == {"finding_id", "criterion_id", "severity", "summary"}
+                            and all(isinstance(finding.get(field), str) and finding[field]
+                                    for field in ("finding_id", "criterion_id", "severity", "summary"))
+                            and finding["severity"] in {"blocker", "major", "minor"}
+                            for finding in findings)
+                    and tuple(sorted(finding["finding_id"] for finding in findings)) == tuple(finding_ids)
+                )
+                expected_association = f"separate-review-correction:{source_task}:{content}:{generation}"
+                correction_contract_valid = (
+                    isinstance(action.target.get("review_id"), str) and bool(action.target["review_id"])
+                    and isinstance(generation, int) and not isinstance(generation, bool) and generation > 0
+                    and action.target.get("task_id") == source_task and valid_findings
+                )
+            else:
+                expected_association = (f"premature-done:{source_task}:{content}" if replacement_for is None
+                                        else f"premature-done-replacement:{replacement_for}:{content}")
+                correction_contract_valid = True
             if (not isinstance(source_task, str) or not source_task or not isinstance(content, str) or not content
                     or (action.target.get("correction_of") is not None and action.target.get("correction_of") != source_task)
                     or (replacement_for is not None and (not isinstance(replacement_for, str)
                         or not replacement_for or replacement_for == source_task))
-                    or association != expected_association):
+                    or not correction_contract_valid or association != expected_association):
                 return self._result(action, "conflict", "parentless create requires exact scoped source candidate association", None)
         created_body = body if marker in body else f"{body}\n\n{marker}"
         if len(created_body) > _MAX_FIELD: raise ValueError("creation body plus stable marker exceeds bound")
@@ -408,7 +431,7 @@ class HermesBoardAdapter:
         except _BoardUnavailable as exc: return self._result(action, "unknown", f"pre-create anchor read unavailable: {exc}", None)
         if action.expected_observed_identity != before.digest: return self._result(action, "conflict", "action observation identity is stale", before)
         try:
-            marker_count, matches = self._marked_create_matches(marker)
+            marker_count, matches = self._marked_create_matches(marker, idempotency_key=idempotency_key)
         except _BoardUnavailable as exc:
             return self._result(action, "unknown", f"pre-create marker reconciliation unavailable: {exc}", before)
         if marker_count > 1:
@@ -532,7 +555,8 @@ class HermesBoardAdapter:
             if not all(isinstance(action.target.get(field), str) and action.target[field] for field in fields):
                 return self._result(action, "unsupported", "create recovery requires exact persisted create identity", None)
             try:
-                count, matches = self._marked_create_matches(self._create_marker(action))
+                count, matches = self._marked_create_matches(self._create_marker(action),
+                                                             idempotency_key=action.target["create_idempotency_key"])
             except _BoardUnavailable as exc:
                 return self._result(action, "unknown", f"create marker reconciliation unavailable: {exc}", None)
             if count != 1:

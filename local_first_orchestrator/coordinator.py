@@ -1099,6 +1099,65 @@ class Coordinator:
                 and session_id != self._worker_session(source_run)
                 and len(claims) == 1 and len(completions) == (0 if changes_requested else 1))
 
+    def _prior_changes_are_reconciled(self, task_id: str, state: Mapping[str, Any]) -> bool:
+        """Require each prior same-card rejection to have its exact native repair receipt."""
+        member = next((item for item in state["members"] if item.task_id == task_id), None)
+        if member is None:
+            return False
+        for prior in state["reviews"]:
+            native = prior.get("native_review") if isinstance(prior, Mapping) else None
+            if (not isinstance(native, Mapping) or prior.get("verdict") != "changes_requested"
+                    or native.get("task_id") != task_id):
+                continue
+            run_id, session_id, profile = native.get("run_id"), native.get("session_id"), native.get("profile")
+            findings = prior.get("findings")
+            if (not all(isinstance(value, str) and value for value in (run_id, session_id, profile))
+                    or not isinstance(findings, list) or not findings):
+                return False
+            finding_id_values: list[str] = []
+            for item in findings:
+                if isinstance(item, Mapping) and isinstance(item.get("finding_id"), str):
+                    finding_id_values.append(item["finding_id"])
+            finding_ids = tuple(sorted(finding_id_values))
+            if len(finding_ids) != len(findings) or len(set(finding_ids)) != len(finding_ids):
+                return False
+            operations = [operation for operation in state["operations"]
+                          if operation.effect == "request_changes"
+                          and operation.target.get("task_id") == task_id
+                          and operation.target.get("candidate") == prior.get("candidate_identity")
+                          and operation.target.get("review_id") == prior.get("review_id")
+                          and operation.target.get("review_run_id") == run_id
+                          and operation.target.get("reviewer_profile") == profile
+                          and operation.target.get("reviewer_session_id") == session_id
+                          and operation.target.get("reviewer_session_receipt") == session_id
+                          and operation.target.get("finding_ids") == finding_ids
+                          and tuple(operation.target.get("findings", ())) == tuple(findings)]
+            if len(operations) != 1:
+                return False
+            operation = operations[0]
+            event_id = f"{REVIEW_CORRECTIONS}:{operation.key}"
+            if not any(event.get("event_id") == event_id
+                       and event.get("native_source_id") == operation.key
+                       and event.get("source_task_id") == task_id
+                       and event.get("generation") == member.generation
+                       and event.get("finding_id") == GENERAL_ATTEMPT
+                       for event in state["budget_events"]):
+                return False
+            evidence = self._snapshot_from_readback(operation.readback)
+            if operation.phase != "applied" or evidence is None:
+                return False
+            events = [event for event in evidence.events if event.get("kind") == "changes_requested"
+                      and str(event.get("run_id")) == run_id and isinstance(event.get("payload"), Mapping)
+                      and event["payload"].get("reason") == operation.target.get("reason")
+                      and event["payload"].get("implementer") == operation.target.get("implementation_profile")
+                      and event["payload"].get("reviewer") == profile]
+            run = next((item for item in evidence.runs if str(item.get("id")) == run_id), None)
+            if (len(events) != 1 or not isinstance(run, Mapping) or run.get("outcome") != "changes_requested"
+                    or evidence.native_task.get("status") not in {"ready", "todo"}
+                    or evidence.native_task.get("assignee") != operation.target.get("implementation_profile")):
+                return False
+        return True
+
     def submit_review(self, task_id: str, candidate: Any, review: Mapping[str, Any], *,
                       expected_profile: str) -> dict[str, Any]:
         """Persist a local verdict only after independent native provenance readback."""
@@ -1124,7 +1183,8 @@ class Coordinator:
             intent = self.store.read_scope(self.scope)["operator_intent"]
             if intent is not None and intent.active:
                 return {"outcome": "held", "reason": "operator_pause_or_cancellation_active"}
-            for prior in self.store.read_scope(self.scope)["reviews"]:
+            state = self.store.read_scope(self.scope)
+            for prior in state["reviews"]:
                 prior_native = prior.get("native_review")
                 if (prior.get("candidate_identity") == candidate.to_dict()
                         and isinstance(prior_native, Mapping)
@@ -1195,6 +1255,8 @@ class Coordinator:
                                if event.get("kind") == "completed" and str(event.get("run_id")) == run_id]
                 if len(completions) != 1:
                     return {"outcome": "held", "reason": "review_done_without_exact_completion_event"}
+            if verdict == "approved" and not self._prior_changes_are_reconciled(task_id, state):
+                return {"outcome": "held", "reason": "prior_native_correction_unreconciled"}
             stored = self.store.record_review(self.scope, candidate, review)
             if stored["verdict"] == "approved":
                 return {"outcome": "accepted", "candidate": candidate.content_identity, "review_id": stored["review_id"]}

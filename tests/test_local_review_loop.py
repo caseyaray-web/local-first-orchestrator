@@ -173,6 +173,39 @@ def propose(controller):
     return controller.request_local_review("piece", candidate(), implementation_profile="implementer", reviewer_profile="local-review", summary="review candidate", operation_key="review-request-1")
 
 
+def fresh_approval_after_changes(controller, board, store, monkeypatch, *, operation_key="review-request-2"):
+    """Build a real fresh implementation/reviewer lineage after a rejection."""
+    fresh = next_candidate()
+    board.task = snapshot("piece", "running", (*board.task.runs,
+        {"id": "implement-run-2", "status": "running", "profile": "implementer",
+         "metadata": {"worker_session_id": "implement-session-2"}},
+    ), board.task.events, assignee="implementer")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "piece")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "implement-run-2")
+    monkeypatch.setenv("HERMES_SESSION_ID", "implement-session-2")
+    assert controller.request_local_review("piece", fresh, implementation_profile="implementer", reviewer_profile="local-review",
+                                           summary="review corrected candidate", operation_key=operation_key) == {
+        "outcome": "proposed", "operation_key": operation_key,
+    }
+    marker = next(operation.target["review_marker"] for operation in store.read_scope(SCOPE)["operations"]
+                  if operation.key == operation_key)
+    board.task = snapshot("piece", "done", (*board.task.runs[:-1],
+        {"id": "implement-run-2", "status": "completed", "outcome": "review_requested", "profile": "implementer",
+         "metadata": {"local_first_review": marker, "worker_session_id": "implement-session-2"}},
+        {"id": "review-run-2", "status": "completed", "outcome": "completed", "profile": "local-review",
+         "metadata": {"worker_session_id": "review-session-2"}},
+    ), (*board.task.events,
+        {"kind": "review_requested", "run_id": "implement-run-2", "payload": {"implementer": "implementer", "reviewer": "local-review"}},
+        {"kind": "claimed", "run_id": "review-run-2", "payload": {"run_id": "review-run-2", "source_status": "review"}},
+        {"kind": "completed", "run_id": "review-run-2", "payload": {"summary": "approved"}},
+    ), assignee="local-review")
+    approved = review(run_id="review-run-2", session_id="review-session-2")
+    approved["review_id"] = "review-2"
+    approved["candidate_identity"] = fresh.to_dict()
+    controller.git_observer = lambda _scope: trusted_observation(fresh)
+    return fresh, approved
+
+
 def test_active_worker_context_reserves_handoff_before_native_terminal_session_stamp(tmp_path, monkeypatch):
     controller, board, store = coordinator(tmp_path)
     # Hermes stamps worker_session_id only while kanban_request_review ends the
@@ -323,6 +356,25 @@ def test_submit_review_requires_every_trusted_check_and_contract_criterion_to_pa
     incomplete = review()
     assert controller.submit_review("piece", candidate(), incomplete, expected_profile="local-review") == {
         "outcome": "held", "reason": "trusted_git_freeze_unavailable",
+    }
+
+
+def test_fresh_approval_holds_until_prior_changes_has_exact_reconciled_native_correction(tmp_path, monkeypatch):
+    controller, board, store = coordinator(tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "piece")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "implement-run")
+    monkeypatch.setenv("HERMES_SESSION_ID", "implement-session")
+    propose(controller)
+    marker = store.read_scope(SCOPE)["operations"][0].target["review_marker"]
+    active_reviewer(board, marker)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "review-run")
+    monkeypatch.setenv("HERMES_SESSION_ID", "review-session")
+    rejected = changes_review()
+    assert controller.submit_review("piece", candidate(), rejected, expected_profile="local-review")["outcome"] == "changes_requested"
+
+    fresh, approved = fresh_approval_after_changes(controller, board, store, monkeypatch)
+    assert controller.submit_review("piece", fresh, approved, expected_profile="local-review") == {
+        "outcome": "held", "reason": "prior_native_correction_unreconciled",
     }
 
 

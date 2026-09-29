@@ -248,23 +248,42 @@ def test_create_held_accepts_exact_bounded_replacement_review_association(fake_r
     assert len([call for call in mutations(fake_runner) if call[4] == "create"]) == 1
 
 
-def test_create_held_accepts_only_exact_separate_review_correction_association(fake_runner, tmp_path):
+def separate_correction_target(*, association: str = "separate-review-correction:separate-review:candidate-content:1") -> dict[str, Any]:
+    findings = (
+        {"finding_id": "finding-1", "criterion_id": "tests", "severity": "major", "summary": "cover edge"},
+        {"finding_id": "finding-2", "criterion_id": "edge", "severity": "blocker", "summary": "cover boundary"},
+    )
+    return {
+        "anchor_task_id": "anchor-1", "native_parent": False,
+        "task_id": "separate-review", "source_task_id": "separate-review", "correction_of": "separate-review",
+        "candidate": {"content_identity": "candidate-content"}, "review_id": "review-1",
+        "generation": 1, "finding_ids": ("finding-1", "finding-2"), "findings": findings,
+        "association": association,
+    }
+
+
+def test_create_held_accepts_complete_generation_bound_separate_review_correction_association(fake_runner, tmp_path):
     fake_runner.add("anchor-1", status="ready")
     board = adapter(fake_runner, tmp_path, create_lock_assertion=lambda *_: None)
-    target = {
-        "anchor_task_id": "anchor-1", "native_parent": False,
-        "source_task_id": "separate-review", "correction_of": "separate-review",
-        "candidate": {"content_identity": "candidate-content"},
-        "review_id": "review-1", "finding_id": "finding-1",
-        "association": "separate-review-correction:separate-review:candidate-content:finding-1",
-    }
-    valid = action(board, "correction", "create_held", target)
+    target = separate_correction_target()
+    valid = action(board, "correction", "create_held", target, identity=board.read_task("anchor-1").digest)
     result = board.create_held(valid, title="correction", body="body", assignee="implementer",
                                workspace="dir:/candidate", idempotency_key="correction")
     assert result.outcome == "verified" and result.readback is not None and result.readback["parents"] == ()
-    invalid = action(board, "other-correction", "create_held", {**target, "finding_id": "other"})
-    assert board.create_held(invalid, title="correction", body="body", assignee="implementer",
-                             workspace="dir:/candidate", idempotency_key="other-correction").outcome == "conflict"
+
+    malformed = (
+        {**target, "association": "separate-review-correction:separate-review:candidate-content:2"},
+        {**target, "generation": 0},
+        {**target, "finding_ids": ("finding-1",)},
+        {**target, "findings": (target["findings"][0],)},
+        {**target, "findings": ({**target["findings"][0], "finding_id": "other"}, target["findings"][1])},
+    )
+    for index, invalid_target in enumerate(malformed):
+        invalid = action(board, f"bad-correction-{index}", "create_held", invalid_target,
+                         identity=board.read_task("anchor-1").digest)
+        assert board.create_held(invalid, title="correction", body="body", assignee="implementer",
+                                 workspace="dir:/candidate", idempotency_key=f"bad-correction-{index}").outcome == "conflict"
+    assert len([call for call in mutations(fake_runner) if call[4] == "create"]) == 1
 
 
 def test_unknown_store_associated_create_reconciles_by_exact_marker_without_resend(fake_runner, tmp_path):
@@ -326,6 +345,64 @@ def test_native_parentless_held_card_preserves_marker_and_releases_without_a_pri
     after = json.loads(run("show", task_id, "--json").stdout)
     assert after["task"]["status"] == "ready"
     assert json.loads(run("runs", task_id, "--json").stdout) == []
+
+
+
+
+def test_native_adapter_accepts_coordinator_shaped_multi_finding_correction_and_replays_unknown_marker(tmp_path):
+    binary = os.environ.get("HERMES_M0_CLI")
+    if not binary or not Path(binary).is_file():
+        pytest.skip("Set HERMES_M0_CLI to the installed Hermes executable")
+    home = tmp_path / "isolated-hermes"
+    home.mkdir()
+    env = os.environ.copy()
+    env.update(HERMES_HOME=str(home), HERMES_KANBAN_HOME=str(home), HERMES_KANBAN_BOARD="adapter-correction")
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_ATTACHMENTS_ROOT",
+                "HERMES_KANBAN_LOGS_ROOT", "HERMES_PROFILE", "HERMES_KANBAN_TASK", "HERMES_DELEGATED_CHILD_CONTEXT"):
+        env.pop(key, None)
+    def run(*args: str) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run([binary, "kanban", "--board", "adapter-correction", *args], env=env,
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        return result
+    assert subprocess.run([binary, "kanban", "boards", "create", "adapter-correction"], env=env,
+                          capture_output=True, text=True, timeout=30).returncode == 0
+    anchor = json.loads(run("create", "anchor", "--assignee", "implementer", "--initial-status", "blocked", "--json").stdout)["id"]
+    adapter = HermesBoardAdapter(board="adapter-correction", anchor_task_id=anchor, executable=binary,
+                                 hermes_home=home, kanban_home=home, create_lock_assertion=lambda *_: None,
+                                 claim_create_attempt=lambda *_: None)
+    findings = (
+        {"finding_id": "finding-1", "criterion_id": "tests", "severity": "major", "summary": "cover edge"},
+        {"finding_id": "finding-2", "criterion_id": "edge", "severity": "blocker", "summary": "cover boundary"},
+    )
+    target = {"anchor_task_id": anchor, "task_id": "separate-review", "source_task_id": "separate-review",
+              "correction_of": "separate-review", "candidate": {"content_identity": "candidate-content"},
+              "review_id": "review-1", "generation": 1, "finding_ids": ("finding-1", "finding-2"),
+              "findings": findings, "association": "separate-review-correction:separate-review:candidate-content:1",
+              "native_parent": False, "create_title": "Correction", "create_body": "all findings",
+              "reviewer_profile": "implementer", "create_workspace": "dir:/candidate",
+              "create_idempotency_key": "native-correction"}
+    action = Action("native-correction", {"board_id": "adapter-correction", "anchor_task_id": anchor}, target,
+                    "create_held", adapter.read_task(anchor).digest)
+    real_runner = adapter.runner
+    sent = False
+    def ambiguous_runner(*args, **kwargs):
+        nonlocal sent
+        result = real_runner(*args, **kwargs)
+        if not sent and args[0][4] == "create":
+            sent = True
+            return subprocess.CompletedProcess(args[0], 1, "", "simulated lost response")
+        return result
+    adapter.runner = ambiguous_runner
+    first = adapter.create_held(action, title="Correction", body="all findings", assignee="implementer",
+                                workspace="dir:/candidate", idempotency_key="native-correction")
+    replay = adapter.verify_effect(action)
+    assert first.outcome == "unknown", first.details
+    # The installed CLI does not expose workspace/idempotency on show, so replay
+    # is conservatively partial rather than a fabricated verification; it found
+    # the exact marker without issuing another create.
+    assert replay.outcome == "partial", replay.details
+    assert replay.readback is not None and replay.readback["parents"] == ()
 
 
 def test_create_held_with_running_run_is_partial_not_verified(fake_runner, tmp_path):
