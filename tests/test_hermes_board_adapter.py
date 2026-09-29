@@ -24,6 +24,7 @@ class FakeKanban:
     after_block: Any = None
     after_link: Any = None
     create_returncode_after_effect: int | None = None
+    native_returncode_after_effect: dict[str, int] = field(default_factory=dict)
     expose_reviewer: bool = False
     archived_task_ids: set[str] = field(default_factory=set)
 
@@ -69,14 +70,23 @@ class FakeKanban:
                 self.tasks[args[1]]["task"]["reviewer"] = args[args.index("--reviewer") + 1]
         elif args[0] == "reopen-review": self.tasks[args[1]]["task"]["status"] = "ready"
         elif args[0] == "block":
+            source_status = self.tasks[args[1]]["task"]["status"]
             self.tasks[args[1]]["task"]["status"] = "blocked"
+            self.tasks[args[1]]["comments"].append({"author": self.comment_author, "body": f"BLOCKED: {args[2]}"})
+            self.tasks[args[1]]["events"].append({"kind": "blocked", "payload": {"reason": args[2], "kind": "needs_input", "recurrences": 1, "source_status": source_status}})
             if self.after_block: self.after_block(self.tasks[args[1]])
-        elif args[0] == "unblock": self.tasks[args[1]]["task"]["status"] = "ready"
+        elif args[0] == "unblock":
+            self.tasks[args[1]]["task"]["status"] = "ready"
+            reason = args[args.index("--reason") + 1]
+            self.tasks[args[1]]["comments"].append({"author": "hermes", "body": f"UNBLOCK: {reason}"})
+            self.tasks[args[1]]["events"].append({"kind": "unblocked", "payload": None})
         elif args[0] == "link":
             self.tasks[args[2]]["parents"].append(args[1])
             if self.after_link: self.after_link(self.tasks[args[2]])
         elif args[0] == "complete": self.tasks[args[1]]["task"]["status"] = "done"
         else: return subprocess.CompletedProcess(argv, 2, "", "unsupported")
+        if args[0] in self.native_returncode_after_effect:
+            return subprocess.CompletedProcess(argv, self.native_returncode_after_effect.pop(args[0]), "", "ambiguous native result")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
 
@@ -318,6 +328,86 @@ def test_verify_effect_never_verifies_only_a_lane(fake_runner, tmp_path):
     fake_runner.add("anchor-1", status="blocked")
     board = adapter(fake_runner, tmp_path)
     assert board.verify_effect(action(board, "verify", "hold", {"task_id": "anchor-1"})).outcome == "unsupported"
+
+
+def test_unknown_native_hold_is_reconciled_read_only_by_exact_scoped_marker(fake_runner, tmp_path):
+    fake_runner.add("anchor-1", status="ready")
+    fake_runner.native_returncode_after_effect["block"] = 1
+    board = adapter(fake_runner, tmp_path)
+    act = action(board, "recover-hold", "hold", {"task_id": "anchor-1"})
+    assert board.hold(act, "anchor-1", "operator prose").outcome == "unknown"
+    writes = len(mutations(fake_runner))
+    marker = board._native_marker(act)
+    assert fake_runner.tasks["anchor-1"]["comments"] == [{"author": fake_runner.comment_author, "body": f"BLOCKED: {marker}"}]
+    assert fake_runner.tasks["anchor-1"]["events"] == [{"kind": "blocked", "payload": {"reason": marker, "kind": "needs_input", "recurrences": 1, "source_status": "ready"}}]
+    restarted = adapter(fake_runner, tmp_path)
+    assert restarted.verify_effect(act).outcome == "verified"
+    assert len(mutations(fake_runner)) == writes
+
+
+def test_unknown_native_release_is_reconciled_read_only_by_exact_scoped_marker(fake_runner, tmp_path):
+    fake_runner.add("anchor-1", status="blocked")
+    fake_runner.native_returncode_after_effect["unblock"] = 1
+    board = adapter(fake_runner, tmp_path)
+    act = action(board, "recover-release", "release", {"task_id": "anchor-1"})
+    assert board.release(act, "anchor-1", "operator prose").outcome == "unknown"
+    writes = len(mutations(fake_runner))
+    marker = board._native_marker(act)
+    assert fake_runner.tasks["anchor-1"]["comments"] == [{"author": "hermes", "body": f"UNBLOCK: {marker}"}]
+    assert fake_runner.tasks["anchor-1"]["events"] == [{"kind": "unblocked", "payload": None}]
+    restarted = adapter(fake_runner, tmp_path)
+    assert restarted.verify_effect(act).outcome == "verified"
+    assert len(mutations(fake_runner)) == writes
+
+
+def test_hold_recovery_requires_marker_and_event_not_only_blocked_lane(fake_runner, tmp_path):
+    fake_runner.add("anchor-1", status="blocked")
+    board = adapter(fake_runner, tmp_path)
+    act = action(board, "manual-hold", "hold", {"task_id": "anchor-1"})
+    assert board.verify_effect(act).outcome == "unsupported"
+    marker = board._native_marker(act)
+    fake_runner.tasks["anchor-1"]["comments"].append({"author": "hermes", "body": f"BLOCKED: {marker}"})
+    assert board.verify_effect(act).outcome == "unknown"
+
+
+def test_hold_recovery_with_active_run_is_partial_and_wrong_scope_conflicts(fake_runner, tmp_path):
+    fake_runner.add("anchor-1", status="blocked", runs=[{"id": "run", "status": "running"}])
+    board = adapter(fake_runner, tmp_path)
+    act = action(board, "held-running", "hold", {"task_id": "anchor-1"})
+    marker = board._native_marker(act)
+    fake_runner.tasks["anchor-1"]["comments"].append({"author": "hermes", "body": f"BLOCKED: {marker}"})
+    fake_runner.tasks["anchor-1"]["events"].append({"kind": "blocked", "payload": {"reason": marker, "kind": "needs_input", "recurrences": 1, "source_status": "ready"}})
+    assert board.verify_effect(act).outcome == "partial"
+    wrong_scope = Action("held-running", {"board_id": "fixture-board", "anchor_task_id": "other"}, {"task_id": "anchor-1"}, "hold", act.expected_observed_identity)
+    assert board.verify_effect(wrong_scope).outcome == "conflict"
+
+
+def test_release_recovery_after_dispatcher_claim_is_partial_not_success(fake_runner, tmp_path):
+    fake_runner.add("anchor-1", status="blocked")
+    fake_runner.native_returncode_after_effect["unblock"] = 1
+    board = adapter(fake_runner, tmp_path)
+    act = action(board, "release-claimed", "release", {"task_id": "anchor-1"})
+    assert board.release(act, "anchor-1", "operator prose").outcome == "unknown"
+    writes = len(mutations(fake_runner))
+    fake_runner.tasks["anchor-1"]["task"]["status"] = "running"
+    fake_runner.tasks["anchor-1"]["runs"].append({"id": "dispatcher", "status": "running"})
+    assert board.verify_effect(act).outcome == "partial"
+    assert len(mutations(fake_runner)) == writes
+
+
+def test_recovery_rejects_duplicate_or_cross_operation_scoped_markers(fake_runner, tmp_path):
+    fake_runner.add("anchor-1", status="blocked")
+    board = adapter(fake_runner, tmp_path)
+    act = action(board, "duplicate-hold", "hold", {"task_id": "anchor-1"})
+    marker = board._native_marker(act)
+    fake_runner.tasks["anchor-1"]["comments"] = [
+        {"author": "hermes", "body": f"BLOCKED: {marker}"},
+        {"author": "hermes", "body": f"BLOCKED: {marker}"},
+    ]
+    fake_runner.tasks["anchor-1"]["events"] = [{"kind": "blocked", "payload": {"reason": marker}}]
+    assert board.verify_effect(act).outcome == "conflict"
+    fake_runner.tasks["anchor-1"]["comments"] = [{"author": "hermes", "body": f"UNBLOCK: {marker}"}]
+    assert board.verify_effect(act).outcome == "conflict"
 
 
 def test_create_markers_are_scoped_to_board_anchor_and_action_key(fake_runner, tmp_path):

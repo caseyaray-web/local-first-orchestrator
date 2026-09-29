@@ -217,6 +217,73 @@ class HermesBoardAdapter:
         )
         return "<!-- local-first-create:v1:sha256:" + hashlib.sha256(canonical.encode()).hexdigest() + " -->"
 
+    @staticmethod
+    def _native_marker(action: Action) -> str:
+        """Stable native hold/release identity, bound to one board lineage."""
+        canonical = json.dumps(
+            {"action_key": action.key, "anchor_task_id": action.scope["anchor_task_id"],
+             "board_id": action.scope["board_id"], "effect": action.effect},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
+        return "<!-- local-first-native:v1:sha256:" + hashlib.sha256(canonical.encode()).hexdigest() + " -->"
+
+    @staticmethod
+    def _contains_marker(value: Any, marker: str) -> bool:
+        if isinstance(value, str): return marker in value
+        if isinstance(value, Mapping): return any(HermesBoardAdapter._contains_marker(item, marker) for item in value.values())
+        if isinstance(value, (list, tuple)): return any(HermesBoardAdapter._contains_marker(item, marker) for item in value)
+        return False
+
+    def _verify_native_hold_release(self, action: Action, snapshot: BoardSnapshot) -> str | None:
+        """Read-only reconciliation of one exact native hold/release effect.
+
+        Status alone is never evidence. Hold events retain the reason marker,
+        so hold requires the exact comment and event. Unblock events do not
+        retain a reason, so release requires the exact UNBLOCK comment instead
+        of inventing an event-to-marker linkage.
+        """
+        marker = self._native_marker(action)
+        is_hold = action.effect == "hold"
+        expected_comment = f"BLOCKED: {marker}" if is_hold else f"UNBLOCK: {marker}"
+        marked_comments = [item for item in snapshot.comments if self._contains_marker(item, marker)]
+        exact_comments = [item for item in marked_comments if item.get("body") == expected_comment]
+        if len(marked_comments) > 1 or len(exact_comments) > 1:
+            return "conflict"
+        if marked_comments and not exact_comments:
+            return "conflict"
+        marked_events = [item for item in snapshot.events if self._contains_marker(item, marker)]
+        if not is_hold:
+            # Native unblock events have no reason payload, so on a later
+            # read they cannot be tied to this operation. The exact UNBLOCK
+            # comment is the supported scoped evidence; do not invent linkage.
+            if marked_events: return "conflict"
+            if not exact_comments: return "unsupported"
+        else:
+            exact_events = [
+                item for item in snapshot.events
+                if item.get("kind") == "blocked"
+                and isinstance(item.get("payload"), Mapping)
+                and item["payload"].get("reason") == marker
+                and item["payload"].get("kind") == "needs_input"
+                and item["payload"].get("source_status") in {"ready", "running"}
+                and isinstance(item["payload"].get("recurrences"), int)
+                and item["payload"]["recurrences"] > 0
+            ]
+            if len(marked_events) > 1 or len(exact_events) > 1:
+                return "conflict"
+            if marked_events and not any(item in exact_events for item in marked_events):
+                return "conflict"
+            if not exact_comments and not exact_events:
+                return "unsupported"
+            if not exact_comments or not exact_events:
+                return "unknown"
+        if is_hold:
+            if self._running(snapshot): return "partial"
+            return None if snapshot.native_task.get("status") == "blocked" else "conflict"
+        if snapshot.native_task.get("status") in {"ready", "todo"}: return None
+        if self._running(snapshot) or snapshot.native_task.get("status") not in {"blocked"}: return "partial"
+        return "unknown"
+
     def _verify_existing_create(self, action: Action, snapshot: BoardSnapshot, *, title: str, body: str, assignee: str, workspace: str, idempotency_key: str) -> ActionResult:
         task = snapshot.native_task
         if self._running(snapshot):
@@ -319,9 +386,11 @@ class HermesBoardAdapter:
         assert before is not None
         if self._running(before): return self._result(action, "partial", "running work cannot be safely held", before)
         if before.native_task.get("status") == "blocked": return self._result(action, "no-op", "exact task already held", before)
-        return self._mutate(action, task_id=task_id, argv=("block", task_id, reason, "--kind", "needs_input"), verifier=lambda _b,a: "partial" if self._running(a) else (None if a.native_task.get("status") == "blocked" else "conflict"), description="hold")
+        marker = self._native_marker(action)
+        return self._mutate(action, task_id=task_id, argv=("block", task_id, marker, "--kind", "needs_input"), verifier=lambda _b, a: self._verify_native_hold_release(action, a), description="hold")
     def release(self, action: Action, task_id: str, reason: str) -> ActionResult:
-        return self._mutate(action, task_id=task_id, argv=("unblock", task_id, "--reason", reason), verifier=lambda b,a: None if b.native_task.get("status") == "blocked" and a.native_task.get("status") in {"ready","todo"} else "conflict", description="release")
+        marker = self._native_marker(action)
+        return self._mutate(action, task_id=task_id, argv=("unblock", task_id, "--reason", marker), verifier=lambda _b, a: self._verify_native_hold_release(action, a), description="release")
     def stop_run(self, action: Action, task_id: str, run_id: str, reason: str) -> ActionResult:
         before, result = self._preflight(action, "stop_run", task_id)
         if result is not None: return result
@@ -360,9 +429,19 @@ class HermesBoardAdapter:
     def verify_effect(self, action: Action) -> ActionResult:
         task_id = action.target.get("task_id")
         if not isinstance(task_id, str) or not task_id: raise ValueError("verify_effect requires exact task target")
-        before, result = self._preflight(action, action.effect, task_id)
-        if result is not None: return result
-        assert before is not None
-        return self._result(action, "unsupported", "a standalone readback cannot prove this operation caused an effect", before)
+        if action.effect not in {"hold", "release"}:
+            return self._result(action, "unsupported", "standalone readback is only supported for exact native hold/release markers", None)
+        error = self._scope_and_target(action, action.effect, task_id)
+        if error: return self._result(action, "conflict", error, None)
+        try: before = self._snapshot(task_id)
+        except (_BoardUnavailable, ValueError) as exc: return self._result(action, "unknown", f"read-only effect verification unavailable: {exc}", None)
+        outcome = self._verify_native_hold_release(action, before)
+        if outcome is None:
+            evidence = "exact scoped native marker, event, and target status" if action.effect == "hold" else "exact scoped UNBLOCK marker and target status"
+            return self._result(action, "verified", f"{evidence} verified read-only", before)
+        if outcome == "unsupported": return self._result(action, outcome, "native hold/release marker and event are absent; lane alone cannot prove an effect", before)
+        if outcome == "partial": return self._result(action, outcome, "native marker is present but target has active or advanced beyond-ready work", before)
+        if outcome == "unknown": return self._result(action, outcome, "native marker history is incomplete and cannot prove the effect", before)
+        return self._result(action, "conflict", "native marker history or target state contradicts the action", before)
 
 __all__ = ["BoardCapabilities", "HermesBoardAdapter"]
