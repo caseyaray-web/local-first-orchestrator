@@ -277,8 +277,31 @@ class Coordinator:
                 return False
         return True
 
-    def _resume_budget_exhausted(self, state: Mapping[str, Any]) -> bool:
-        """A release gate covers general and every managed finding lineage."""
+    def _reserved_correction_release(self, state: Mapping[str, Any], task_id: str) -> bool:
+        """A persisted correction reservation authorizes its later native release.
+
+        Admission is the budget-consuming decision.  A pause must not convert
+        an already-reserved final correction into stranded blocked work merely
+        because that reservation exhausted the root limit.
+        """
+        for operation in state["operations"]:
+            if operation.effect != "create_held" or operation.phase != "applied":
+                continue
+            target = operation.target
+            proof = self._snapshot_from_readback(operation.readback)
+            if (target.get("correction_of") is None or proof is None
+                    or proof.native_task.get("id") != task_id):
+                continue
+            if any(event.get("event_id") == f"{REVIEW_CORRECTIONS}:{operation.key}"
+                   and event.get("finding_id") == GENERAL_ATTEMPT
+                   for event in state["budget_events"]):
+                return True
+        return False
+
+    def _resume_budget_exhausted(self, state: Mapping[str, Any], *, release_task_id: str | None = None) -> bool:
+        """Gate new repairs, but not execution of an already-reserved correction."""
+        if release_task_id is not None and self._reserved_correction_release(state, release_task_id):
+            return False
         if self.budget_policy is None:
             return False
         finding_ids = {GENERAL_ATTEMPT}
@@ -386,12 +409,15 @@ class Coordinator:
             if intent is None or not intent.active:
                 return {"outcome": "held", "reason": "no_active_pause_to_clear", "actions_attempted": 0}
             unknown = bool(self.store.pending_operations(self.scope))
-            exhausted = self._resume_budget_exhausted(state)
             safe = ReconciliationDecision("verified", (), reconciliation["report"]) if reconciliation["outcome"] == "verified" else None
             snapshots = self._read()
             # Continue a persisted multi-member release without generating fresh
             # action identities.  The stored key is the proof identity.
             if intent.resuming:
+                eligible = next((item for item in snapshots if self._state(item) == "blocked" and str(item.native_task["id"]) in state["operator_intent"].resuming_action_keys), None)
+                exhausted = self._resume_budget_exhausted(
+                    state, release_task_id=None if eligible is None else str(eligible.native_task["id"]),
+                )
                 if unknown or exhausted or reconciliation["outcome"] != "verified":
                     reason = "unknown_effects" if unknown else "budget_exhausted" if exhausted else "unsafe_human_edits"
                     return {"outcome": "held", "reason": reason, "actions_attempted": 0}
@@ -412,6 +438,10 @@ class Coordinator:
                 self._assert_lock()
                 self.store.set_operator_intent(final.intent, authorized_clear=True, resume_decision=final)
                 return {"outcome": "verified", "reason": "release_verified", "actions_attempted": 0}
+            release_candidate = next((item for item in snapshots if self._state(item) == "blocked"), None)
+            exhausted = self._resume_budget_exhausted(
+                state, release_task_id=None if release_candidate is None else str(release_candidate.native_task["id"]),
+            )
             decision = plan_resume(self.scope, pause_intent=state["operator_intent"], reconciliation=safe,
                 unknown_effects=unknown, budget_exhausted=exhausted, unsafe_human_edits=reconciliation["outcome"] == "conflict",
                 operator_authorized_resume=authorized_clear, members=state["members"], snapshots=snapshots)
@@ -780,8 +810,12 @@ class Coordinator:
             finding_ids = tuple(sorted(item["finding_id"] for item in findings))
             if len(set(finding_ids)) != len(finding_ids):
                 return {"outcome": "held", "reason": "duplicate_correction_finding"}
-            finding_id = finding_ids[0]
-            association = f"separate-review-correction:{review_task_id}:{candidate.content_identity}:{finding_id}"
+            # One correction generation owns the complete review finding set.
+            # Its immutable target—not only the human-readable body—binds every
+            # finding that the single root-budget reservation represents.
+            structured_findings = tuple(sorted((dict(item) for item in findings), key=lambda item: item["finding_id"]))
+            member = next(member for member in state["members"] if member.task_id == review_task_id)
+            association = f"separate-review-correction:{review_task_id}:{candidate.content_identity}:{member.generation + 1}"
             if any(member.work_association == association for member in state["members"]):
                 return {"outcome": "held", "reason": "correction_already_registered"}
             if (self._separate_review_intent(review_task_id, candidate, reviewer) is None
@@ -796,19 +830,18 @@ class Coordinator:
                 return {"outcome": "held", "reason": "anchor_read_unavailable"}
             canonical = json.dumps({"scope": self.scope, "review_task_id": review_task_id,
                                     "review_id": review["review_id"], "candidate": candidate.to_dict(),
-                                    "finding_id": finding_id}, sort_keys=True, separators=(",", ":"))
+                                    "findings": structured_findings}, sort_keys=True, separators=(",", ":"))
             key = "separate-review-correction:" + hashlib.sha256(canonical.encode()).hexdigest()
             action = Action(key, self.scope, {
                 "anchor_task_id": self.scope["anchor_task_id"], "task_id": review_task_id,
                 "source_task_id": review_task_id, "correction_of": review_task_id,
-                "candidate": candidate.to_dict(), "finding_id": finding_id,
+                "candidate": candidate.to_dict(), "finding_ids": finding_ids, "findings": structured_findings,
                 "review_id": review["review_id"], "reviewer_profile": implementer,
                 "association": association, "native_parent": False,
                 "create_title": f"Correction: {review_task_id}",
-                "create_body": "\n".join(f"Finding {item['finding_id']}: {item['summary']}" for item in findings),
+                "create_body": "\n".join(f"Finding {item['finding_id']}: {item['summary']}" for item in structured_findings),
                 "create_workspace": candidate.worktree, "create_idempotency_key": key,
             }, "create_held", anchor.digest)
-            member = next(member for member in state["members"] if member.task_id == review_task_id)
             event = {"event_id": f"{REVIEW_CORRECTIONS}:{key}",
                      "lineage_id": f"{self.scope['anchor_task_id']}:{GENERAL_ATTEMPT}",
                      "root_task_id": self.scope["anchor_task_id"], "finding_id": GENERAL_ATTEMPT,
@@ -1210,19 +1243,21 @@ class Coordinator:
         if handoff is None or handoff["marker"].get("implementation_profile") != implementation_profile:
             return {"outcome": "held", "reason": "verified_local_review_handoff_missing"}
         findings = review.get("findings")
-        finding_ids: list[str] = []
-        if isinstance(findings, list):
-            finding_ids = sorted({item["finding_id"] for item in findings if isinstance(item, Mapping)
-                                  and isinstance(item.get("finding_id"), str) and item["finding_id"]})
-        if len(finding_ids) != 1:
-            return {"outcome": "held", "reason": "correction_finding_lineage_ambiguous"}
-        finding_id = finding_ids[0]
+        if (not isinstance(findings, list) or not findings
+                or not all(isinstance(item, Mapping) and isinstance(item.get("finding_id"), str)
+                           and item.get("finding_id") and isinstance(item.get("summary"), str) for item in findings)):
+            return {"outcome": "held", "reason": "exact_correction_finding_required"}
+        finding_ids = tuple(sorted(item["finding_id"] for item in findings))
+        if len(set(finding_ids)) != len(finding_ids):
+            return {"outcome": "held", "reason": "duplicate_correction_finding"}
+        structured_findings = tuple(sorted((dict(item) for item in findings), key=lambda item: item["finding_id"]))
         before = self.board.read_task(task_id)
         if (not isinstance(before, BoardSnapshot) or before.native_task.get("status") != "running"
                 or before.native_task.get("assignee") != reviewer):
             return {"outcome": "held", "reason": "reviewer_owned_native_run_missing"}
         action = Action(operation_key, self.scope, {
             "task_id": task_id, "candidate": candidate.to_dict(), "review_id": review.get("review_id"),
+            "finding_ids": finding_ids, "findings": structured_findings,
             "review_run_id": run_id, "reviewer_profile": reviewer, "reviewer_session_id": session_id,
             "reviewer_session_receipt": active_session,
             "implementation_profile": implementation_profile, "reason": reason,
@@ -1236,11 +1271,14 @@ class Coordinator:
                 return {"outcome": "held", "reason": "finite_correction_budget_required"}
             member = next(member for member in self._members() if member.task_id == task_id)
             event = {"event_id": f"{REVIEW_CORRECTIONS}:{operation_key}",
-                     "lineage_id": f"{self.scope['anchor_task_id']}:{finding_id}",
-                     "root_task_id": self.scope["anchor_task_id"], "finding_id": finding_id,
+                     "lineage_id": f"{self.scope['anchor_task_id']}:{GENERAL_ATTEMPT}",
+                     "root_task_id": self.scope["anchor_task_id"], "finding_id": GENERAL_ATTEMPT,
                      "generation": member.generation, "source_task_id": task_id,
                      "source_kind": "native_operation", "native_source_id": operation_key, "count": 1}
-            stored = admit_repair_operation(self.budget_policy, self.store, self.scope, self._intent_for(action), event)
+            try:
+                stored = admit_repair_operation(self.budget_policy, self.store, self.scope, self._intent_for(action), event)
+            except Exception as error:
+                return {"outcome": "held", "reason": str(error)}
             return {"outcome": "verified" if stored.phase == "applied" else "proposed", "operation_key": operation_key}
 
     def reconcile_local_corrections(self, task_id: str, candidate: Any, *, operation_key: str) -> dict[str, Any]:

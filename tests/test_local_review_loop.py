@@ -8,7 +8,7 @@ import pytest
 
 from local_first_orchestrator.contracts import ActionResult, BoardSnapshot, CandidateIdentity, ManagedMember
 from local_first_orchestrator.coordinator import Coordinator
-from local_first_orchestrator.budgets import BudgetPolicy
+from local_first_orchestrator.budgets import BudgetPolicy, GENERAL_ATTEMPT, REVIEW_CORRECTIONS, remaining
 from local_first_orchestrator.daemon import instance_lock
 from local_first_orchestrator.evidence_store import EvidenceStore
 
@@ -328,6 +328,8 @@ def test_submit_review_requires_every_trusted_check_and_contract_criterion_to_pa
 
 def test_repeated_same_card_changes_are_worker_proposed_then_reconciled_before_fresh_candidate_can_accept(tmp_path, monkeypatch):
     controller, board, store = coordinator(tmp_path)
+    controller.budget_policy = BudgetPolicy(implementation_attempts=2, review_corrections=1,
+                                            infrastructure_retries=2, workflow_repairs=2, paid_capacity=2)
     monkeypatch.setenv("HERMES_KANBAN_TASK", "piece")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "implement-run")
     monkeypatch.setenv("HERMES_SESSION_ID", "implement-session")
@@ -337,6 +339,7 @@ def test_repeated_same_card_changes_are_worker_proposed_then_reconciled_before_f
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "review-run")
     monkeypatch.setenv("HERMES_SESSION_ID", "review-session")
     rejected = changes_review()
+    rejected["findings"].append({"finding_id": "finding-2", "criterion_id": "tests", "severity": "major", "summary": "cover companion edge"})
     assert controller.submit_review("piece", candidate(), rejected, expected_profile="local-review") == {
         "outcome": "changes_requested", "candidate": "content", "review_id": "review-1",
     }
@@ -357,6 +360,23 @@ def test_repeated_same_card_changes_are_worker_proposed_then_reconciled_before_f
     proposed = controller.request_corrections("piece", candidate(), rejected, implementation_profile="implementer",
                                               operation_key="changes-1")
     assert proposed == {"outcome": "proposed", "operation_key": "changes-1"}
+    correction = next(item for item in store.read_scope(SCOPE)["operations"] if item.key == "changes-1")
+    assert correction.target["finding_ids"] == ("finding-1", "finding-2")
+    assert tuple(dict(finding) for finding in correction.target["findings"]) == tuple(rejected["findings"])
+    assert remaining(controller.budget_policy, store, SCOPE, REVIEW_CORRECTIONS, finding_id=GENERAL_ATTEMPT) == 0
+    assert remaining(controller.budget_policy, store, SCOPE, REVIEW_CORRECTIONS, finding_id="finding-1") == 1
+    # Stable retries are idempotent even after the root budget is exhausted.
+    assert controller.request_corrections("piece", candidate(), rejected, implementation_profile="implementer",
+                                          operation_key="changes-1") == proposed
+    assert len([event for event in store.read_scope(SCOPE)["budget_events"]
+                if event["event_id"].startswith("review_corrections:")]) == 1
+    # A different native request cannot use a detailed finding lineage to renew
+    # the already exhausted root correction generation.
+    denied = controller.request_corrections("piece", candidate(), rejected, implementation_profile="implementer",
+                                            operation_key="changes-2")
+    assert denied["outcome"] == "held"
+    assert len([event for event in store.read_scope(SCOPE)["budget_events"]
+                if event["event_id"].startswith("review_corrections:")]) == 1
     # Native kanban_request_changes is reviewer-owned. Its public event—not a
     # coordinator write—proves the same card returned to its original worker.
     board.task = snapshot("piece", "ready", (
@@ -570,6 +590,8 @@ def test_separate_review_records_changes_from_active_fresh_reviewer(tmp_path, mo
 
 def test_separate_changes_create_and_release_bounded_correction_work(tmp_path, monkeypatch):
     controller, board, store = coordinator(tmp_path)
+    controller.budget_policy = BudgetPolicy(implementation_attempts=2, review_corrections=1,
+                                            infrastructure_retries=2, workflow_repairs=2, paid_capacity=2)
     board.task = snapshot("piece", "done", (
         {"id": "implement-run", "status": "done", "outcome": "completed", "profile": "implementer",
          "metadata": {"worker_session_id": "implement-session"}},
@@ -598,6 +620,21 @@ def test_separate_changes_create_and_release_bounded_correction_work(tmp_path, m
     assert controller.tick() == {"outcome": "held", "actions_attempted": 1, "task_id": "correction-task"}
     correction = next(m for m in store.read_scope(SCOPE)["members"] if m.task_id == "correction-task")
     assert correction.role == "implementation" and correction.finding_ids == ("finding-1", "finding-2")
+    correction_create = next(item for item in store.read_scope(SCOPE)["operations"]
+                             if item.effect == "create_held" and item.target.get("correction_of") == "separate-review")
+    assert correction_create.target["finding_ids"] == ("finding-1", "finding-2")
+    assert tuple(dict(finding) for finding in correction_create.target["findings"]) == tuple(evidence["findings"])
+    assert remaining(controller.budget_policy, store, SCOPE, REVIEW_CORRECTIONS, finding_id=GENERAL_ATTEMPT) == 0
+    # Restart retains the root reservation and still releases that authorized
+    # correction; only a future admission is denied.
+    database = store.path
+    store.close()
+    store = EvidenceStore.open(database)
+    controller = Coordinator(SCOPE, board=board, store=store, lock=instance_lock(tmp_path / "restart-lock"),
+                             git_observer=lambda _scope: {**trusted_observation(), "criterion_ids": ["edge", "tests"]},
+                             budget_policy=BudgetPolicy(implementation_attempts=2, review_corrections=1,
+                                                        infrastructure_retries=2, workflow_repairs=2, paid_capacity=2),
+                             configured_roles={"implementation_profile": "implementer", "local_review_profile": "local-review"})
     assert controller.tick() == {"outcome": "released", "actions_attempted": 1, "task_id": "correction-task"}
     assert controller.tick() == {"outcome": "no-op", "actions_attempted": 0}
     assert board.calls == ["create-held", "release", "create-held", "release"]

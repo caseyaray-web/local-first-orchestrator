@@ -86,7 +86,7 @@ The separate review starts held without a native parent. Before creating it, the
 
 ## Plugin extension strategy and limits
 
-Use plugin CLI/tools/dashboard routes for operator controls and structured review findings. Use `pre_tool_call` to catch normal mistakes, such as implementation-side completion that should request review. Keep native dispatcher ownership of claims and profile launches.
+Use plugin CLI/tools/dashboard routes for operator controls and structured review findings. M3 may implement and fixture-test the advisory `pre_tool_call` helper to catch normal mistakes, such as implementation-side completion that should request review; runtime registration remains an M6 packaging gate and is not activated by M3 source work. Keep native dispatcher ownership of claims and profile launches.
 
 Tool interception is not a universal board-write guard: CLI, dashboard, direct Python, and direct registry dispatch are separate paths. Terminal command filtering is not robust OS isolation. A model with unrestricted same-user execution can bypass conventions or create unrelated work. Do not claim otherwise.
 

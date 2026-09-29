@@ -9,7 +9,7 @@ import pytest
 
 from local_first_orchestrator.contracts import Action, ActionResult, BoardSnapshot, ManagedMember, OperationIntent
 from local_first_orchestrator.coordinator import Coordinator
-from local_first_orchestrator.budgets import BudgetPolicy
+from local_first_orchestrator.budgets import BudgetPolicy, GENERAL_ATTEMPT, REVIEW_CORRECTIONS, admit_repair_operation
 from local_first_orchestrator.daemon import instance_lock
 from local_first_orchestrator.evidence_store import EvidenceStore
 from local_first_orchestrator.hermes_board import HermesBoardAdapter
@@ -242,6 +242,26 @@ def test_exhausted_finding_lineage_denies_resume_without_charging_safety_control
     before_events = store.read_scope(SCOPE)["budget_events"]
     assert coordinator.resume(authorized_clear=True) == {"outcome": "held", "reason": "budget_exhausted", "actions_attempted": 0}
     assert store.read_scope(SCOPE)["budget_events"] == before_events
+
+
+
+def test_reserved_final_correction_releases_after_pause_when_root_budget_is_exhausted(tmp_path):
+    store, board, lock_path = setup(tmp_path, state="held")
+    policy = BudgetPolicy(1, 1, 1, 0, 1)
+    coordinator = Coordinator(SCOPE, board=board, store=store, lock=instance_lock(lock_path), budget_policy=policy)
+    correction = Action("separate-review-correction:reserved", SCOPE, {
+        "task_id": "task", "correction_of": "separate-review", "association": "separate-review-correction:separate-review:content:1",
+    }, "create_held", board.snapshots["task"].digest)
+    event = {"event_id": f"{REVIEW_CORRECTIONS}:{correction.key}",
+             "lineage_id": f"anchor:{GENERAL_ATTEMPT}", "root_task_id": "anchor", "finding_id": GENERAL_ATTEMPT,
+             "generation": 0, "source_task_id": "task", "source_kind": "native_operation",
+             "native_source_id": correction.key, "count": 1}
+    reserved = admit_repair_operation(policy, store, SCOPE, coordinator._intent_for(correction), event)
+    store.ack_effect(SCOPE, reserved.key, readback=board.snapshots["task"].to_dict())
+
+    assert coordinator.pause()["outcome"] == "verified"
+    assert coordinator.resume(authorized_clear=True)["outcome"] == "partial"
+    assert board.snapshots["task"].native_task["status"] == "ready"
 
 
 def test_exhausted_finding_lineage_stops_continued_resume_without_charging_controls(tmp_path):
