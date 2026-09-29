@@ -199,12 +199,50 @@ def test_pause_intent_old_payload_defaults_to_active_and_clear_is_strictly_valid
     restored = PauseIntent.from_dict(legacy)
 
     assert restored.active is True
-    assert restored.to_dict() == {**legacy, "active": True}
+    assert restored.to_dict() == {
+        **legacy, "active": True, "managed_task_ids": [], "baseline_digests": {}, "resuming": False, "resuming_task_ids": [],
+        "resuming_action_keys": {},
+    }
     assert PauseIntent.from_dict(restored.to_dict()) == restored
     with pytest.raises(ValueError, match="inactive"):
         PauseIntent(scope(), "operator", 4, True, False, active=False)
     with pytest.raises(ValueError, match="inactive"):
         PauseIntent(scope(), "automatic", 4, False, False, active=False)
+
+
+def test_pause_intent_legacy_transport_defaults_diagnostic_and_resuming_fields():
+    v1 = {
+        "scope": scope(), "origin": "operator", "generation": 3,
+        "stop_requested": True, "cancellation_requested": False,
+    }
+    v2 = {**v1, "active": True}
+    v3 = {**v2, "baseline_digests": {"task-1": "digest-1"}}
+
+    assert PauseIntent.from_dict(v1).baseline_digests == {}
+    assert PauseIntent.from_dict(v2).resuming is False
+    restored = PauseIntent.from_dict(v3)
+    assert restored.baseline_digests == {"task-1": "digest-1"}
+    with pytest.raises(TypeError):
+        restored.baseline_digests["task-2"] = "digest-2"
+
+
+def test_resuming_pause_roundtrips_and_cannot_mix_with_cancellation_or_clear():
+    resuming = PauseIntent(
+        scope(), "operator", 4, False, False, active=True, resuming=True,
+        baseline_digests={"task-1": "digest-1"}, resuming_task_ids=("task-1",),
+        resuming_action_keys={"task-1": "release:task-1:digest-1"},
+    )
+
+    assert PauseIntent.from_dict(resuming.to_dict()) == resuming
+    with pytest.raises(ValueError, match="cancellation"):
+        PauseIntent(scope(), "operator", 4, False, True, resuming=True)
+    with pytest.raises(ValueError, match="inactive"):
+        PauseIntent(
+            scope(), "operator", 4, False, False, active=False, resuming=True,
+            resuming_task_ids=("task-1",), resuming_action_keys={"task-1": "release:task-1:digest-1"},
+        )
+    with pytest.raises(ValueError, match="non-empty"):
+        PauseIntent(scope(), "operator", 4, False, False, active=True, resuming=True)
 
 
 @pytest.mark.parametrize(

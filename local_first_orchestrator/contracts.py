@@ -102,6 +102,18 @@ def _strings(value: tuple[str, ...], name: str) -> tuple[str, ...]:
     return value
 
 
+def _digest_mapping(value: Mapping[str, str], name: str) -> Mapping[str, str]:
+    """Freeze the bounded task-to-observation-digest diagnostic baseline."""
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    if len(value) > 128:
+        raise ValueError(f"{name} exceeds the 128-task bound")
+    if not all(isinstance(task_id, str) and task_id and isinstance(digest, str) and digest
+               for task_id, digest in value.items()):
+        raise ValueError(f"{name} must map non-empty task ids to non-empty digests")
+    return MappingProxyType(dict(value))
+
+
 def _required(payload: Mapping[str, Any], fields: tuple[str, ...], name: str) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise ValueError(f"{name} payload must be a mapping")
@@ -261,6 +273,11 @@ class PauseIntent:
     stop_requested: bool
     cancellation_requested: bool
     active: bool = True
+    managed_task_ids: tuple[str, ...] = ()
+    baseline_digests: Mapping[str, str] = MappingProxyType({})
+    resuming: bool = False
+    resuming_task_ids: tuple[str, ...] = ()
+    resuming_action_keys: Mapping[str, str] = MappingProxyType({})
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "scope", MappingProxyType(validate_scope(self.scope)))
@@ -272,8 +289,30 @@ class PauseIntent:
             raise ValueError("pause flags must be booleans")
         if not isinstance(self.active, bool):
             raise ValueError("active must be a boolean")
+        object.__setattr__(self, "managed_task_ids", _strings(self.managed_task_ids, "managed_task_ids"))
+        object.__setattr__(self, "baseline_digests", _digest_mapping(self.baseline_digests, "baseline_digests"))
+        object.__setattr__(self, "resuming_task_ids", _strings(self.resuming_task_ids, "resuming_task_ids"))
+        object.__setattr__(self, "resuming_action_keys", _digest_mapping(self.resuming_action_keys, "resuming_action_keys"))
+        if len(set(self.resuming_task_ids)) != len(self.resuming_task_ids):
+            raise ValueError("resuming_task_ids must not contain duplicates")
+        if len(set(self.managed_task_ids)) != len(self.managed_task_ids):
+            raise ValueError("managed_task_ids must not contain duplicates")
+        if not isinstance(self.resuming, bool):
+            raise ValueError("resuming must be a boolean")
+        if self.resuming and self.cancellation_requested:
+            raise ValueError("resuming and cancellation_requested are mutually exclusive")
+        if self.resuming and (self.origin != "operator" or self.stop_requested):
+            raise ValueError("resuming intents must be operator intents without stop_requested")
+        if self.resuming and not self.resuming_task_ids:
+            raise ValueError("resuming_task_ids must be non-empty for a resuming intent")
+        if not self.resuming and self.resuming_task_ids:
+            raise ValueError("resuming_task_ids require a resuming intent")
+        if not self.resuming and self.resuming_action_keys:
+            raise ValueError("resuming_action_keys require a resuming intent")
+        if self.resuming_action_keys and set(self.resuming_action_keys) != set(self.resuming_task_ids):
+            raise ValueError("resuming_action_keys must name exactly the resuming tasks")
         if not self.active and (
-            self.origin != "operator" or self.stop_requested or self.cancellation_requested
+            self.origin != "operator" or self.stop_requested or self.cancellation_requested or self.resuming
         ):
             raise ValueError("inactive pause intents must be operator clears without stop or cancellation")
 
@@ -282,10 +321,29 @@ class PauseIntent:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "PauseIntent":
-        legacy_fields = tuple(field for field in cls.__dataclass_fields__ if field != "active")
-        if set(payload) == set(legacy_fields):
-            return cls(**_required(payload, legacy_fields, cls.__name__), active=True)
-        return cls(**_required(payload, tuple(cls.__dataclass_fields__), cls.__name__))
+        required_fields = ("scope", "origin", "generation", "stop_requested", "cancellation_requested")
+        optional_fields = ("active", "managed_task_ids", "baseline_digests", "resuming", "resuming_task_ids", "resuming_action_keys")
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"{cls.__name__} payload must be a mapping")
+        keys = set(payload)
+        allowed = set(required_fields) | set(optional_fields)
+        if not set(required_fields) <= keys or not keys <= allowed:
+            missing = sorted(set(required_fields) - keys)
+            extra = sorted(keys - allowed)
+            raise ValueError(f"{cls.__name__} payload fields mismatch: missing={missing}, extra={extra}")
+        data = dict(payload)
+        data.setdefault("active", True)
+        data.setdefault("managed_task_ids", ())
+        data.setdefault("baseline_digests", {})
+        data.setdefault("resuming", False)
+        data.setdefault("resuming_task_ids", ())
+        data.setdefault("resuming_action_keys", {})
+        for field in ("managed_task_ids", "resuming_task_ids"):
+            if isinstance(data[field], list):
+                data[field] = tuple(data[field])
+            elif data[field] != ():
+                raise ValueError(f"{field} must be a transport list")
+        return cls(**data)
 
 
 @dataclass(frozen=True, slots=True)

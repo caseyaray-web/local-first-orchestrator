@@ -5,6 +5,8 @@ import pytest
 from local_first_orchestrator.contracts import ActionResult, BoardSnapshot, ManagedMember, PauseIntent
 from local_first_orchestrator.operator_controls import (
     can_resume,
+    expected_native_digest,
+    native_digest_mismatches,
     plan_pause,
     plan_resume,
     plan_stop,
@@ -44,7 +46,11 @@ def test_pause_planning_is_scoped_and_honest_about_dispatch_races(
     planned = plan_pause(SCOPE, stop, generation=4, members=(member("task-1"),),
                          snapshots=(snapshot("task-1", task_status, *runs),))
 
-    assert planned.intent == PauseIntent(SCOPE, "operator", 4, stop, False)
+    assert planned.intent == PauseIntent(
+        SCOPE, "operator", 4, stop, False,
+        managed_task_ids=("task-1",),
+        baseline_digests={"task-1": f"digest-task-1-{task_status}"},
+    )
     assert planned.outcome == outcome
     assert tuple(action.effect for action in planned.actions) == effects
     assert planned.report.active_workers == active
@@ -386,3 +392,232 @@ def test_plan_resume_without_an_active_pause_is_an_explicit_noop_denial(pause_in
     assert not decision.allowed
     assert decision.reason == "no_active_pause_to_clear"
     assert decision.intent is None
+
+
+def test_pause_captures_immutable_snapshot_digest_baseline_without_native_lane_or_status():
+    planned = plan_pause(
+        SCOPE, False, members=(member("task-1"),), snapshots=(snapshot("task-1", "ready"),),
+    )
+
+    assert planned.intent.baseline_digests == {"task-1": "digest-task-1-ready"}
+    assert "status" not in planned.intent.to_dict()
+    assert "lane" not in planned.intent.to_dict()
+
+
+def test_restart_digest_comparison_uses_persisted_baseline_unless_verified_readback_supersedes_it():
+    paused = PauseIntent(SCOPE, "operator", 4, False, False, baseline_digests={"task-1": "before"})
+
+    assert expected_native_digest(paused, "task-1") == "before"
+    assert expected_native_digest(paused, "task-1", verified_applied_digests={"task-1": "after"}) == "after"
+    assert expected_native_digest(paused, "task-1", verified_applied_digests={"task-1": "after"}) != "manual-edit"
+    assert native_digest_mismatches(
+        SCOPE, (member("task-1"),), (snapshot("task-1", "ready"),), paused,
+    ) == ("task-1",)
+    assert native_digest_mismatches(
+        SCOPE, (member("task-1"),), (snapshot("task-1", "ready"),), paused,
+        verified_applied_digests={"task-1": "digest-task-1-ready"},
+    ) == ()
+
+
+def test_missing_managed_member_is_a_digest_mismatch_even_without_a_persisted_digest_for_it():
+    paused = PauseIntent(
+        SCOPE, "operator", 4, False, False,
+        baseline_digests={"task-1": "digest-task-1-ready"},
+    )
+
+    assert native_digest_mismatches(
+        SCOPE, (member("task-1"), member("task-2")), (snapshot("task-1", "ready"),), paused,
+    ) == ("task-2",)
+
+
+def test_resume_refuses_missing_managed_member_at_phase_entry_and_never_creates_a_zero_action_phase():
+    paused = PauseIntent(
+        SCOPE, "operator", 6, False, False,
+        baseline_digests={"task-1": "digest-task-1-blocked", "task-2": "digest-task-2-blocked"},
+    )
+    reconciliation = reconcile_operator_edits(SCOPE, (), (), (), ())
+
+    entry = plan_resume(
+        SCOPE, pause_intent=paused, reconciliation=reconciliation,
+        operator_authorized_resume=True, members=(member("task-1"), member("task-2")),
+        snapshots=(snapshot("task-1", "blocked"),),
+    )
+
+    assert not entry.allowed
+    assert entry.reason == "resume_member_observations_incomplete"
+    assert entry.actions == ()
+    assert entry.intent is None
+
+
+def test_resume_refuses_empty_current_members_when_pause_persisted_managed_members():
+    paused = PauseIntent(
+        SCOPE, "operator", 6, False, False,
+        managed_task_ids=("task-1", "task-2"),
+        baseline_digests={"task-1": "before-1", "task-2": "before-2"},
+    )
+    decision = plan_resume(
+        SCOPE, pause_intent=paused,
+        reconciliation=reconcile_operator_edits(SCOPE, (), (), (), ()),
+        operator_authorized_resume=True, members=(), snapshots=(),
+    )
+    assert not decision.allowed
+    assert decision.intent is None
+    assert decision.reason == "resume_member_observations_incomplete"
+
+
+def test_resume_final_clear_refuses_a_missing_known_member_and_a_zero_release_plan():
+    paused = PauseIntent(
+        SCOPE, "operator", 6, False, False, managed_task_ids=("task-1", "task-2"),
+        baseline_digests={"task-1": "digest-task-1-blocked", "task-2": "digest-task-2-blocked"},
+    )
+    reconciliation = reconcile_operator_edits(SCOPE, (), (), (), ())
+    begin = plan_resume(
+        SCOPE, pause_intent=paused, reconciliation=reconciliation,
+        operator_authorized_resume=True, members=(member("task-1"), member("task-2")),
+        snapshots=(snapshot("task-1", "blocked"), snapshot("task-2", "blocked")),
+    )
+    assert begin.intent is not None
+    released = snapshot("task-1", "ready")
+
+    final = plan_resume(
+        SCOPE, pause_intent=begin.intent, reconciliation=reconciliation,
+        operator_authorized_resume=True, members=(member("task-1"), member("task-2")), snapshots=(released,),
+        effect_results=(ActionResult(begin.intent.resuming_action_keys["task-1"], "verified", "released", released.to_dict()),),
+    )
+    zero_action = plan_resume(
+        SCOPE, pause_intent=paused, reconciliation=reconciliation,
+        operator_authorized_resume=True, members=(member("task-1"), member("task-2")),
+        snapshots=(snapshot("task-1", "ready"), snapshot("task-2", "ready")),
+    )
+
+    assert not final.allowed
+    assert final.reason == "resume_release_unverified"
+    assert not zero_action.allowed
+    assert zero_action.reason == "resume_release_unverified"
+    assert zero_action.actions == ()
+    assert zero_action.intent is None
+
+
+def test_authorized_resume_enters_persisted_resuming_phase_then_cannot_clear_multi_member_early():
+    paused = PauseIntent(
+        SCOPE, "operator", 6, False, False,
+        managed_task_ids=("task-1", "task-2"),
+        baseline_digests={"task-1": "before-1", "task-2": "before-2"},
+    )
+    held = (snapshot("task-1", "blocked"), snapshot("task-2", "blocked"))
+    begin = plan_resume(
+        SCOPE, pause_intent=paused, reconciliation=reconcile_operator_edits(SCOPE, (), (), (), ()),
+        operator_authorized_resume=True, members=(member("task-1"), member("task-2")), snapshots=held,
+    )
+
+    assert begin.intent == PauseIntent(
+        SCOPE, "operator", 7, False, False, resuming=True,
+        managed_task_ids=("task-1", "task-2"),
+        baseline_digests=paused.baseline_digests, resuming_task_ids=("task-1", "task-2"),
+        resuming_action_keys={
+            "task-1": "release:task-1:digest-task-1-blocked",
+            "task-2": "release:task-2:digest-task-2-blocked",
+        },
+    )
+    assert tuple(action.effect for action in begin.actions) == ("release", "release")
+    early = plan_resume(
+        SCOPE, pause_intent=begin.intent, reconciliation=reconcile_operator_edits(SCOPE, (), (), (), ()),
+        operator_authorized_resume=True, members=(member("task-1"), member("task-2")),
+        snapshots=(snapshot("task-1", "ready"), snapshot("task-2", "blocked")),
+        effect_results=(ActionResult("release:task-1:digest-task-1-blocked", "verified", "released", {"task_id": "task-1", "released": True}),),
+    )
+
+    assert not early.allowed
+    assert early.reason == "resume_release_unverified"
+
+
+def test_resume_clear_requires_the_exact_persisted_release_key_and_native_snapshot_readback():
+    paused = PauseIntent(
+        SCOPE, "operator", 6, False, False, managed_task_ids=("task-1",),
+        baseline_digests={"task-1": "digest-task-1-blocked"},
+    )
+    held = snapshot("task-1", "blocked")
+    reconciliation = reconcile_operator_edits(SCOPE, (), (), (), ())
+    begin = plan_resume(
+        SCOPE, pause_intent=paused, reconciliation=reconciliation,
+        operator_authorized_resume=True, members=(member("task-1"),), snapshots=(held,),
+    )
+
+    assert begin.intent is not None
+    persisted = PauseIntent.from_dict(begin.intent.to_dict())
+    release_key = persisted.resuming_action_keys["task-1"]
+    released = snapshot("task-1", "ready")
+    cleared = plan_resume(
+        SCOPE, pause_intent=persisted, reconciliation=reconciliation,
+        operator_authorized_resume=True, members=(member("task-1"),), snapshots=(released,),
+        effect_results=(ActionResult(release_key, "verified", "released", released.to_dict()),),
+    )
+
+    assert cleared.allowed
+    assert cleared.intent is not None and not cleared.intent.active
+
+
+@pytest.mark.parametrize(
+    ("action_key", "readback", "runs"),
+    [
+        ("release:task-1:WRONG", "native", ()),
+        ("exact", "flat", ()),
+        ("exact", "native", ({"id": "unknown-run", "status": "mystery"},)),
+    ],
+    ids=("wrong_persisted_key", "flat_unverified_readback", "unknown_run_status"),
+)
+def test_resume_clear_rejects_release_proof_with_wrong_key_incomplete_readback_or_unknown_run_status(
+    action_key, readback, runs,
+):
+    paused = PauseIntent(
+        SCOPE, "operator", 6, False, False, managed_task_ids=("task-1",),
+        baseline_digests={"task-1": "digest-task-1-blocked"},
+    )
+    held = snapshot("task-1", "blocked")
+    reconciliation = reconcile_operator_edits(SCOPE, (), (), (), ())
+    begin = plan_resume(
+        SCOPE, pause_intent=paused, reconciliation=reconciliation,
+        operator_authorized_resume=True, members=(member("task-1"),), snapshots=(held,),
+    )
+
+    assert begin.intent is not None
+    expected_key = begin.intent.resuming_action_keys["task-1"]
+    released = snapshot("task-1", "ready", *runs)
+    result_key = expected_key if action_key == "exact" else action_key
+    result_readback = released.to_dict() if readback == "native" else {"task_id": "task-1", "released": True}
+    decision = plan_resume(
+        SCOPE, pause_intent=begin.intent, reconciliation=reconciliation,
+        operator_authorized_resume=True, members=(member("task-1"),), snapshots=(released,),
+        effect_results=(ActionResult(result_key, "verified", "released", result_readback),),
+    )
+
+    assert not decision.allowed
+    assert decision.reason == "resume_release_unverified"
+
+
+@pytest.mark.parametrize("outcome", ("partial", "unknown"))
+def test_resume_clear_rejects_even_exact_release_proof_when_an_effect_is_not_final(outcome):
+    paused = PauseIntent(
+        SCOPE, "operator", 6, False, False, managed_task_ids=("task-1",),
+        baseline_digests={"task-1": "digest-task-1-blocked"},
+    )
+    held = snapshot("task-1", "blocked")
+    reconciliation = reconcile_operator_edits(SCOPE, (), (), (), ())
+    begin = plan_resume(
+        SCOPE, pause_intent=paused, reconciliation=reconciliation,
+        operator_authorized_resume=True, members=(member("task-1"),), snapshots=(held,),
+    )
+
+    assert begin.intent is not None
+    released = snapshot("task-1", "ready")
+    decision = plan_resume(
+        SCOPE, pause_intent=begin.intent, reconciliation=reconciliation,
+        operator_authorized_resume=True, members=(member("task-1"),), snapshots=(released,),
+        effect_results=(
+            ActionResult(begin.intent.resuming_action_keys["task-1"], "verified", "released", released.to_dict()),
+            ActionResult("release:task-else:unknown", outcome, "unresolved", released.to_dict()),
+        ),
+    )
+
+    assert not decision.allowed
+    assert decision.reason == "resume_release_unverified"

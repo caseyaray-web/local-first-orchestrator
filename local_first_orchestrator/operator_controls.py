@@ -66,6 +66,12 @@ def _member_snapshots(scope: Mapping[str, str], members: tuple[ManagedMember, ..
     return tuple((member, by_task.get(member.task_id)) for member in selected)
 
 
+def _managed_task_ids(scope: Mapping[str, str], members: tuple[ManagedMember, ...]) -> tuple[str, ...]:
+    """Return the immutable in-scope membership the pause must account for."""
+    return tuple(sorted({member.task_id for member in members
+                         if member.board_id == scope["board_id"] and member.anchor_task_id == scope["anchor_task_id"]}))
+
+
 def _run_id(run: Mapping[str, Any]) -> str | None:
     value = run.get("id")
     return value if isinstance(value, str) and value else None
@@ -95,12 +101,57 @@ def _active_runs(snapshots: tuple[BoardSnapshot, ...], runs: tuple[Mapping[str, 
     return tuple(sorted(run_id for run_id, run in observed.items() if _run_is_live(run)))
 
 
+def _runs_have_known_statuses(snapshots: tuple[BoardSnapshot, ...]) -> bool:
+    """Do not clear a pause while any observed native run has an unknown state."""
+    return all(
+        isinstance(run.get("status"), str) and run["status"] in _ACTIVE_RUN_STATUSES | _TERMINAL_RUN_STATUSES
+        for snapshot in snapshots for run in snapshot.runs
+    )
+
+
 def _snapshots_by_task(snapshots: tuple[BoardSnapshot, ...]) -> dict[str, BoardSnapshot]:
     return {
         task_id: snapshot
         for snapshot in snapshots
         if isinstance((task_id := snapshot.native_task.get("id")), str) and task_id
     }
+
+
+def expected_native_digest(pause_intent: PauseIntent, task_id: str, *,
+                           verified_applied_digests: Mapping[str, str] | None = None) -> str | None:
+    """Return the only digest a restart may accept without silently adopting edits.
+
+    A coordinator may replace a pause baseline only with a digest from a verified
+    applied operation readback.  Unverified or absent effects leave the persisted
+    observation baseline authoritative for diagnostics, not for board mutation.
+    """
+    if not isinstance(task_id, str) or not task_id:
+        raise ValueError("task_id must be a non-empty string")
+    if verified_applied_digests is None:
+        verified_applied_digests = {}
+    if not isinstance(verified_applied_digests, Mapping):
+        raise ValueError("verified_applied_digests must be a mapping")
+    replacement = verified_applied_digests.get(task_id)
+    if replacement is not None and (not isinstance(replacement, str) or not replacement):
+        raise ValueError("verified applied digests must be non-empty strings")
+    return replacement if replacement is not None else pause_intent.baseline_digests.get(task_id)
+
+
+def native_digest_mismatches(scope: Mapping[str, Any], members: tuple[ManagedMember, ...],
+                             snapshots: tuple[BoardSnapshot, ...], pause_intent: PauseIntent, *,
+                             verified_applied_digests: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Identify restart-time native observations that cannot be silently adopted."""
+    resolved_scope = _scope(scope)
+    current = _snapshots_by_task(snapshots)
+    mismatches = []
+    for member, _ in _member_snapshots(resolved_scope, members, snapshots):
+        expected = expected_native_digest(
+            pause_intent, member.task_id, verified_applied_digests=verified_applied_digests,
+        )
+        observed = current.get(member.task_id)
+        if expected is None or observed is None or observed.digest != expected:
+            mismatches.append(member.task_id)
+    return tuple(sorted(set(mismatches)))
 
 
 def _stop_result_matches(result: ActionResult, task_id: str, run_id: str) -> bool:
@@ -156,7 +207,14 @@ def plan_pause(scope: Mapping[str, Any], stop: bool, *, generation: int = 0,
     never a successful stop.
     """
     resolved_scope = _scope(scope)
-    intent = PauseIntent(resolved_scope, "operator", generation, stop, cancellation, active=True)
+    baseline_digests = {
+        member.task_id: observed.digest
+        for member, observed in _member_snapshots(resolved_scope, members, snapshots)
+        if observed is not None
+    }
+    intent = PauseIntent(resolved_scope, "operator", generation, stop, cancellation,
+                         active=True, managed_task_ids=_managed_task_ids(resolved_scope, members),
+                         baseline_digests=baseline_digests)
     actions: list[Action] = []
     active: list[str] = []
     partial = False
@@ -328,12 +386,65 @@ def reconcile_operator_edits(scope: Mapping[str, Any], members: tuple[ManagedMem
     return ReconciliationDecision(containment.outcome, (), containment.report)
 
 
+def _release_result_matches(result: ActionResult, task_id: str, action_key: str,
+                            current: BoardSnapshot) -> bool:
+    """Accept one exact persisted release only with adapter-native readback."""
+    readback = result.readback
+    if result.outcome != "verified" or result.action_key != action_key or readback is None:
+        return False
+    try:
+        if set(readback) != set(BoardSnapshot.__dataclass_fields__):
+            return False
+        # ActionResult freezes transport lists into tuples, while the adapter's
+        # actual evidence remains a complete BoardSnapshot-shaped mapping.
+        verified = BoardSnapshot(**dict(readback))
+    except (TypeError, ValueError):
+        return False
+    return (
+        verified.native_task.get("id") == task_id
+        and _task_status(verified) in {"ready", "todo"}
+        and verified.digest == current.digest
+        and _runs_have_known_statuses((verified,))
+        and not _active_runs((verified,))
+    )
+
+
+def _resume_releases_verified(scope: Mapping[str, str], pause_intent: PauseIntent,
+                              members: tuple[ManagedMember, ...], snapshots: tuple[BoardSnapshot, ...],
+                              effect_results: tuple[ActionResult, ...]) -> bool:
+    if any(result.outcome in {"ambiguous", "unknown", "partial"} for result in effect_results):
+        return False
+    current = _snapshots_by_task(snapshots)
+    scoped = _managed_task_ids(scope, members)
+    if (
+        not scoped or tuple(sorted(pause_intent.managed_task_ids)) != scoped
+        or set(pause_intent.baseline_digests) != set(scoped)
+        or set(pause_intent.resuming_task_ids) != set(scoped)
+        or set(pause_intent.resuming_action_keys) != set(scoped)
+    ):
+        return False
+    for task_id in pause_intent.resuming_task_ids:
+        observed = current.get(task_id)
+        action_key = pause_intent.resuming_action_keys.get(task_id)
+        if (
+            task_id not in scoped or observed is None or action_key is None
+            or _task_status(observed) not in {"ready", "todo"}
+            or not _runs_have_known_statuses((observed,))
+        ):
+            return False
+        if not any(_release_result_matches(result, task_id, action_key, observed) for result in effect_results):
+            return False
+    return _runs_have_known_statuses(snapshots) and not _active_runs(snapshots)
+
+
 def can_resume(scope: Mapping[str, Any], *, pause_intent: PauseIntent | None = None,
                reconciliation: ReconciliationDecision | None = None, unknown_effects: bool = False,
                budget_exhausted: bool = False, unsafe_human_edits: bool = False,
-               operator_authorized_resume: bool = False) -> ResumeDecision:
-    """Fail closed; cancellation needs a new explicit operator authorization."""
-    _scope(scope)
+               operator_authorized_resume: bool = False,
+               members: tuple[ManagedMember, ...] = (), snapshots: tuple[BoardSnapshot, ...] = (),
+               effect_results: tuple[ActionResult, ...] = ()) -> ResumeDecision:
+    """Fail closed and require release proof before a resuming intent can clear."""
+    resolved_scope = _scope(scope)
     if not isinstance(operator_authorized_resume, bool):
         raise ValueError("operator_authorized_resume must be a boolean")
     if unknown_effects:
@@ -351,27 +462,69 @@ def can_resume(scope: Mapping[str, Any], *, pause_intent: PauseIntent | None = N
             return ResumeDecision(False, "pause_requires_operator_authorization")
         if reconciliation is None:
             return ResumeDecision(False, "reconciliation_required")
+        if pause_intent.managed_task_ids and not members:
+            return ResumeDecision(False, "resume_member_observations_incomplete")
+        if pause_intent.resuming:
+            if not _resume_releases_verified(resolved_scope, pause_intent, members, snapshots, effect_results):
+                return ResumeDecision(False, "resume_release_unverified")
+        elif members:
+            scoped = _managed_task_ids(resolved_scope, members)
+            observed = _snapshots_by_task(snapshots)
+            if (
+                not scoped
+                or tuple(sorted(pause_intent.managed_task_ids)) != scoped
+                or set(pause_intent.baseline_digests) != set(scoped)
+                or any(observed.get(task_id) is None for task_id in scoped)
+            ):
+                return ResumeDecision(False, "resume_member_observations_incomplete")
+            releases: list[Action] = []
+            for member, observed in _member_snapshots(resolved_scope, members, snapshots):
+                if observed is not None and _task_status(observed) in _HELD_TASK_STATUSES:
+                    releases.append(Action(f"release:{member.task_id}:{observed.digest}", resolved_scope,
+                                           {"task_id": member.task_id}, "release", observed.digest))
+            release_ids = tuple(action.target["task_id"] for action in releases)
+            release_keys = {str(action.target["task_id"]): action.key for action in releases}
+            if not release_ids or set(release_ids) != set(scoped):
+                return ResumeDecision(False, "resume_release_unverified")
+            return ResumeDecision(
+                True, "coherent", tuple(releases),
+                PauseIntent(pause_intent.scope, "operator", pause_intent.generation + 1, False, False,
+                            active=True, managed_task_ids=pause_intent.managed_task_ids,
+                            baseline_digests=pause_intent.baseline_digests,
+                            resuming=True, resuming_task_ids=release_ids, resuming_action_keys=release_keys),
+            )
     return ResumeDecision(True, "coherent")
 
 
 def plan_resume(scope: Mapping[str, Any], *, pause_intent: PauseIntent | None = None,
                 reconciliation: ReconciliationDecision | None = None, unknown_effects: bool = False,
                 budget_exhausted: bool = False, unsafe_human_edits: bool = False,
-                operator_authorized_resume: bool = False) -> ResumeDecision:
-    """Return the generation-advancing clear record only after safe explicit authorization."""
+                operator_authorized_resume: bool = False,
+                members: tuple[ManagedMember, ...] = (), snapshots: tuple[BoardSnapshot, ...] = (),
+                effect_results: tuple[ActionResult, ...] = ()) -> ResumeDecision:
+    """Enter a durable release phase, then clear only after exact release proofs.
+
+    Callers that omit members retain the legacy single-clear transport behavior;
+    coordinators handling managed members must pass their snapshots and persist the
+    returned resuming intent before applying its release actions.
+    """
     decision = can_resume(
         scope, pause_intent=pause_intent, reconciliation=reconciliation,
         unknown_effects=unknown_effects, budget_exhausted=budget_exhausted,
-        unsafe_human_edits=unsafe_human_edits,
-        operator_authorized_resume=operator_authorized_resume,
+        unsafe_human_edits=unsafe_human_edits, operator_authorized_resume=operator_authorized_resume,
+        members=members, snapshots=snapshots, effect_results=effect_results,
     )
     if not decision.allowed:
         return decision
     if pause_intent is None or not pause_intent.active:
         return ResumeDecision(False, "no_active_pause_to_clear")
+    if decision.intent is not None:
+        return decision
     return ResumeDecision(
         True, decision.reason, decision.actions,
-        PauseIntent(pause_intent.scope, "operator", pause_intent.generation + 1, False, False, active=False),
+        PauseIntent(pause_intent.scope, "operator", pause_intent.generation + 1, False, False,
+                    active=False, managed_task_ids=pause_intent.managed_task_ids,
+                    baseline_digests=pause_intent.baseline_digests),
     )
 
 
@@ -385,6 +538,8 @@ def reject_late_result(scope: Mapping[str, Any], run_id: str, *, pause_intent: P
         raise ValueError("run_generation must be a non-negative integer or None")
     if pause_intent is not None and pause_intent.active and pause_intent.cancellation_requested:
         return LateResultDecision(True, "cancellation_requested")
+    if pause_intent is not None and pause_intent.active and pause_intent.resuming:
+        return LateResultDecision(True, "resuming_release_in_progress")
     if pause_intent is not None and pause_intent.active and pause_intent.origin == "operator":
         return LateResultDecision(True, "operator_pause_persisted")
     if pause_intent is not None and not pause_intent.active:
