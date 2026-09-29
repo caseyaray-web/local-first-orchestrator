@@ -349,6 +349,29 @@ def test_unknown_store_associated_create_reconciles_by_exact_marker_without_rese
     assert recovered.readback["parents"] == ()
 
 
+def test_marker_reconciliation_rejects_visible_match_when_another_list_row_is_opaque(fake_runner, tmp_path):
+    """A visible marker cannot prove uniqueness while another bounded row hides its body."""
+    class MixedListKanban(FakeKanban):
+        def __call__(self, argv, **kwargs):
+            result = super().__call__(argv, **kwargs)
+            if tuple(argv[4:])[0] == "list" and result.returncode == 0:
+                rows = json.loads(result.stdout)
+                for row in rows:
+                    if row["id"] == "opaque-duplicate":
+                        row.pop("body", None)
+                return subprocess.CompletedProcess(argv, 0, json.dumps(rows), "")
+            return result
+
+    fake = MixedListKanban(); fake.add("anchor-1")
+    board = adapter(fake, tmp_path)
+    marker = "<!-- local-first-create:v1:duplicate -->"
+    fake.add("visible", body=f"body {marker}")
+    fake.add("opaque-duplicate", body=f"another {marker}", archived=True)
+    count, matches = board._marked_create_matches(marker)
+    assert count == 2 and matches == ()
+    assert any(call[4:6] == ("show", "opaque-duplicate") for call in fake.calls)
+
+
 def test_native_parentless_held_card_preserves_marker_and_releases_without_a_prior_run(tmp_path):
     binary = os.environ.get("HERMES_M0_CLI")
     if not binary or not Path(binary).is_file():

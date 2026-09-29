@@ -1096,17 +1096,30 @@ class Coordinator:
             return False
         run = next((item for item in reviewed.runs if str(item.get("id")) == run_id), None)
         claims = [event for event in reviewed.events if event.get("kind") == "claimed"
-                  and str(event.get("run_id")) == run_id and isinstance(event.get("payload"), Mapping)
-                  and event["payload"].get("source_status") == "ready"]
+                  and str(event.get("run_id")) == run_id and isinstance(event.get("payload"), Mapping)]
         completions = [event for event in reviewed.events if event.get("kind") == "completed" and str(event.get("run_id")) == run_id]
         reviewer_session = (self._active_worker_session(task_id, run_id) if changes_requested
                             else self._worker_session(run)) if isinstance(run, Mapping) else None
+        # Older/native ordinary-ready claims omit source_status entirely.  That
+        # omission is compatible only with the exact durable held-card create
+        # and its exact durable release receipt; explicit contrary metadata is
+        # never normalized into a ready claim.
+        release_key = f"release-separate-review:{create.key}"
+        releases = [operation for operation in self.store.read_scope(self.scope)["operations"]
+                    if operation.key == release_key and operation.effect == "release"
+                    and operation.phase == "applied" and dict(operation.target) == {"task_id": task_id}
+                    and (proof := self._snapshot_from_readback(operation.readback)) is not None
+                    and proof.native_task.get("id") == task_id and self._state(proof) in {"ready", "todo"}]
+        claim_is_ready = (len(claims) == 1 and claims[0]["payload"].get("source_status") == "ready")
+        claim_is_native_ready = (len(claims) == 1 and "source_status" not in claims[0]["payload"]
+                                 and len(releases) == 1)
         return (isinstance(run, Mapping) and run.get("profile") == expected_profile
                 and (run.get("status") == "running" if changes_requested else run.get("status") in {"completed", "done"})
                 and reviewer_session == session_id
                 and isinstance(session_id, str) and bool(session_id)
                 and session_id != self._worker_session(source_run)
-                and len(claims) == 1 and len(completions) == (0 if changes_requested else 1))
+                and (claim_is_ready or claim_is_native_ready)
+                and len(completions) == (0 if changes_requested else 1))
 
     def _prior_changes_are_reconciled(self, task_id: str, state: Mapping[str, Any]) -> bool:
         """Require each prior same-card rejection to have its exact native repair receipt."""
@@ -1257,8 +1270,13 @@ class Coordinator:
                 return {"outcome": "held", "reason": "verified_separate_review_provenance_missing"}
             reviewer_claims = [event for event in task_snapshot.events
                                if event.get("kind") == "claimed" and str(event.get("run_id")) == run_id
-                               and isinstance(event.get("payload"), Mapping)
-                               and event["payload"].get("source_status") == ("ready" if separate is not None else "review")]
+                               and isinstance(event.get("payload"), Mapping)]
+            if separate is None:
+                reviewer_claims = [event for event in reviewer_claims
+                                   if event["payload"].get("source_status") == "review"]
+            elif not self._verified_separate_review(task_id, candidate, expected_profile, run_id, session_id,
+                                                     changes_requested=verdict == "changes_requested"):
+                reviewer_claims = []
             if len(reviewer_claims) != 1:
                 return {"outcome": "held", "reason": "review_run_not_claimed_from_native_review" if separate is None else "separate_review_run_not_claimed_from_ready"}
             if verdict == "approved":

@@ -225,42 +225,36 @@ class HermesBoardAdapter:
             body = row.get("body")
             if isinstance(body, str) and marker in body:
                 matches.append(row["id"])
-            elif (not isinstance(body, str) and isinstance(idempotency_key, str)
-                  and row.get("idempotency_key") == idempotency_key):
-                # Current native list rows may omit bodies.  The exact native
-                # idempotency key is a bounded shortlist, then show verifies
-                # the stable marker before accepting it.
-                matches.append(row["id"])
             elif not isinstance(body, str):
                 # A list row without a supported marker-bearing field is not
-                # evidence of absence.  A bounded query cannot safely rule
-                # out an archived prior effect, so do not issue another send.
+                # evidence of absence or uniqueness.  Even a visible marker
+                # must fan out over every bounded opaque row before it can be
+                # accepted; an exact show verifies the stable marker.
                 opaque_ids.append(row["id"])
             if len(matches) > 1:
                 return len(matches), tuple()
+        # The native list serializer may omit both body and idempotency key.
+        # Read every bounded opaque row exactly; absence and uniqueness are
+        # proved only after this complete fan-out, never inferred from a list.
+        for task_id in opaque_ids:
+            shown = invoke("show", task_id, "--json")
+            task = shown.get("task") if isinstance(shown, Mapping) else None
+            if not isinstance(task, Mapping) or task.get("id") != task_id:
+                raise _BoardUnavailable("opaque marker row exact read malformed")
+            body = task.get("body")
+            # A native null body is an explicit empty body, not an opaque
+            # value that could retain a marker. Any other non-string shape
+            # remains malformed and blocks a resend.
+            if body is None:
+                continue
+            if not isinstance(body, str):
+                raise _BoardUnavailable("opaque marker row exact read lacks body")
+            if marker in body:
+                matches.append(task_id)
+                if len(matches) > 1:
+                    return len(matches), tuple()
         if not matches:
-            # The native list serializer may omit both body and idempotency
-            # key.  Read each bounded opaque row exactly; absence is proved
-            # only after this complete fan-out, never inferred from the list.
-            for task_id in opaque_ids:
-                shown = invoke("show", task_id, "--json")
-                task = shown.get("task") if isinstance(shown, Mapping) else None
-                if not isinstance(task, Mapping) or task.get("id") != task_id:
-                    raise _BoardUnavailable("opaque marker row exact read malformed")
-                body = task.get("body")
-                # A native null body is an explicit empty body, not an opaque
-                # value that could retain a marker. Any other non-string shape
-                # remains malformed and blocks a resend.
-                if body is None:
-                    continue
-                if not isinstance(body, str):
-                    raise _BoardUnavailable("opaque marker row exact read lacks body")
-                if marker in body:
-                    matches.append(task_id)
-                    if len(matches) > 1:
-                        return len(matches), tuple()
-            if not matches:
-                return 0, tuple()
+            return 0, tuple()
         # list plus this exact show/runs read is the entire bounded search.
         if calls + 2 > _MAX_MARKER_SEARCH_CLI_CALLS:
             raise _BoardUnavailable("bounded create marker search exceeded CLI call limit")

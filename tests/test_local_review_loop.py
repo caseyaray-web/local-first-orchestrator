@@ -607,6 +607,55 @@ def test_separate_approval_requires_fresh_session_from_source_implementation(tmp
     evidence["native_review"]["task_id"] = "separate-review"
     assert controller.submit_review("separate-review", candidate(), evidence, expected_profile="local-review")["outcome"] == "held"
 
+
+def test_separate_review_rejects_explicit_nonready_claim_source_status(tmp_path):
+    controller, board, _ = coordinator(tmp_path)
+    board.task = snapshot("piece", "done", (
+        {"id": "implement-run", "status": "done", "outcome": "completed", "profile": "implementer",
+         "metadata": {"worker_session_id": "implement-session"}},
+    ))
+    controller.recover_premature_done("piece", candidate(), reviewer_profile="local-review")
+    controller.release_separate_review("separate-review", candidate(), reviewer_profile="local-review")
+    board.task = snapshot("separate-review", "done", (
+        {"id": "review-run", "status": "done", "outcome": "completed", "profile": "local-review",
+         "metadata": {"worker_session_id": "review-session"}},
+    ), (
+        {"kind": "claimed", "run_id": "review-run", "payload": {"source_status": "review"}},
+        {"kind": "completed", "run_id": "review-run", "payload": {}},
+    ), assignee="local-review")
+    evidence = review(); evidence["native_review"]["task_id"] = "separate-review"
+    assert controller.submit_review("separate-review", candidate(), evidence, expected_profile="local-review") == {
+        "outcome": "held", "reason": "verified_separate_review_provenance_missing",
+    }
+
+
+def test_separate_review_missing_native_source_status_requires_durable_release_receipt(tmp_path, monkeypatch):
+    controller, board, store = coordinator(tmp_path)
+    board.task = snapshot("piece", "done", (
+        {"id": "implement-run", "status": "done", "outcome": "completed", "profile": "implementer",
+         "metadata": {"worker_session_id": "implement-session"}},
+    ))
+    controller.recover_premature_done("piece", candidate(), reviewer_profile="local-review")
+    controller.release_separate_review("separate-review", candidate(), reviewer_profile="local-review")
+    board.task = snapshot("separate-review", "done", (
+        {"id": "review-run", "status": "done", "outcome": "completed", "profile": "local-review",
+         "metadata": {"worker_session_id": "review-session"}},
+    ), (
+        {"kind": "claimed", "run_id": "review-run", "payload": {"lock": "native"}},
+        {"kind": "completed", "run_id": "review-run", "payload": {}},
+    ), assignee="local-review")
+    original_read_scope = store.read_scope
+    monkeypatch.setattr(store, "read_scope", lambda scope: {
+        **original_read_scope(scope),
+        "operations": tuple(operation for operation in original_read_scope(scope)["operations"]
+                            if operation.effect != "release"),
+    })
+    evidence = review(); evidence["native_review"]["task_id"] = "separate-review"
+    assert controller.submit_review("separate-review", candidate(), evidence, expected_profile="local-review") == {
+        "outcome": "held", "reason": "verified_separate_review_provenance_missing",
+    }
+
+
 def test_separate_review_records_changes_from_active_fresh_reviewer(tmp_path, monkeypatch):
     controller, board, store = coordinator(tmp_path)
     board.task = snapshot("piece", "done", (
