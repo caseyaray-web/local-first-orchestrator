@@ -20,29 +20,29 @@ def member(task_id: str) -> ManagedMember:
     return ManagedMember("board-1", "anchor-1", task_id, "implementation", 0, ("finding-1",), f"work-{task_id}")
 
 
-def snapshot(task_id: str, state: str, *runs: dict[str, str], **native_task: object) -> BoardSnapshot:
+def snapshot(task_id: str, status: str, *runs: dict[str, str], **native_task: object) -> BoardSnapshot:
     return BoardSnapshot(
-        native_task={"id": task_id, "state": state, **native_task}, parents=(), runs=tuple(runs),
+        native_task={"id": task_id, "status": status, **native_task}, parents=(), runs=tuple(runs),
         comments=(), events=(), attachments=(), observed_at="2026-09-28T00:00:00Z",
-        digest=f"digest-{task_id}-{state}",
+        digest=f"digest-{task_id}-{status}",
     )
 
 
 @pytest.mark.parametrize(
-    ("name", "task_state", "runs", "stop", "outcome", "effects", "active"),
+    ("name", "task_status", "runs", "stop", "outcome", "effects", "active"),
     [
-        ("queued", "queued", (), False, "pending", ("hold",), ()),
-        ("claim race", "claimed", ({"id": "run-race", "status": "running"},), False, "partial", ("hold",), ("run-race",)),
+        ("ready", "ready", (), False, "pending", ("hold",), ()),
+        ("dispatch race", "running", ({"id": "run-race", "status": "running"},), False, "partial", ("hold",), ("run-race",)),
         ("active run", "running", ({"id": "run-active", "status": "running"},), True, "partial", ("stop_run",), ("run-active",)),
         ("partial stop", "running", ({"id": "run-live", "status": "running", "stop_supported": "false"},), True, "partial", (), ("run-live",)),
     ],
     ids=lambda value: value if isinstance(value, str) else None,
 )
 def test_pause_planning_is_scoped_and_honest_about_dispatch_races(
-    name, task_state, runs, stop, outcome, effects, active,
+    name, task_status, runs, stop, outcome, effects, active,
 ):
     planned = plan_pause(SCOPE, stop, generation=4, members=(member("task-1"),),
-                         snapshots=(snapshot("task-1", task_state, *runs),))
+                         snapshots=(snapshot("task-1", task_status, *runs),))
 
     assert planned.intent == PauseIntent(SCOPE, "operator", 4, stop, False)
     assert planned.outcome == outcome
@@ -65,10 +65,10 @@ def test_stop_planning_requires_a_live_exact_supported_run(run, expected):
 
 
 def test_containment_requires_observed_hold_and_exact_run_stop_before_success():
-    prior_held = snapshot("task-1", "held")
+    prior_held = snapshot("task-1", "blocked")
     prior = snapshot("task-2", "running", {"id": "run-stopped", "status": "running"})
-    queued = snapshot("task-1", "held")
-    stopped = snapshot("task-2", "held", {"id": "run-stopped", "status": "stopped"})
+    queued = snapshot("task-1", "blocked")
+    stopped = snapshot("task-2", "blocked", {"id": "run-stopped", "status": "stopped"})
     report = verify_containment(
         SCOPE, (member("task-1"), member("task-2")), (queued, stopped),
         ({"id": "run-stopped", "task_id": "task-2", "status": "stopped"},),
@@ -82,6 +82,36 @@ def test_containment_requires_observed_hold_and_exact_run_stop_before_success():
 
     assert report.outcome == "verified"
     assert report.report.active_workers == ()
+
+
+@pytest.mark.parametrize(
+    ("observed", "outcome", "active"),
+    [
+        (snapshot("task-1", "blocked"), "verified", ()),
+        (snapshot("task-1", "blocked", {"id": "run-live", "status": "running"}), "partial", ("run-live",)),
+    ],
+    ids=("blocked_without_running_run", "blocked_with_running_run"),
+)
+def test_containment_uses_hermes_blocked_status_but_never_equates_it_with_stopped_runs(observed, outcome, active):
+    result = verify_containment(
+        SCOPE, (member("task-1"),), (observed,), (),
+        pause_intent=PauseIntent(SCOPE, "operator", 4, False, False),
+    )
+
+    assert result.outcome == outcome
+    assert result.report.active_workers == active
+
+
+@pytest.mark.parametrize("terminal_status", ("done", "archived"))
+def test_terminal_hermes_statuses_release_pause_dependencies_without_new_holds(terminal_status):
+    planned = plan_pause(
+        SCOPE, False, members=(member("task-1"),), snapshots=(snapshot("task-1", terminal_status),),
+    )
+    contained = verify_containment(SCOPE, (member("task-1"),), (snapshot("task-1", terminal_status),), ())
+
+    assert planned.outcome == "no-op"
+    assert planned.actions == ()
+    assert contained.outcome == "verified"
 
 
 def test_reconcile_preserves_done_human_edit_and_blocks_unsafe_resume():
@@ -126,13 +156,13 @@ def test_automatic_cancellation_never_auto_resumes_and_late_results_stay_rejecte
 @pytest.mark.parametrize(
     ("prior", "current", "effects"),
     [
-        ((), (snapshot("task-1", "held"),), ()),
+        ((), (snapshot("task-1", "blocked"),), ()),
         ((snapshot("task-1", "running", {"id": "run-1", "status": "running"}),),
-         (snapshot("task-1", "held", {"id": "run-1", "status": "stopped"}),),
+         (snapshot("task-1", "blocked", {"id": "run-1", "status": "stopped"}),),
          (ActionResult("stop_run:task-1:other-run:digest", "verified", "exited",
                        {"task_id": "task-1", "run_id": "other-run", "stop_supported": True, "process_exited": True, "status": "stopped"}),)),
     ],
-    ids=("held_snapshot_without_captured_run", "mismatched_stop_readback"),
+    ids=("blocked_snapshot_without_captured_run", "mismatched_stop_readback"),
 )
 def test_stop_containment_does_not_infer_success_without_matching_prior_run_and_exit_proof(prior, current, effects):
     report = verify_containment(
@@ -147,7 +177,7 @@ def test_stop_containment_does_not_infer_success_without_matching_prior_run_and_
 @pytest.mark.parametrize(
     ("changed"),
     [
-        {"state": "blocked"},
+        {"status": "blocked"},
         {"route": "manual-route"},
         {"dependencies": ("manual-dependency",)},
         {"runs": ({"id": "manual-run", "status": "running"},)},
@@ -157,7 +187,7 @@ def test_stop_containment_does_not_infer_success_without_matching_prior_run_and_
 def test_reconcile_reports_manual_native_changes_without_claiming_them_verified(changed):
     before = snapshot("task-1", "ready", route="managed-route", dependencies=("dep-1",))
     native = {key: value for key, value in changed.items() if key != "runs"}
-    after = snapshot("task-1", native.pop("state", "ready"), *changed.get("runs", ()),
+    after = snapshot("task-1", native.pop("status", "ready"), *changed.get("runs", ()),
                      route=native.get("route", "managed-route"),
                      dependencies=native.get("dependencies", ("dep-1",)))
 

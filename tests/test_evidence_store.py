@@ -110,6 +110,7 @@ def test_no_shadow_ticket_lifecycle_schema(store):
         "operation_intents",
         "budget_events",
         "budget_reconciliation_evidence",
+        "effect_observations",
         "operator_intents",
     }
     assert not ({"status", "lane", "task_state", "board_snapshot", "dependencies", "runs"} & columns)
@@ -162,38 +163,77 @@ def create_operation(*, key="create-1", scope=SCOPE):
     )
 
 
-def test_begin_create_attempt_durably_marks_only_reserved_pending_create_unknown_before_io(store):
+@pytest.mark.parametrize("effect", ["hold_task", "release", "stop_run", "create_held"])
+def test_begin_effect_attempt_durably_marks_each_supported_pending_effect_unknown_before_io(store, effect):
     opened, _ = store
-    opened.reserve_operation(create_operation())
+    intent = create_operation() if effect == "create_held" else OperationIntent(
+        **{**operation(key=f"{effect}-1").to_dict(), "effect": effect}
+    )
+    opened.reserve_operation(intent)
 
-    begun = opened.begin_effect_attempt(SCOPE, "create-1")
+    begun = opened.begin_effect_attempt(SCOPE, intent.key)
 
     assert begun.phase == "unknown"
     assert begun.outcome == "ambiguous"
     assert opened.read_scope(SCOPE)["operations"] == (begun,)
     with pytest.raises(ConflictError, match="unknown"):
-        opened.begin_effect_attempt(SCOPE, "create-1")
+        opened.begin_effect_attempt(SCOPE, intent.key)
 
 
-def test_begin_create_attempt_requires_reserved_create_held_intent(store):
+def test_begin_effect_attempt_rejects_unsupported_reserved_intent(store):
     opened, _ = store
-    opened.reserve_operation(operation())
+    opened.reserve_operation(OperationIntent(**{**operation().to_dict(), "effect": "publish_external"}))
 
-    with pytest.raises(ConflictError, match="create_held"):
+    with pytest.raises(ConflictError, match="unsupported"):
         opened.begin_effect_attempt(SCOPE, "hold-1")
     with pytest.raises(KeyError, match="not reserved"):
         opened.begin_effect_attempt(SCOPE, "missing")
 
 
-def test_begin_create_attempt_survives_restart_and_prohibits_resend(store):
+def test_begin_effect_attempt_survives_restart_and_prohibits_resend(store):
     opened, database = store
-    opened.reserve_operation(create_operation())
-    assert opened.begin_effect_attempt(SCOPE, "create-1").phase == "unknown"
+    opened.reserve_operation(operation())
+    assert opened.begin_effect_attempt(SCOPE, "hold-1").phase == "unknown"
     opened.close()
 
     with EvidenceStore.open(database) as reopened:
         with pytest.raises(ConflictError, match="unknown"):
-            reopened.begin_effect_attempt(SCOPE, "create-1")
+            reopened.begin_effect_attempt(SCOPE, "hold-1")
+
+
+def test_non_success_action_result_is_append_only_truthful_evidence(store):
+    opened, _ = store
+    opened.reserve_operation(operation())
+
+    saved = opened.record_effect_observation(
+        SCOPE, "hold-1", outcome="partial", details="native hold accepted but readback incomplete",
+        readback={"task_id": "task-1", "state": "holding"},
+    )
+
+    assert saved == {"operation_key": "hold-1", "outcome": "partial", "details": "native hold accepted but readback incomplete", "readback": {"task_id": "task-1", "state": "holding"}}
+    assert opened.record_effect_observation(
+        SCOPE, "hold-1", outcome="partial", details="native hold accepted but readback incomplete",
+        readback={"task_id": "task-1", "state": "holding"},
+    ) == saved
+    assert opened.read_scope(SCOPE)["effect_observations"] == (saved,)
+    with pytest.raises(ValueError, match="supported action result"):
+        opened.record_effect_observation(SCOPE, "hold-1", outcome="not-an-action-result", details="invalid", readback=None)
+    assert opened.read_scope(SCOPE)["effect_observations"] == (saved,)
+    with pytest.raises(sqlite3.DatabaseError, match="immutable"):
+        opened.connection.execute("UPDATE effect_observations SET observation_json = '{}' ")
+
+
+def test_read_scope_bounds_effect_observations(store):
+    opened, _ = store
+    opened.reserve_operation(operation())
+    for number in range(65):
+        opened.record_effect_observation(
+            SCOPE, "hold-1", outcome="unsupported", details=f"unsupported-{number}", readback=None,
+        )
+
+    observations = opened.read_scope(SCOPE)["effect_observations"]
+    assert len(observations) == 64
+    assert all(record["outcome"] == "unsupported" for record in observations)
 
 
 def test_duplicate_operation_is_idempotent_but_changed_payload_conflicts(store):
@@ -269,13 +309,49 @@ def test_migrate_valid_v1_to_v2_preserves_budget_evidence(tmp_path):
         opened.record_budget_event(SCOPE, saved)
     connection = sqlite3.connect(database)
     connection.execute("DROP TABLE budget_reconciliation_evidence")
+    connection.execute("DROP TABLE effect_observations")
     connection.execute("UPDATE schema_metadata SET value='1' WHERE key='schema_version'")
     connection.commit()
     connection.close()
     with EvidenceStore.open(database) as upgraded:
         upgraded.migrate()
         assert upgraded.read_scope(SCOPE)["budget_events"] == (saved,)
-        assert upgraded.connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "2"
+        assert upgraded.connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "3"
+
+
+def test_migrate_valid_v2_to_v3_preserves_operation_evidence(tmp_path):
+    database = tmp_path / "v2.sqlite3"
+    with EvidenceStore.open(database, create_new=True) as opened:
+        opened.migrate()
+        saved = opened.reserve_operation(operation())
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE effect_observations")
+    connection.execute("UPDATE schema_metadata SET value='2' WHERE key='schema_version'")
+    connection.commit()
+    connection.close()
+
+    with EvidenceStore.open(database) as upgraded:
+        upgraded.migrate()
+        assert upgraded.read_scope(SCOPE)["operations"] == (saved,)
+        assert upgraded.connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "3"
+
+
+def test_migrate_rejects_malformed_v2_before_any_write(tmp_path):
+    database = tmp_path / "malformed-v2.sqlite3"
+    with EvidenceStore.open(database, create_new=True) as opened:
+        opened.migrate()
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE effect_observations")
+    connection.execute("CREATE TRIGGER surplus_v2_trigger BEFORE INSERT ON budget_events BEGIN SELECT 1; END")
+    connection.execute("UPDATE schema_metadata SET value='2' WHERE key='schema_version'")
+    connection.commit()
+    connection.close()
+
+    with EvidenceStore.open(database) as opened:
+        with pytest.raises(SchemaError, match="trigger"):
+            opened.migrate()
+        assert opened.connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "2"
+        assert opened.connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='effect_observations'").fetchone() is None
 
 
 def test_migrate_rejects_v1_with_malformed_review_foreign_key_before_any_write(tmp_path):
@@ -288,6 +364,7 @@ def test_migrate_rejects_v1_with_malformed_review_foreign_key_before_any_write(t
     connection.execute("CREATE TABLE review_evidence (board_id TEXT NOT NULL, anchor_task_id TEXT NOT NULL, candidate_content_identity TEXT NOT NULL, review_id TEXT NOT NULL, evidence_json TEXT NOT NULL, PRIMARY KEY (board_id, anchor_task_id, review_id))")
     connection.execute("DROP TABLE old_review_evidence")
     connection.execute("DROP TABLE budget_reconciliation_evidence")
+    connection.execute("DROP TABLE effect_observations")
     connection.execute("UPDATE schema_metadata SET value='1' WHERE key='schema_version'")
     connection.commit()
     connection.close()
@@ -305,6 +382,7 @@ def test_migrate_rejects_v1_with_surplus_index_before_any_write(tmp_path):
         opened.migrate()
     connection = sqlite3.connect(database)
     connection.execute("DROP TABLE budget_reconciliation_evidence")
+    connection.execute("DROP TABLE effect_observations")
     connection.execute("CREATE INDEX surplus_v1_index ON budget_events (event_id)")
     connection.execute("UPDATE schema_metadata SET value='1' WHERE key='schema_version'")
     connection.commit()

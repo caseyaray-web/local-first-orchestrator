@@ -12,8 +12,10 @@ from typing import Any, Mapping
 from .contracts import Action, ActionResult, BoardSnapshot, ManagedMember, PauseIntent, RecoveryReport, validate_scope
 
 _ACTIVE_RUN_STATUSES = frozenset({"active", "claimed", "running", "stopping"})
-_HELD_TASK_STATES = frozenset({"held", "paused", "parked", "waiting"})
-_TERMINAL_TASK_STATES = frozenset({"cancelled", "completed", "done", "stopped"})
+_TERMINAL_RUN_STATUSES = frozenset({"cancelled", "completed", "done", "stopped"})
+_SUPPORTED_TASK_STATUSES = frozenset({"blocked", "ready", "todo", "review", "running", "done", "archived"})
+_HELD_TASK_STATUSES = frozenset({"blocked"})
+_TERMINAL_TASK_STATUSES = frozenset({"done", "archived"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +75,12 @@ def _run_is_live(run: Mapping[str, Any]) -> bool:
     return run.get("status") in _ACTIVE_RUN_STATUSES
 
 
+def _task_status(snapshot: BoardSnapshot) -> str | None:
+    """Return only a native Hermes task status that this policy understands."""
+    status = snapshot.native_task.get("status")
+    return status if status in _SUPPORTED_TASK_STATUSES else None
+
+
 def _active_runs(snapshots: tuple[BoardSnapshot, ...], runs: tuple[Mapping[str, Any], ...] = ()) -> tuple[str, ...]:
     observed: dict[str, Mapping[str, Any]] = {}
     for snapshot in snapshots:
@@ -106,12 +114,12 @@ def _stop_result_matches(result: ActionResult, task_id: str, run_id: str) -> boo
         and readback.get("run_id") == run_id
         and readback.get("stop_supported") is True
         and readback.get("process_exited") is True
-        and readback.get("status") in _TERMINAL_TASK_STATES
+        and readback.get("status") in _TERMINAL_RUN_STATUSES
     )
 
 
 def _stopped_in_snapshot(snapshot: BoardSnapshot, run_id: str) -> bool:
-    return any(_run_id(run) == run_id and run.get("status") in _TERMINAL_TASK_STATES for run in snapshot.runs)
+    return any(_run_id(run) == run_id and run.get("status") in _TERMINAL_RUN_STATUSES for run in snapshot.runs)
 
 
 def _report(scope: Mapping[str, str], problem: str, *, actions: tuple[Action, ...] = (), preserved: tuple[str, ...] = (), active: tuple[str, ...] = (), required: str | None = None) -> RecoveryReport:
@@ -158,7 +166,7 @@ def plan_pause(scope: Mapping[str, Any], stop: bool, *, generation: int = 0,
             continue
         live = _active_runs((observed,))
         active.extend(live)
-        state = observed.native_task.get("state")
+        status = _task_status(observed)
         if live:
             partial = True
             if stop:
@@ -168,12 +176,12 @@ def plan_pause(scope: Mapping[str, Any], stop: bool, *, generation: int = 0,
                                        expected_observed_identity=observed.digest)
                     if action is not None:
                         actions.append(action)
-            elif state == "claimed":
+            elif status == "running":
                 # A hold may lose the independent-dispatch race; it is still the
                 # only supported proposed containment, with partial reported.
                 actions.append(Action(f"hold:{member.task_id}:{observed.digest}", resolved_scope,
                                       {"task_id": member.task_id}, "hold", observed.digest))
-        elif state not in _HELD_TASK_STATES and state not in _TERMINAL_TASK_STATES:
+        elif status not in _HELD_TASK_STATUSES and status not in _TERMINAL_TASK_STATUSES:
             actions.append(Action(f"hold:{member.task_id}:{observed.digest}", resolved_scope,
                                   {"task_id": member.task_id}, "hold", observed.digest))
     active_ids = tuple(sorted(set(active)))
@@ -205,8 +213,8 @@ def verify_containment(scope: Mapping[str, Any], members: tuple[ManagedMember, .
         if observed is None:
             incomplete = True
             continue
-        state = observed.native_task.get("state")
-        if state not in _HELD_TASK_STATES and state not in _TERMINAL_TASK_STATES:
+        status = _task_status(observed)
+        if status not in _HELD_TASK_STATUSES and status not in _TERMINAL_TASK_STATUSES:
             incomplete = True
         if not stop_requested:
             continue
@@ -234,7 +242,7 @@ def verify_containment(scope: Mapping[str, Any], members: tuple[ManagedMember, .
 
 def _native_change(before: BoardSnapshot, after: BoardSnapshot) -> bool:
     """Compare only native control fields, not observation metadata or digest."""
-    for field in ("state", "lane", "route", "dependencies"):
+    for field in ("status", "lane", "route", "dependencies"):
         if before.native_task.get(field) != after.native_task.get(field):
             return True
     def run_shape(run: Mapping[str, Any]) -> tuple[str, str, str]:
@@ -291,7 +299,7 @@ def reconcile_operator_edits(scope: Mapping[str, Any], members: tuple[ManagedMem
         if observed is None:
             continue
         before = before_by_task.get(member.task_id)
-        is_done = observed.native_task.get("state") == "done"
+        is_done = _task_status(observed) == "done"
         if is_done:
             done.append(member.task_id)
             coherent, stale_candidate_row, stale_review_row = _coherent_done_evidence(
