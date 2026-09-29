@@ -4,13 +4,12 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 
-from .ledger import Ledger
-from .local_qwen import LocalQwenAdapter
-from .states import CanonicalState
-from .ticket import MicroTicket
+from .ticket import TicketContract
+
+_SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 
 @dataclass(frozen=True)
@@ -21,183 +20,119 @@ class ReviewFinding:
     evidence: str
     minimal_repair: str
     verification: str
-    fingerprint: str
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(getattr(self, name), str) or not getattr(self, name).strip() for name in ("criterion_id", "file", "symbol", "evidence", "minimal_repair", "verification")):
+            raise ValueError("review finding fields must be non-empty strings")
 
 
 @dataclass(frozen=True)
 class ReviewResult:
+    ticket_id: str
+    contract_hash: str
+    candidate_sha: str
     verdict: str
-    criterion_results: tuple[dict[str, str], ...]
+    criterion_results: tuple[Mapping[str, str], ...]
     findings: tuple[ReviewFinding, ...]
-    suggestions: tuple[str, ...]
-    raw: dict[str, object]
+    escalation_reason: str | None = None
 
 
-def _text(value: object) -> str:
-    return value.strip() if isinstance(value, str) else ""
-
-
-def failure_fingerprint(ticket_id: str, stage: str, criterion_id: str, file: str, symbol: str, error: str) -> str:
-    """Hash stable defect identity, excluding volatile locations and timestamps."""
-    normalized = error.lower()
-    normalized = re.sub(r"\b(?:line|ln)\s*\d+\b", "", normalized)
-    normalized = re.sub(r"\b\d{4}-\d\d-\d\d(?:[t ]\d\d:\d\d:\d\d(?:\.\d+)?z?)?\b", "", normalized)
-    normalized = re.sub(r"(?:[a-z]:)?/(?:[^\s:]+/)+[^\s:]+", "<path>", normalized)
-    normalized = re.sub(r"\s+", " ", normalized).strip(" :,-")
-    source = "\x1f".join((ticket_id, stage, criterion_id, file, symbol, normalized))
+def failure_fingerprint(result: ReviewResult) -> str | None:
+    if type(result) is not ReviewResult:
+        raise ValueError("review result is required")
+    if result.verdict != "repair":
+        return None
+    source = "\x1f".join(
+        [result.ticket_id, result.contract_hash, result.candidate_sha]
+        + ["\x1e".join((finding.criterion_id, finding.file, finding.symbol, _normalized_text(finding.evidence), finding.minimal_repair, finding.verification)) for finding in result.findings]
+    )
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
-def normalize_review(payload: object, ticket: MicroTicket) -> ReviewResult:
-    """Strictly accept only criterion- and allowlist-scoped repair blockers."""
-    raw = payload if isinstance(payload, dict) else {}
-    verdict = _text(raw.get("verdict"))
+def normalize_review(payload: object, contract: TicketContract, *, expected_candidate_sha: str) -> ReviewResult:
+    if type(contract) is not TicketContract:
+        raise ValueError("ticket contract is required")
+    if not isinstance(expected_candidate_sha, str) or not _SHA.fullmatch(expected_candidate_sha):
+        raise ValueError("expected candidate must be a full lowercase Git SHA")
+    if not isinstance(payload, Mapping):
+        raise ValueError("review payload must be an object")
+    candidate_sha = payload.get("candidate_sha")
+    if payload.get("ticket_id") != contract.ticket_id or payload.get("contract_hash") != contract.contract_hash or candidate_sha != expected_candidate_sha:
+        raise ValueError("review candidate identity mismatch")
+    verdict = payload.get("verdict")
     if verdict not in {"pass", "repair", "escalate"}:
-        raise ValueError("review verdict must be pass, repair, or escalate")
-    criteria: list[dict[str, str]] = []
-    for item in raw.get("criterion_results", []):
-        if not isinstance(item, dict):
-            continue
-        criterion_id, status, evidence = _text(item.get("criterion_id")), _text(item.get("status")), _text(item.get("evidence"))
-        if criterion_id in ticket.criterion_ids and status in {"pass", "fail"} and evidence:
-            criteria.append({"criterion_id": criterion_id, "status": status, "evidence": evidence})
-    if verdict == "pass":
-        passed_criteria = {item["criterion_id"] for item in criteria if item["status"] == "pass"}
-        if passed_criteria != set(ticket.criterion_ids):
-            raise ValueError("pass review must include pass evidence for every criterion")
+        raise ValueError("invalid review verdict")
+    raw_results = payload.get("criterion_results", ())
+    if not isinstance(raw_results, (list, tuple)):
+        raise ValueError("malformed criterion results")
+    results: list[Mapping[str, str]] = []
+    seen: set[str] = set()
+    for item in raw_results:
+        if not isinstance(item, Mapping):
+            raise ValueError("malformed criterion result")
+        criterion_id, status, evidence = item.get("criterion_id"), item.get("status"), item.get("evidence")
+        if criterion_id not in contract.criterion_ids or criterion_id in seen or status not in {"pass", "fail"} or not isinstance(evidence, str) or not evidence.strip():
+            raise ValueError("unknown, duplicate, or malformed review criterion")
+        seen.add(criterion_id)
+        results.append(MappingProxyType({"criterion_id": criterion_id, "status": status, "evidence": evidence.strip()}))
+    raw_findings = payload.get("findings", ())
+    if not isinstance(raw_findings, (list, tuple)):
+        raise ValueError("malformed review findings")
     findings: list[ReviewFinding] = []
-    suggestions = [_text(item) for item in raw.get("suggestions", []) if _text(item)]
-    for item in raw.get("findings", []):
-        if not isinstance(item, dict):
-            continue
-        criterion_id, file, symbol = _text(item.get("criterion_id")), _text(item.get("file")), _text(item.get("symbol"))
-        evidence, repair, verification, fingerprint_input = (_text(item.get(key)) for key in ("evidence", "minimal_repair", "verification", "fingerprint_input"))
-        is_blocking = _text(item.get("severity")) == "blocking"
-        valid = is_blocking and criterion_id in ticket.criterion_ids and file in {*ticket.allowed_files, *ticket.create_files, *ticket.new_test_files} and bool(symbol and evidence and repair and verification and fingerprint_input)
-        if not valid:
-            suggestions.append("review finding downgraded: malformed or outside ticket criterion/file scope")
-            continue
-        findings.append(ReviewFinding(criterion_id, file, symbol, evidence, repair, verification, failure_fingerprint(ticket.ticket_id, "review", criterion_id, file, symbol, fingerprint_input)))
-    return ReviewResult(verdict, tuple(criteria), tuple(findings), tuple(suggestions), raw)
+    for item in raw_findings:
+        if not isinstance(item, Mapping):
+            raise ValueError("malformed review finding")
+        if item.get("severity", "blocking") != "blocking":
+            raise ValueError("repair findings must be explicitly blocking")
+        finding = ReviewFinding(
+            criterion_id=item.get("criterion_id"), file=item.get("file"), symbol=item.get("symbol"),
+            evidence=item.get("evidence"), minimal_repair=item.get("minimal_repair"), verification=item.get("verification"),
+        )
+        if finding.criterion_id not in contract.criterion_ids or finding.file not in contract.allowed_paths:
+            raise ValueError("review finding outside contract scope")
+        if not any(result["criterion_id"] == finding.criterion_id and result["status"] == "fail" for result in results):
+            raise ValueError("blocking finding must match failed criterion evidence")
+        findings.append(finding)
+    if verdict == "pass" and (seen != set(contract.criterion_ids) or any(result["status"] != "pass" for result in results) or findings):
+        raise ValueError("pass requires evidence for every criterion and no blockers")
+    if verdict == "repair":
+        if not findings:
+            raise ValueError("repair requires a valid blocking finding")
+        covered = {finding.criterion_id for finding in findings}
+        if any(result["status"] == "fail" and result["criterion_id"] not in covered for result in results):
+            raise ValueError("failed criterion is missing a valid blocker")
+    reason = payload.get("reason") if verdict == "escalate" else None
+    if verdict == "escalate" and (not isinstance(reason, str) or not reason.strip()):
+        raise ValueError("escalation requires an actionable reason")
+    return ReviewResult(contract.ticket_id, contract.contract_hash, expected_candidate_sha, verdict, tuple(results), tuple(findings), reason.strip() if isinstance(reason, str) else None)
+
+
+def validate_review_identity(result: ReviewResult, expected: Mapping[str, str]) -> bool:
+    if type(result) is not ReviewResult or not isinstance(expected, Mapping):
+        return False
+    return all(expected.get(field) == getattr(result, field) for field in ("ticket_id", "contract_hash", "candidate_sha"))
 
 
 class ReviewPacketBuilder:
-    """Builds a bounded fresh review context with all authoritative review inputs."""
-
-    max_packet_chars = 90_000
-    max_selected_file_chars = 24_000
-    min_selected_file_chars = 1_024
-
     @staticmethod
-    def _section(name: str, value: str) -> str:
-        return f"## {name}\n{value}"
-
-    @staticmethod
-    def _compact_selected_file(name: str, text: str, budget: int) -> str:
-        if len(text) <= budget:
-            return text
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        marker = f"[selected file excerpt: {name}; original_chars={len(text)}; sha256={digest}]\n"
-        omission = "\n...<middle omitted; full validated diff is included above>...\n"
-        remaining = budget - len(marker) - len(omission)
-        if remaining < 2:
-            raise ValueError("review packet selected-file budget is too small")
-        head = remaining // 2
-        tail = remaining - head
-        return marker + text[:head] + omission + text[-tail:]
-
-    def build(self, ticket: MicroTicket, *, diff: str, selected_files: Mapping[str, str], validation_evidence: str) -> str:
-        if not diff.strip() or not selected_files or not validation_evidence.strip():
-            raise ValueError("diff, selected files, and validation evidence are mandatory")
-        prefix = "\n\n".join((
-            self._section("ticket_contract", json.dumps(ticket.contract(), sort_keys=True)),
-            self._section("current_diff", diff),
-        ))
-        suffix = "\n\n".join((
-            self._section("validation_evidence", validation_evidence[:4000]),
-            self._section("review_instruction", "Return one JSON object matching verdict, criterion_results, findings, and suggestions. Review only existing criteria and allowed files. The complete validated diff is authoritative; large selected-file snapshots may be bounded excerpts with SHA-256 metadata."),
-        ))
-        ordered = sorted(selected_files.items())
-        selected_header_overhead = sum(len(f"\n\n## selected_file:{name}\n") for name, _ in ordered)
-        available = self.max_packet_chars - len(prefix) - len(suffix) - 2 - selected_header_overhead
-        minimum_required = self.min_selected_file_chars * len(ordered)
-        if available < minimum_required:
-            raise ValueError("review packet fixed inputs leave insufficient selected-file context budget")
-        rendered: list[tuple[str, str]] = []
-        remaining = available
-        for index, (name, text) in enumerate(ordered):
-            remaining_files = len(ordered) - index
-            reserved_for_rest = self.min_selected_file_chars * (remaining_files - 1)
-            budget = min(self.max_selected_file_chars, remaining - reserved_for_rest)
-            compacted = self._compact_selected_file(name, text, budget)
-            rendered.append((name, compacted))
-            remaining -= len(compacted)
-        sections = [
-            ("ticket_contract", json.dumps(ticket.contract(), sort_keys=True)),
-            ("current_diff", diff),
-            *[(f"selected_file:{name}", text) for name, text in rendered],
-            ("validation_evidence", validation_evidence[:4000]),
-            ("review_instruction", "Return one JSON object matching verdict, criterion_results, findings, and suggestions. Review only existing criteria and allowed files. The complete validated diff is authoritative; large selected-file snapshots may be bounded excerpts with SHA-256 metadata."),
-        ]
-        packet = "\n\n".join(self._section(name, value) for name, value in sections)
-        if len(packet) > self.max_packet_chars:
-            raise ValueError("review packet exceeds bounded context budget")
-        return packet
+    def build(*, candidate: Mapping[str, object], checks: tuple[Mapping[str, object], ...], contract: TicketContract) -> Mapping[str, object]:
+        if type(contract) is not TicketContract or not isinstance(candidate, Mapping) or not isinstance(checks, tuple):
+            raise ValueError("candidate, checks, and ticket contract are required")
+        candidate_sha = candidate.get("sha")
+        if not isinstance(candidate_sha, str) or not _SHA.fullmatch(candidate_sha):
+            raise ValueError("candidate SHA must be a full lowercase Git SHA")
+        if any(not isinstance(check, Mapping) for check in checks):
+            raise ValueError("review checks must be immutable-compatible objects")
+        frozen_checks = tuple(MappingProxyType(dict(check)) for check in checks)
+        return MappingProxyType({
+            "ticket_id": contract.ticket_id,
+            "contract_hash": contract.contract_hash,
+            "candidate_sha": candidate_sha,
+            "candidate": MappingProxyType(dict(candidate)),
+            "checks": frozen_checks,
+        })
 
 
-class LocalReviewAdapter:
-    def __init__(self, model: LocalQwenAdapter) -> None:
-        self.model = model
-
-    def review(self, ticket: MicroTicket, packet: str, *, artifact_dir: Path, workdir: Path | None = None) -> ReviewResult:
-        # Review is packet-only: never grant the reviewer an editable worktree cwd.
-        return normalize_review(self.model.invoke("review", packet, artifact_dir=artifact_dir).payload, ticket)
-
-
-class SameTicketRepairCoordinator:
-    """Ledger-only convergence policy; it never creates work or board tickets."""
-    def __init__(self, ledger: Ledger) -> None:
-        self.ledger = ledger
-
-    def apply(self, ticket_id: str, attempt_number: int, review: ReviewResult) -> str:
-        state = CanonicalState(self.ledger.get_ticket(ticket_id)["state"])
-        if state == CanonicalState.NEEDS_TRIAGE:
-            return "triage"
-        if state != CanonicalState.LOCAL_REVIEW:
-            raise ValueError("review can only be applied from local_review")
-        self.ledger.record_review(ticket_id, attempt_number, review)
-        if review.verdict == "pass":
-            # A clean review closes an implementation attempt; optional suggestions do not.
-            if not review.suggestions:
-                self.ledger.ensure_attempt(ticket_id, attempt_number)
-            for result in review.criterion_results:
-                if result["status"] == "pass":
-                    self.ledger.set_criterion_status(ticket_id, result["criterion_id"], "accepted", evidence=result["evidence"])
-            self.ledger.transition(ticket_id, CanonicalState.ACCEPTED, payload={"review_verdict": "pass"})
-            return "accepted"
-        if review.verdict == "escalate":
-            self.ledger.transition(ticket_id, CanonicalState.NEEDS_TRIAGE, payload={"review_verdict": "escalate"})
-            return "triage"
-        failed_criteria = {str(result["criterion_id"]) for result in review.criterion_results if result["status"] == "fail"}
-        covered_criteria = {finding.criterion_id for finding in review.findings}
-        uncovered_failures = sorted(failed_criteria - covered_criteria)
-        if uncovered_failures:
-            # Never convert an explicit failed criterion into acceptance merely because its
-            # blocking finding was malformed or outside the ticket boundary.
-            self.ledger.transition(ticket_id, CanonicalState.NEEDS_TRIAGE, payload={"review_verdict": "repair", "invalid_repair_missing_blocking_findings": uncovered_failures})
-            return "triage"
-        if not review.findings:
-            # A repair verdict with no failed criterion and no valid blocker is non-blocking.
-            self.ledger.transition(ticket_id, CanonicalState.ACCEPTED, payload={"review_verdict": "repair", "downgraded_to_suggestions": True})
-            return "accepted"
-        self.ledger.ensure_attempt(ticket_id, attempt_number)
-        repeated = False
-        for finding in review.findings:
-            occurrence = self.ledger.record_review_finding(ticket_id, attempt_number, finding)
-            repeated = repeated or occurrence >= 2
-        max_attempts = int(self.ledger.get_ticket(ticket_id)["max_attempts"])
-        if attempt_number >= max_attempts:
-            self.ledger.transition(ticket_id, CanonicalState.NEEDS_TRIAGE, payload={"review_verdict": "repair", "repeated_fingerprint": repeated, "attempt_number": attempt_number})
-            return "triage"
-        self.ledger.transition(ticket_id, CanonicalState.REPAIRING, payload={"review_verdict": "repair", "attempt_number": attempt_number})
-        return "repair"
+def _normalized_text(value: str) -> str:
+    value = re.sub(r"\b(?:line|ln)\s*\d+\b", "", value.lower())
+    return re.sub(r"\s+", " ", value).strip(" :,-")

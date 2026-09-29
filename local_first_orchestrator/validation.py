@@ -13,11 +13,15 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .git_security import safe_git_argv, safe_git_env
-from .m1_contracts import MAX_VERIFICATION_COMMANDS, MAX_ARGV_MEMBERS, MAX_ARG_LENGTH, MAX_ARGV_BYTES
-
-from .ticket import MicroTicket, declared_ticket_paths
-from .source_languages import is_supported_source, is_test_path, normalized_repository_path
-from .symbols import contract_target_scope, enforce_symbol_scope
+from .ticket import (
+    MAX_ARG_LENGTH,
+    MAX_ARGV_BYTES,
+    MAX_ARGV_MEMBERS,
+    MAX_VERIFICATION_COMMANDS,
+    TicketContract,
+    declared_ticket_paths,
+)
+from .source_languages import normalized_repository_path
 
 
 class ValidationError(RuntimeError):
@@ -132,8 +136,8 @@ class DeterministicValidator:
             handle.write(payload)
         return path
 
-    def validate_strict(
-        self, worktree: Path, ticket: MicroTicket, *, base_sha: str,
+    def validate(
+        self, worktree: Path, ticket: TicketContract, *, base_sha: str,
         trusted_commands: tuple[tuple[str, ...], ...], expected_head_sha: str | None = None,
         trusted_max_timeout_seconds: int, trusted_max_output_limit: int,
         trusted_max_snapshot_file_bytes: int = 8 * 1024 * 1024,
@@ -141,6 +145,8 @@ class DeterministicValidator:
         trusted_max_total_verification_seconds: float = 300,
     ) -> ValidationResult:
         """M1 boundary: authorize commands and budgets independently; pin candidate content."""
+        if type(ticket) is not TicketContract:
+            raise ValidationError("ticket contract is required")
         if (type(trusted_max_total_verification_seconds) not in (int, float)
                 or not 0 < trusted_max_total_verification_seconds <= 3600):
             raise ValidationError("trusted total verification deadline must be finite, positive and bounded")
@@ -148,21 +154,23 @@ class DeterministicValidator:
                 or not 0 < trusted_max_snapshot_file_bytes <= 64 * 1024 * 1024
                 or not 0 < trusted_max_snapshot_total_bytes <= 256 * 1024 * 1024):
             raise ValidationError("trusted snapshot limits must be finite positive integers within hard ceilings")
-        if not 0 < trusted_max_timeout_seconds <= 3600 or not 0 < trusted_max_output_limit <= 1_000_000:
+        if (type(trusted_max_timeout_seconds) is not int or type(trusted_max_output_limit) is not int
+                or not 0 < trusted_max_timeout_seconds <= 3600 or not 0 < trusted_max_output_limit <= 1_000_000):
             raise ValidationError("trusted verification limits must be finite and positive")
         if not 0 < ticket.verification.timeout_seconds <= trusted_max_timeout_seconds:
             raise ValidationError("verification exceeds trusted timeout limit")
         if not 0 < ticket.verification.output_limit <= trusted_max_output_limit:
             raise ValidationError("verification exceeds trusted output limit")
         commands = ticket.verification.commands
-        if (not isinstance(commands, tuple) or not commands or not trusted_commands
+        if (not isinstance(trusted_commands, tuple) or not isinstance(commands, tuple) or not commands or not trusted_commands
                 or len(trusted_commands) > MAX_VERIFICATION_COMMANDS or len(commands) > MAX_VERIFICATION_COMMANDS
                 or any(not isinstance(command, tuple) or not command or len(command) > MAX_ARGV_MEMBERS
                        or any(not isinstance(arg, str) or not arg.strip() or len(arg) > MAX_ARG_LENGTH
-                              for arg in command) for command in commands)):
+                              for arg in command) for command in (*commands, *trusted_commands))):
             raise ValidationError("verification command count or argv limit exceeded")
         if (len(set(commands)) != len(commands)
-                or sum(len(arg.encode("utf-8")) for command in commands for arg in command) > MAX_ARGV_BYTES):
+                or sum(len(arg.encode("utf-8")) for command in commands for arg in command) > MAX_ARGV_BYTES
+                or sum(len(arg.encode("utf-8")) for command in trusted_commands for arg in command) > MAX_ARGV_BYTES):
             raise ValidationError("verification command count or argv limit exceeded")
         if any(command not in trusted_commands for command in commands):
             raise ValidationError("verification commands are not in the trusted allowlist")
@@ -175,7 +183,7 @@ class DeterministicValidator:
         if artifact_root == worktree or worktree in artifact_root.parents:
             raise ValidationError("validation artifacts must be outside the candidate worktree")
 
-        def identity() -> tuple[str, str, tuple[tuple[str, str | None], ...]]:
+        def identity() -> tuple[str, str, tuple[tuple[str, str | None], ...], str]:
             head = self._git(worktree, "rev-parse", "HEAD").strip()
             tracked_metadata = self._git(worktree, "diff", "--raw", "-z", "HEAD", "--")
             tracked_paths = self._git(worktree, "diff", "--name-only", "-z", "HEAD", "--")
@@ -208,10 +216,10 @@ class DeterministicValidator:
                     total_bytes += file_bytes
                     digest = checksum.hexdigest()
                 contents.append((path, digest))
-            return head, hashlib.sha256(tracked_metadata.encode()).hexdigest(), tuple(contents)
+            return head, hashlib.sha256(tracked_metadata.encode()).hexdigest(), tuple(contents), self._git_admin_identity(worktree)
 
         before = identity()
-        result = self.validate(worktree, ticket, base_sha=base_sha, expected_head_sha=expected_head_sha,
+        result = self._check_candidate(worktree, ticket, base_sha=base_sha, expected_head_sha=expected_head_sha,
                                verification_budget_seconds=trusted_max_total_verification_seconds,
                                defer_artifact=True)
         if identity() != before:
@@ -220,6 +228,66 @@ class DeterministicValidator:
         payload["candidate_identity"] = hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest()
         path = self._write_artifact(json.dumps(payload, default=list, sort_keys=True))
         return replace(result, full_evidence_path=path, _artifact_json="")
+
+    def _git_admin_identity(self, worktree: Path) -> str:
+        """Bounded snapshot of administrative state, including linked worktrees."""
+        git_dir = self._git(worktree, "rev-parse", "--absolute-git-dir").strip()
+        common_dir = self._git(worktree, "rev-parse", "--git-common-dir").strip()
+        if not git_dir or not common_dir:
+            raise ValidationError("cannot identify Git administrative directories")
+        roots = (worktree / ".git", Path(git_dir), worktree / common_dir)
+        digest = hashlib.sha256()
+        total_bytes = 0
+        entry_count = 0
+        deadline = time.monotonic() + 15
+        seen: set[Path] = set()
+        for root in roots:
+            if root.is_symlink():
+                raise ValidationError("Git administrative pointer is a symlink")
+            resolved = root.resolve(strict=True)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            digest.update(str(resolved).encode("utf-8"))
+            if resolved.is_file():
+                entries = ((resolved, ".", "file"),)
+            elif resolved.is_dir():
+                def _walk_error(error: OSError) -> None:
+                    raise ValidationError("cannot inspect Git administrative state") from error
+                def _entries():
+                    for directory, subdirs, files in os.walk(resolved, followlinks=False, onerror=_walk_error):
+                        subdirs.sort()
+                        files.sort()
+                        for name in subdirs:
+                            child = Path(directory) / name
+                            if child.is_symlink():
+                                raise ValidationError("Git administrative directory contains a symlink")
+                        yield Path(directory), str(Path(directory).relative_to(resolved)), "directory"
+                        for name in files:
+                            path = Path(directory) / name
+                            yield path, str(path.relative_to(resolved)), "file"
+                entries = _entries()
+            else:
+                raise ValidationError("Git administrative state is not a regular path")
+            for path, relative, kind in entries:
+                entry_count += 1
+                if entry_count > 100_000 or time.monotonic() > deadline or path.is_symlink():
+                    raise ValidationError("Git administrative inspection exceeded safe bounds")
+                digest.update(kind.encode("ascii") + b"\0" + relative.encode("utf-8") + b"\0")
+                if kind == "directory":
+                    continue
+                if not path.is_file():
+                    raise ValidationError("Git administrative state is not a regular file")
+                size = path.stat().st_size
+                if size > 8 * 1024 * 1024 or total_bytes + size > 64 * 1024 * 1024:
+                    raise ValidationError("Git administrative inspection exceeded byte limit")
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(65536), b""):
+                        total_bytes += len(chunk)
+                        if total_bytes > 64 * 1024 * 1024 or time.monotonic() > deadline:
+                            raise ValidationError("Git administrative inspection exceeded safe bounds")
+                        digest.update(chunk)
+        return digest.hexdigest()
 
     def _git(self, path: Path, *args: str) -> str:
         """Run non-interactive Git inspection with a hard streaming output cap."""
@@ -296,8 +364,10 @@ class DeterministicValidator:
                 return f"secret material detected in changed file: {relative_path}"
         return None
 
-    def validate(self, worktree: Path, ticket: MicroTicket, *, base_sha: str, expected_head_sha: str | None = None,
+    def _check_candidate(self, worktree: Path, ticket: TicketContract, *, base_sha: str, expected_head_sha: str | None = None,
                  verification_budget_seconds: float | None = None, defer_artifact: bool = False) -> ValidationResult:
+        if type(ticket) is not TicketContract:
+            raise ValidationError("ticket contract is required")
         worktree = Path(worktree).resolve()
         base_sha = self._validated_base_sha(base_sha)
         # Resolve before diffing: no revision expression reaches the diff parser.
@@ -320,37 +390,17 @@ class DeterministicValidator:
             if candidate not in names:
                 names.append(candidate)
         errors = ["no_changes: model produced no effective diff"] if not names else []
-        allowed = set(ticket.allowed_files)
-        declared_create = set(ticket.create_files)
-        declared_new = declared_create | set(ticket.new_test_files)
         errors += [f"changed path outside allowlist: {p}" for p in names if p not in set(declared_ticket_paths(ticket))]
-        # Undeclared paths already fail scope; do not load their contents for secret/symbol checks.
+        # Undeclared paths already fail scope; do not load their contents for secret checks.
         declared_names = [p for p in names if p in set(declared_ticket_paths(ticket))]
-        for path in names:
-            if path not in declared_new:
-                continue
-            if path in declared_create:
-                if not is_supported_source(path) or is_test_path(path): errors.append(f"declared create path is not a supported non-test artifact: {path}")
-            elif not is_supported_source(path) or not is_test_path(path):
-                errors.append(f"declared new path is not a supported test artifact: {path}")
-            candidate = (worktree / path).resolve()
-            raw_candidate = worktree / path
-            if worktree not in candidate.parents or raw_candidate.is_symlink() or not candidate.is_file():
-                errors.append(f"declared new file is unsafe or missing: {path}")
-            if self._git(worktree, "ls-tree", "-r", "--name-only", base_sha, "--", path).strip() == path:
-                errors.append(f"declared new file existed at base: {path}")
         errors += [f"forbidden file type: {p}" for p in names if p.endswith(self.denied_suffixes)]
         errors += [error for path in declared_names if (error := self._secret_scan_error(worktree, path))]
-        if contract_target_scope(ticket) == "file":
-            symbol_errors, scope_unverified = (), False
-        else:
-            symbol_errors, scope_unverified = enforce_symbol_scope(worktree, declared_names, ticket, base_sha)
-        errors.extend(symbol_errors)
+        scope_unverified = False
         diff = self._git(worktree, "diff", "--numstat", base_sha, "--")
         numstat_rows = [line.split("\t") for line in diff.splitlines() if line]
         changed_lines = sum(int(parts[0]) + int(parts[1]) for parts in numstat_rows)
         numstat_paths = {parts[-1] for parts in numstat_rows if len(parts) >= 3}
-        for path in (declared_new & set(names)) - numstat_paths:
+        for path in set(declared_names) - numstat_paths:
             candidate = worktree / path
             try:
                 content = candidate.read_text(encoding="utf-8")
@@ -360,7 +410,6 @@ class DeterministicValidator:
         if len(names) > ticket.patch_budget.max_files: errors.append("changed file budget exceeded")
         if changed_lines > ticket.patch_budget.max_changed_lines: errors.append("changed line budget exceeded")
         records: list[CommandEvidence] = []
-        env = {key: os.environ[key] for key in self.environment_allowlist if key in os.environ}
         if not errors:
             run_cwd = (worktree / ticket.verification.working_directory).resolve()
             if worktree not in run_cwd.parents and run_cwd != worktree:

@@ -1,22 +1,9 @@
-"""Native Hermes registration for the local-first orchestration CLI.
+"""Replacement plugin entrypoint; registration is gated until M6/M7 are verified.
 
-The controller remains a standalone package.  This thin adapter only exposes
-the identical parser and handler at ``hermes local-first-orchestrator``.
+This isolated source tree must not load or advertise the obsolete controller.
 """
 
-from local_first_orchestrator.cli import register_cli, run_command
 
-
-def register(ctx) -> None:
-    """Register the operator CLI without adding model tools or hooks."""
-    ctx.register_cli_command(
-        name="local-first-orchestrator",
-        help="Operate the Local First Hermes-native orchestration runtime",
-        setup_fn=register_cli,
-        handler_fn=run_command,
-        description=(
-            "Operator CLI for durable Local First orchestration, recovery, planning, "
-            "validation, integration, and metrics. Dry-run is the default; board "
-            "writes require explicit flags."
-        ),
-    )
+def register(ctx: object) -> None:
+    """Refuse activation until the planned coordinator and release gates exist."""
+    raise RuntimeError("replacement plugin is not ready for registration")
