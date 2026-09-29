@@ -439,6 +439,37 @@ class EvidenceStore:
             raise KeyError("operation intent is not reserved in this scope")
         return OperationIntent.from_dict(_decode(row[0]))
 
+    def begin_effect_attempt(self, scope: Mapping[str, Any], key: str) -> OperationIntent:
+        """Durably fence the one permitted create attempt before external I/O.
+
+        The conservative ``unknown`` state is intentional: a crash after this
+        transaction may have reached the CLI, so a later process must reconcile
+        the stable marker rather than issue another create.
+        """
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            current = self._operation({"board_id": board, "anchor_task_id": anchor}, key)
+            if current.effect != "create_held":
+                raise ConflictError("effect attempt requires a reserved create_held intent")
+            if current.phase == "unknown":
+                raise ConflictError("operation effect is unknown and must be reconciled before retry")
+            if current.phase != "pending":
+                raise ConflictError("only a pending create effect can begin an attempt")
+            attempted = OperationIntent(
+                **{**current.to_dict(), "outcome": "ambiguous", "readback": None, "phase": "unknown"}
+            )
+            self.connection.execute(
+                "UPDATE operation_intents SET intent_json = ? WHERE board_id = ? AND anchor_task_id = ? AND operation_key = ?",
+                (_json(attempted.to_dict()), board, anchor, key),
+            )
+            self.connection.commit()
+            return attempted
+        except BaseException:
+            self.connection.rollback()
+            raise
+
     def observe_effect(self, scope: Mapping[str, Any], key: str, *, outcome: str | None, readback: Mapping[str, Any] | None, phase: str) -> OperationIntent:
         self._require_schema()
         if phase == "applied" and (outcome not in {"verified", "no-op"} or not isinstance(readback, Mapping) or not readback):

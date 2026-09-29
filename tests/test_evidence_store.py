@@ -145,6 +145,55 @@ def test_unknown_effect_preserved_and_never_returned_as_replayable(store):
     assert opened.ack_effect(SCOPE, reserved.key, readback={"stable_marker": "hold-1"}).phase == "applied"
 
 
+def create_operation(*, key="create-1", scope=SCOPE):
+    return OperationIntent(
+        key=key,
+        scope=scope,
+        target={"anchor_task_id": scope["anchor_task_id"]},
+        effect="create_held",
+        expected_observed_identity="observation-1",
+        before_evidence={"marker": "before-1"},
+        outcome=None,
+        readback=None,
+        retry={"stable_marker": key},
+        phase="pending",
+    )
+
+
+def test_begin_create_attempt_durably_marks_only_reserved_pending_create_unknown_before_io(store):
+    opened, _ = store
+    opened.reserve_operation(create_operation())
+
+    begun = opened.begin_effect_attempt(SCOPE, "create-1")
+
+    assert begun.phase == "unknown"
+    assert begun.outcome == "ambiguous"
+    assert opened.read_scope(SCOPE)["operations"] == (begun,)
+    with pytest.raises(ConflictError, match="unknown"):
+        opened.begin_effect_attempt(SCOPE, "create-1")
+
+
+def test_begin_create_attempt_requires_reserved_create_held_intent(store):
+    opened, _ = store
+    opened.reserve_operation(operation())
+
+    with pytest.raises(ConflictError, match="create_held"):
+        opened.begin_effect_attempt(SCOPE, "hold-1")
+    with pytest.raises(KeyError, match="not reserved"):
+        opened.begin_effect_attempt(SCOPE, "missing")
+
+
+def test_begin_create_attempt_survives_restart_and_prohibits_resend(store):
+    opened, database = store
+    opened.reserve_operation(create_operation())
+    assert opened.begin_effect_attempt(SCOPE, "create-1").phase == "unknown"
+    opened.close()
+
+    with EvidenceStore.open(database) as reopened:
+        with pytest.raises(ConflictError, match="unknown"):
+            reopened.begin_effect_attempt(SCOPE, "create-1")
+
+
 def test_duplicate_operation_is_idempotent_but_changed_payload_conflicts(store):
     opened, _ = store
     first = opened.reserve_operation(operation())

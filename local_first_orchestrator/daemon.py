@@ -1,21 +1,32 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
+import errno
+import fcntl
 import math
-import signal
+import os
+from pathlib import Path
+import stat
 import threading
 import time
 from numbers import Real
 from typing import Any, Callable
 
-from .daemon_text import bounded_daemon_text, validate_daemon_status_label, validate_daemon_worker_id
-from .ledger import (
-    SQLITE_INT_MAX,
-    Ledger,
-    saturating_non_negative_counter,
-    saturating_non_negative_counter_increment,
-)
-from .scheduler import ProcessNextResult, ProcessNextScheduler, scheduler_observability
+
+class InstanceLockError(RuntimeError):
+    """The configured coordinator instance cannot safely mutate state."""
+
+
+@dataclass(frozen=True)
+class _LockIdentity:
+    path: str
+    device: int
+    inode: int
+    token: object
+
+
+_process_locks: dict[str, _LockIdentity] = {}
+_process_locks_guard = threading.RLock()
 
 
 def _finite_non_negative_real(value: object, *, name: str) -> float:
@@ -30,358 +41,264 @@ def _finite_non_negative_real(value: object, *, name: str) -> float:
     return 0.0 if normalized == 0.0 else normalized
 
 
-def _saturating_exponential_backoff(base: float, exponent: int, maximum: float) -> float:
-    """Double a finite non-negative delay without overflowing before its cap."""
+def bounded_backoff(base: float, failures: int, maximum: float) -> float:
+    """Return a finite capped exponential delay; the first failure uses base."""
     base = _finite_non_negative_real(base, name="backoff base")
     maximum = _finite_non_negative_real(maximum, name="backoff maximum")
-    if type(exponent) is not int or exponent < 0:
-        raise ValueError("backoff exponent must be a non-negative integer")
-    if base == 0.0 or maximum == 0.0:
+    if type(failures) is not int or failures < 1:
+        raise ValueError("failures must be a positive built-in int")
+    if base > maximum:
+        raise ValueError("backoff base cannot exceed maximum")
+    if base == 0.0:
         return 0.0
     try:
-        scaled = math.ldexp(base, exponent)
+        delay = math.ldexp(base, failures - 1)
     except OverflowError:
         return maximum
-    return maximum if not math.isfinite(scaled) else min(maximum, scaled)
+    return min(maximum, delay) if math.isfinite(delay) else maximum
+
+
+class InstanceLock:
+    """A non-reentrant flock tied to one stable, user-owned lock-file inode."""
+
+    def __init__(self, path: str | os.PathLike[str]) -> None:
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            raise ValueError("instance lock path must be absolute")
+        self.path = candidate
+        self._path_key = os.fspath(candidate)
+        self._fd: int | None = None
+        self._identity: _LockIdentity | None = None
+
+    @staticmethod
+    def _validate_user_owned_regular(st: os.stat_result, *, subject: str) -> None:
+        if not stat.S_ISREG(st.st_mode):
+            raise InstanceLockError(f"{subject} must be a regular file")
+        if st.st_uid != os.geteuid():
+            raise InstanceLockError(f"{subject} must be owned by the current user")
+        if stat.S_IMODE(st.st_mode) != 0o600:
+            raise InstanceLockError(f"{subject} must have mode 0600")
+
+    def _validate_parent(self) -> None:
+        try:
+            parent = os.lstat(self.path.parent)
+        except OSError as exc:
+            raise InstanceLockError("instance lock parent is unavailable") from exc
+        if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
+            raise InstanceLockError("instance lock parent must be a directory, not a symlink")
+        if parent.st_uid != os.geteuid():
+            raise InstanceLockError("instance lock parent must be owned by the current user")
+
+    def acquire(self) -> "InstanceLock":
+        if self._fd is not None:
+            raise InstanceLockError("instance lock is already acquired")
+        self._validate_parent()
+        with _process_locks_guard:
+            if self._path_key in _process_locks:
+                raise InstanceLockError("instance lock is already held in this process")
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(self.path, flags, 0o600)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.EACCES, errno.ENOENT}:
+                raise InstanceLockError("instance lock path is unsafe or unavailable") from exc
+            raise
+        try:
+            fd_stat = os.fstat(fd)
+            self._validate_user_owned_regular(fd_stat, subject="instance lock")
+            path_stat = os.lstat(self.path)
+            self._validate_user_owned_regular(path_stat, subject="instance lock")
+            if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+                raise InstanceLockError("instance lock path changed during acquisition")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise InstanceLockError("instance lock is held by another process") from exc
+            # Detect replacement while waiting for flock too.
+            path_stat = os.lstat(self.path)
+            if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+                raise InstanceLockError("instance lock path changed during acquisition")
+            identity = _LockIdentity(self._path_key, fd_stat.st_dev, fd_stat.st_ino, object())
+            with _process_locks_guard:
+                if self._path_key in _process_locks:
+                    raise InstanceLockError("instance lock is already held in this process")
+                _process_locks[self._path_key] = identity
+            self._fd = fd
+            self._identity = identity
+            return self
+        except BaseException:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+            raise
+
+    def assert_held(self) -> None:
+        fd, identity = self._fd, self._identity
+        if fd is None or identity is None:
+            raise InstanceLockError("instance lock is not held")
+        with _process_locks_guard:
+            if _process_locks.get(self._path_key) is not identity:
+                raise InstanceLockError("instance lock ownership is no longer valid")
+        try:
+            fd_stat = os.fstat(fd)
+            path_stat = os.lstat(self.path)
+        except OSError as exc:
+            raise InstanceLockError("instance lock path is unavailable") from exc
+        self._validate_user_owned_regular(fd_stat, subject="instance lock")
+        self._validate_user_owned_regular(path_stat, subject="instance lock")
+        if (fd_stat.st_dev, fd_stat.st_ino) != (identity.device, identity.inode):
+            raise InstanceLockError("instance lock descriptor changed")
+        if (path_stat.st_dev, path_stat.st_ino) != (identity.device, identity.inode):
+            raise InstanceLockError("instance lock path changed while held")
+
+    def close(self) -> None:
+        fd, identity = self._fd, self._identity
+        self._fd = None
+        self._identity = None
+        if identity is not None:
+            with _process_locks_guard:
+                if _process_locks.get(self._path_key) is identity:
+                    del _process_locks[self._path_key]
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+    def __enter__(self) -> "InstanceLock":
+        return self.acquire()
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self.close()
+
+
+def instance_lock(path: str | os.PathLike[str]) -> InstanceLock:
+    """Create the explicit instance lock; callers hold it only around mutations."""
+    return InstanceLock(path)
 
 
 @dataclass(frozen=True)
-class DaemonHealth:
-    worker_id: str
+class CoordinatorHealth:
     running: bool
     stop_requested: bool
-    iterations: int
+    ticks: int
     successful_ticks: int
-    idle_ticks: int
-    busy_ticks: int
-    paused_ticks: int
-    transient_errors: int
+    errors: int
     consecutive_errors: int
-    last_status: str | None
-    last_stage: str | None
-    last_ticket_id: str | None
-    state: str
-    consecutive_undispatchable: int
-    last_reason_category: str | None
-    last_reason: str | None
     last_error: str | None
     last_tick_started_at: float | None
     last_tick_completed_at: float | None
 
 
-@dataclass(frozen=True)
-class ExternalProgressResult:
-    """Bounded result of the authorized Hermes progress probe."""
-
-    status: str
-    stage: str | None = None
-    ticket_id: str | None = None
-    reason_category: str | None = None
-    reason: str | None = None
-
-
-class SchedulerDaemon:
-    """Thin operational loop around the proven one-tick scheduler primitive."""
+class CoordinatorLoop:
+    """Wakeable bounded coordinator driver with no board, model, or provider calls."""
 
     def __init__(
         self,
-        ledger: Ledger,
-        scheduler_factory: Callable[[], ProcessNextScheduler],
-        external_progress_runner: Callable[[], ExternalProgressResult | str | dict[str, Any] | None] | None = None,
+        coordinator_tick: Callable[[Callable[[], None]], Any],
         *,
-        worker_id: str,
-        idle_sleep_seconds: float = 1.0,
-        busy_sleep_seconds: float = 0.25,
+        lock_path: str | os.PathLike[str],
+        interval_seconds: float = 1.0,
         error_backoff_seconds: float = 1.0,
         max_error_backoff_seconds: float = 30.0,
-        undispatchable_backoff_seconds: float = 1.0,
-        max_undispatchable_backoff_seconds: float = 30.0,
-        sleep: Callable[[float], None] = time.sleep,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] = time.monotonic,
+        wake_event: threading.Event | None = None,
     ) -> None:
-        numeric_inputs = {
-            "idle_sleep_seconds": idle_sleep_seconds,
-            "busy_sleep_seconds": busy_sleep_seconds,
-            "error_backoff_seconds": error_backoff_seconds,
-            "max_error_backoff_seconds": max_error_backoff_seconds,
-            "undispatchable_backoff_seconds": undispatchable_backoff_seconds,
-            "max_undispatchable_backoff_seconds": max_undispatchable_backoff_seconds,
-        }
-        normalized_inputs = {name: _finite_non_negative_real(value, name=name) for name, value in numeric_inputs.items()}
-        idle_sleep_seconds = normalized_inputs["idle_sleep_seconds"]
-        busy_sleep_seconds = normalized_inputs["busy_sleep_seconds"]
-        error_backoff_seconds = normalized_inputs["error_backoff_seconds"]
-        max_error_backoff_seconds = normalized_inputs["max_error_backoff_seconds"]
-        undispatchable_backoff_seconds = normalized_inputs["undispatchable_backoff_seconds"]
-        max_undispatchable_backoff_seconds = normalized_inputs["max_undispatchable_backoff_seconds"]
-        if error_backoff_seconds > max_error_backoff_seconds:
-            raise ValueError("initial error backoff cannot exceed maximum error backoff")
-        if undispatchable_backoff_seconds > max_undispatchable_backoff_seconds:
-            raise ValueError("initial undispatchable backoff cannot exceed maximum undispatchable backoff")
-        self.ledger = ledger
-        self.scheduler_factory = scheduler_factory
-        self.external_progress_runner = external_progress_runner
-        self.worker_id = validate_daemon_worker_id(worker_id)
-        self.idle_sleep_seconds = idle_sleep_seconds
-        self.busy_sleep_seconds = busy_sleep_seconds
-        self.error_backoff_seconds = error_backoff_seconds
-        self.max_error_backoff_seconds = max_error_backoff_seconds
-        self.undispatchable_backoff_seconds = undispatchable_backoff_seconds
-        self.max_undispatchable_backoff_seconds = max_undispatchable_backoff_seconds
-        self.sleep = sleep
-        self.clock = clock
+        if not callable(coordinator_tick):
+            raise ValueError("coordinator_tick must be callable")
+        self.interval_seconds = _finite_non_negative_real(interval_seconds, name="interval_seconds")
+        if self.interval_seconds == 0:
+            raise ValueError("interval_seconds must be greater than zero to prevent a busy loop")
+        self.error_backoff_seconds = _finite_non_negative_real(error_backoff_seconds, name="error_backoff_seconds")
+        self.max_error_backoff_seconds = _finite_non_negative_real(max_error_backoff_seconds, name="max_error_backoff_seconds")
+        if self.error_backoff_seconds > self.max_error_backoff_seconds:
+            raise ValueError("error_backoff_seconds cannot exceed max_error_backoff_seconds")
+        self._coordinator_tick = coordinator_tick
+        self._lock_path = lock_path
+        self._clock = clock
+        self._wake = wake_event if wake_event is not None else threading.Event()
         self._stop = threading.Event()
+        self._run_guard = threading.Lock()
         self._running = False
-        self._iterations = 0
+        self._ticks = 0
         self._successful_ticks = 0
-        self._idle_ticks = 0
-        self._busy_ticks = 0
-        self._paused_ticks = 0
-        self._transient_errors = 0
+        self._errors = 0
         self._consecutive_errors = 0
-        self._last_result: ProcessNextResult | None = None
         self._last_error: str | None = None
-        self._state = "starting"
-        self._consecutive_undispatchable = 0
-        self._last_reason_category: str | None = None
-        self._last_reason: str | None = None
         self._last_tick_started_at: float | None = None
         self._last_tick_completed_at: float | None = None
-        # Do not erase a prior worker record during restart.  The previous
-        # result/error remains operator-visible until the first new tick.
-        persisted = self.ledger.connection.execute("SELECT * FROM daemon_status WHERE worker_id=?", (self.worker_id,)).fetchone()
-        if persisted is None:
-            self._persist_status()
-        else:
-            validated = Ledger._operator_daemon_row(persisted)
-            if validated.get("status") != "invalid_persisted_state":
-                self._state = str(validated["status"])
-                self._iterations = saturating_non_negative_counter(validated["iterations"])
-                self._successful_ticks = saturating_non_negative_counter(validated["successful_ticks"])
-                self._idle_ticks = saturating_non_negative_counter(validated["idle_ticks"])
-                self._busy_ticks = saturating_non_negative_counter(validated["busy_ticks"])
-                self._paused_ticks = saturating_non_negative_counter(validated["paused_ticks"])
-                self._transient_errors = saturating_non_negative_counter(validated["transient_errors"])
-                self._consecutive_errors = saturating_non_negative_counter(validated["consecutive_errors"])
-                self._consecutive_undispatchable = saturating_non_negative_counter(validated["consecutive_undispatchable"])
-                self._last_error = validated["last_error"]
-                self._last_reason_category = validated["reason_category"]
-                self._last_reason = validated["reason"]
-                self._last_tick_started_at = validated["last_tick_started_at"]
-                self._last_tick_completed_at = validated["last_tick_completed_at"]
-                if validated["last_status"] is not None:
-                    self._last_result = ProcessNextResult(
-                        validated["last_status"], validated["last_stage"], validated["last_ticket_id"]
-                    )
 
     def request_stop(self) -> None:
         self._stop.set()
+        self._wake.set()
+
+    def wake(self) -> None:
+        self._wake.set()
 
     @property
     def stop_requested(self) -> bool:
         return self._stop.is_set()
 
-    def health(self) -> DaemonHealth:
-        result = self._last_result
-        try:
-            state = validate_daemon_status_label(self._state)
-        except ValueError as exc:
-            raise RuntimeError("daemon health state failed validation") from exc
-        return DaemonHealth(
-            worker_id=validate_daemon_worker_id(self.worker_id),
+    def health(self) -> CoordinatorHealth:
+        return CoordinatorHealth(
             running=self._running,
             stop_requested=self.stop_requested,
-            iterations=self._iterations,
+            ticks=self._ticks,
             successful_ticks=self._successful_ticks,
-            idle_ticks=self._idle_ticks,
-            busy_ticks=self._busy_ticks,
-            paused_ticks=self._paused_ticks,
-            transient_errors=self._transient_errors,
-            consecutive_errors=self._consecutive_errors,
-            last_status=None if result is None else bounded_daemon_text(result.status, limit=80),
-            last_stage=None if result is None else bounded_daemon_text(result.stage, limit=80),
-            last_ticket_id=None if result is None else bounded_daemon_text(result.ticket_id, limit=160),
-            state=state,
-            consecutive_undispatchable=self._consecutive_undispatchable,
-            last_reason_category=bounded_daemon_text(self._last_reason_category, limit=80),
-            last_reason=bounded_daemon_text(self._last_reason, limit=500),
-            last_error=bounded_daemon_text(self._last_error, limit=500),
-            last_tick_started_at=self._last_tick_started_at,
-            last_tick_completed_at=self._last_tick_completed_at,
-        )
-
-    def status(self) -> dict[str, Any]:
-        return {
-            "health": asdict(self.health()),
-            "scheduler": scheduler_observability(self.ledger),
-            "daemon_status": self.ledger.daemon_status_rows(limit=1),
-        }
-
-    @staticmethod
-    def _external_result(value: ExternalProgressResult | str | dict[str, Any] | None) -> ExternalProgressResult:
-        if value is None:
-            return ExternalProgressResult("no_authorized_work")
-        if isinstance(value, str):
-            return ExternalProgressResult("dispatched", stage="hermes_dispatch", ticket_id=value)
-        if isinstance(value, ExternalProgressResult):
-            outcome = value
-        elif isinstance(value, dict):
-            outcome = ExternalProgressResult(
-                status=str(value.get("status") or ""),
-                stage=None if value.get("stage") is None else str(value["stage"]),
-                ticket_id=None if value.get("ticket_id") is None else str(value["ticket_id"]),
-                reason_category=None if value.get("reason_category") is None else str(value["reason_category"]),
-                reason=None if value.get("reason") is None else str(value["reason"]),
-            )
-        else:
-            raise RuntimeError("external progress runner returned an unsupported result")
-        if outcome.status not in {"no_authorized_work", "dispatched", "authorized_undispatchable"}:
-            raise RuntimeError("external progress runner returned an unsupported status")
-        if outcome.status == "dispatched" and not outcome.ticket_id:
-            raise RuntimeError("external progress runner reported dispatch without a task")
-        return outcome
-
-    def _normalize_persisted_counters(self) -> None:
-        for field in (
-            "_consecutive_undispatchable",
-            "_iterations",
-            "_successful_ticks",
-            "_idle_ticks",
-            "_busy_ticks",
-            "_paused_ticks",
-            "_transient_errors",
-            "_consecutive_errors",
-        ):
-            setattr(self, field, min(saturating_non_negative_counter(getattr(self, field)), SQLITE_INT_MAX))
-
-    def _persist_status(self) -> None:
-        self._normalize_persisted_counters()
-        result = self._last_result
-        self.ledger.upsert_daemon_status(
-            worker_id=self.worker_id,
-            status=self._state,
-            last_status=None if result is None else result.status,
-            last_stage=None if result is None else result.stage,
-            last_ticket_id=None if result is None else result.ticket_id,
-            reason_category=self._last_reason_category,
-            reason=self._last_reason,
-            consecutive_undispatchable=self._consecutive_undispatchable,
-            iterations=self._iterations,
-            successful_ticks=self._successful_ticks,
-            idle_ticks=self._idle_ticks,
-            busy_ticks=self._busy_ticks,
-            paused_ticks=self._paused_ticks,
-            transient_errors=self._transient_errors,
+            errors=self._errors,
             consecutive_errors=self._consecutive_errors,
             last_error=self._last_error,
             last_tick_started_at=self._last_tick_started_at,
             last_tick_completed_at=self._last_tick_completed_at,
         )
 
-    def _sleep_after_result(self, result: ProcessNextResult) -> None:
+    def tick(self) -> Any | None:
         if self.stop_requested:
-            return
-        if result.status == "authorized_undispatchable":
-            delay = _saturating_exponential_backoff(
-                self.undispatchable_backoff_seconds,
-                max(0, self._consecutive_undispatchable - 1),
-                self.max_undispatchable_backoff_seconds,
-            )
-            self.sleep(delay)
-        elif result.status in {"idle", "no_work"}:
-            self.sleep(self.idle_sleep_seconds)
-        elif result.status == "busy":
-            self.sleep(self.busy_sleep_seconds)
-        elif result.status == "paused":
-            self.sleep(self.idle_sleep_seconds)
-
-    def run_iteration(self) -> ProcessNextResult:
-        if self.stop_requested:
-            return ProcessNextResult("stopped")
-        self._iterations = saturating_non_negative_counter_increment(self._iterations)
-        self._last_tick_started_at = self.clock()
+            return None
+        self._ticks += 1
+        self._last_tick_started_at = self._clock()
         try:
-            result = self.scheduler_factory().process_next()
-            if result.status in {"idle", "no_work"} and self.external_progress_runner is not None:
-                external = self._external_result(self.external_progress_runner())
-                if external.status == "dispatched":
-                    result = ProcessNextResult("external_progress", external.stage or "hermes_dispatch", external.ticket_id)
-                    self._consecutive_undispatchable = 0
-                    self._last_reason_category = None
-                    self._last_reason = None
-                elif external.status == "authorized_undispatchable":
-                    self._consecutive_undispatchable = saturating_non_negative_counter_increment(self._consecutive_undispatchable)
-                    category = external.reason_category or "no_dispatchable_plan"
-                    self._last_reason_category = category if category.replace("_", "").replace("-", "").replace(":", "").isalnum() and len(category) <= 80 else "no_dispatchable_plan"
-                    # Keep operator state categorical. Do not copy Hermes/model
-                    # output or card text into the durable status record.
-                    self._last_reason = "authorized work has no dispatchable plan"
-                    result = ProcessNextResult("authorized_undispatchable", external.stage or "hermes_dispatch", external.ticket_id)
-                else:
-                    self._consecutive_undispatchable = 0
-                    self._last_reason_category = None
-                    self._last_reason = None
-            else:
-                self._consecutive_undispatchable = 0
-                self._last_reason_category = None
-                self._last_reason = None
-        except Exception as exc:
-            self._transient_errors = saturating_non_negative_counter_increment(self._transient_errors)
-            self._consecutive_errors = saturating_non_negative_counter_increment(self._consecutive_errors)
-            self._last_error = bounded_daemon_text(f"{type(exc).__name__}: {exc}")
-            self._state = "error"
-            self._last_tick_completed_at = self.clock()
-            self._persist_status()
-            delay = _saturating_exponential_backoff(
-                self.error_backoff_seconds,
-                max(0, self._consecutive_errors - 1),
-                self.max_error_backoff_seconds,
-            )
-            if not self.stop_requested:
-                self.sleep(delay)
+            with instance_lock(self._lock_path) as lock:
+                lock.assert_held()
+                result = self._coordinator_tick(lock.assert_held)
+            self._successful_ticks += 1
+            self._consecutive_errors = 0
+            self._last_error = None
+            return result
+        except BaseException as exc:
+            self._errors += 1
+            self._consecutive_errors += 1
+            self._last_error = f"{type(exc).__name__}: {exc}"
             raise
-        self._last_result = result
-        self._last_error = None
-        self._successful_ticks = saturating_non_negative_counter_increment(self._successful_ticks)
-        self._consecutive_errors = 0
-        self._state = result.status
-        self._last_tick_completed_at = self.clock()
-        if not self.stop_requested:
-            if result.status in {"idle", "no_work"}:
-                self._idle_ticks = saturating_non_negative_counter_increment(self._idle_ticks)
-            elif result.status == "busy":
-                self._busy_ticks = saturating_non_negative_counter_increment(self._busy_ticks)
-            elif result.status == "paused":
-                self._paused_ticks = saturating_non_negative_counter_increment(self._paused_ticks)
-        self._persist_status()
-        self._sleep_after_result(result)
-        return result
+        finally:
+            self._last_tick_completed_at = self._clock()
 
-    def run(self, *, max_iterations: int | None = None, continue_on_error: bool = True) -> DaemonHealth:
-        if max_iterations is not None and (type(max_iterations) is not int or max_iterations < 0):
-            raise ValueError("max_iterations must be None or a non-negative built-in int")
+    def run(self, *, max_ticks: int | None = None) -> CoordinatorHealth:
+        if max_ticks is not None and (type(max_ticks) is not int or max_ticks < 0):
+            raise ValueError("max_ticks must be None or a non-negative built-in int")
+        if not self._run_guard.acquire(blocking=False):
+            raise RuntimeError("coordinator loop is already running")
         self._running = True
-        invocation_iterations = 0
+        invocation_ticks = 0
         try:
-            while not self.stop_requested and (max_iterations is None or invocation_iterations < max_iterations):
-                invocation_iterations += 1
+            while not self.stop_requested and (max_ticks is None or invocation_ticks < max_ticks):
+                invocation_ticks += 1
+                failed = False
                 try:
-                    self.run_iteration()
+                    self.tick()
                 except Exception:
-                    if not continue_on_error:
-                        raise
+                    failed = True
+                if self.stop_requested or (max_ticks is not None and invocation_ticks >= max_ticks):
+                    break
+                delay = bounded_backoff(
+                    self.error_backoff_seconds, self._consecutive_errors, self.max_error_backoff_seconds
+                ) if failed else self.interval_seconds
+                if self._wake.wait(delay):
+                    self._wake.clear()
         finally:
             self._running = False
+            self._run_guard.release()
         return self.health()
-
-    def install_signal_handlers(self) -> dict[int, Any]:
-        previous: dict[int, Any] = {}
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            previous[sig] = signal.getsignal(sig)
-            signal.signal(sig, lambda _signum, _frame: self.request_stop())
-        return previous
-
-    @staticmethod
-    def restore_signal_handlers(previous: dict[int, Any]) -> None:
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)

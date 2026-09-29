@@ -1,691 +1,347 @@
+"""Fail-closed, CLI-only Hermes Kanban adapter.
+
+The adapter never treats a read as a CAS.  It binds one board and one enrolled
+anchor, applies only bounded documented CLI commands, and returns partial,
+conflict, unknown, or unsupported where native evidence cannot prove an effect.
+"""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import sqlite3
 import subprocess
-from contextlib import contextmanager
-from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Callable
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Mapping
 
-from .comment_delivery import MarkerLookup
-from .execution_handoff import HANDOFF_MARKER, HANDOFF_SENTINEL, attach_execution_handoff
-from .states import CanonicalState
+from .contracts import Action, ActionResult, BoardSnapshot
 
-
-@dataclass(frozen=True)
-class ExternalTicket:
-    id: str
-    title: str
-    body: str
-    status: str
-    workspace_path: str | None
-    parents: tuple[str, ...] = ()
-    children: tuple[str, ...] = ()
-    assignee: str | None = None
-    workspace_kind: str | None = None
-    repository_identity: str | None = None
-    base_sha: str | None = None
-    raw: dict[str, Any] | None = None
+_AUTHOR = "local-first-orchestrator"
+_MAX_FIELD = 16_384
+_MAX_MARKER_SEARCH_ROWS = 1_000
 
 
-@dataclass(frozen=True)
-class ExternalExecutionRun:
-    id: int
-    status: str
-    outcome: str | None
-    started_at: int | None
-    ended_at: int | None
-    summary: str | None
-    profile: str | None
-    worker_pid: int | None
-    metadata: Any = None
+@dataclass(frozen=True, slots=True)
+class BoardCapabilities:
+    read_tasks: bool; read_runs: bool; create_held: bool; comment: bool; request_review: bool
+    request_changes: bool; return_waiting_review: bool; hold: bool; release: bool; link: bool
+    complete_anchor: bool; exact_run_stop: bool; atomic_read_bound_mutation: bool
+
+    @classmethod
+    def native_m0(cls) -> "BoardCapabilities":
+        return cls(True, True, True, True, True, False, True, True, True, True, False, False, False)
 
 
-@dataclass(frozen=True)
-class ExternalExecutionSnapshot:
-    task: ExternalTicket
-    session_id: str | None
-    branch_name: str | None
-    started_at: int | None
-    completed_at: int | None
-    runs: tuple[ExternalExecutionRun, ...]
-    repository_identity: str | None = None
-    base_sha: str | None = None
-    current_run_id: int | None = None
-    task_events: tuple[dict[str, Any], ...] = ()
-    comments: tuple[Any, ...] = ()
-    # Lossless CLI representations.  Typed fields are convenience views only;
-    # authority and hashes must use these complete values.
-    raw_task: dict[str, Any] | None = None
-    raw_comments: tuple[dict[str, Any], ...] = ()
-    raw_events: tuple[dict[str, Any], ...] = ()
-    raw_runs: tuple[dict[str, Any], ...] = ()
-    raw_snapshot: dict[str, Any] | None = None
-
-
-from .revalidation_boundary import create_revalidation_capability, revoke_revalidation_capability
-from .native_workspace import validate_native_workspace_path, canonical_native_workspace_path
+class _BoardUnavailable(RuntimeError): pass
 
 
 class HermesBoardAdapter:
-    """Hermes CLI adapter. Writes require explicit opt-in; reads are always safe."""
     is_fake = False
 
-    def __init__(self, *, board: str, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run, executable: str, allow_writes: bool = False, timeout_seconds: int = 15, output_limit: int = 200_000, implementation_profile: str | None = None, canonical_repository: Path | None = None, board_db_path: Path | None = None) -> None:
+    def __init__(self, *, board: str, anchor_task_id: str, executable: str,
+                 runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+                 hermes_home: Path, kanban_home: Path, timeout_seconds: int = 15,
+                 output_limit: int = 200_000,
+                 managed_member_lookup: Callable[[Mapping[str, str], str], bool] | None = None,
+                 completion_evidence_verifier: Callable[[Mapping[str, str], str, str], bool] | None = None,
+                 create_lock_assertion: Callable[[Mapping[str, str], str], Any] | None = None,
+                 claim_create_attempt: Callable[[Mapping[str, str], str], Any] | None = None) -> None:
+        if not all(isinstance(x, str) and x and x.replace("-", "").replace("_", "").isalnum() for x in (board, anchor_task_id)):
+            raise ValueError("explicit board and anchor IDs required")
+        executable_path = Path(executable)
+        if not executable_path.is_absolute() or not executable_path.is_file(): raise ValueError("Hermes executable must be an absolute existing path")
+        if not isinstance(hermes_home, Path) or not isinstance(kanban_home, Path): raise ValueError("explicit isolated home paths required")
         if timeout_seconds < 1 or output_limit < 1: raise ValueError("positive process limits required")
-        if not board or not board.replace("-", "").replace("_", "").isalnum(): raise ValueError("explicit board slug required")
-        path=Path(executable)
-        if not path.is_absolute() or not path.is_file(): raise ValueError("Hermes executable must be an absolute existing path")
-        if implementation_profile is not None and (not implementation_profile.strip() or any(c.isspace() for c in implementation_profile)):
-            raise ValueError("implementation profile must be a non-empty token")
-        self.runner, self.executable, self.board, self.allow_writes, self.timeout_seconds, self.output_limit = runner, str(path), board, allow_writes, timeout_seconds, output_limit
-        self.implementation_profile = implementation_profile
-        self.canonical_repository = None if canonical_repository is None else Path(canonical_repository).expanduser().resolve()
-        # Keep the configured spelling (including a symlink) so validation can
-        # detect retargeting instead of silently following the new target.
-        self.board_db_path = None if board_db_path is None else Path(board_db_path).expanduser()
+        self.board, self.anchor_task_id, self.executable = board, anchor_task_id, str(executable_path)
+        self.runner, self.hermes_home, self.kanban_home = runner, hermes_home, kanban_home
+        self.timeout_seconds, self.output_limit = timeout_seconds, output_limit
+        self.managed_member_lookup = managed_member_lookup
+        self.completion_evidence_verifier = completion_evidence_verifier
+        # The coordinator owns the singleton/OS lock.  This callback only
+        # asserts it remains held for the full reconciliation and create.
+        self.create_lock_assertion = create_lock_assertion
+        # The evidence store consumes this entitlement before any native send.
+        self.claim_create_attempt = claim_create_attempt
+        self.capabilities = BoardCapabilities.native_m0()
 
-    def _resolved_board_db_path(self) -> Path:
-        if self.board_db_path is not None:
-            path = self.board_db_path
-        else:
-            try:
-                from hermes_cli import kanban_db
-                path = Path(kanban_db.kanban_db_path(self.board))
-            except Exception as exc:
-                raise RuntimeError("trusted board revalidation cannot resolve Hermes Kanban DB") from exc
-        try:
-            path = path.expanduser().resolve(strict=True)
-        except OSError as exc:
-            raise RuntimeError("trusted board revalidation requires an existing local SQLite board DB") from exc
-        if not path.is_file():
-            raise RuntimeError("trusted board revalidation requires an existing local SQLite board DB")
-        return path
+    def _env(self) -> dict[str, str]:
+        env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL") if os.environ.get(k)}
+        env.update({"HERMES_HOME": str(self.hermes_home), "HERMES_KANBAN_HOME": str(self.kanban_home), "NO_COLOR": "1", "GIT_TERMINAL_PROMPT": "0"})
+        return env
+
+    def _invoke(self, *args: str, json_output: bool = False) -> Any:
+        if not all(isinstance(x, str) and len(x) <= _MAX_FIELD for x in args): raise ValueError("bounded string argv required")
+        argv = (self.executable, "kanban", "--board", self.board, *args)
+        try: completed = self.runner(argv, text=True, capture_output=True, timeout=self.timeout_seconds, check=False, shell=False, env=self._env())
+        except (OSError, subprocess.TimeoutExpired) as exc: raise _BoardUnavailable("Hermes Kanban CLI unavailable") from exc
+        stdout, stderr = completed.stdout or "", completed.stderr or ""
+        if len(stdout) > self.output_limit or len(stderr) > self.output_limit: raise _BoardUnavailable("Hermes Kanban output exceeded bound")
+        if completed.returncode: raise _BoardUnavailable((stderr or stdout or "Hermes Kanban CLI failed")[:2000])
+        if not json_output: return stdout
+        try: return json.loads(stdout)
+        except json.JSONDecodeError as exc: raise _BoardUnavailable("Hermes Kanban returned malformed JSON") from exc
 
     @staticmethod
-    def _snapshot_from_connection(connection: sqlite3.Connection, task_id: str) -> ExternalExecutionSnapshot:
-        try:
-            from hermes_cli import kanban_db
-            task = kanban_db.get_task(connection, task_id)
-            if task is None:
-                raise KeyError(task_id)
-            from hermes_cli.kanban_output import _SHOW_RUN_FIELDS, _obj_dict, _task_to_dict
-            parents = tuple(kanban_db.parent_ids(connection, task_id))
-            children = tuple(kanban_db.child_ids(connection, task_id))
-            raw_task = _task_to_dict(task)
-            runs = kanban_db.list_runs(connection, task_id)
-            comments = kanban_db.list_comments(connection, task_id)
-            events = kanban_db.list_events(connection, task_id)
-            latest_summary = kanban_db.latest_summary(connection, task_id)
-        except (sqlite3.DatabaseError, KeyError, AttributeError, TypeError) as exc:
-            raise RuntimeError("Hermes Kanban execution snapshot read failed") from exc
-        external_runs = tuple(ExternalExecutionRun(int(run.id), str(run.status or ""), None if run.outcome is None else str(run.outcome), int(run.started_at) if run.started_at is not None else None, None if run.ended_at is None else int(run.ended_at), None if run.summary is None else str(run.summary), None if run.profile is None else str(run.profile), None if run.worker_pid is None else int(run.worker_pid), run.metadata) for run in runs)
-        active_runs = [run for run in external_runs if run.status == "running"]
-        if str(task.status or "") == "running" and len(active_runs) != 1:
-            raise RuntimeError("Hermes running task execution evidence drift: exactly one active run required")
-        derived_run_id = active_runs[0].id if len(active_runs) == 1 else None
-        raw_snapshot = {"task": raw_task, "latest_summary": latest_summary, "parents": list(parents), "children": list(children), "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments], "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events], "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs]}
-        return ExternalExecutionSnapshot(
-            task=ExternalTicket(str(task.id), str(task.title or ""), str(task.body or ""), str(task.status or ""), task.workspace_path, parents=parents, children=children, assignee=task.assignee, workspace_kind=task.workspace_kind),
-            session_id=raw_task.get("session_id"), branch_name=raw_task.get("branch_name"), started_at=raw_task.get("started_at"), completed_at=raw_task.get("completed_at"),
-            runs=external_runs, repository_identity=None, base_sha=None,
-            current_run_id=derived_run_id, raw_snapshot=raw_snapshot,
-            raw_task=raw_task, raw_comments=tuple(raw_snapshot["comments"]), raw_events=tuple(raw_snapshot["events"]), raw_runs=tuple(raw_snapshot["runs"]),
-        )
+    def _digest(payload: Mapping[str, Any]) -> str:
+        return "sha256:" + hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
 
-    @contextmanager
-    def revalidation(self, local_first_ticket_id: str, external_task_id: str | None = None):
-        """Hold the exact Hermes board write lock across the caller's ledger commit."""
-        if external_task_id is None:
-            # Legacy direct-adapter callers used one external identity for both
-            # domains. Controller paths always pass both explicitly.
-            external_task_id = local_first_ticket_id
-        path = self._resolved_board_db_path()
+    def _snapshot(self, task_id: str) -> BoardSnapshot:
+        if not isinstance(task_id, str) or not task_id: raise ValueError("task_id must be non-empty")
+        payload = self._invoke("show", task_id, "--json", json_output=True)
+        if not isinstance(payload, dict) or not isinstance(payload.get("task"), dict) or payload["task"].get("id") != task_id: raise _BoardUnavailable("exact task read identity mismatch")
+        runs = self._invoke("runs", task_id, "--json", json_output=True)
+        if not isinstance(runs, list) or not all(isinstance(x, dict) for x in runs): raise _BoardUnavailable("exact run read malformed")
+        def records(name: str) -> tuple[Mapping[str, Any], ...]:
+            value = payload.get(name, [])
+            if not isinstance(value, list) or not all(isinstance(x, dict) for x in value): raise _BoardUnavailable(f"exact task {name} malformed")
+            return tuple(value)
+        parents = payload.get("parents", [])
+        if not isinstance(parents, list) or not all(isinstance(x, str) and x for x in parents): raise _BoardUnavailable("exact task parent graph malformed")
+        data = {"native_task": payload["task"], "parents": [{"id": x} for x in parents], "runs": runs, "comments": list(records("comments")), "events": list(records("events")), "attachments": list(records("attachments"))}
+        return BoardSnapshot(native_task=data["native_task"], parents=tuple(data["parents"]), runs=tuple(runs), comments=records("comments"), events=records("events"), attachments=records("attachments"), observed_at=datetime.now(timezone.utc).isoformat(), digest=self._digest(data))
+
+    def list_tasks(self) -> tuple[BoardSnapshot, ...]:
+        rows = self._invoke("list", "--json", json_output=True)
+        if not isinstance(rows, list) or not all(isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"] for x in rows): raise _BoardUnavailable("task list malformed")
+        return tuple(self._snapshot(x["id"]) for x in rows)
+    def read_task(self, task_id: str) -> BoardSnapshot: return self._snapshot(task_id)
+    def read_run(self, task_id: str, run_id: str) -> Mapping[str, Any]:
+        for run in self._snapshot(task_id).runs:
+            if str(run.get("id")) == str(run_id): return run
+        raise KeyError(f"Hermes run not found: {task_id}/{run_id}")
+
+    @staticmethod
+    def _evidence(snapshot: BoardSnapshot) -> dict[str, Any]: return snapshot.to_dict()
+    def _result(self, action: Action, outcome: str, details: str, snapshot: BoardSnapshot | None) -> ActionResult:
+        return ActionResult(action.key, outcome, details, None if snapshot is None else self._evidence(snapshot))
+    @staticmethod
+    def _running(snapshot: BoardSnapshot) -> bool:
+        return snapshot.native_task.get("status") == "running" or any(x.get("status") == "running" for x in snapshot.runs)
+
+    def _scope_and_target(self, action: Action, effect: str, task_id: str | None = None) -> str | None:
+        if not isinstance(action, Action) or action.effect != effect: raise ValueError("action effect does not match adapter operation")
+        if action.scope.get("board_id") != self.board or action.scope.get("anchor_task_id") != self.anchor_task_id: return "action scope is not this adapter's explicit board and anchor"
+        if task_id is not None:
+            if action.target.get("task_id") != task_id: return "action target does not match exact task"
+            if task_id != self.anchor_task_id and not self._trusted_member(action.scope, task_id): return "target is neither the anchor nor a trusted managed member"
+        return None
+
+    def _trusted_member(self, scope: Mapping[str, str], task_id: str) -> bool:
+        if self.managed_member_lookup is None: return False
+        try: return self.managed_member_lookup(scope, task_id) is True
+        except Exception: return False
+
+    def _preflight(self, action: Action, effect: str, task_id: str) -> tuple[BoardSnapshot | None, ActionResult | None]:
+        error = self._scope_and_target(action, effect, task_id)
+        if error: return None, self._result(action, "conflict", error, None)
+        try: before = self._snapshot(task_id)
+        except (_BoardUnavailable, ValueError) as exc: return None, self._result(action, "unknown", f"pre-read unavailable: {exc}", None)
+        if action.expected_observed_identity != before.digest: return before, self._result(action, "conflict", "action observation identity is stale", before)
+        return before, None
+
+    def _mutate(self, action: Action, *, task_id: str, argv: tuple[str, ...], verifier: Callable[[BoardSnapshot, BoardSnapshot], str | None], description: str) -> ActionResult:
+        before, result = self._preflight(action, action.effect, task_id)
+        if result is not None: return result
+        assert before is not None
+        if not self._assert_create_lock(action):
+            return self._result(action, "unsupported", "trusted singleton lock assertion is required immediately before native mutation", before)
+        try: self._invoke(*argv)
+        except (_BoardUnavailable, ValueError) as exc: return self._result(action, "unknown", f"native {description} outcome unknown: {exc}", before)
+        try: after = self._snapshot(task_id)
+        except (_BoardUnavailable, ValueError) as exc: return self._result(action, "unknown", f"post-{description} readback unavailable: {exc}", None)
+        outcome = verifier(before, after)
+        if outcome is None: return self._result(action, "verified", f"native {description} verified by exact readback", after)
+        return self._result(action, outcome, f"native {description} could not be safely verified: {outcome}", after)
+
+    def _assert_create_lock(self, action: Action) -> bool:
+        if self.create_lock_assertion is None:
+            return False
         try:
-            from hermes_cli.sqlite_util import open_db
-            connection = open_db(path, db_label=f"kanban:{self.board}", busy_timeout_ms=int(self.timeout_seconds * 1000), wal=False, check_same_thread=False)
-        except Exception as exc:
-            raise RuntimeError("trusted board revalidation cannot open the configured local SQLite board") from exc
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            snapshot = self._snapshot_from_connection(connection, external_task_id)
-            capability = create_revalidation_capability(
-                self, connection, path, local_first_ticket_id, external_task_id,
-                snapshot, self.board, configured_path=self.board_db_path or path,
-            )
-            try:
-                yield capability
-            finally:
-                revoke_revalidation_capability(capability)
-            connection.execute("COMMIT")
+            self.create_lock_assertion(action.scope, self.anchor_task_id)
+            return True
         except Exception:
-            try:
-                connection.execute("ROLLBACK")
-            except sqlite3.OperationalError:
-                pass
-            raise
-        finally:
-            connection.close()
+            return False
 
-    def _run(self, *args: str) -> Any:
+    def _claim_create_attempt(self, action: Action) -> bool:
+        if self.claim_create_attempt is None:
+            return False
         try:
-            completed = self.runner((self.executable, "kanban", "--board", self.board, *args), text=True, capture_output=True, timeout=self.timeout_seconds, check=False, env={**os.environ,"NO_COLOR":"1","GIT_TERMINAL_PROMPT":"0"})
-        except (OSError, subprocess.TimeoutExpired) as exc: raise RuntimeError("Hermes Kanban read unavailable") from exc
-        if len(completed.stdout or "") > self.output_limit or len(completed.stderr or "") > self.output_limit: raise RuntimeError("Hermes Kanban output exceeded bound")
-        if completed.returncode: raise RuntimeError((completed.stderr or completed.stdout or "Hermes Kanban CLI failed")[:2000])
-        if "--json" not in args: return completed.stdout[:self.output_limit]
-        try: return json.loads(completed.stdout[:self.output_limit])
-        except json.JSONDecodeError as exc: raise RuntimeError("Hermes Kanban malformed JSON") from exc
+            self.claim_create_attempt(action.scope, action.key)
+            return True
+        except Exception:
+            return False
 
-    def dispatch_one_if_allowed(self, allowed_task_ids: set[str]) -> str | None:
-        """Dispatch at most one task, refusing a board plan containing unrelated work."""
-        if not self.allow_writes:
-            raise PermissionError("real board writes require --allow-board-writes")
-        if not allowed_task_ids:
-            return None
-        preview = self._run("dispatch", "--dry-run", "--max", "100", "--json")
-        if not isinstance(preview, dict) or not isinstance(preview.get("spawned"), list):
-            raise RuntimeError("Hermes dispatch dry-run returned malformed JSON")
-        planned_ids: list[str] = []
-        for item in preview["spawned"]:
-            if not isinstance(item, dict) or not isinstance(item.get("task_id"), str):
-                raise RuntimeError("Hermes dispatch dry-run returned malformed spawn identity")
-            planned_ids.append(str(item["task_id"]))
-        if not planned_ids:
-            return None
-        unexpected = sorted(set(planned_ids) - set(allowed_task_ids))
-        if unexpected:
-            raise RuntimeError("Hermes dispatch plan contains non-Local-First task(s): " + ",".join(unexpected))
-        result = self._run("dispatch", "--max", "1", "--json")
-        if not isinstance(result, dict) or not isinstance(result.get("spawned"), list):
-            raise RuntimeError("Hermes dispatch returned malformed JSON")
-        spawned = result["spawned"]
-        if not spawned:
-            return None
-        if len(spawned) != 1 or not isinstance(spawned[0], dict) or not isinstance(spawned[0].get("task_id"), str):
-            raise RuntimeError("Hermes dispatch violated single-task bound")
-        task_id = str(spawned[0]["task_id"])
-        if task_id not in allowed_task_ids:
-            raise RuntimeError("Hermes dispatch spawned a task outside Local First authority")
-        return task_id
-
-    def get_task(self, task_id: str) -> ExternalTicket:
-        payload = self._run("show", task_id, "--json")
-        row = payload.get("task") if isinstance(payload, dict) else None
-        if not isinstance(row, dict):
-            raise KeyError(f"Hermes task not found: {task_id}")
-        parents = payload.get("parents", []) if isinstance(payload, dict) else []
-        children = payload.get("children", []) if isinstance(payload, dict) else []
-        if not isinstance(parents, list) or not all(isinstance(value, str) and value for value in parents):
-            raise RuntimeError("Hermes Kanban malformed parent graph")
-        if not isinstance(children, list) or not all(isinstance(value, str) and value for value in children):
-            raise RuntimeError("Hermes Kanban malformed child graph")
-        return ExternalTicket(
-            str(row["id"]),
-            str(row.get("title") or ""),
-            str(row.get("body") or ""),
-            str(row.get("status") or ""),
-            row.get("workspace_path"),
-            tuple(sorted(set(parents))),
-            tuple(sorted(set(children))),
-            None if row.get("assignee") is None else str(row["assignee"]),
-            None if row.get("workspace_kind") is None else str(row["workspace_kind"]),
-            None if row.get("repository_identity") is None else str(row["repository_identity"]),
-            None if row.get("base_sha") is None else str(row["base_sha"]),
-            dict(row),
-        )
-
-    def execution_snapshot(self, task_id: str) -> ExternalExecutionSnapshot:
-        payload = self._run("show", task_id, "--json")
-        row = payload.get("task") if isinstance(payload, dict) else None
-        runs = payload.get("runs") if isinstance(payload, dict) else None
-        if not isinstance(row, dict) or not isinstance(runs, list):
-            raise RuntimeError("Hermes execution snapshot is malformed")
-        parents = payload.get("parents")
-        children = payload.get("children")
-        comments = payload.get("comments", [])
-        events = payload.get("events", [])
-        if not isinstance(parents, list) or not all(type(value) is str and value for value in parents):
-            raise RuntimeError("Hermes execution snapshot parent graph is malformed")
-        if not isinstance(children, list) or not all(type(value) is str and value for value in children):
-            raise RuntimeError("Hermes execution snapshot child graph is malformed")
-        if not isinstance(comments, list) or not all(isinstance(item, dict) for item in comments):
-            raise RuntimeError("Hermes execution snapshot comments are malformed")
-        if not isinstance(events, list) or not all(isinstance(item, dict) for item in events):
-            raise RuntimeError("Hermes execution snapshot events are malformed")
-        for key in ("started_at", "completed_at"):
-            if row.get(key) is not None and (type(row[key]) is not int or row[key] < 0):
-                raise RuntimeError(f"Hermes task {key} has the wrong type")
-        for key in ("session_id", "branch_name"):
-            if row.get(key) is not None and type(row[key]) is not str:
-                raise RuntimeError(f"Hermes task {key} has the wrong type")
-        task = ExternalTicket(
-            str(row["id"]),
-            str(row.get("title") or ""),
-            str(row.get("body") or ""),
-            str(row.get("status") or ""),
-            row.get("workspace_path"),
-            tuple(parents),
-            tuple(children),
-            None if row.get("assignee") is None else str(row["assignee"]),
-            None if row.get("workspace_kind") is None else str(row["workspace_kind"]),
-            None if row.get("repository_identity") is None else str(row["repository_identity"]),
-            None if row.get("base_sha") is None else str(row["base_sha"]),
-            dict(row),
-        )
-        parsed: list[ExternalExecutionRun] = []
-        for item in runs:
-            if not isinstance(item, dict) or type(item.get("id")) is not int:
-                raise RuntimeError("Hermes execution run is malformed")
-            if item["id"] < 0:
-                raise RuntimeError("Hermes execution run id is invalid")
-            for key in ("status", "profile", "summary", "outcome"):
-                if item.get(key) is not None and type(item[key]) is not str:
-                    raise RuntimeError(f"Hermes execution run {key} has the wrong type")
-            for key in ("started_at", "ended_at"):
-                if item.get(key) is not None and (type(item[key]) is not int or item[key] < 0):
-                    raise RuntimeError(f"Hermes execution run {key} has the wrong type")
-            if item.get("worker_pid") is not None and (type(item["worker_pid"]) is not int or item["worker_pid"] <= 0):
-                raise RuntimeError("Hermes execution run worker_pid has the wrong type")
-            if item.get("metadata") is not None and not isinstance(item["metadata"], dict):
-                raise RuntimeError("Hermes execution run metadata has the wrong type")
-            if item.get("started_at") is None:
-                raise RuntimeError("Hermes execution run started_at is missing")
-            if item.get("ended_at") is not None and item["ended_at"] < item["started_at"]:
-                raise RuntimeError("Hermes execution run timestamps are not monotonic")
-            parsed.append(ExternalExecutionRun(
-                id=int(item["id"]),
-                status=item.get("status"),
-                outcome=item.get("outcome"),
-                started_at=item.get("started_at"),
-                ended_at=item.get("ended_at"),
-                summary=item.get("summary"),
-                profile=item.get("profile"),
-                worker_pid=item.get("worker_pid"),
-                metadata=item.get("metadata"),
-            ))
-        active_runs = [run for run in parsed if run.status == "running"]
-        if task.status == "running" and len(active_runs) != 1:
-            raise RuntimeError("Hermes running task execution evidence drift: exactly one active run required")
-        derived_run_id = active_runs[0].id if len(active_runs) == 1 else None
-        return ExternalExecutionSnapshot(
-            task=task,
-            session_id=None if row.get("session_id") is None else str(row["session_id"]),
-            branch_name=None if row.get("branch_name") is None else str(row["branch_name"]),
-            started_at=None if row.get("started_at") is None else int(row["started_at"]),
-            completed_at=None if row.get("completed_at") is None else int(row["completed_at"]),
-            # Hermes already supplies start/id order. Never sort or deduplicate
-            # history here: order drift is evidence, not presentation noise.
-            runs=tuple(parsed),
-            repository_identity=None if row.get("repository_identity") is None else str(row["repository_identity"]),
-            base_sha=None if row.get("base_sha") is None else str(row["base_sha"]),
-            current_run_id=derived_run_id,
-            task_events=tuple(events),
-            comments=tuple(comments),
-            raw_task=dict(row), raw_comments=tuple(comments), raw_events=tuple(events),
-            raw_runs=tuple(dict(item) for item in runs), raw_snapshot=dict(payload),
-        )
-
-    def import_candidates(self) -> list[ExternalTicket]:
-        rows = self._run("list", "--json", "--status", "scheduled")
-        if not isinstance(rows, list):
-            raise RuntimeError("Kanban list JSON must be an array")
-        candidates = []
+    def _marked_create_matches(self, marker: str) -> tuple[int, tuple[BoardSnapshot, ...]]:
+        rows = self._invoke("list", "--archived", "--json", json_output=True)
+        if not isinstance(rows, list) or len(rows) > _MAX_MARKER_SEARCH_ROWS:
+            raise _BoardUnavailable("bounded create marker search malformed or exceeded row limit")
+        ids: list[str] = []
         for row in rows:
-            if not isinstance(row, dict):
-                raise RuntimeError("Kanban list contains a non-object task")
-            body = str(row.get("body") or "")
-            if "<!-- local-first-orchestrator -->" not in body:
-                continue
-            candidates.append(ExternalTicket(
-                str(row["id"]), str(row.get("title") or ""), body, str(row.get("status") or ""), row.get("workspace_path"),
-                assignee=None if row.get("assignee") is None else str(row["assignee"]),
-                workspace_kind=None if row.get("workspace_kind") is None else str(row["workspace_kind"]),
-                repository_identity=None if row.get("repository_identity") is None else str(row["repository_identity"]),
-                base_sha=None if row.get("base_sha") is None else str(row["base_sha"]),
-                raw=dict(row),
-            ))
-        return candidates
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
+                raise _BoardUnavailable("bounded create marker search row malformed")
+            ids.append(row["id"])
+        matches = tuple(snapshot for snapshot in (self._snapshot(task_id) for task_id in ids)
+                        if isinstance(snapshot.native_task.get("body"), str) and marker in snapshot.native_task["body"])
+        if len(matches) > 1:
+            return len(matches), tuple()
+        return len(matches), matches
 
-    def find_comment_marker(self, external_task_id: str, marker: str) -> MarkerLookup:
-        payload = self._run("show", external_task_id, "--json")
-        comments = payload.get("comments", []) if isinstance(payload, dict) else []
-        if not isinstance(comments, list):
-            return MarkerLookup.UNAVAILABLE
-        for row in comments:
-            if isinstance(row, dict) and marker in str(row.get("body") or ""):
-                return MarkerLookup.FOUND
-        return MarkerLookup.NOT_FOUND
+    @staticmethod
+    def _create_marker(action: Action) -> str:
+        """Bound reconciliation identity, scoped to one board-anchor lineage."""
+        canonical = json.dumps(
+            {"action_key": action.key, "anchor_task_id": action.scope["anchor_task_id"], "board_id": action.scope["board_id"]},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
+        return "<!-- local-first-create:v1:sha256:" + hashlib.sha256(canonical.encode()).hexdigest() + " -->"
 
-    def set_state(self, ticket_id: str, state: CanonicalState, *, idempotency_key: str, expected_routing: dict[str, str] | None = None) -> None:
-        if not self.allow_writes:
-            raise PermissionError("real board writes require --allow-board-writes")
-        task = self.get_task(ticket_id)
-        if expected_routing is not None:
-            verified = self._verify_native_release_route(task, expected_workspace_path=expected_routing["workspace_path"], allow_unbound_workspace=True)
-            if verified != {"profile": expected_routing.get("profile"), "workspace_kind": expected_routing.get("workspace_kind"), "workspace_path": expected_routing.get("workspace_path")}:
-                raise RuntimeError("native release authority mismatch")
-        current = task.status
-        handoff = HANDOFF_MARKER in task.body
-        if state == CanonicalState.DONE:
-            if current == "done":
-                return
-            if current == "scheduled":
-                self._run("unblock", ticket_id, "--reason", f"local-first completion {idempotency_key}")
-            self._run("complete", ticket_id, "--result", f"local-first projection {idempotency_key}")
-        elif handoff and state in {CanonicalState.READY_LOCAL, CanonicalState.REPAIRING}:
-            if current == "ready":
-                return
-            if current in {"blocked", "scheduled", "todo"}:
-                self._run("unblock", ticket_id, "--reason", f"local-first execution released {idempotency_key}")
-                return
-            if current == "running":
-                return
-            raise RuntimeError(f"Hermes execution handoff release has incompatible state: {current}")
-        elif handoff:
-            if current in {"blocked", "review", "done"}:
-                # Review is the preferred implementation handoff. Done is tolerated
-                # as a recoverable premature worker finality signal; Local First
-                # remains authoritative for validation/review/integration/finality.
-                return
-            if current in {"running", "ready", "todo", "scheduled"}:
-                raise RuntimeError(f"Hermes execution handoff is not parked for Local First trust stage: {current}")
-            return
-        elif state in {CanonicalState.BLOCKED, CanonicalState.NEEDS_TRIAGE, CanonicalState.NEEDS_CHECKPOINT, CanonicalState.NEEDS_HUMAN_TEST}:
-            if current == "blocked":
-                return
-            self._run("block", ticket_id, f"local-first projection {state.value} ({idempotency_key})", "--kind", "needs_input")
-        else:
-            # Scheduled is deliberately non-dispatchable by Hermes; the local-first
-            # controller owns execution and avoids racing the gateway dispatcher.
-            if current == "scheduled":
-                return
-            self._run("schedule", ticket_id, f"local-first projection {state.value} ({idempotency_key})")
+    def _verify_existing_create(self, action: Action, snapshot: BoardSnapshot, *, title: str, body: str, assignee: str, workspace: str, idempotency_key: str) -> ActionResult:
+        task = snapshot.native_task
+        if self._running(snapshot):
+            return self._result(action, "partial", "marked create has active work and is not safely held", snapshot)
+        expected = {"title": title, "body": body, "assignee": assignee, "workspace": workspace, "idempotency_key": idempotency_key}
+        missing = [field for field in expected if field not in task]
+        if missing:
+            return self._result(action, "partial", f"marked create readback cannot expose identity fields: {', '.join(missing)}", snapshot)
+        if any(task.get(field) != value for field, value in expected.items()):
+            return self._result(action, "conflict", "marked create identity fields differ from action", snapshot)
+        if task.get("status") != "blocked":
+            return self._result(action, "conflict", "marked create is not held", snapshot)
+        if not any(parent.get("id") == self.anchor_task_id for parent in snapshot.parents):
+            return self._result(action, "conflict", "marked create is not associated with anchor", snapshot)
+        return self._result(action, "no-op", "exact marked held creation already present", snapshot)
 
-    def activation_marker_present(self, ticket_id: str, marker: str) -> bool:
+    def create_held(self, action: Action, *, title: str, body: str, assignee: str, workspace: str, idempotency_key: str) -> ActionResult:
+        error = self._scope_and_target(action, "create_held")
+        if error or action.target.get("anchor_task_id") != self.anchor_task_id: return self._result(action, "conflict", error or "create target must name exact anchor", None)
+        if not all(isinstance(x, str) and x and len(x) <= _MAX_FIELD for x in (title, body, assignee, workspace, idempotency_key)): raise ValueError("bounded non-empty creation values required")
+        marker = self._create_marker(action)
+        created_body = body if marker in body else f"{body}\n\n{marker}"
+        if len(created_body) > _MAX_FIELD: raise ValueError("creation body plus stable marker exceeds bound")
+        if not self._assert_create_lock(action):
+            return self._result(action, "unsupported", "trusted singleton create lock assertion is required and must be held", None)
+        try: before = self._snapshot(self.anchor_task_id)
+        except _BoardUnavailable as exc: return self._result(action, "unknown", f"pre-create anchor read unavailable: {exc}", None)
+        if action.expected_observed_identity != before.digest: return self._result(action, "conflict", "action observation identity is stale", before)
         try:
-            from hermes_cli.sqlite_util import open_db
-            path = self._resolved_board_db_path()
-            with open_db(path, db_label=f"kanban:{self.board}", busy_timeout_ms=int(self.timeout_seconds * 1000), wal=False, check_same_thread=False) as connection:
-                rows = connection.execute("SELECT body FROM task_comments WHERE task_id=? ORDER BY id", (ticket_id,)).fetchall()
-                return sum(1 for row in rows if str(row["body"]) == f"UNBLOCK: {marker}") == 1
-        except Exception as exc:
-            raise RuntimeError("native release activation marker read unavailable") from exc
+            marker_count, matches = self._marked_create_matches(marker)
+        except _BoardUnavailable as exc:
+            return self._result(action, "unknown", f"pre-create marker reconciliation unavailable: {exc}", before)
+        if marker_count > 1:
+            return self._result(action, "conflict", "multiple exact stable create markers found", None)
+        if marker_count == 1:
+            assert len(matches) == 1
+            return self._verify_existing_create(action, matches[0], title=title, body=created_body, assignee=assignee, workspace=workspace, idempotency_key=idempotency_key)
+        if not self._claim_create_attempt(action):
+            outcome = "unsupported" if self.claim_create_attempt is None else "unknown"
+            return self._result(action, outcome, "durable create attempt claim is required and must succeed before native create", before)
+        if not self._assert_create_lock(action):
+            return self._result(action, "unsupported", "trusted singleton create lock was not held immediately before native create", before)
+        try: payload = self._invoke("create", title, "--body", created_body, "--assignee", assignee, "--workspace", workspace, "--parent", self.anchor_task_id, "--idempotency-key", idempotency_key, "--initial-status", "blocked", "--json", json_output=True)
+        except (_BoardUnavailable, ValueError) as exc: return self._result(action, "unknown", f"native create outcome unknown: {exc}", before)
+        task_id = payload.get("id") if isinstance(payload, dict) else None
+        if not isinstance(task_id, str) or not task_id: return self._result(action, "unknown", "native create returned no exact task identity", None)
+        try: after = self._snapshot(task_id)
+        except _BoardUnavailable as exc: return self._result(action, "unknown", f"post-create readback unavailable: {exc}", None)
+        task = after.native_task
+        if self._running(after): return self._result(action, "partial", "created card has active work and is not safely held", after)
+        if task.get("status") != "blocked": return self._result(action, "conflict", "create did not leave exact task held", after)
+        expected_fields = {"id": task_id, "title": title, "body": created_body, "assignee": assignee, "workspace": workspace, "idempotency_key": idempotency_key}
+        missing = [field for field in expected_fields if field not in task]
+        if missing: return self._result(action, "partial", f"native create readback cannot expose identity fields: {', '.join(missing)}", after)
+        if any(task.get(k) != v for k, v in expected_fields.items()): return self._result(action, "conflict", "created task identity fields differ from action", after)
+        if not any(x.get("id") == self.anchor_task_id for x in after.parents): return self._result(action, "conflict", "created task is not associated with anchor", after)
+        return self._result(action, "verified", "held creation verified by exact readback", after)
 
-    def activate_native_release(self, ticket_id: str, *, activation_marker: str, expected_routing: dict[str, str]) -> ExternalTicket:
-        """Perform exactly one supported scheduled-to-ready Hermes mutation."""
-        if not self.allow_writes:
-            raise PermissionError("real board writes require --allow-board-writes")
-        if not activation_marker or not isinstance(expected_routing, dict):
-            raise ValueError("native release activation requires marker and routing")
-        task = self.get_task(ticket_id)
-        self.verify_native_release_task(task, expected_workspace_path=expected_routing["workspace_path"])
-        if task.status == "ready":
-            raise RuntimeError("native release activation requires the exact scheduled side effect marker")
-        if task.status != "scheduled":
-            raise RuntimeError(f"native release activation target has incompatible state: {task.status}")
-        if {"profile": task.assignee, "workspace_kind": task.workspace_kind, "workspace_path": task.workspace_path} != {"profile": expected_routing.get("profile"), "workspace_kind": expected_routing.get("workspace_kind"), "workspace_path": expected_routing.get("workspace_path")}:
-            raise RuntimeError("native release activation routing drift")
-        self._run("unblock", ticket_id, "--reason", activation_marker)
-        updated = self.get_task(ticket_id)
-        self.verify_native_release_task(updated, expected_workspace_path=expected_routing["workspace_path"])
-        if updated.status != "ready":
-            raise RuntimeError("native release activation did not produce ready state")
-        return updated
+    def comment(self, action: Action, task_id: str, text: str) -> ActionResult:
+        if not isinstance(text, str) or not text or len(text) > _MAX_FIELD: raise ValueError("bounded non-empty comment required")
+        marker = f"<!-- local-first-action:{action.key} -->"
+        if marker not in text: return self._result(action, "conflict", "comment lacks stable action marker", None)
+        before, result = self._preflight(action, "comment", task_id)
+        if result is not None: return result
+        assert before is not None
+        matching = [x for x in before.comments if x.get("body") == text and x.get("author") == _AUTHOR]
+        if matching: return self._result(action, "no-op", "exact marked comment already present", before)
+        if not self._assert_create_lock(action):
+            return self._result(action, "unsupported", "trusted singleton lock assertion is required immediately before native mutation", before)
+        try: self._invoke("comment", task_id, text, "--author", _AUTHOR)
+        except (_BoardUnavailable, ValueError) as exc: return self._result(action, "unknown", f"native comment outcome unknown: {exc}", before)
+        try: after = self._snapshot(task_id)
+        except _BoardUnavailable as exc: return self._result(action, "unknown", f"post-comment readback unavailable: {exc}", None)
+        if any(x.get("body") == text and x.get("author") == _AUTHOR for x in after.comments): return self._result(action, "verified", "native comment verified by exact marker and author", after)
+        return self._result(action, "conflict", "marked comment absent after native write", after)
 
-    def reclaim_for_repair(self, ticket_id: str, *, reason: str) -> ExternalTicket:
-        if not self.allow_writes:
-            raise PermissionError("real board writes require --allow-board-writes")
-        task = self.get_task(ticket_id)
-        if task.status not in {"todo", "ready"}:
-            self._run("reclaim", ticket_id, "--reason", reason)
-            task = self.get_task(ticket_id)
-        if task.status not in {"todo", "ready"}:
-            raise RuntimeError(f"Hermes repair reclaim did not make task dispatchable: {task.status}")
-        return task
+    def request_review(self, action: Action, task_id: str, summary: str, *, reviewer: str | None = None, metadata: Mapping[str, Any] | None = None) -> ActionResult:
+        if not isinstance(summary, str) or not summary or len(summary) > _MAX_FIELD or not isinstance(reviewer, str) or not reviewer or len(reviewer) > _MAX_FIELD: raise ValueError("bounded summary and reviewer required")
+        before, result = self._preflight(action, "request_review", task_id)
+        if result is not None: return result
+        assert before is not None
+        if before.native_task.get("status") not in {"ready", "todo"}: return self._result(action, "conflict", "review request requires exact waiting task", before)
+        if reviewer == before.native_task.get("assignee"): return self._result(action, "conflict", "reviewer must differ from implementation assignee", before)
+        encoded = None
+        if metadata is not None:
+            try: encoded = json.dumps(dict(metadata), sort_keys=True, separators=(",", ":"))
+            except (TypeError, ValueError) as exc: raise ValueError("review metadata must be bounded JSON") from exc
+            if len(encoded) > _MAX_FIELD: raise ValueError("review metadata exceeds bound")
+        argv = ("request-review", task_id, "--summary", summary, "--reviewer", reviewer, *( () if encoded is None else ("--metadata", encoded)))
+        return self._mutate(action, task_id=task_id, argv=argv, verifier=lambda _b, a: None if a.native_task.get("status") == "review" and a.native_task.get("reviewer") == reviewer else "partial", description="request-review")
 
-    def repair_predecessor_task(self, task_id: str) -> ExternalTicket:
-        task = self.get_task(task_id)
-        if task.status == "done":
-            return task
-        if task.status in {"blocked", "triage"}:
-            snapshot = self.execution_snapshot(task_id)
-            if snapshot.runs:
-                latest = max(snapshot.runs, key=lambda run: run.id)
-                if latest.status == "blocked" and latest.outcome == "blocked" and latest.summary == HANDOFF_SENTINEL and latest.ended_at is not None:
-                    return task
-        raise RuntimeError(f"Hermes repair predecessor is not terminal Local First work: {task.status}")
+    def request_changes(self, action: Action, task_id: str, reason: str, run_id: str) -> ActionResult:
+        before, result = self._preflight(action, "request_changes", task_id)
+        return result if result is not None else self._result(action, "unsupported", f"native request-changes cannot target exact review run {run_id}", before)
+    def return_waiting_review(self, action: Action, task_id: str, reason: str) -> ActionResult:
+        return self._mutate(action, task_id=task_id, argv=("reopen-review", task_id, "--reason", reason), verifier=lambda b,a: None if b.native_task.get("status") == "review" and a.native_task.get("status") in {"ready","todo"} else "conflict", description="reopen-review")
+    def hold(self, action: Action, task_id: str, reason: str) -> ActionResult:
+        before, result = self._preflight(action, "hold", task_id)
+        if result is not None: return result
+        assert before is not None
+        if self._running(before): return self._result(action, "partial", "running work cannot be safely held", before)
+        if before.native_task.get("status") == "blocked": return self._result(action, "no-op", "exact task already held", before)
+        return self._mutate(action, task_id=task_id, argv=("block", task_id, reason, "--kind", "needs_input"), verifier=lambda _b,a: "partial" if self._running(a) else (None if a.native_task.get("status") == "blocked" else "conflict"), description="hold")
+    def release(self, action: Action, task_id: str, reason: str) -> ActionResult:
+        return self._mutate(action, task_id=task_id, argv=("unblock", task_id, "--reason", reason), verifier=lambda b,a: None if b.native_task.get("status") == "blocked" and a.native_task.get("status") in {"ready","todo"} else "conflict", description="release")
+    def stop_run(self, action: Action, task_id: str, run_id: str, reason: str) -> ActionResult:
+        before, result = self._preflight(action, "stop_run", task_id)
+        if result is not None: return result
+        assert before is not None
+        return self._result(action, "conflict" if not any(str(x.get("id")) == str(run_id) for x in before.runs) else "unsupported", "exact run stop is not supported by native CLI", before)
+    def link(self, action: Action, parent_task_id: str, child_task_id: str) -> ActionResult:
+        if parent_task_id != self.anchor_task_id or parent_task_id == child_task_id or action.target.get("parent_task_id") != parent_task_id or action.target.get("child_task_id") != child_task_id: return self._result(action, "conflict", "links must originate at exact anchor with distinct endpoints", None)
+        error = self._scope_and_target(action, "link")
+        if error: return self._result(action, "conflict", error, None)
+        if not self._trusted_member(action.scope, child_task_id): return self._result(action, "conflict", "link child is not a trusted managed member", None)
+        try:
+            parent, child = self._snapshot(parent_task_id), self._snapshot(child_task_id)
+        except _BoardUnavailable as exc: return self._result(action, "unknown", f"pre-read unavailable: {exc}", None)
+        if action.expected_observed_identity != child.digest: return self._result(action, "conflict", "action observation identity is stale", child)
+        if self._running(child): return self._result(action, "partial", "running dependent cannot be safely relinked", child)
+        if any(item.get("id") == parent_task_id for item in child.parents): return self._result(action, "no-op", "exact dependency already present", child)
+        if not self._assert_create_lock(action):
+            return self._result(action, "unsupported", "trusted singleton lock assertion is required immediately before native mutation", child)
+        try: self._invoke("link", parent_task_id, child_task_id)
+        except (_BoardUnavailable, ValueError) as exc: return self._result(action, "unknown", f"native link outcome unknown: {exc}", child)
+        try: after = self._snapshot(child_task_id)
+        except _BoardUnavailable as exc: return self._result(action, "unknown", f"post-link readback unavailable: {exc}", None)
+        if self._running(after): return self._result(action, "partial", "linked dependent has active work after native link", after)
+        if any(item.get("id") == parent_task_id for item in after.parents): return self._result(action, "verified", "dependency verified by exact child readback", after)
+        return self._result(action, "conflict", "dependency missing after native link", after)
+    def complete_anchor(self, action: Action, task_id: str, approval_evidence: str) -> ActionResult:
+        before, result = self._preflight(action, "complete_anchor", task_id)
+        if result is not None: return result
+        assert before is not None
+        if task_id != self.anchor_task_id: return self._result(action, "conflict", "only exact anchor may complete", before)
+        if self.completion_evidence_verifier is None: return self._result(action, "unsupported", "trusted acceptance-evidence verifier is required", before)
+        try: accepted = self.completion_evidence_verifier(action.scope, task_id, approval_evidence) is True
+        except Exception: accepted = False
+        if not accepted: return self._result(action, "conflict", "trusted verifier rejected acceptance evidence", before)
+        return self._mutate(action, task_id=task_id, argv=("complete", task_id, "--result", approval_evidence), verifier=lambda _b,a: None if a.native_task.get("status") == "done" else "conflict", description="anchor completion")
+    def verify_effect(self, action: Action) -> ActionResult:
+        task_id = action.target.get("task_id")
+        if not isinstance(task_id, str) or not task_id: raise ValueError("verify_effect requires exact task target")
+        before, result = self._preflight(action, action.effect, task_id)
+        if result is not None: return result
+        assert before is not None
+        return self._result(action, "unsupported", "a standalone readback cannot prove this operation caused an effect", before)
 
-    def create_repair_task(
-        self,
-        predecessor_task_id: str,
-        *,
-        title: str,
-        body: str,
-        workspace_path: str | None,
-        downstream_child_ids: tuple[str, ...],
-        idempotency_key: str,
-        reason: str,
-    ) -> ExternalTicket:
-        """Insert a fresh repair task between a completed task and its children.
-
-        Downstream children are parked before any dependency edge is removed, so
-        an interrupted rewrite fails closed instead of releasing successor work.
-        Replaying with the same idempotency key converges the same task/graph.
-        """
-        if not self.allow_writes:
-            raise PermissionError("real board writes require --allow-board-writes")
-        if not predecessor_task_id or not idempotency_key or not reason:
-            raise ValueError("repair task creation requires predecessor, key, and reason")
-        predecessor = self.repair_predecessor_task(predecessor_task_id)
-        expected_children = tuple(sorted(set(downstream_child_ids)))
-        if predecessor_task_id in expected_children:
-            raise ValueError("repair task cannot depend on itself")
-        args = [
-            "create", title,
-            "--body", attach_execution_handoff(body),
-            "--workspace", (f"dir:{workspace_path}" if workspace_path else (f"worktree:{self.canonical_repository}" if self.canonical_repository is not None else "worktree")),
-            "--idempotency-key", idempotency_key,
-            "--initial-status", "blocked",
-        ]
-        # A completed Hermes predecessor is an executable dependency.  A
-        # terminal Local First handoff is only repair lineage: keeping it as a
-        # Hermes parent makes the replacement permanently undispatchable.
-        if predecessor.status == "done":
-            args[4:4] = ["--parent", predecessor_task_id]
-        assignee = self.implementation_profile or predecessor.assignee
-        if assignee:
-            args += ["--assignee", assignee]
-        args += ["--json"]
-        payload = self._run(*args)
-        if not isinstance(payload, dict) or not isinstance(payload.get("id"), str) or not payload["id"]:
-            raise RuntimeError("Hermes repair create JSON missing task id")
-        repair_task_id = str(payload["id"])
-        if repair_task_id == predecessor_task_id:
-            raise RuntimeError("Hermes repair task identity conflicts with predecessor")
-        repair = self.get_task(repair_task_id)
-        expected_parents = {predecessor_task_id} if predecessor.status == "done" else set()
-        parents = set(repair.parents)
-        if predecessor.status != "done" and predecessor_task_id in parents:
-            self._run("unlink", predecessor_task_id, repair_task_id)
-            repair = self.get_task(repair_task_id)
-            parents = set(repair.parents)
-        unexpected_parents = parents - expected_parents
-        if unexpected_parents:
-            raise RuntimeError("Hermes repair task has unexpected parent dependencies")
-        if expected_parents and predecessor_task_id not in parents:
-            raise RuntimeError("Hermes repair task is missing predecessor dependency")
-        extra_children = set(repair.children) - set(expected_children)
-        if extra_children:
-            raise RuntimeError("Hermes repair task has unexpected downstream dependencies")
-
-        for child_id in expected_children:
-            child = self.get_task(child_id)
-            if child.status in {"running", "done"}:
-                raise RuntimeError(f"Hermes downstream child cannot be safely re-parented: {child_id}:{child.status}")
-            if child.status != "blocked":
-                self._run("block", child_id, f"Local First repair dependency insertion ({idempotency_key})", "--kind", "needs_input")
-                child = self.get_task(child_id)
-            if child.status != "blocked":
-                raise RuntimeError(f"Hermes downstream child was not durably parked: {child_id}:{child.status}")
-            parents = set(child.parents)
-            if repair_task_id not in parents:
-                self._run("link", repair_task_id, child_id)
-                child = self.get_task(child_id)
-                parents = set(child.parents)
-            if repair_task_id not in parents:
-                raise RuntimeError(f"Hermes repair dependency link did not converge: {child_id}")
-            if predecessor_task_id in parents:
-                self._run("unlink", predecessor_task_id, child_id)
-                child = self.get_task(child_id)
-                parents = set(child.parents)
-            if repair_task_id not in parents or predecessor_task_id in parents:
-                raise RuntimeError(f"Hermes repair dependency rewrite did not converge: {child_id}")
-
-        repair = self.get_task(repair_task_id)
-        if tuple(sorted(set(repair.children))) != expected_children:
-            raise RuntimeError("Hermes repair task downstream graph did not converge")
-        if workspace_path is not None and repair.status == "blocked":
-            self._run("unblock", repair_task_id, "--reason", reason)
-            repair = self.get_task(repair_task_id)
-        if predecessor.status != "done" and repair.status == "todo":
-            self._run("promote", repair_task_id, reason)
-            repair = self.get_task(repair_task_id)
-        if repair.status not in {"todo", "ready", "scheduled", "running", "blocked", "done"}:
-            raise RuntimeError(f"Hermes repair task entered an unsupported status: {repair.status}")
-        return repair
-
-    def activate_repair_task(self, task_id: str, *, reason: str) -> ExternalTicket:
-        if not self.allow_writes:
-            raise PermissionError("real board writes require --allow-board-writes")
-        if not task_id or not reason:
-            raise ValueError("repair task activation requires task and reason")
-        task = self.get_task(task_id)
-        if task.status in {"ready", "running", "review", "done"}:
-            return task
-        if task.status != "blocked":
-            raise RuntimeError(f"Hermes repair task activation requires blocked state: {task.status}")
-        self._run("unblock", task_id, "--reason", reason)
-        updated = self.get_task(task_id)
-        if updated.status not in {"ready", "todo", "running"}:
-            raise RuntimeError(f"Hermes repair task activation did not release task: {updated.status}")
-        return updated
-
-    def reopen_review_handoff(self, task_id: str, *, reason: str) -> ExternalTicket:
-        if not self.allow_writes:
-            raise PermissionError("real board writes require --allow-board-writes")
-        if not task_id or not reason:
-            raise ValueError("review handoff recovery requires task and reason")
-        task = self.get_task(task_id)
-        if task.status == "ready":
-            return task
-        if task.status != "review":
-            raise RuntimeError(f"Hermes review handoff recovery requires review state: {task.status}")
-        self._run("reopen-review", task_id, "--reason", reason)
-        updated = self.get_task(task_id)
-        if updated.status not in {"ready", "todo"}:
-            raise RuntimeError(f"Hermes review handoff did not return to implementation: {updated.status}")
-        return updated
-
-    def create_microticket(self, title: str, body: str, *, idempotency_key: str) -> str:
-        if not self.allow_writes:
-            raise PermissionError("real board writes require --allow-board-writes")
-        args = ["create", title, "--body", body]
-        if self.implementation_profile is not None:
-            if self.canonical_repository is None:
-                raise RuntimeError("native release authority missing canonical repository")
-            args += ["--assignee", self.implementation_profile, "--workspace", f"worktree:{self.canonical_repository}"]
-        else:
-            args += ["--workspace", "worktree"]
-        args += ["--idempotency-key", idempotency_key, "--initial-status", "blocked", "--json"]
-        payload = self._run(*args)
-        if not isinstance(payload, dict) or not isinstance(payload.get("id"), str) or not payload["id"]:
-            raise RuntimeError("Hermes create JSON missing task id")
-        return payload["id"]
-
-    def _verify_native_release_route(self, task: ExternalTicket, *, expected_workspace_path: str, allow_unbound_workspace: bool) -> dict[str, str]:
-        if self.implementation_profile is None or self.canonical_repository is None:
-            raise RuntimeError("native release authority is not configured")
-        expected = canonical_native_workspace_path(self.canonical_repository, task.id)
-        if expected_workspace_path != str(expected):
-            raise RuntimeError("native release authority mismatch")
-        validate_native_workspace_path(
-            expected_workspace_path,
-            repository=self.canonical_repository,
-            external_task_id=task.id,
-        )
-        if task.assignee != self.implementation_profile or task.workspace_kind != "worktree":
-            raise RuntimeError("native release authority mismatch")
-        if task.workspace_path is None or (allow_unbound_workspace and task.workspace_path == str(self.canonical_repository)):
-            if not allow_unbound_workspace:
-                raise RuntimeError("native release authority mismatch")
-        else:
-            validate_native_workspace_path(
-                task.workspace_path,
-                repository=self.canonical_repository,
-                external_task_id=task.id,
-            )
-            if task.workspace_path != str(expected):
-                raise RuntimeError("native release authority mismatch")
-        return {"profile": self.implementation_profile, "workspace_kind": "worktree", "workspace_path": str(expected)}
-
-    def bind_native_release_task(self, ticket_id: str, *, expected_workspace_path: str) -> dict[str, str]:
-        """Bind pre-dispatch profile authority while Hermes still has no concrete workspace path."""
-        if not self.allow_writes:
-            raise PermissionError("real board writes require --allow-board-writes")
-        if self.implementation_profile is None or self.canonical_repository is None:
-            raise RuntimeError("native release authority is not configured")
-        task = self.get_task(ticket_id)
-        expected = canonical_native_workspace_path(self.canonical_repository, task.id)
-        if expected_workspace_path != str(expected):
-            raise RuntimeError("native release authority mismatch")
-        validate_native_workspace_path(
-            expected_workspace_path,
-            repository=self.canonical_repository,
-            external_task_id=task.id,
-        )
-        if task.workspace_kind != "worktree":
-            raise RuntimeError("native release authority mismatch")
-        if task.workspace_path is not None and task.workspace_path != str(self.canonical_repository):
-            validate_native_workspace_path(task.workspace_path, repository=self.canonical_repository, external_task_id=task.id)
-            if task.workspace_path != str(expected):
-                raise RuntimeError("native release authority mismatch")
-        if task.assignee is None:
-            self._run("assign", ticket_id, self.implementation_profile)
-            task = self.get_task(ticket_id)
-        elif task.assignee != self.implementation_profile:
-            raise RuntimeError("native release authority mismatch")
-        return self._verify_native_release_route(task, expected_workspace_path=expected_workspace_path, allow_unbound_workspace=True)
-
-    def verify_native_release_task(self, task: ExternalTicket, *, expected_workspace_path: str) -> dict[str, str]:
-        """Strictly verify a Hermes task after a concrete workspace has been bound."""
-        return self._verify_native_release_route(task, expected_workspace_path=expected_workspace_path, allow_unbound_workspace=False)
-
-    def link_dependency(self, parent_task_id: str, child_task_id: str) -> None:
-        if not self.allow_writes:
-            raise PermissionError("real board writes require --allow-board-writes")
-        if not parent_task_id or not child_task_id or parent_task_id == child_task_id:
-            raise ValueError("valid distinct dependency task ids required")
-        self._run("link", parent_task_id, child_task_id)
-
-    def park_native_dependency_child(self, ticket_id: str, *, idempotency_key: str) -> None:
-        """Durably keep a linked handoff child non-dispatchable until release."""
-        if not self.allow_writes:
-            raise PermissionError("real board writes require --allow-board-writes")
-        task = self.get_task(ticket_id)
-        if task.status == "blocked":
-            return
-        if task.status in {"done", "running"}:
-            raise RuntimeError("native dependency graph cannot park an active or completed child")
-        self._run("block", ticket_id, f"native dependency graph parked ({idempotency_key})", "--kind", "needs_input")
-
-    def add_comment(self, ticket_id: str, comment: str) -> None:
-        if not self.allow_writes:
-            raise PermissionError("real board writes require --allow-board-writes")
-        self._run("comment", ticket_id, comment, "--author", "local-first-orchestrator")
-
-    def deliver_comment(self, ticket_id: str, comment: str, *, idempotency_key: str) -> None:
-        """Comment-worker boundary; the persisted marker supplies reconciliation identity."""
-        self.add_comment(ticket_id, comment)
+__all__ = ["BoardCapabilities", "HermesBoardAdapter"]
