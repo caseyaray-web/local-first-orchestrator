@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .contracts import Action, ActionResult, BoardSnapshot
+from .contracts import Action, ActionResult, BoardSnapshot, validate_scope
 
 _AUTHOR = "local-first-orchestrator"
 _MAX_FIELD = 16_384
@@ -110,6 +110,27 @@ class HermesBoardAdapter:
         for run in self._snapshot(task_id).runs:
             if str(run.get("id")) == str(run_id): return run
         raise KeyError(f"Hermes run not found: {task_id}/{run_id}")
+
+    def read_scoped_run(self, scope: Mapping[str, str], task_id: str, run_id: str) -> Mapping[str, Any]:
+        """Bind an exact native run read to this configured board and anchor.
+
+        The native runs JSON omits board/anchor provenance. Only this adapter
+        may add those fields after reading the exact managed task and run.
+        """
+        valid = validate_scope(scope)
+        if valid != {"board_id": self.board, "anchor_task_id": self.anchor_task_id}:
+            raise ValueError("native run scope does not match configured board and anchor")
+        if not isinstance(task_id, str) or not task_id or not isinstance(run_id, str) or not run_id:
+            raise ValueError("exact task and run IDs are required")
+        if task_id != self.anchor_task_id and not self._trusted_member(valid, task_id):
+            raise ValueError("native run task is not a trusted managed member")
+        run = self.read_run(task_id, run_id)
+        if run.get("id") != run_id:
+            raise ValueError("native run identity is not exact")
+        for field, expected in (("task_id", task_id), ("board_id", self.board), ("anchor_task_id", self.anchor_task_id)):
+            if field in run and run[field] != expected:
+                raise ValueError(f"native run {field} contradicts the exact read")
+        return {**run, "task_id": task_id, "board_id": self.board, "anchor_task_id": self.anchor_task_id}
 
     @staticmethod
     def _evidence(snapshot: BoardSnapshot) -> dict[str, Any]: return snapshot.to_dict()

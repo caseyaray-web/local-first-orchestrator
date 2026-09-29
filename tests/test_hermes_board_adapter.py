@@ -108,6 +108,26 @@ def test_constructor_binds_explicit_anchor():
         HermesBoardAdapter(board="fixture-board", executable="/bin/true")
 
 
+def test_scoped_run_reader_binds_exact_native_identity(fake_runner, tmp_path):
+    fake_runner.add("anchor-1")
+    fake_runner.add("member-1", runs=[{"id": "run-1", "status": "failed", "started_at": None}])
+    board = adapter(fake_runner, tmp_path, managed_member_lookup=lambda scope, task: task == "member-1")
+    assert board.read_scoped_run(SCOPE, "member-1", "run-1") == {
+        "id": "run-1", "status": "failed", "started_at": None,
+        "task_id": "member-1", "board_id": "fixture-board", "anchor_task_id": "anchor-1",
+    }
+    with pytest.raises(ValueError, match="scope"):
+        board.read_scoped_run({"board_id": "fixture-board", "anchor_task_id": "other"}, "member-1", "run-1")
+    with pytest.raises(KeyError):
+        board.read_scoped_run(SCOPE, "member-1", "missing-run")
+    fake_runner.tasks["member-1"]["runs"][0]["task_id"] = "foreign-task"
+    with pytest.raises(ValueError, match="contradicts"):
+        board.read_scoped_run(SCOPE, "member-1", "run-1")
+    blocked = adapter(fake_runner, tmp_path, managed_member_lookup=None)
+    with pytest.raises(ValueError, match="trusted managed member"):
+        blocked.read_scoped_run(SCOPE, "member-1", "run-1")
+
+
 def test_stale_or_wrong_anchor_action_conflicts_before_any_write(fake_runner, tmp_path):
     fake_runner.add("anchor-1")
     board = adapter(fake_runner, tmp_path)
