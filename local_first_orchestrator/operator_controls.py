@@ -44,6 +44,7 @@ class ResumeDecision:
     allowed: bool
     reason: str
     actions: tuple[Action, ...] = ()
+    intent: PauseIntent | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,7 +148,7 @@ def plan_pause(scope: Mapping[str, Any], stop: bool, *, generation: int = 0,
     never a successful stop.
     """
     resolved_scope = _scope(scope)
-    intent = PauseIntent(resolved_scope, "operator", generation, stop, cancellation)
+    intent = PauseIntent(resolved_scope, "operator", generation, stop, cancellation, active=True)
     actions: list[Action] = []
     active: list[str] = []
     partial = False
@@ -327,26 +328,60 @@ def can_resume(scope: Mapping[str, Any], *, pause_intent: PauseIntent | None = N
     _scope(scope)
     if not isinstance(operator_authorized_resume, bool):
         raise ValueError("operator_authorized_resume must be a boolean")
-    if pause_intent is not None and pause_intent.cancellation_requested and not operator_authorized_resume:
-        return ResumeDecision(False, "cancellation_requires_operator_authorization")
-    if pause_intent is not None and pause_intent.origin == "operator":
-        return ResumeDecision(False, "operator_pause_persisted")
     if unknown_effects:
         return ResumeDecision(False, "unknown_effects")
     if budget_exhausted:
         return ResumeDecision(False, "budget_exhausted")
     if unsafe_human_edits or (reconciliation is not None and reconciliation.outcome in {"conflict", "partial", "unknown"}):
         return ResumeDecision(False, "unsafe_human_edits")
+    if pause_intent is not None and pause_intent.active:
+        if pause_intent.cancellation_requested and not operator_authorized_resume:
+            return ResumeDecision(False, "cancellation_requires_operator_authorization")
+        if not operator_authorized_resume:
+            if pause_intent.origin == "operator":
+                return ResumeDecision(False, "operator_pause_persisted")
+            return ResumeDecision(False, "pause_requires_operator_authorization")
+        if reconciliation is None:
+            return ResumeDecision(False, "reconciliation_required")
     return ResumeDecision(True, "coherent")
 
 
-def reject_late_result(scope: Mapping[str, Any], run_id: str, *, pause_intent: PauseIntent | None = None) -> LateResultDecision:
+def plan_resume(scope: Mapping[str, Any], *, pause_intent: PauseIntent | None = None,
+                reconciliation: ReconciliationDecision | None = None, unknown_effects: bool = False,
+                budget_exhausted: bool = False, unsafe_human_edits: bool = False,
+                operator_authorized_resume: bool = False) -> ResumeDecision:
+    """Return the generation-advancing clear record only after safe explicit authorization."""
+    decision = can_resume(
+        scope, pause_intent=pause_intent, reconciliation=reconciliation,
+        unknown_effects=unknown_effects, budget_exhausted=budget_exhausted,
+        unsafe_human_edits=unsafe_human_edits,
+        operator_authorized_resume=operator_authorized_resume,
+    )
+    if not decision.allowed:
+        return decision
+    if pause_intent is None or not pause_intent.active:
+        return ResumeDecision(False, "no_active_pause_to_clear")
+    return ResumeDecision(
+        True, decision.reason, decision.actions,
+        PauseIntent(pause_intent.scope, "operator", pause_intent.generation + 1, False, False, active=False),
+    )
+
+
+def reject_late_result(scope: Mapping[str, Any], run_id: str, *, pause_intent: PauseIntent | None = None,
+                       run_generation: int | None = None) -> LateResultDecision:
     """Cancellation invalidates results but deliberately does not delete their work."""
     _scope(scope)
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("run_id must be a non-empty string")
-    if pause_intent is not None and pause_intent.cancellation_requested:
+    if run_generation is not None and (not isinstance(run_generation, int) or isinstance(run_generation, bool) or run_generation < 0):
+        raise ValueError("run_generation must be a non-negative integer or None")
+    if pause_intent is not None and pause_intent.active and pause_intent.cancellation_requested:
         return LateResultDecision(True, "cancellation_requested")
-    if pause_intent is not None and pause_intent.origin == "operator":
+    if pause_intent is not None and pause_intent.active and pause_intent.origin == "operator":
         return LateResultDecision(True, "operator_pause_persisted")
+    if pause_intent is not None and not pause_intent.active:
+        if run_generation is None:
+            return LateResultDecision(True, "run_provenance_required")
+        if run_generation != pause_intent.generation:
+            return LateResultDecision(True, "pre_clear_generation")
     return LateResultDecision(False, "eligible")

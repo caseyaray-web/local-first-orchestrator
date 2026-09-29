@@ -187,6 +187,26 @@ def test_operation_pause_recovery_and_action_use_effects_not_task_states():
         )
 
 
+def test_pause_intent_old_payload_defaults_to_active_and_clear_is_strictly_validated():
+    legacy = {
+        "scope": scope(),
+        "origin": "operator",
+        "generation": 3,
+        "stop_requested": True,
+        "cancellation_requested": False,
+    }
+
+    restored = PauseIntent.from_dict(legacy)
+
+    assert restored.active is True
+    assert restored.to_dict() == {**legacy, "active": True}
+    assert PauseIntent.from_dict(restored.to_dict()) == restored
+    with pytest.raises(ValueError, match="inactive"):
+        PauseIntent(scope(), "operator", 4, True, False, active=False)
+    with pytest.raises(ValueError, match="inactive"):
+        PauseIntent(scope(), "automatic", 4, False, False, active=False)
+
+
 @pytest.mark.parametrize(
     ("outcome", "error_type"),
     [

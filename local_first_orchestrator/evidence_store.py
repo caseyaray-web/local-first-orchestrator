@@ -13,7 +13,7 @@ import os
 import sqlite3
 import stat
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .contracts import (
     CandidateIdentity,
@@ -24,7 +24,7 @@ from .contracts import (
     validate_scope,
 )
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _TABLES = frozenset(
     {
         "schema_metadata",
@@ -33,6 +33,7 @@ _TABLES = frozenset(
         "review_evidence",
         "operation_intents",
         "budget_events",
+        "budget_reconciliation_evidence",
         "operator_intents",
     }
 )
@@ -43,7 +44,17 @@ _TABLE_COLUMNS = {
     "review_evidence": (("board_id", "TEXT", 1, 1), ("anchor_task_id", "TEXT", 1, 2), ("candidate_content_identity", "TEXT", 1, 0), ("review_id", "TEXT", 1, 3), ("evidence_json", "TEXT", 1, 0)),
     "operation_intents": (("board_id", "TEXT", 1, 1), ("anchor_task_id", "TEXT", 1, 2), ("operation_key", "TEXT", 1, 3), ("intent_json", "TEXT", 1, 0)),
     "budget_events": (("board_id", "TEXT", 1, 1), ("anchor_task_id", "TEXT", 1, 2), ("event_id", "TEXT", 1, 3), ("source_kind", "TEXT", 1, 0), ("native_source_id", "TEXT", 1, 0), ("event_json", "TEXT", 1, 0)),
+    "budget_reconciliation_evidence": (("board_id", "TEXT", 1, 1), ("anchor_task_id", "TEXT", 1, 2), ("event_id", "TEXT", 1, 3), ("evidence_kind", "TEXT", 1, 4), ("evidence_json", "TEXT", 1, 0)),
     "operator_intents": (("board_id", "TEXT", 1, 1), ("anchor_task_id", "TEXT", 1, 2), ("intent_json", "TEXT", 1, 0)),
+}
+_REVIEW_EVIDENCE_FOREIGN_KEYS = (
+    ("candidates", "board_id", "board_id"),
+    ("candidates", "anchor_task_id", "anchor_task_id"),
+    ("candidates", "candidate_content_identity", "content_identity"),
+)
+_RECONCILIATION_TRIGGER_SQL = {
+    "budget_reconciliation_evidence_immutable_update": "CREATE TRIGGER budget_reconciliation_evidence_immutable_update BEFORE UPDATE ON budget_reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'budget reconciliation evidence is immutable'); END",
+    "budget_reconciliation_evidence_immutable_delete": "CREATE TRIGGER budget_reconciliation_evidence_immutable_delete BEFORE DELETE ON budget_reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'budget reconciliation evidence is immutable'); END",
 }
 
 
@@ -77,6 +88,10 @@ def _canonical_identity(value: Any) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
+def _sha256(value: Any) -> str:
+    return "sha256:" + _canonical_identity(value)
+
+
 def _validate_records(value: Any, *, fields: tuple[str, ...], name: str, outcomes: frozenset[str] | None = None) -> list[dict[str, str]]:
     if not isinstance(value, list) or not value:
         raise ValueError(f"review evidence requires non-empty {name}")
@@ -98,20 +113,39 @@ def _scope_values(scope: Mapping[str, Any]) -> tuple[str, str]:
     return valid["board_id"], valid["anchor_task_id"]
 
 
+def _validate_indexes(connection: sqlite3.Connection) -> None:
+    """Require the fixed native-source index and reject every surplus index."""
+
+    found_native_source_index = False
+    for table in _TABLES:
+        for row in connection.execute(f"PRAGMA index_list({table})"):
+            if row["origin"] == "pk":
+                continue
+            if table == "budget_events" and row["name"] == "budget_events_native_source_unique" and row["unique"] and tuple(column["name"] for column in connection.execute("PRAGMA index_info(budget_events_native_source_unique)")) == ("board_id", "anchor_task_id", "source_kind", "native_source_id"):
+                found_native_source_index = True
+                continue
+            raise SchemaError("evidence-store schema indexes are unrecognized")
+    if not found_native_source_index:
+        raise SchemaError("evidence-store schema indexes are unrecognized")
+
+
 class EvidenceStore:
     """A deliberately narrow, transaction-backed evidence store."""
 
-    def __init__(self, connection: sqlite3.Connection, path: Path, *, created: bool) -> None:
+    def __init__(self, connection: sqlite3.Connection, path: Path, *, created: bool, read_native_run: Callable[[Mapping[str, str], str, str], Mapping[str, Any]] | None = None) -> None:
         self.connection = connection
         self.path = path
         self._created = created
         self._migrated = False
+        self._read_native_run = read_native_run
 
     @classmethod
-    def open(cls, path: str | Path, *, create_new: bool = False) -> "EvidenceStore":
+    def open(cls, path: str | Path, *, create_new: bool = False, read_native_run: Callable[[Mapping[str, str], str, str], Mapping[str, Any]] | None = None) -> "EvidenceStore":
         """Open an existing store or exclusively create an initial fixture store."""
         if not isinstance(create_new, bool):
             raise ValueError("create_new must be a boolean")
+        if read_native_run is not None and not callable(read_native_run):
+            raise ValueError("read_native_run must be a callable trusted native reader")
         database = Path(os.path.abspath(os.path.expanduser(str(path))))
         parent = database.parent
         try:
@@ -154,7 +188,7 @@ class EvidenceStore:
                 raise SchemaError("evidence-store integrity check failed")
         except sqlite3.DatabaseError as error:
             raise SchemaError("cannot open evidence-store database") from error
-        return cls(connection, database, created=not existed)
+        return cls(connection, database, created=not existed, read_native_run=read_native_run)
 
     def close(self) -> None:
         self.connection.close()
@@ -187,19 +221,15 @@ class EvidenceStore:
             (row["table"], row["from"], row["to"])
             for row in self.connection.execute("PRAGMA foreign_key_list(review_evidence)")
         )
-        if foreign_keys != (
-            ("candidates", "board_id", "board_id"),
-            ("candidates", "anchor_task_id", "anchor_task_id"),
-            ("candidates", "candidate_content_identity", "content_identity"),
-        ):
+        if foreign_keys != _REVIEW_EVIDENCE_FOREIGN_KEYS:
             raise SchemaError("evidence-store schema foreign keys are unrecognized")
-        source_index = self.connection.execute("PRAGMA index_list(budget_events)").fetchall()
-        expected_index = next((row for row in source_index if row["name"] == "budget_events_native_source_unique"), None)
-        if expected_index is None or not expected_index["unique"] or tuple(row["name"] for row in self.connection.execute("PRAGMA index_info(budget_events_native_source_unique)")) != ("board_id", "anchor_task_id", "source_kind", "native_source_id"):
-            raise SchemaError("evidence-store schema indexes are unrecognized")
+        _validate_indexes(self.connection)
         metadata = tuple(tuple(row) for row in self.connection.execute("SELECT key, value FROM schema_metadata ORDER BY key"))
         if metadata != (("schema_version", str(_SCHEMA_VERSION)),):
             raise SchemaError("evidence-store schema version is unsupported")
+        triggers = {row["name"]: row["sql"] for row in self.connection.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger'")}
+        if set(triggers) != set(_RECONCILIATION_TRIGGER_SQL) or any(" ".join(triggers[name].split()).upper() != " ".join(sql.split()).upper() for name, sql in _RECONCILIATION_TRIGGER_SQL.items()):
+            raise SchemaError("evidence-store schema reconciliation triggers are unrecognized")
         self._migrated = True
 
     def migrate(self) -> None:
@@ -211,6 +241,35 @@ class EvidenceStore:
             )
         }
         if names:
+            if names == _TABLES:
+                self._require_schema()
+                return
+            old_tables = _TABLES - {"budget_reconciliation_evidence"}
+            metadata = tuple(tuple(row) for row in self.connection.execute("SELECT key, value FROM schema_metadata ORDER BY key")) if "schema_metadata" in names else ()
+            if names != old_tables or metadata != (("schema_version", "1"),):
+                raise SchemaError("existing database has no recognized evidence-store schema")
+            # Validate v1 precisely before an additive, no-rewrite upgrade.
+            for table, columns in _TABLE_COLUMNS.items():
+                if table == "budget_reconciliation_evidence":
+                    continue
+                actual = tuple((row["name"], row["type"].upper(), row["notnull"], row["pk"]) for row in self.connection.execute(f"PRAGMA table_info({table})"))
+                if actual != columns:
+                    raise SchemaError("evidence-store schema columns or primary key are unrecognized")
+            foreign_keys = tuple((row["table"], row["from"], row["to"]) for row in self.connection.execute("PRAGMA foreign_key_list(review_evidence)"))
+            if foreign_keys != _REVIEW_EVIDENCE_FOREIGN_KEYS:
+                raise SchemaError("evidence-store schema foreign keys are unrecognized")
+            if tuple(self.connection.execute("SELECT name FROM sqlite_master WHERE type='trigger'")):
+                raise SchemaError("evidence-store schema triggers are unrecognized")
+            _validate_indexes(self.connection)
+            try:
+                with self.connection:
+                    self.connection.execute("CREATE TABLE budget_reconciliation_evidence (board_id TEXT NOT NULL, anchor_task_id TEXT NOT NULL, event_id TEXT NOT NULL, evidence_kind TEXT NOT NULL, evidence_json TEXT NOT NULL, PRIMARY KEY (board_id, anchor_task_id, event_id, evidence_kind))")
+                    self.connection.execute("CREATE TRIGGER budget_reconciliation_evidence_immutable_update BEFORE UPDATE ON budget_reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'budget reconciliation evidence is immutable'); END")
+                    self.connection.execute("CREATE TRIGGER budget_reconciliation_evidence_immutable_delete BEFORE DELETE ON budget_reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'budget reconciliation evidence is immutable'); END")
+                    self.connection.execute("UPDATE schema_metadata SET value = '2' WHERE key = 'schema_version'")
+            except sqlite3.DatabaseError as error:
+                raise SchemaError("could not migrate evidence-store") from error
+            self._migrated = False
             self._require_schema()
             return
         if not self._created:
@@ -268,13 +327,27 @@ class EvidenceStore:
                     );
                     CREATE UNIQUE INDEX budget_events_native_source_unique
                     ON budget_events (board_id, anchor_task_id, source_kind, native_source_id);
+                    CREATE TABLE budget_reconciliation_evidence (
+                        board_id TEXT NOT NULL,
+                        anchor_task_id TEXT NOT NULL,
+                        event_id TEXT NOT NULL,
+                        evidence_kind TEXT NOT NULL,
+                        evidence_json TEXT NOT NULL,
+                        PRIMARY KEY (board_id, anchor_task_id, event_id, evidence_kind)
+                    );
                     CREATE TABLE operator_intents (
                         board_id TEXT NOT NULL,
                         anchor_task_id TEXT NOT NULL,
                         intent_json TEXT NOT NULL,
                         PRIMARY KEY (board_id, anchor_task_id)
                     );
-                    INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '1');
+                    CREATE TRIGGER budget_reconciliation_evidence_immutable_update
+                    BEFORE UPDATE ON budget_reconciliation_evidence
+                    BEGIN SELECT RAISE(ABORT, 'budget reconciliation evidence is immutable'); END;
+                    CREATE TRIGGER budget_reconciliation_evidence_immutable_delete
+                    BEFORE DELETE ON budget_reconciliation_evidence
+                    BEGIN SELECT RAISE(ABORT, 'budget reconciliation evidence is immutable'); END;
+                    INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '2');
                     """
                 )
         except sqlite3.DatabaseError as error:
@@ -507,7 +580,7 @@ class EvidenceStore:
         )
         return tuple(intent for row in rows if (intent := OperationIntent.from_dict(_decode(row[0]))).phase != "applied")
 
-    def record_budget_event(self, scope: Mapping[str, Any], event: Mapping[str, Any]) -> Mapping[str, Any]:
+    def record_budget_event(self, scope: Mapping[str, Any], event: Mapping[str, Any], *, policy_limit: int | None = None, run_classification: str | None = None) -> Mapping[str, Any]:
         self._require_schema()
         board, anchor = _scope_values(scope)
         required = {"event_id", "lineage_id", "root_task_id", "finding_id", "generation", "source_task_id", "source_kind", "native_source_id", "count"}
@@ -521,6 +594,10 @@ class EvidenceStore:
             raise ValueError("budget event generation must be a non-negative integer")
         if not isinstance(event["count"], int) or isinstance(event["count"], bool) or event["count"] <= 0:
             raise ValueError("budget event count must be a positive integer")
+        if policy_limit is not None and (not isinstance(policy_limit, int) or isinstance(policy_limit, bool) or policy_limit < 0):
+            raise ValueError("budget policy limit must be a non-negative integer")
+        if run_classification is not None and run_classification not in {"confirmed_started", "unknown_active"}:
+            raise ValueError("budget charge classification is unsupported")
         if event["root_task_id"] != anchor:
             raise ConflictError("budget event root task must be the scope anchor")
         expected_lineage = f"{anchor}:{event['finding_id']}"
@@ -537,18 +614,41 @@ class EvidenceStore:
         if event["finding_id"] != "__general_attempt__" and event["finding_id"] not in _decode(member["finding_ids_json"]):
             raise ConflictError("budget event finding is not associated with source member")
         payload = _json(dict(event))
-        row = self.connection.execute("SELECT event_json FROM budget_events WHERE board_id = ? AND anchor_task_id = ? AND event_id = ?", (board, anchor, event["event_id"])).fetchone()
-        if row is not None:
-            if row[0] != payload:
-                raise ConflictError("budget event conflicts with existing lineage evidence")
-            return dict(event)
+        self.connection.execute("BEGIN IMMEDIATE")
         try:
-            with self.connection:
-                self.connection.execute(
-                    "INSERT INTO budget_events VALUES (?, ?, ?, ?, ?, ?)",
-                    (board, anchor, event["event_id"], event["source_kind"], event["native_source_id"], payload),
+            row = self.connection.execute("SELECT event_json FROM budget_events WHERE board_id = ? AND anchor_task_id = ? AND event_id = ?", (board, anchor, event["event_id"])).fetchone()
+            if row is not None:
+                if row[0] != payload:
+                    raise ConflictError("budget event conflicts with existing lineage evidence")
+                self.connection.commit()
+                return dict(event)
+            source = self.connection.execute("SELECT event_json FROM budget_events WHERE board_id=? AND anchor_task_id=? AND source_kind=? AND native_source_id=?", (board, anchor, event["source_kind"], event["native_source_id"])).fetchone()
+            if source is not None:
+                raise ConflictError("budget event conflicts with immutable native source evidence")
+            if policy_limit is not None:
+                category = event["event_id"].split(":", 1)[0]
+                category_events = tuple(
+                    (stored["event_id"], stored)
+                    for stored in (_decode(row[0]) for row in self.connection.execute("SELECT event_json FROM budget_events WHERE board_id=? AND anchor_task_id=?", (board, anchor)))
+                    if stored["finding_id"] == event["finding_id"] and stored["event_id"].split(":", 1)[0] == category
                 )
+                charged = sum(stored["count"] for _, stored in category_events)
+                reconciled_ids = {
+                    row[0]
+                    for row in self.connection.execute(
+                        "SELECT event_id FROM budget_reconciliation_evidence WHERE board_id=? AND anchor_task_id=? AND evidence_kind='pre_start_proof'",
+                        (board, anchor),
+                    )
+                }
+                released = sum(stored["count"] for event_id, stored in category_events if event_id in reconciled_ids)
+                if charged - released + event["count"] > policy_limit:
+                    raise ConflictError("budget policy limit is exhausted")
+            self.connection.execute("INSERT INTO budget_events VALUES (?, ?, ?, ?, ?, ?)", (board, anchor, event["event_id"], event["source_kind"], event["native_source_id"], payload))
+            if run_classification is not None:
+                self.connection.execute("INSERT INTO budget_reconciliation_evidence VALUES (?, ?, ?, 'charge', ?)", (board, anchor, event["event_id"], _json({"classification": run_classification, "source_task_id": event["source_task_id"], "generation": event["generation"], "finding_id": event["finding_id"], "native_run_id": event["native_source_id"]})))
+            self.connection.commit()
         except sqlite3.IntegrityError as error:
+            self.connection.rollback()
             existing = self.connection.execute(
                 "SELECT event_json FROM budget_events WHERE board_id = ? AND anchor_task_id = ? AND event_id = ?",
                 (board, anchor, event["event_id"]),
@@ -556,21 +656,87 @@ class EvidenceStore:
             if existing is not None and existing["event_json"] == payload:
                 return dict(event)
             raise ConflictError("budget event conflicts with immutable native source evidence") from error
+        except BaseException:
+            self.connection.rollback()
+            raise
         return dict(event)
 
-    def set_operator_intent(self, intent: PauseIntent) -> PauseIntent:
+    def reconcile_unknown_budget_run(self, scope: Mapping[str, Any], *, source_task_id: str, generation: int, finding_id: str, native_run_id: str) -> bool:
+        """Append only a trusted, exact native re-read proving the run never started."""
         self._require_schema()
+        board, anchor = _scope_values(scope)
+        if self._read_native_run is None:
+            raise ConflictError("budget reconciliation requires a trusted native run reader")
+        try:
+            run = self._read_native_run({"board_id": board, "anchor_task_id": anchor}, source_task_id, native_run_id)
+        except Exception as error:
+            raise ConflictError("budget reconciliation trusted native run reread failed") from error
+        if not isinstance(run, Mapping):
+            raise ConflictError("budget reconciliation trusted native run reread is malformed")
+        native_run = dict(run)
+        observed_run_id = native_run.get("id")
+        if observed_run_id != native_run_id:
+            raise ConflictError("budget reconciliation trusted native run identity does not match the charged source")
+        if native_run.get("task_id") != source_task_id or native_run.get("board_id") != board or native_run.get("anchor_task_id") != anchor:
+            raise ConflictError("budget reconciliation trusted native run provenance does not exactly bind task, board, and anchor")
+        if native_run.get("status") not in {"failed", "rejected", "cancelled"} or native_run.get("started_at", "missing") is not None or native_run.get("started") is True or native_run.get("start_time") not in (None, ""):
+            raise ConflictError("budget reconciliation requires conclusive trusted native pre-start proof")
+        proof = {"source_task_id": source_task_id, "generation": generation, "finding_id": finding_id, "native_run_id": native_run_id, "native_run": native_run, "native_run_sha256": _sha256(native_run)}
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT event_id FROM budget_events WHERE board_id=? AND anchor_task_id=? AND source_kind='native_run' AND native_source_id=?", (board, anchor, native_run_id)).fetchone()
+            if row is None:
+                raise ConflictError("budget reconciliation native run is not charged")
+            charge = self.connection.execute("SELECT evidence_json FROM budget_reconciliation_evidence WHERE board_id=? AND anchor_task_id=? AND event_id=? AND evidence_kind='charge'", (board, anchor, row["event_id"])).fetchone()
+            if charge is None or _decode(charge[0]) != {"classification": "unknown_active", "source_task_id": source_task_id, "generation": generation, "finding_id": finding_id, "native_run_id": native_run_id}:
+                raise ConflictError("budget reconciliation does not exactly bind an unknown charge")
+            prior = self.connection.execute("SELECT 1 FROM budget_reconciliation_evidence WHERE board_id=? AND anchor_task_id=? AND event_id=? AND evidence_kind='pre_start_proof'", (board, anchor, row["event_id"])).fetchone()
+            if prior is not None:
+                self.connection.commit()
+                return False
+            self.connection.execute("INSERT INTO budget_reconciliation_evidence VALUES (?, ?, ?, 'pre_start_proof', ?)", (board, anchor, row["event_id"], _json(proof)))
+            self.connection.commit()
+            return True
+        except BaseException:
+            self.connection.rollback()
+            raise
+
+    def budget_reconciled_event_ids(self, scope: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        return tuple(_decode(row[0]) for row in self.connection.execute("SELECT b.event_json FROM budget_events b JOIN budget_reconciliation_evidence r ON r.board_id=b.board_id AND r.anchor_task_id=b.anchor_task_id AND r.event_id=b.event_id WHERE b.board_id=? AND b.anchor_task_id=? AND r.evidence_kind='pre_start_proof' ORDER BY b.event_id", (board, anchor)))
+
+    def set_operator_intent(self, intent: PauseIntent, *, authorized_clear: bool = False,
+                            resume_decision: Any = None) -> PauseIntent:
+        """Persist an active pause or a proven, explicitly authorized clear."""
+        self._require_schema()
+        if not isinstance(authorized_clear, bool):
+            raise ValueError("authorized_clear must be a boolean")
         board, anchor = _scope_values(intent.scope)
         payload = _json(intent.to_dict())
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             row = self.connection.execute("SELECT intent_json FROM operator_intents WHERE board_id = ? AND anchor_task_id = ?", (board, anchor)).fetchone()
-            if row is not None:
-                previous = PauseIntent.from_dict(_decode(row[0]))
+            previous = None if row is None else PauseIntent.from_dict(_decode(row[0]))
+            if not intent.active:
+                if previous != intent:
+                    if previous is None or not previous.active:
+                        raise ConflictError("operator clear requires an existing active intent")
+                    if intent.generation != previous.generation + 1:
+                        raise ConflictError("operator clear generation must advance exactly once")
+                if not authorized_clear:
+                    raise ConflictError("operator clear requires explicit authorization")
+                from .operator_controls import ResumeDecision
+                if not isinstance(resume_decision, ResumeDecision) or not resume_decision.allowed or resume_decision.intent != intent:
+                    raise ConflictError("operator clear requires a matching authorized resume decision")
+                if previous == intent:
+                    self.connection.commit()
+                    return intent
+            if previous is not None:
                 if previous == intent:
                     self.connection.commit()
                     return previous
-                if intent.generation <= previous.generation:
+                if intent.active and intent.generation <= previous.generation:
                     raise ConflictError("operator intent generation must advance")
                 self.connection.execute("UPDATE operator_intents SET intent_json = ? WHERE board_id = ? AND anchor_task_id = ?", (payload, board, anchor))
             else:
@@ -589,8 +755,23 @@ class EvidenceStore:
         reviews = tuple(_decode(row[0]) for row in self.connection.execute("SELECT evidence_json FROM review_evidence WHERE board_id = ? AND anchor_task_id = ? ORDER BY review_id", (board, anchor)))
         operations = tuple(OperationIntent.from_dict(_decode(row[0])) for row in self.connection.execute("SELECT intent_json FROM operation_intents WHERE board_id = ? AND anchor_task_id = ? ORDER BY operation_key", (board, anchor)))
         budgets = tuple(_decode(row[0]) for row in self.connection.execute("SELECT event_json FROM budget_events WHERE board_id = ? AND anchor_task_id = ? ORDER BY event_id", (board, anchor)))
+        reconciliations = tuple(
+            {"event_id": row["event_id"], "evidence_kind": row["evidence_kind"], "evidence": _decode(row["evidence_json"])}
+            for row in self.connection.execute("SELECT event_id, evidence_kind, evidence_json FROM budget_reconciliation_evidence WHERE board_id = ? AND anchor_task_id = ? ORDER BY event_id, evidence_kind", (board, anchor))
+        )
+        reconciled_event_ids = {record["event_id"] for record in reconciliations if record["evidence_kind"] == "pre_start_proof"}
+        net_rows: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for event in budgets:
+            category = event["event_id"].split(":", 1)[0]
+            key = (event["root_task_id"], event["finding_id"], category)
+            row_net = net_rows.setdefault(key, {"root_task_id": key[0], "finding_id": key[1], "category": key[2], "charged": 0, "reconciled": 0, "net": 0})
+            row_net["charged"] += event["count"]
+            if event["event_id"] in reconciled_event_ids:
+                row_net["reconciled"] += event["count"]
+            row_net["net"] = row_net["charged"] - row_net["reconciled"]
+        budget_net = tuple(net_rows[key] for key in sorted(net_rows))
         row = self.connection.execute("SELECT intent_json FROM operator_intents WHERE board_id = ? AND anchor_task_id = ?", (board, anchor)).fetchone()
-        return {"scope": {"board_id": board, "anchor_task_id": anchor}, "members": members, "candidates": candidates, "reviews": reviews, "operations": operations, "budget_events": budgets, "operator_intent": None if row is None else PauseIntent.from_dict(_decode(row[0]))}
+        return {"scope": {"board_id": board, "anchor_task_id": anchor}, "members": members, "candidates": candidates, "reviews": reviews, "operations": operations, "budget_events": budgets, "budget_reconciliations": reconciliations, "budget_net": budget_net, "operator_intent": None if row is None else PauseIntent.from_dict(_decode(row[0]))}
 
 
 __all__ = ["EvidenceStore", "EvidenceStoreError", "SchemaError"]

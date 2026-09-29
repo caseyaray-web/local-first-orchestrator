@@ -260,6 +260,7 @@ class PauseIntent:
     generation: int
     stop_requested: bool
     cancellation_requested: bool
+    active: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "scope", MappingProxyType(validate_scope(self.scope)))
@@ -269,12 +270,21 @@ class PauseIntent:
             raise ValueError("generation must be a non-negative integer")
         if not isinstance(self.stop_requested, bool) or not isinstance(self.cancellation_requested, bool):
             raise ValueError("pause flags must be booleans")
+        if not isinstance(self.active, bool):
+            raise ValueError("active must be a boolean")
+        if not self.active and (
+            self.origin != "operator" or self.stop_requested or self.cancellation_requested
+        ):
+            raise ValueError("inactive pause intents must be operator clears without stop or cancellation")
 
     def to_dict(self) -> dict[str, Any]:
         return _thaw({field: getattr(self, field) for field in self.__dataclass_fields__})
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "PauseIntent":
+        legacy_fields = tuple(field for field in cls.__dataclass_fields__ if field != "active")
+        if set(payload) == set(legacy_fields):
+            return cls(**_required(payload, legacy_fields, cls.__name__), active=True)
         return cls(**_required(payload, tuple(cls.__dataclass_fields__), cls.__name__))
 
 

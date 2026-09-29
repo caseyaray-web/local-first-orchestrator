@@ -13,6 +13,7 @@ from local_first_orchestrator.contracts import (
     PauseIntent,
 )
 from local_first_orchestrator.evidence_store import EvidenceStore, SchemaError
+from local_first_orchestrator.operator_controls import plan_resume, reconcile_operator_edits
 
 
 SCOPE = {"board_id": "board-a", "anchor_task_id": "anchor-a"}
@@ -108,6 +109,7 @@ def test_no_shadow_ticket_lifecycle_schema(store):
         "review_evidence",
         "operation_intents",
         "budget_events",
+        "budget_reconciliation_evidence",
         "operator_intents",
     }
     assert not ({"status", "lane", "task_state", "board_snapshot", "dependencies", "runs"} & columns)
@@ -252,10 +254,84 @@ def test_migrate_refuses_existing_database_without_plugin_schema(tmp_path):
     sqlite3.connect(database).execute("CREATE TABLE unrelated (value TEXT)").connection.close()
     opened = EvidenceStore.open(database)
     try:
-        with pytest.raises(SchemaError, match="unrecognized"):
+        with pytest.raises(SchemaError, match="recognized"):
             opened.migrate()
     finally:
         opened.close()
+
+
+def test_migrate_valid_v1_to_v2_preserves_budget_evidence(tmp_path):
+    database = tmp_path / "v1.sqlite3"
+    with EvidenceStore.open(database, create_new=True) as opened:
+        opened.migrate()
+        opened.register_member(ManagedMember("board-a", "anchor-a", "implementation-1", "implementation", 0, ("finding-1",), "work-1"))
+        saved = budget_event()
+        opened.record_budget_event(SCOPE, saved)
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE budget_reconciliation_evidence")
+    connection.execute("UPDATE schema_metadata SET value='1' WHERE key='schema_version'")
+    connection.commit()
+    connection.close()
+    with EvidenceStore.open(database) as upgraded:
+        upgraded.migrate()
+        assert upgraded.read_scope(SCOPE)["budget_events"] == (saved,)
+        assert upgraded.connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "2"
+
+
+def test_migrate_rejects_v1_with_malformed_review_foreign_key_before_any_write(tmp_path):
+    database = tmp_path / "malformed-v1.sqlite3"
+    with EvidenceStore.open(database, create_new=True) as opened:
+        opened.migrate()
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute("ALTER TABLE review_evidence RENAME TO old_review_evidence")
+    connection.execute("CREATE TABLE review_evidence (board_id TEXT NOT NULL, anchor_task_id TEXT NOT NULL, candidate_content_identity TEXT NOT NULL, review_id TEXT NOT NULL, evidence_json TEXT NOT NULL, PRIMARY KEY (board_id, anchor_task_id, review_id))")
+    connection.execute("DROP TABLE old_review_evidence")
+    connection.execute("DROP TABLE budget_reconciliation_evidence")
+    connection.execute("UPDATE schema_metadata SET value='1' WHERE key='schema_version'")
+    connection.commit()
+    connection.close()
+
+    with EvidenceStore.open(database) as opened:
+        with pytest.raises(SchemaError, match="foreign"):
+            opened.migrate()
+        assert opened.connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "1"
+        assert opened.connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='budget_reconciliation_evidence'").fetchone() is None
+
+
+def test_migrate_rejects_v1_with_surplus_index_before_any_write(tmp_path):
+    database = tmp_path / "surplus-index-v1.sqlite3"
+    with EvidenceStore.open(database, create_new=True) as opened:
+        opened.migrate()
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE budget_reconciliation_evidence")
+    connection.execute("CREATE INDEX surplus_v1_index ON budget_events (event_id)")
+    connection.execute("UPDATE schema_metadata SET value='1' WHERE key='schema_version'")
+    connection.commit()
+    connection.close()
+
+    with EvidenceStore.open(database) as opened:
+        with pytest.raises(SchemaError, match="indexes"):
+            opened.migrate()
+        assert opened.connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "1"
+        assert opened.connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='budget_reconciliation_evidence'").fetchone() is None
+
+
+def test_reconciliation_evidence_is_append_only_and_trigger_schema_is_checked_after_reopen(store):
+    opened, database = store
+    opened.connection.execute("INSERT INTO budget_reconciliation_evidence VALUES (?, ?, ?, ?, ?)", ("board-a", "anchor-a", "event-1", "fixture", "{}"))
+    with pytest.raises(sqlite3.DatabaseError, match="immutable"):
+        opened.connection.execute("UPDATE budget_reconciliation_evidence SET evidence_json='{}'")
+    with pytest.raises(sqlite3.DatabaseError, match="immutable"):
+        opened.connection.execute("DELETE FROM budget_reconciliation_evidence")
+    opened.close()
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TRIGGER budget_reconciliation_evidence_immutable_delete")
+    connection.commit()
+    connection.close()
+    with EvidenceStore.open(database) as reopened:
+        with pytest.raises(SchemaError, match="trigger"):
+            reopened.read_scope(SCOPE)
 
 
 def test_open_missing_configured_database_fails_closed_without_creating_a_file(tmp_path):
@@ -598,3 +674,63 @@ def test_concurrent_distinct_generation_one_operator_intents_do_not_last_write_w
     assert len(failures) == 1
     assert isinstance(failures[0], ConflictError)
     assert opened.read_scope(SCOPE)["operator_intent"] == successes[0]
+
+
+def test_store_rejects_first_or_unauthorized_inactive_pause_clear_without_altering_state(store):
+    opened, _ = store
+    first_clear = PauseIntent(SCOPE, "operator", 0, False, False, active=False)
+
+    with pytest.raises(ConflictError, match="active"):
+        opened.set_operator_intent(first_clear, authorized_clear=True)
+    assert opened.read_scope(SCOPE)["operator_intent"] is None
+
+    active = PauseIntent(SCOPE, "operator", 6, False, False)
+    opened.set_operator_intent(active)
+    clear = PauseIntent(SCOPE, "operator", 7, False, False, active=False)
+    with pytest.raises(ConflictError, match="authorization"):
+        opened.set_operator_intent(clear)
+    assert opened.read_scope(SCOPE)["operator_intent"] == active
+
+
+def test_store_persists_only_authorized_plan_resume_clear_and_reopens_idempotently(store):
+    opened, database = store
+    active = PauseIntent(SCOPE, "operator", 6, False, False)
+    opened.set_operator_intent(active)
+    decision = plan_resume(
+        SCOPE, pause_intent=active,
+        reconciliation=reconcile_operator_edits(SCOPE, (), (), (), ()),
+        operator_authorized_resume=True,
+    )
+    assert decision.intent is not None
+
+    assert opened.set_operator_intent(
+        decision.intent, authorized_clear=True, resume_decision=decision,
+    ) == decision.intent
+    assert opened.set_operator_intent(
+        decision.intent, authorized_clear=True, resume_decision=decision,
+    ) == decision.intent
+    opened.close()
+
+    with EvidenceStore.open(database) as reopened:
+        assert reopened.read_scope(SCOPE)["operator_intent"] == decision.intent
+
+
+def test_store_rejects_stale_or_unproven_pause_clear_without_altering_active_intent(store):
+    opened, _ = store
+    active = PauseIntent(SCOPE, "operator", 6, False, False)
+    opened.set_operator_intent(active)
+    stale = PauseIntent(SCOPE, "operator", 8, False, False, active=False)
+    stale_decision = plan_resume(
+        SCOPE, pause_intent=active,
+        reconciliation=reconcile_operator_edits(SCOPE, (), (), (), ()),
+        operator_authorized_resume=True,
+    )
+
+    with pytest.raises(ConflictError, match="generation"):
+        opened.set_operator_intent(stale, authorized_clear=True, resume_decision=stale_decision)
+    with pytest.raises(ConflictError, match="decision"):
+        opened.set_operator_intent(
+            PauseIntent(SCOPE, "operator", 7, False, False, active=False),
+            authorized_clear=True,
+        )
+    assert opened.read_scope(SCOPE)["operator_intent"] == active
