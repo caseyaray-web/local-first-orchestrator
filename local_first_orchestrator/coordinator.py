@@ -347,9 +347,18 @@ class Coordinator:
         This deliberately supports only a fully held, parentless tranche zero;
         no native link effect or post-link receipt is authorized here.
         """
+        with self.lock:
+            return self._active_piece_dependency_authority_locked(
+                plan_id, ticket_id, dependency_id, request_id=request_id)
+
+    def _active_piece_dependency_authority_locked(
+            self, plan_id: str, ticket_id: str, dependency_id: str, *,
+            request_id: str | None = None) -> Mapping[str, Any]:
+        """Reconstruct read-only authority; caller must own the instance lock."""
         from .contracts import ManagedMember
         from .planning_coordinator import (ActiveTrancheRoute, request_from_payload,
             request_payload, first_active_tranche_materialization)
+        self._assert_lock()
         values = (plan_id, ticket_id, dependency_id)
         if any(type(value) is not str or not value.strip() or len(value) > 256 for value in values):
             raise ValueError("bounded plan, target, and dependency IDs are required")
@@ -361,138 +370,137 @@ class Coordinator:
                 or os.path.realpath(workspace) != workspace or not os.path.isdir(workspace)
                 or os.path.islink(workspace)):
             raise ValueError("trusted persistent planning workspace must be canonical and existing")
-        with self.lock:
-            self._assert_lock()
-            state = self.store.read_scope(self.scope)
-            pause = state["operator_intent"]
-            if pause is not None and pause.active:
-                raise ValueError("dependency authority is fenced by pause/cancellation")
-            token = self.store.read_accepted_plan(self.scope, plan_id)
-            registration = self.store.read_planning_request(self.scope, request_id=request_id)
-            evidence = self.store.read_plan(self.scope, plan_id)
-            if self.planning_observer is None:
-                raise ValueError("trusted planning observer is required")
-            observed = self.planning_observer(dict(self.scope))
-            if type(observed) is not dict or set(observed) != {"request"}:
-                raise ValueError("trusted planning observer returned malformed observation")
-            current_request = request_from_payload(observed["request"])
-            registered_request = request_from_payload(registration["request"])
-            if (request_payload(current_request) != request_payload(registered_request)
-                    or current_request.identity != token["request_identity"]):
-                raise ValueError("current request differs from accepted source")
-            route = token["route"]
-            if route != {"implementation_profile": implementation, "workspace": workspace}:
-                raise ValueError("accepted route differs from configured role/workspace")
-            material = first_active_tranche_materialization(
-                evidence, ActiveTrancheRoute(implementation, workspace))
-            targets = {target.ticket_id: target for target in material.targets}
-            target, source = targets.get(ticket_id), targets.get(dependency_id)
-            if target is None or source is None or dependency_id == ticket_id:
-                raise ValueError("dependency edge must name distinct tranche-zero tickets")
-            if dependency_id not in target.declared_dependencies:
-                raise ValueError("dependency is not declared by the target ticket")
-            if target.tranche_ordinal != 0 or source.tranche_ordinal != 0:
-                raise ValueError("only tranche-zero dependencies are supported")
-            roots = [m for m in state["members"] if m.role == "root"]
-            if len(roots) != 1 or roots[0].task_id != self.scope["anchor_task_id"]:
-                raise ValueError("exactly one scope root member required")
-            receipts = []
-            for item in material.targets:
-                matches = [op for op in state["operations"] if op.key == item.operation_key]
-                members = [m for m in state["members"] if m.work_association == item.association]
-                if (len(matches) != 1 or len(members) != 1):
-                    raise ValueError("every tranche-zero piece needs one exact create receipt and member")
-                op, member = matches[0], members[0]
-                description = self._accepted_piece_description(self.scope, item.operation_key)
-                canonical_target = {**dict(description.target), "task_id": self.scope["anchor_task_id"],
-                    "anchor_task_id": self.scope["anchor_task_id"], "native_parent": False,
-                    "native_deps": [], "plan_id": plan_id, "ticket_id": item.ticket_id,
-                    "accepted_token_key": description.target["accepted_token_key"]}
-                def plain(value):
-                    if isinstance(value, Mapping):
-                        return {key: plain(child) for key, child in value.items()}
-                    if isinstance(value, (tuple, list)):
-                        return [plain(child) for child in value]
-                    return value
-                if (op.phase != "applied" or op.effect != "create_held"
-                        or op.outcome not in {"verified", "no-op"}
-                        or dict(op.scope) != dict(self.scope)
-                        or plain(op.target) != plain(canonical_target)
-                        or op.key != item.operation_key
-                        or member != ManagedMember(self.scope["board_id"], self.scope["anchor_task_id"],
-                            str(member.task_id), "implementation", 0, (), item.association)):
-                    raise ValueError("piece intent, receipt, or generation-zero membership is not canonical")
-                proof = self._snapshot_from_readback(op.readback)
-                if proof is None:
-                    raise ValueError("immutable create receipt is malformed")
-                route_check = getattr(self.board, "_workspace_routing", None)
-                route_state = (route_check(proof.native_task, f"dir:{workspace}") if callable(route_check)
-                               else (None if proof.native_task.get("workspace") == f"dir:{workspace}" else "unsupported"))
-                if (proof.native_task.get("id") != member.task_id
-                        or proof.native_task.get("status") != "blocked" or proof.parents or proof.runs
-                        or proof.native_task.get("assignee") != implementation or route_state is not None):
-                    raise ValueError("immutable create receipt is not an exact held card")
-                fresh = self.board.read_task(member.task_id)
-                if not isinstance(fresh, BoardSnapshot):
-                    raise ValueError("fresh native card differs from immutable create receipt")
-                fresh_content = fresh.to_dict()
-                proof_content = proof.to_dict()
-                fresh_content.pop("observed_at", None)
-                proof_content.pop("observed_at", None)
-                if fresh_content != proof_content:
-                    raise ValueError("fresh native card differs from immutable create receipt")
-                verifier = getattr(self.board, "verify_effect", None)
-                if not callable(verifier):
-                    raise ValueError("read-only exact creation verifier unavailable")
-                action = self._action_from_intent(op)
-                native_target = {key: value for key, value in action.target.items() if key != "plan_id"}
-                verified = verifier(Action(action.key, action.scope, native_target, action.effect,
-                                           action.expected_observed_identity))
-                verified_snapshot = self._snapshot_from_readback(verified.readback) if isinstance(verified, ActionResult) else None
-                verified_content = None if verified_snapshot is None else verified_snapshot.to_dict()
-                proof_content = proof.to_dict()
-                if verified_content is not None:
-                    verified_content.pop("observed_at", None)
-                proof_content.pop("observed_at", None)
-                if (not isinstance(verified, ActionResult) or verified.outcome not in {"verified", "no-op"}
-                        or verified_content != proof_content or verified.action_key != op.key):
-                    raise ValueError("read-only verifier does not prove the immutable create receipt")
-                receipts.append({"ticket_id": item.ticket_id, "task_id": member.task_id,
-                    "association": item.association, "operation_key": op.key,
-                    "digest": proof.digest, "readback": proof.to_dict()})
-            latest = self.store.read_scope(self.scope)
-            latest_pause = latest["operator_intent"]
-            if latest_pause is not None and latest_pause.active:
-                raise ValueError("dependency authority fenced by changed pause/cancellation")
-            if (latest["members"] != state["members"] or latest["operations"] != state["operations"]
-                    or latest["operator_intent"] != state["operator_intent"]):
-                raise ValueError("authority store changed during read-only proof")
-            latest_token = self.store.read_accepted_plan(self.scope, plan_id)
-            latest_evidence = self.store.read_plan(self.scope, plan_id)
-            latest_registration = self.store.read_planning_request(self.scope, request_id=request_id)
-            latest_observed = self.planning_observer(dict(self.scope))
-            if (latest_token != token or latest_evidence != evidence
-                    or request_payload(request_from_payload(latest_registration["request"])) != request_payload(current_request)
-                    or type(latest_observed) is not dict or set(latest_observed) != {"request"}
-                    or request_payload(request_from_payload(latest_observed["request"])) != request_payload(current_request)
-                    or token["route"] != {"implementation_profile": implementation, "workspace": workspace}):
-                raise ValueError("accepted source, request, or route changed during read-only proof")
-            from .planning_coordinator import _canonical_digest, _deep_freeze
-            identity = {"kind": "accepted_active_tranche_native_link_v1",
-                "acceptance_identity": token["acceptance_identity"], "plan_id": plan_id,
-                "request_identity": token["request_identity"], "scope": dict(self.scope),
-                "route": dict(token["route"]), "root_task_id": roots[0].task_id,
-                "tranche_ordinal": 0, "tranche_id": material.active_tranche_id,
-                "source_ticket_id": dependency_id, "target_ticket_id": ticket_id,
-                "source_association": source.association, "target_association": target.association,
-                "source_task_id": next(x["task_id"] for x in receipts if x["ticket_id"] == dependency_id),
-                "target_task_id": next(x["task_id"] for x in receipts if x["ticket_id"] == ticket_id),
-                "frozen_create_receipts": receipts}
-            key = "native-link:" + _canonical_digest(identity)
-            authority = {**identity, "operation_key": key,
-                "scope": dict(self.scope), "frozen_create_receipts": receipts,
-                "read_only_first_edge_only": True}
-            return _deep_freeze(authority)
+        state = self.store.read_scope(self.scope)
+        pause = state["operator_intent"]
+        if pause is not None and pause.active:
+            raise ValueError("dependency authority is fenced by pause/cancellation")
+        token = self.store.read_accepted_plan(self.scope, plan_id)
+        registration = self.store.read_planning_request(self.scope, request_id=request_id)
+        evidence = self.store.read_plan(self.scope, plan_id)
+        if self.planning_observer is None:
+            raise ValueError("trusted planning observer is required")
+        observed = self.planning_observer(dict(self.scope))
+        if type(observed) is not dict or set(observed) != {"request"}:
+            raise ValueError("trusted planning observer returned malformed observation")
+        current_request = request_from_payload(observed["request"])
+        registered_request = request_from_payload(registration["request"])
+        if (request_payload(current_request) != request_payload(registered_request)
+                or current_request.identity != token["request_identity"]):
+            raise ValueError("current request differs from accepted source")
+        route = token["route"]
+        if route != {"implementation_profile": implementation, "workspace": workspace}:
+            raise ValueError("accepted route differs from configured role/workspace")
+        material = first_active_tranche_materialization(
+            evidence, ActiveTrancheRoute(implementation, workspace))
+        targets = {target.ticket_id: target for target in material.targets}
+        target, source = targets.get(ticket_id), targets.get(dependency_id)
+        if target is None or source is None or dependency_id == ticket_id:
+            raise ValueError("dependency edge must name distinct tranche-zero tickets")
+        if dependency_id not in target.declared_dependencies:
+            raise ValueError("dependency is not declared by the target ticket")
+        if target.tranche_ordinal != 0 or source.tranche_ordinal != 0:
+            raise ValueError("only tranche-zero dependencies are supported")
+        roots = [m for m in state["members"] if m.role == "root"]
+        if len(roots) != 1 or roots[0].task_id != self.scope["anchor_task_id"]:
+            raise ValueError("exactly one scope root member required")
+        receipts = []
+        for item in material.targets:
+            matches = [op for op in state["operations"] if op.key == item.operation_key]
+            members = [m for m in state["members"] if m.work_association == item.association]
+            if (len(matches) != 1 or len(members) != 1):
+                raise ValueError("every tranche-zero piece needs one exact create receipt and member")
+            op, member = matches[0], members[0]
+            description = self._accepted_piece_description(self.scope, item.operation_key)
+            canonical_target = {**dict(description.target), "task_id": self.scope["anchor_task_id"],
+                "anchor_task_id": self.scope["anchor_task_id"], "native_parent": False,
+                "native_deps": [], "plan_id": plan_id, "ticket_id": item.ticket_id,
+                "accepted_token_key": description.target["accepted_token_key"]}
+            def plain(value):
+                if isinstance(value, Mapping):
+                    return {key: plain(child) for key, child in value.items()}
+                if isinstance(value, (tuple, list)):
+                    return [plain(child) for child in value]
+                return value
+            if (op.phase != "applied" or op.effect != "create_held"
+                    or op.outcome not in {"verified", "no-op"}
+                    or dict(op.scope) != dict(self.scope)
+                    or plain(op.target) != plain(canonical_target)
+                    or op.key != item.operation_key
+                    or member != ManagedMember(self.scope["board_id"], self.scope["anchor_task_id"],
+                        str(member.task_id), "implementation", 0, (), item.association)):
+                raise ValueError("piece intent, receipt, or generation-zero membership is not canonical")
+            proof = self._snapshot_from_readback(op.readback)
+            if proof is None:
+                raise ValueError("immutable create receipt is malformed")
+            route_check = getattr(self.board, "_workspace_routing", None)
+            route_state = (route_check(proof.native_task, f"dir:{workspace}") if callable(route_check)
+                           else (None if proof.native_task.get("workspace") == f"dir:{workspace}" else "unsupported"))
+            if (proof.native_task.get("id") != member.task_id
+                    or proof.native_task.get("status") != "blocked" or proof.parents or proof.runs
+                    or proof.native_task.get("assignee") != implementation or route_state is not None):
+                raise ValueError("immutable create receipt is not an exact held card")
+            fresh = self.board.read_task(member.task_id)
+            if not isinstance(fresh, BoardSnapshot):
+                raise ValueError("fresh native card differs from immutable create receipt")
+            fresh_content = fresh.to_dict()
+            proof_content = proof.to_dict()
+            fresh_content.pop("observed_at", None)
+            proof_content.pop("observed_at", None)
+            if fresh_content != proof_content:
+                raise ValueError("fresh native card differs from immutable create receipt")
+            verifier = getattr(self.board, "verify_effect", None)
+            if not callable(verifier):
+                raise ValueError("read-only exact creation verifier unavailable")
+            action = self._action_from_intent(op)
+            native_target = {key: value for key, value in action.target.items() if key != "plan_id"}
+            verified = verifier(Action(action.key, action.scope, native_target, action.effect,
+                                       action.expected_observed_identity))
+            verified_snapshot = self._snapshot_from_readback(verified.readback) if isinstance(verified, ActionResult) else None
+            verified_content = None if verified_snapshot is None else verified_snapshot.to_dict()
+            proof_content = proof.to_dict()
+            if verified_content is not None:
+                verified_content.pop("observed_at", None)
+            proof_content.pop("observed_at", None)
+            if (not isinstance(verified, ActionResult) or verified.outcome not in {"verified", "no-op"}
+                    or verified_content != proof_content or verified.action_key != op.key):
+                raise ValueError("read-only verifier does not prove the immutable create receipt")
+            receipts.append({"ticket_id": item.ticket_id, "task_id": member.task_id,
+                "association": item.association, "operation_key": op.key,
+                "digest": proof.digest, "readback": proof.to_dict()})
+        latest = self.store.read_scope(self.scope)
+        latest_pause = latest["operator_intent"]
+        if latest_pause is not None and latest_pause.active:
+            raise ValueError("dependency authority fenced by changed pause/cancellation")
+        if (latest["members"] != state["members"] or latest["operations"] != state["operations"]
+                or latest["operator_intent"] != state["operator_intent"]):
+            raise ValueError("authority store changed during read-only proof")
+        latest_token = self.store.read_accepted_plan(self.scope, plan_id)
+        latest_evidence = self.store.read_plan(self.scope, plan_id)
+        latest_registration = self.store.read_planning_request(self.scope, request_id=request_id)
+        latest_observed = self.planning_observer(dict(self.scope))
+        if (latest_token != token or latest_evidence != evidence
+                or request_payload(request_from_payload(latest_registration["request"])) != request_payload(current_request)
+                or type(latest_observed) is not dict or set(latest_observed) != {"request"}
+                or request_payload(request_from_payload(latest_observed["request"])) != request_payload(current_request)
+                or token["route"] != {"implementation_profile": implementation, "workspace": workspace}):
+            raise ValueError("accepted source, request, or route changed during read-only proof")
+        from .planning_coordinator import _canonical_digest, _deep_freeze
+        identity = {"kind": "accepted_active_tranche_native_link_v1",
+            "acceptance_identity": token["acceptance_identity"], "plan_id": plan_id,
+            "request_identity": token["request_identity"], "scope": dict(self.scope),
+            "route": dict(token["route"]), "root_task_id": roots[0].task_id,
+            "tranche_ordinal": 0, "tranche_id": material.active_tranche_id,
+            "source_ticket_id": dependency_id, "target_ticket_id": ticket_id,
+            "source_association": source.association, "target_association": target.association,
+            "source_task_id": next(x["task_id"] for x in receipts if x["ticket_id"] == dependency_id),
+            "target_task_id": next(x["task_id"] for x in receipts if x["ticket_id"] == ticket_id),
+            "frozen_create_receipts": receipts}
+        key = "native-link:" + _canonical_digest(identity)
+        authority = {**identity, "operation_key": key,
+            "scope": dict(self.scope), "frozen_create_receipts": receipts,
+            "read_only_first_edge_only": True}
+        return _deep_freeze(authority)
+
 
     def prepare_planner(self, *, request_id: str | None = None,
                         planning_profile: str | None = None) -> Mapping[str, Any]:
