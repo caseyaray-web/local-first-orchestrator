@@ -81,3 +81,89 @@ def test_locked_helper_preserves_full_barrier_and_invalid_edge_read_only(tmp_pat
             store2.close()
     finally:
         store.close()
+
+
+def test_persisted_context_is_non_authorizing_frozen_original_identity_without_native_calls(
+    tmp_path, monkeypatch,
+):
+    coordinator, store, board, cards = _batch_fixture(tmp_path, monkeypatch)
+    try:
+        _seed_two(coordinator)
+        before = _database_rows(store)
+        calls = []
+        original_read, original_verify = board.read_task, board.verify_effect
+        board.read_task = lambda task_id: (calls.append(("read", task_id)), original_read(task_id))[1]
+        board.verify_effect = lambda action: (calls.append(("verify", action.key)), original_verify(action))[1]
+        with coordinator.lock:
+            context = coordinator._active_piece_dependency_persisted_context_locked(
+                "plan-1", "TK-B", "TK-A")
+        assert context["kind"] == "accepted_first_link_persisted_context_v1"
+        assert context["requires_native_receipt_validation"] is True
+        assert calls == []
+        assert _database_rows(store) == before
+
+        authority = coordinator.active_piece_dependency_authority("plan-1", "TK-B", "TK-A")
+        assert dict(context["authority_identity"]) == {
+            key: authority[key] for key in context["authority_identity"]
+        }
+        assert context["operation_key"] == authority["operation_key"]
+        assert context["frozen_create_receipts"] == authority["frozen_create_receipts"]
+        with pytest.raises(TypeError):
+            context["authority_identity"]["plan_id"] = "changed"
+
+        original = cards["native-TK-A"]
+        cards["native-TK-A"] = type(original)(native_task=original.native_task,
+            parents=original.parents, runs=original.runs, comments=({"body": "drift"},),
+            events=original.events, attachments=original.attachments,
+            observed_at=original.observed_at, digest=original.digest)
+        calls.clear()
+        with coordinator.lock:
+            drift_context = coordinator._active_piece_dependency_persisted_context_locked(
+                "plan-1", "TK-B", "TK-A")
+        assert drift_context["frozen_create_receipts"] == context["frozen_create_receipts"]
+        assert calls == []
+        with pytest.raises(ValueError, match="fresh native card differs"):
+            coordinator.active_piece_dependency_authority("plan-1", "TK-B", "TK-A")
+        assert _database_rows(store) == before
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("fault", ("edge", "request", "member", "pause"))
+def test_persisted_context_rejects_invalid_edge_request_member_and_pause_before_native_calls(
+    tmp_path, monkeypatch, fault,
+):
+    coordinator, store, board, _cards = _batch_fixture(tmp_path, monkeypatch)
+    try:
+        _seed_two(coordinator)
+        calls = []
+        original_read, original_verify = board.read_task, board.verify_effect
+        board.read_task = lambda task_id: (calls.append(("read", task_id)), original_read(task_id))[1]
+        board.verify_effect = lambda action: (calls.append(("verify", action.key)), original_verify(action))[1]
+        target, dependency = "TK-B", "TK-A"
+        if fault == "edge":
+            target, dependency = "TK-A", "TK-B"
+        elif fault == "request":
+            coordinator.planning_observer = lambda scope: {"request": {}}
+        else:
+            original_scope = store.read_scope
+
+            def changed_scope(scope):
+                state = original_scope(scope)
+                if fault == "member":
+                    assert any(member.task_id == "native-TK-B" for member in state["members"])
+                    state["members"] = tuple(
+                        member for member in state["members"] if member.task_id != "native-TK-B")
+                else:
+                    from local_first_orchestrator.contracts import PauseIntent
+                    state["operator_intent"] = PauseIntent(SCOPE, "operator", 1, True, False)
+                return state
+
+            store.read_scope = changed_scope
+        with coordinator.lock:
+            with pytest.raises((ValueError, KeyError)):
+                coordinator._active_piece_dependency_persisted_context_locked(
+                    "plan-1", target, dependency)
+        assert calls == []
+    finally:
+        store.close()

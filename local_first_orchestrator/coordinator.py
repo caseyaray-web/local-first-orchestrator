@@ -354,10 +354,31 @@ class Coordinator:
     def _active_piece_dependency_authority_locked(
             self, plan_id: str, ticket_id: str, dependency_id: str, *,
             request_id: str | None = None) -> Mapping[str, Any]:
-        """Reconstruct read-only authority; caller must own the instance lock."""
+        """Authorize only after a fresh native whole-tranche barrier succeeds."""
+        context = self._active_piece_dependency_persisted_context_locked(
+            plan_id, ticket_id, dependency_id, request_id=request_id)
+        self._active_piece_dependency_native_barrier_locked(context)
+        self._active_piece_dependency_final_fence_locked(context)
+        from .planning_coordinator import _deep_freeze
+        identity = context["authority_identity"]
+        return _deep_freeze({**dict(identity), "operation_key": context["operation_key"],
+            "scope": dict(self.scope), "frozen_create_receipts": context["frozen_create_receipts"],
+            "read_only_first_edge_only": True})
+
+    def _active_piece_dependency_persisted_context_locked(
+            self, plan_id: str, ticket_id: str, dependency_id: str, *,
+            request_id: str | None = None) -> Mapping[str, Any]:
+        """NON-AUTHORIZING reconstruction of persisted facts; lock required.
+
+        This does not read native cards, verify a native effect, or certify a
+        stored acknowledgement as historical native truth.  A later native
+        barrier remains mandatory before the authority-shaped identity can be
+        returned by the public helper.
+        """
         from .contracts import ManagedMember
         from .planning_coordinator import (ActiveTrancheRoute, request_from_payload,
-            request_payload, first_active_tranche_materialization)
+            request_payload, first_active_tranche_materialization, _canonical_digest,
+            _deep_freeze)
         self._assert_lock()
         values = (plan_id, ticket_id, dependency_id)
         if any(type(value) is not str or not value.strip() or len(value) > 256 for value in values):
@@ -439,11 +460,41 @@ class Coordinator:
                     or proof.native_task.get("status") != "blocked" or proof.parents or proof.runs
                     or proof.native_task.get("assignee") != implementation or route_state is not None):
                 raise ValueError("immutable create receipt is not an exact held card")
-            fresh = self.board.read_task(member.task_id)
+            receipts.append({"ticket_id": item.ticket_id, "task_id": member.task_id,
+                "association": item.association, "operation_key": op.key,
+                "digest": proof.digest, "readback": proof.to_dict()})
+
+        identity = {"kind": "accepted_active_tranche_native_link_v1",
+            "acceptance_identity": token["acceptance_identity"], "plan_id": plan_id,
+            "request_identity": token["request_identity"], "scope": dict(self.scope),
+            "route": dict(token["route"]), "root_task_id": roots[0].task_id,
+            "tranche_ordinal": 0, "tranche_id": material.active_tranche_id,
+            "source_ticket_id": dependency_id, "target_ticket_id": ticket_id,
+            "source_association": source.association, "target_association": target.association,
+            "source_task_id": next(x["task_id"] for x in receipts if x["ticket_id"] == dependency_id),
+            "target_task_id": next(x["task_id"] for x in receipts if x["ticket_id"] == ticket_id),
+            "frozen_create_receipts": receipts}
+        key = "native-link:" + _canonical_digest(identity)
+        return _deep_freeze({"kind": "accepted_first_link_persisted_context_v1",
+            "requires_native_receipt_validation": True, "authority_identity": identity,
+            "operation_key": key, "frozen_create_receipts": receipts,
+            "_persisted_fence": {"state_members": tuple(state["members"]),
+                "state_operations": tuple(state["operations"]),
+                "state_pause": pause, "token": token, "evidence": evidence,
+                "current_request": request_payload(current_request), "request_id": request_id,
+                "plan_id": plan_id, "implementation": implementation, "workspace": workspace}})
+
+    def _active_piece_dependency_native_barrier_locked(self, context: Mapping[str, Any]) -> None:
+        """Require fresh reads and exact native receipt verification for all pieces."""
+        self._assert_lock()
+        fence = context["_persisted_fence"]
+        operations = {op.key: op for op in fence["state_operations"]}
+        for receipt in context["frozen_create_receipts"]:
+            proof = self._snapshot_from_readback(receipt["readback"])
+            fresh = self.board.read_task(receipt["task_id"])
             if not isinstance(fresh, BoardSnapshot):
                 raise ValueError("fresh native card differs from immutable create receipt")
-            fresh_content = fresh.to_dict()
-            proof_content = proof.to_dict()
+            fresh_content, proof_content = fresh.to_dict(), proof.to_dict()
             fresh_content.pop("observed_at", None)
             proof_content.pop("observed_at", None)
             if fresh_content != proof_content:
@@ -451,6 +502,7 @@ class Coordinator:
             verifier = getattr(self.board, "verify_effect", None)
             if not callable(verifier):
                 raise ValueError("read-only exact creation verifier unavailable")
+            op = operations[receipt["operation_key"]]
             action = self._action_from_intent(op)
             native_target = {key: value for key, value in action.target.items() if key != "plan_id"}
             verified = verifier(Action(action.key, action.scope, native_target, action.effect,
@@ -464,42 +516,32 @@ class Coordinator:
             if (not isinstance(verified, ActionResult) or verified.outcome not in {"verified", "no-op"}
                     or verified_content != proof_content or verified.action_key != op.key):
                 raise ValueError("read-only verifier does not prove the immutable create receipt")
-            receipts.append({"ticket_id": item.ticket_id, "task_id": member.task_id,
-                "association": item.association, "operation_key": op.key,
-                "digest": proof.digest, "readback": proof.to_dict()})
+
+    def _active_piece_dependency_final_fence_locked(self, context: Mapping[str, Any]) -> None:
+        """Recheck persisted source and observer facts after the full native barrier."""
+        self._assert_lock()
+        from .planning_coordinator import _deep_freeze, request_from_payload, request_payload
+        fence = context["_persisted_fence"]
         latest = self.store.read_scope(self.scope)
         latest_pause = latest["operator_intent"]
         if latest_pause is not None and latest_pause.active:
             raise ValueError("dependency authority fenced by changed pause/cancellation")
-        if (latest["members"] != state["members"] or latest["operations"] != state["operations"]
-                or latest["operator_intent"] != state["operator_intent"]):
+        if (tuple(latest["members"]) != fence["state_members"]
+                or tuple(latest["operations"]) != fence["state_operations"]
+                or latest["operator_intent"] != fence["state_pause"]):
             raise ValueError("authority store changed during read-only proof")
-        latest_token = self.store.read_accepted_plan(self.scope, plan_id)
-        latest_evidence = self.store.read_plan(self.scope, plan_id)
-        latest_registration = self.store.read_planning_request(self.scope, request_id=request_id)
+        latest_token = self.store.read_accepted_plan(self.scope, fence["plan_id"])
+        latest_evidence = self.store.read_plan(self.scope, fence["plan_id"])
+        latest_registration = self.store.read_planning_request(self.scope, request_id=fence["request_id"])
         latest_observed = self.planning_observer(dict(self.scope))
-        if (latest_token != token or latest_evidence != evidence
-                or request_payload(request_from_payload(latest_registration["request"])) != request_payload(current_request)
+        if (_deep_freeze(latest_token) != fence["token"]
+                or _deep_freeze(latest_evidence) != fence["evidence"]
+                or _deep_freeze(request_payload(request_from_payload(latest_registration["request"]))) != fence["current_request"]
                 or type(latest_observed) is not dict or set(latest_observed) != {"request"}
-                or request_payload(request_from_payload(latest_observed["request"])) != request_payload(current_request)
-                or token["route"] != {"implementation_profile": implementation, "workspace": workspace}):
+                or _deep_freeze(request_payload(request_from_payload(latest_observed["request"]))) != fence["current_request"]
+                or fence["token"]["route"] != {"implementation_profile": fence["implementation"],
+                    "workspace": fence["workspace"]}):
             raise ValueError("accepted source, request, or route changed during read-only proof")
-        from .planning_coordinator import _canonical_digest, _deep_freeze
-        identity = {"kind": "accepted_active_tranche_native_link_v1",
-            "acceptance_identity": token["acceptance_identity"], "plan_id": plan_id,
-            "request_identity": token["request_identity"], "scope": dict(self.scope),
-            "route": dict(token["route"]), "root_task_id": roots[0].task_id,
-            "tranche_ordinal": 0, "tranche_id": material.active_tranche_id,
-            "source_ticket_id": dependency_id, "target_ticket_id": ticket_id,
-            "source_association": source.association, "target_association": target.association,
-            "source_task_id": next(x["task_id"] for x in receipts if x["ticket_id"] == dependency_id),
-            "target_task_id": next(x["task_id"] for x in receipts if x["ticket_id"] == ticket_id),
-            "frozen_create_receipts": receipts}
-        key = "native-link:" + _canonical_digest(identity)
-        authority = {**identity, "operation_key": key,
-            "scope": dict(self.scope), "frozen_create_receipts": receipts,
-            "read_only_first_edge_only": True}
-        return _deep_freeze(authority)
 
 
     def prepare_planner(self, *, request_id: str | None = None,
