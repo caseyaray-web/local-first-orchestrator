@@ -11,6 +11,7 @@ from tests.test_m4_active_piece_preparation import (
     native_fixture,
 )
 from tests.test_m4_plan_evidence import proposal
+from local_first_orchestrator.hermes_board import validate_accepted_first_link_transition
 
 
 def _json_diff(before, after, path="$", out=None):
@@ -107,6 +108,12 @@ def test_native_first_edge_link_characterization(tmp_path, native_fixture, monke
         assert link_result.returncode == 0
 
         raw_after = {"source": raw_show(source_id), "child": raw_show(child_id)}
+        transition = validate_accepted_first_link_transition(
+            raw_before["source"], raw_before["child"], raw_after["source"], raw_after["child"],
+            source_id=source_id, child_id=child_id,
+            command_started_seconds=int(command_started), command_ended_seconds=int(command_ended))
+        assert transition.source_id == source_id and transition.child_id == child_id
+        assert transition.event == raw_after["child"]["events"][-1]
         runs_after = {"source": json.loads(cli("runs", source_id, "--json").stdout),
                       "child": json.loads(cli("runs", child_id, "--json").stdout)}
         adapter_after = {"source": observed(source_id), "child": observed(child_id)}

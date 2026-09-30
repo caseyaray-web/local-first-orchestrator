@@ -12,6 +12,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass
+from types import MappingProxyType
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -20,6 +21,85 @@ from .contracts import Action, ActionResult, BoardSnapshot, validate_scope
 from .planning_coordinator import (request_from_payload, _canonical_digest, _evidence_snapshot,
     reconstruct_evidence, first_active_tranche_materialization, accepted_active_tranche_create_payload,
     ActiveTrancheRoute, HeldCardTarget)
+
+
+def _freeze_link_value(value):
+    if type(value) is dict:
+        return MappingProxyType({key: _freeze_link_value(item) for key, item in value.items()})
+    if type(value) is list:
+        return tuple(_freeze_link_value(item) for item in value)
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedFirstLinkTransition:
+    """Bounded description of a characterized raw native first-link transition only."""
+    source_id: str
+    child_id: str
+    event: Mapping
+    source_before: Mapping
+    child_before: Mapping
+    source_after: Mapping
+    child_after: Mapping
+
+
+def validate_accepted_first_link_transition(before_source, before_child, after_source, after_child,
+                                            *, source_id, child_id,
+                                            command_started_seconds=None, command_ended_seconds=None):
+    """Validate the exact observed parentless first-edge raw-show transition; no I/O or authority."""
+    if (type(source_id) is not str or not source_id or len(source_id) > _MAX_FIELD or not _utf8_clean(source_id)
+            or type(child_id) is not str or not child_id or len(child_id) > _MAX_FIELD
+            or not _utf8_clean(child_id) or source_id == child_id):
+        raise ValueError("distinct bounded nonempty literal task IDs required")
+    if (type(command_started_seconds) is not int or command_started_seconds <= 0
+            or type(command_ended_seconds) is not int or command_ended_seconds < command_started_seconds):
+        raise ValueError("positive integer command time bounds required")
+    bundle = _evidence_snapshot({"before_source": before_source, "before_child": before_child,
+                                 "after_source": after_source, "after_child": after_child})
+    bs, bc = bundle["before_source"], bundle["before_child"]
+    a_s, a_c = bundle["after_source"], bundle["after_child"]
+    if any(type(item) is not dict for item in (bs, bc, a_s, a_c)):
+        raise ValueError("raw task show objects must be JSON objects")
+    task_rows = [item.get("task") for item in (bs, bc, a_s, a_c)]
+    if any(type(row) is not dict or type(row.get("id")) is not str for row in task_rows):
+        raise ValueError("raw task identity fields are malformed")
+    if (task_rows[0]["id"] != source_id or task_rows[1]["id"] != child_id
+            or task_rows[2]["id"] != source_id or task_rows[3]["id"] != child_id):
+        raise ValueError("raw task IDs do not match the literal requested IDs")
+    if any(type(row.get("status")) is not str or row["status"] != "blocked"
+           for row in (task_rows[0], task_rows[1])):
+        raise ValueError("first-link precondition requires source and child held as blocked")
+    if any(item.get("parents") != [] for item in (bs, bc, a_s)):
+        raise ValueError("transition requires parentless source and child")
+    if bs.get("children") != [] or bc.get("children") != []:
+        raise ValueError("transition requires no pre-existing outbound children")
+    if a_s.get("children") != [child_id]:
+        raise ValueError("source must append exactly the child edge")
+    expected_source = dict(bs)
+    expected_source["children"] = [child_id]
+    if a_s != expected_source:
+        raise ValueError("source raw show changed outside the characterized children append")
+    before_events = bc.get("events")
+    after_events = a_c.get("events")
+    if type(before_events) is not list or type(after_events) is not list or len(after_events) != len(before_events) + 1:
+        raise ValueError("child must append exactly one event")
+    if after_events[:-1] != before_events:
+        raise ValueError("child event history was rewritten")
+    event = after_events[-1]
+    if type(event) is not dict or set(event) != {"created_at", "kind", "payload", "run_id"}:
+        raise ValueError("event does not match characterized linked event shape")
+    timestamp = event["created_at"]
+    if type(timestamp) is not int or timestamp <= 0 or not command_started_seconds <= timestamp <= command_ended_seconds:
+        raise ValueError("linked event timestamp is outside the exact command window")
+    if event["kind"] != "linked" or event["run_id"] is not None or event["payload"] != {"parent": source_id, "child": child_id}:
+        raise ValueError("linked event fields do not match the requested edge")
+    expected_child = dict(bc)
+    expected_child["parents"] = [source_id]
+    expected_child["events"] = before_events + [event]
+    if a_c != expected_child:
+        raise ValueError("child raw show changed outside the characterized parent and event appends")
+    frozen = [_freeze_link_value(item) for item in (event, bs, bc, a_s, a_c)]
+    return AcceptedFirstLinkTransition(source_id, child_id, *frozen)
 from .ticket import parse_contract, contract_payload
 
 _AUTHOR = "local-first-orchestrator"
