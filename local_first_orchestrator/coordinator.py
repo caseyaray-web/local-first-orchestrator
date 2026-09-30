@@ -88,6 +88,92 @@ class Coordinator:
             "idempotency_key": built.idempotency_key, "plan_evidence": evidence,
         })()
 
+    def prepare_active_tranche(self, plan_id: str, *, request_id: str | None = None) -> Mapping[str, Any]:
+        """Prepare only accepted tranche zero, serially, without lifecycle activation."""
+        from .planning_coordinator import ActiveTrancheRoute, first_active_tranche_materialization
+        if type(plan_id) is not str or not plan_id.strip() or len(plan_id) > 256:
+            raise ValueError("bounded explicit plan ID is required")
+        if request_id is not None and (type(request_id) is not str or not request_id.strip() or len(request_id) > 256):
+            raise ValueError("request_id must be a bounded explicit string")
+        implementation, _ = self._local_review_roles()
+        workspace = self.planning_workspace
+        if (not isinstance(workspace, str) or not os.path.isabs(workspace)
+                or os.path.realpath(workspace) != workspace or not os.path.isdir(workspace)
+                or os.path.islink(workspace)):
+            raise ValueError("trusted persistent planning workspace must be canonical and existing")
+
+        def source():
+            token = self.store.read_accepted_plan(self.scope, plan_id)
+            registration = self.store.read_planning_request(self.scope, request_id=request_id)
+            evidence = self.store.read_plan(self.scope, plan_id)
+            route = ActiveTrancheRoute(implementation, workspace)
+            material = first_active_tranche_materialization(evidence, route)
+            from .planning_coordinator import request_from_payload, request_payload
+            observed = self.planning_observer(dict(self.scope)) if self.planning_observer is not None else None
+            if not isinstance(observed, Mapping) or set(observed) != {"request"}:
+                raise ValueError("trusted planning observer returned malformed observation")
+            current = request_from_payload(observed["request"])
+            registered = request_from_payload(registration["request"])
+            if (request_payload(current) != request_payload(registered)
+                    or current.identity != token["request_identity"]):
+                raise ValueError("trusted current and accepted plan requests differ")
+            if token.get("route") != {"implementation_profile": implementation, "workspace": workspace}:
+                raise ValueError("accepted route differs from configured implementation role/workspace")
+            identity = (token["acceptance_identity"], token["request_identity"],
+                        tuple((target.ticket_id, target.operation_key, target.association) for target in material.targets))
+            return identity, material
+
+        initial_identity, material = source()
+        tickets = tuple(target.ticket_id for target in material.targets)
+        pieces = []
+        attempted = 0
+        for ticket_id in tickets:
+            try:
+                current_identity, _ = source()
+                if current_identity != initial_identity:
+                    raise ValueError("accepted tranche source identity drift")
+                result = self.prepare_active_piece(plan_id, ticket_id, request_id=request_id)
+            except (ValueError, OSError, RuntimeError, KeyError, TypeError) as error:
+                pieces.append({"outcome": "partial", "plan_id": plan_id, "ticket_id": ticket_id,
+                               "reason": str(error), "actions_attempted": 0})
+                return {"outcome": "partial", "plan_id": plan_id, "request_id": request_id,
+                        "active_tranche": {"tranche_id": material.active_tranche_id, "ordinal": 0},
+                        "pieces": tuple(pieces), "completed": sum(item.get("outcome") == "held" for item in pieces), "total": len(tickets),
+                        "actions_attempted": attempted}
+            pieces.append(dict(result))
+            count = result.get("actions_attempted", 0)
+            if type(count) is int and count >= 0:
+                attempted += count
+            if result.get("outcome") != "held":
+                return {"outcome": "partial", "plan_id": plan_id, "request_id": request_id,
+                        "active_tranche": {"tranche_id": material.active_tranche_id, "ordinal": 0},
+                        "pieces": tuple(pieces), "completed": sum(item.get("outcome") == "held" for item in pieces), "total": len(tickets),
+                        "actions_attempted": attempted}
+        try:
+            final_identity, _ = source()
+            if final_identity != initial_identity:
+                raise ValueError("accepted tranche source identity drift at final barrier")
+            # Read-only applied-operation replay validates exact persisted marker and
+            # membership/card readback through the existing authority path.
+            verified = []
+            for ticket_id in tickets:
+                result = self.prepare_active_piece(plan_id, ticket_id, request_id=request_id)
+                if result.get("outcome") != "held" or result.get("actions_attempted") != 0:
+                    raise ValueError("final tranche proof was not read-only and held")
+                verified.append(result)
+            if tuple((item.get("ticket_id"), item.get("operation_key"), item.get("task_id")) for item in verified) != tuple(
+                    (item.get("ticket_id"), item.get("operation_key"), item.get("task_id")) for item in pieces):
+                raise ValueError("final tranche proof differs from initial held receipts")
+        except (ValueError, OSError, RuntimeError, KeyError, TypeError) as error:
+            return {"outcome": "partial", "plan_id": plan_id, "request_id": request_id,
+                    "active_tranche": {"tranche_id": material.active_tranche_id, "ordinal": 0},
+                    "pieces": tuple(pieces), "completed": len(pieces), "total": len(tickets),
+                    "actions_attempted": attempted, "reason": str(error)}
+        return {"outcome": "held", "plan_id": plan_id, "request_id": request_id,
+                "active_tranche": {"tranche_id": material.active_tranche_id, "ordinal": 0},
+                "pieces": tuple(pieces), "completed": len(pieces), "total": len(tickets),
+                "actions_attempted": attempted}
+
     def prepare_active_piece(self, plan_id: str, ticket_id: str, *, request_id: str | None = None) -> Mapping[str, Any]:
         """Reserve/create at most one accepted tranche-zero held piece."""
         from .contracts import ManagedMember, Action
@@ -183,68 +269,76 @@ class Coordinator:
             native_action = Action(action.key, action.scope, native_target, action.effect,
                                    action.expected_observed_identity)
             attempted = 0
-            if prior.phase == "applied":
-                verifier = getattr(self.board, "verify_effect", None)
-                if not callable(verifier):
-                    return {"outcome":"partial", "reason":"read-only applied receipt verifier unavailable", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":0}
-                result = verifier(native_action)
-            elif prior.phase == "unknown":
-                verifier = getattr(self.board, "verify_effect", None)
-                if callable(verifier) and action.target.get("kind") == "accepted_active_tranche_piece_v1":
-                    # plan_id is durable coordinator resolver context, not part of
-                    # the adapter's exact canonical accepted payload. ticket_id is canonical.
-                    native_target = {key: value for key, value in action.target.items()
-                                     if key != "plan_id"}
+            try:
+                if prior.phase == "applied":
+                    verifier = getattr(self.board, "verify_effect", None)
+                    if not callable(verifier):
+                        return {"outcome":"partial", "reason":"read-only applied receipt verifier unavailable", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":0}
+                    result = verifier(native_action)
+                elif prior.phase == "unknown":
+                    verifier = getattr(self.board, "verify_effect", None)
+                    if callable(verifier) and action.target.get("kind") == "accepted_active_tranche_piece_v1":
+                        # plan_id is durable coordinator resolver context, not part of
+                        # the adapter's exact canonical accepted payload. ticket_id is canonical.
+                        native_target = {key: value for key, value in action.target.items()
+                                         if key != "plan_id"}
+                        native_action = Action(action.key, action.scope, native_target, action.effect,
+                                               action.expected_observed_identity)
+                        result = verifier(native_action)
+                    else:
+                        result = verifier(action) if callable(verifier) else ActionResult(operation_key, "unknown", "read-only verifier unavailable", None)
+                else:
+                    attempted = 1
+                    # plan_id is coordinator-local resolver context, not part of the
+                    # native adapter's canonical create target contract.
+                    native_target = {key: value for key, value in action.target.items() if key != "plan_id"}
                     native_action = Action(action.key, action.scope, native_target, action.effect,
                                            action.expected_observed_identity)
-                    result = verifier(native_action)
+                    try:
+                        result = self.board.create_held(native_action, title=built.title, body=built.body,
+                            assignee=implementation, workspace=f"dir:{workspace}", idempotency_key=operation_key)
+                    except Exception as error:
+                        return {"outcome":"partial", "reason":f"create attempt outcome unknown: {error}", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
+                try:
+                    readback = self._portable_readback(result.readback)
+                    self.store.record_effect_observation(self.scope, operation_key, outcome=result.outcome, details=result.details, readback=readback)
+                except Exception as error:
+                    return {"outcome":"partial", "reason":f"effect observation unavailable; outcome unknown: {error}", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
+                proof = self._snapshot_from_readback(readback)
+                if result.outcome not in {"verified", "no-op"} or proof is None:
+                    return {"outcome":"partial", "reason":result.details, "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
+                if prior.phase != "applied":
+                    self.store.ack_effect(self.scope, operation_key, readback=proof.to_dict(), outcome=result.outcome)
                 else:
-                    result = verifier(action) if callable(verifier) else ActionResult(operation_key, "unknown", "read-only verifier unavailable", None)
-            else:
-                attempted = 1
-                # plan_id is coordinator-local resolver context, not part of the
-                # native adapter's canonical create target contract.
-                native_target = {key: value for key, value in action.target.items() if key != "plan_id"}
-                native_action = Action(action.key, action.scope, native_target, action.effect,
-                                       action.expected_observed_identity)
-                result = self.board.create_held(native_action, title=built.title, body=built.body,
-                    assignee=implementation, workspace=f"dir:{workspace}", idempotency_key=operation_key)
-            readback = self._portable_readback(result.readback)
-            self.store.record_effect_observation(self.scope, operation_key, outcome=result.outcome, details=result.details, readback=readback)
-            proof = self._snapshot_from_readback(readback)
-            if result.outcome not in {"verified", "no-op"} or proof is None:
-                return {"outcome":"partial", "reason":result.details, "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
-            if prior.phase != "applied":
-                self.store.ack_effect(self.scope, operation_key, readback=proof.to_dict(), outcome=result.outcome)
-            else:
-                saved = self._snapshot_from_readback(prior.readback)
-                if (saved is None or proof.digest != saved.digest or proof.native_task.get("id") != saved.native_task.get("id")):
-                    return {"outcome":"partial", "reason":"applied receipt differs from immutable acknowledgement readback", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":0}
-            # An operator pause may race a native acknowledgement. Preserve the
-            # receipt, but do not enroll work after the intent changes.
-            latest_state = self.store.read_scope(self.scope)
-            latest_pause = latest_state["operator_intent"]
-            if latest_pause is not None and latest_pause.active:
-                return {"outcome":"partial", "reason":"active-piece creation acknowledged while pause/cancellation became active", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
-            latest_root = [m for m in latest_state["members"] if m.role == "root"]
-            if len(latest_root) != 1 or latest_root[0].task_id != self.scope["anchor_task_id"]:
-                return {"outcome":"partial", "reason":"scope root enrollment changed after native acknowledgement", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
-            current_card = self.board.read_task(str(proof.native_task.get("id")))
-            if current_card.digest != proof.digest or current_card.native_task.get("status") != "blocked" or current_card.parents or current_card.runs or current_card.native_task.get("assignee") != implementation or (prior.phase == "applied" and current_card.digest != prior.readback.get("digest")):
-                return {"outcome":"partial", "reason":"fresh held-card readback conflicts", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
-            existing = [m for m in self.store.read_scope(self.scope)["members"] if m.work_association == member_assoc]
-            member = ManagedMember(self.scope["board_id"], self.scope["anchor_task_id"], str(proof.native_task["id"]), "implementation", 0, (), member_assoc)
-            if existing and existing != [member]:
-                return {"outcome":"partial", "reason":"existing member association conflicts", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
-            try:
-                # Membership is authorized only by a fresh exact readback above.
-                # A store failure after native acknowledgement remains recoverable
-                # from the immutable receipt; never report held without membership.
-                self.store.register_member(member)
-            except (OSError, RuntimeError) as error:
-                return {"outcome":"partial", "reason":f"membership registration failed after native acknowledgement: {error}","plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
-            return {"outcome":"held", "task_id":member.task_id,"plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
-
+                    saved = self._snapshot_from_readback(prior.readback)
+                    if (saved is None or proof.digest != saved.digest or proof.native_task.get("id") != saved.native_task.get("id")):
+                        return {"outcome":"partial", "reason":"applied receipt differs from immutable acknowledgement readback", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":0}
+                # An operator pause may race a native acknowledgement. Preserve the
+                # receipt, but do not enroll work after the intent changes.
+                latest_state = self.store.read_scope(self.scope)
+                latest_pause = latest_state["operator_intent"]
+                if latest_pause is not None and latest_pause.active:
+                    return {"outcome":"partial", "reason":"active-piece creation acknowledged while pause/cancellation became active", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
+                latest_root = [m for m in latest_state["members"] if m.role == "root"]
+                if len(latest_root) != 1 or latest_root[0].task_id != self.scope["anchor_task_id"]:
+                    return {"outcome":"partial", "reason":"scope root enrollment changed after native acknowledgement", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
+                current_card = self.board.read_task(str(proof.native_task.get("id")))
+                if current_card.digest != proof.digest or current_card.native_task.get("status") != "blocked" or current_card.parents or current_card.runs or current_card.native_task.get("assignee") != implementation or (prior.phase == "applied" and current_card.digest != prior.readback.get("digest")):
+                    return {"outcome":"partial", "reason":"fresh held-card readback conflicts", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
+                existing = [m for m in self.store.read_scope(self.scope)["members"] if m.work_association == member_assoc]
+                member = ManagedMember(self.scope["board_id"], self.scope["anchor_task_id"], str(proof.native_task["id"]), "implementation", 0, (), member_assoc)
+                if existing and existing != [member]:
+                    return {"outcome":"partial", "reason":"existing member association conflicts", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
+                try:
+                    # Membership is authorized only by a fresh exact readback above.
+                    # A store failure after native acknowledgement remains recoverable
+                    # from the immutable receipt; never report held without membership.
+                    self.store.register_member(member)
+                except Exception as error:
+                    return {"outcome":"partial", "reason":f"membership registration failed after native acknowledgement: {error}","plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
+                return {"outcome":"held", "task_id":member.task_id,"plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
+            except Exception as error:
+                return {"outcome": "partial", "reason": str(error), "plan_id": plan_id, "ticket_id": ticket_id, "operation_key": operation_key, "actions_attempted": attempted}
     def prepare_planner(self, *, request_id: str | None = None,
                         planning_profile: str | None = None) -> Mapping[str, Any]:
         """Create one durable, blocked planner card. This never dispatches work.

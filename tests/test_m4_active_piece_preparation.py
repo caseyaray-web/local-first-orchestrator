@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,16 @@ from tests.test_m4_plan_evidence import proposal
 from tests.test_m4_planner_creation import native_fixture as _native_fixture, setup
 from tests.test_m4_planner_run_binding import _claim
 from tests.test_m4_plan_acceptance import _pure_acceptance_fixture, _authority_rows
+from local_first_orchestrator.planning_coordinator import evidence_payload
+
+
+def _batch_proposal(req):
+    from local_first_orchestrator.decomposition import TranchePlan
+    from local_first_orchestrator.decomposition_planner import PlanProposal, TrancheSemantics
+    original = proposal(req)
+    plan = dataclasses.replace(original.plan, tranches=(TranchePlan("TR-A", 0,
+        (original.plan.tranches[0].tickets[0], original.plan.tranches[1].tickets[0]), ("AC-1", "AC-2")),))
+    return PlanProposal(req.identity, plan, (TrancheSemantics("TR-A", "First tranche", ("No unrelated changes",)),))
 
 
 @pytest.fixture
@@ -21,7 +32,7 @@ def native_fixture(tmp_path):
     return _native_fixture.__wrapped__(tmp_path)
 
 
-def _accepted_plan(tmp_path, native_fixture, monkeypatch):
+def _accepted_plan(tmp_path, native_fixture, monkeypatch, proposal_factory=proposal):
     board, anchor, workspace, adapter, membership, cli = native_fixture
     controller, store, scope, req = setup(tmp_path, native_fixture)
     request_id = "acceptance-request"
@@ -32,8 +43,8 @@ def _accepted_plan(tmp_path, native_fixture, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_id)
     monkeypatch.setenv("HERMES_SESSION_ID", "controlled-active-piece-session")
     controller.register_planning_request(planner["task_id"], request_id=request_id)
-    controller.submit_plan(serialize_proposal(proposal(req)), request_id=request_id)
-    accepted = controller.accept_validated_plan(proposal(req).plan.plan_id, request_id=request_id)
+    controller.submit_plan(serialize_proposal(proposal_factory(req)), request_id=request_id)
+    accepted = controller.accept_validated_plan(proposal_factory(req).plan.plan_id, request_id=request_id)
     assert len([event for event in store.read_scope(scope)["budget_events"]
                 if event["event_id"].startswith("paid_capacity:")]) == 1
     return board, anchor, workspace, adapter, membership, cli, controller, store, scope, accepted, request_id
@@ -42,6 +53,242 @@ def _accepted_plan(tmp_path, native_fixture, monkeypatch):
 def _piece_task_ids(cli):
     import json
     return {item["id"] for item in json.loads(cli("list", "--json").stdout)}
+
+
+def test_pure_batch_receipt_requires_final_replay_proof(tmp_path, monkeypatch):
+    import tests.test_m4_plan_acceptance as acceptance
+    original_evidence = acceptance.evidence
+    def batch_evidence():
+        base = original_evidence()
+        req = acceptance.base_request()
+        return evidence_payload(req, _batch_proposal(req), planner_task_id=base["planner"]["task_id"],
+            planner_run_id=base["planner"]["run_id"], planner_session_id=base["planner"]["session_id"], planner_profile=base["planner"]["profile"])
+    monkeypatch.setattr(acceptance, "evidence", batch_evidence)
+    ctl, store, _board, _observed = _pure_acceptance_fixture(tmp_path)
+    try:
+        ctl.accept_validated_plan("plan-1")
+        calls = []
+        def piece(plan_id, ticket_id, *, request_id=None):
+            calls.append(ticket_id)
+            return {"outcome": "held", "task_id": "piece-" + ticket_id,
+                    "plan_id": plan_id, "ticket_id": ticket_id,
+                    "operation_key": "op-" + ticket_id,
+                    "actions_attempted": 1 if calls.count(ticket_id) == 1 else 0}
+        monkeypatch.setattr(ctl, "prepare_active_piece", piece)
+        result = ctl.prepare_active_tranche("plan-1")
+        assert calls == ["TK-A", "TK-B", "TK-A", "TK-B"]
+        assert result["outcome"] == "held"
+        assert result["active_tranche"]["ordinal"] == 0
+        assert result["completed"] == result["total"] == 2
+        assert result["actions_attempted"] == 2
+        assert result["pieces"][0]["task_id"] == "piece-TK-A"
+    finally:
+        store.close()
+
+
+def test_pure_batch_partial_piece_resumes_without_replaying_held_piece(tmp_path, monkeypatch):
+    import tests.test_m4_plan_acceptance as acceptance
+    original_evidence = acceptance.evidence
+
+    def batch_evidence():
+        base = original_evidence()
+        req = acceptance.base_request()
+        return evidence_payload(req, _batch_proposal(req), planner_task_id=base["planner"]["task_id"],
+            planner_run_id=base["planner"]["run_id"], planner_session_id=base["planner"]["session_id"], planner_profile=base["planner"]["profile"])
+
+    monkeypatch.setattr(acceptance, "evidence", batch_evidence)
+    ctl, store, _board, _observed = _pure_acceptance_fixture(tmp_path)
+    calls = []
+    created = {}
+    fail_b = True
+    try:
+        ctl.accept_validated_plan("plan-1")
+
+        def piece(plan_id, ticket_id, *, request_id=None):
+            nonlocal fail_b
+            calls.append(ticket_id)
+            attempts = 0 if ticket_id in created else 1
+            if ticket_id == "TK-B" and fail_b:
+                return {"outcome": "partial", "task_id": None, "plan_id": plan_id,
+                        "ticket_id": ticket_id, "operation_key": "op-" + ticket_id,
+                        "actions_attempted": attempts, "reason": "injected partial"}
+            task_id = "piece-" + ticket_id
+            created[ticket_id] = task_id
+            return {"outcome": "held", "task_id": task_id, "plan_id": plan_id,
+                    "ticket_id": ticket_id, "operation_key": "op-" + ticket_id,
+                    "actions_attempted": attempts}
+
+        monkeypatch.setattr(ctl, "prepare_active_piece", piece)
+        first = ctl.prepare_active_tranche("plan-1")
+        assert calls == ["TK-A", "TK-B"]
+        assert first["outcome"] == "partial"
+        assert first["completed"] == 1 and first["total"] == 2
+        assert first["actions_attempted"] == 2
+        assert tuple(piece["outcome"] for piece in first["pieces"]) == ("held", "partial")
+
+        fail_b = False
+        retry = ctl.prepare_active_tranche("plan-1")
+        assert calls == ["TK-A", "TK-B", "TK-A", "TK-B", "TK-A", "TK-B"]
+        assert retry["outcome"] == "held"
+        assert retry["completed"] == retry["total"] == 2
+        assert retry["actions_attempted"] == 1
+        assert tuple(piece["task_id"] for piece in retry["pieces"]) == ("piece-TK-A", "piece-TK-B")
+        assert len(created) == 2
+    finally:
+        store.close()
+
+
+def test_pure_batch_pause_after_first_piece_fences_next_piece(tmp_path, monkeypatch):
+    import tests.test_m4_plan_acceptance as acceptance
+    from local_first_orchestrator.contracts import ActionResult, BoardSnapshot, PauseIntent
+    from tests.test_m4_plan_evidence import SCOPE
+    original_evidence = acceptance.evidence
+    def batch_evidence():
+        base = original_evidence()
+        req = acceptance.base_request()
+        return evidence_payload(req, _batch_proposal(req), planner_task_id=base["planner"]["task_id"],
+            planner_run_id=base["planner"]["run_id"], planner_session_id=base["planner"]["session_id"], planner_profile=base["planner"]["profile"])
+    monkeypatch.setattr(acceptance, "evidence", batch_evidence)
+    ctl, store, board, _observed = _pure_acceptance_fixture(tmp_path)
+    calls = []
+    try:
+        ctl.accept_validated_plan("plan-1")
+        def read_task(task_id):
+            if task_id == "anchor-A":
+                return BoardSnapshot(native_task={"id":"anchor-A","status":"ready"}, parents=(), runs=(), comments=(), events=(), attachments=(), observed_at="now", digest="anchor-digest")
+            return BoardSnapshot(native_task={"id":"piece-A","status":"blocked","assignee":"implementer"}, parents=(), runs=(), comments=(), events=(), attachments=(), observed_at="now", digest="piece-digest")
+        board.read_task = read_task
+        def create_held(action, **kwargs):
+            calls.append(action.key)
+            receipt = read_task("piece-A")
+            return ActionResult(action.key, "verified", "verified", receipt.to_dict())
+        board.create_held = create_held
+        original_register = store.register_member
+        def register_then_pause(*args, **kwargs):
+            result = original_register(*args, **kwargs)
+            store.set_operator_intent(PauseIntent(SCOPE, "operator", 1, True, False))
+            return result
+        monkeypatch.setattr(store, "register_member", register_then_pause)
+        before_budget = tuple(store.read_scope(SCOPE)["budget_events"])
+        result = ctl.prepare_active_tranche("plan-1")
+        assert result["outcome"] == "partial"
+        assert result["completed"] == 1 and result["total"] == 2
+        assert result["actions_attempted"] == 1
+        assert tuple(piece["outcome"] for piece in result["pieces"]) == ("held", "partial")
+        assert len(calls) == 1
+        state = store.read_scope(SCOPE)
+        assert [member for member in state["members"] if member.role == "implementation"]
+        assert tuple(state["budget_events"]) == before_budget
+        retry = ctl.prepare_active_tranche("plan-1")
+        assert retry["outcome"] == "partial" and retry["actions_attempted"] == 0
+        assert len(calls) == 1
+    finally:
+        store.close()
+
+
+def test_pure_batch_post_create_observation_failure_counts_attempt(tmp_path, monkeypatch):
+    import tests.test_m4_plan_acceptance as acceptance
+    from local_first_orchestrator.contracts import ActionResult, BoardSnapshot
+    from tests.test_m4_plan_evidence import SCOPE
+    original_evidence = acceptance.evidence
+    def batch_evidence():
+        base = original_evidence()
+        req = acceptance.base_request()
+        return evidence_payload(req, _batch_proposal(req), planner_task_id=base["planner"]["task_id"],
+            planner_run_id=base["planner"]["run_id"], planner_session_id=base["planner"]["session_id"], planner_profile=base["planner"]["profile"])
+    monkeypatch.setattr(acceptance, "evidence", batch_evidence)
+    ctl, store, board, _observed = _pure_acceptance_fixture(tmp_path)
+    calls = []
+    try:
+        ctl.accept_validated_plan("plan-1")
+        def read_task(task_id):
+            if task_id == "anchor-A":
+                return BoardSnapshot(native_task={"id":"anchor-A","status":"ready"}, parents=(), runs=(), comments=(), events=(), attachments=(), observed_at="now", digest="anchor-digest")
+            return BoardSnapshot(native_task={"id":"piece-A","status":"blocked","assignee":"implementer"}, parents=(), runs=(), comments=(), events=(), attachments=(), observed_at="now", digest="piece-digest")
+        board.read_task = read_task
+        def create_held(action, **kwargs):
+            calls.append(action.key)
+            return ActionResult(action.key, "verified", "created", read_task("piece-A").to_dict())
+        board.create_held = create_held
+        original_observe = store.record_effect_observation
+        def fail_after_create(*args, **kwargs):
+            if kwargs.get("outcome"):
+                raise RuntimeError("injected durable observation failure")
+            return original_observe(*args, **kwargs)
+        monkeypatch.setattr(store, "record_effect_observation", fail_after_create)
+        result = ctl.prepare_active_tranche("plan-1")
+        assert result["outcome"] == "partial" and result["completed"] == 0
+        assert result["actions_attempted"] == 1
+        assert result["pieces"][0]["actions_attempted"] == 1
+        assert len(calls) == 1
+        assert not [m for m in store.read_scope(SCOPE)["members"] if m.role == "implementation"]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("fault", ["ack", "fresh-read", "post-ack-scope", "member-valueerror"])
+def test_pure_active_piece_post_create_faults_preserve_conservative_authority(tmp_path, monkeypatch, fault):
+    """Synthetic unit faults do not demonstrate native CLI fault behavior."""
+    from local_first_orchestrator.contracts import ActionResult, BoardSnapshot
+    from tests.test_m4_plan_evidence import SCOPE
+
+    ctl, store, board, _observed = _pure_acceptance_fixture(tmp_path)
+    acked = False
+    creates = []
+    try:
+        ctl.accept_validated_plan("plan-1")
+        anchor = BoardSnapshot(native_task={"id":"anchor-A","status":"ready"}, parents=(), runs=(), comments=(), events=(), attachments=(), observed_at="now", digest="anchor-digest")
+        piece = BoardSnapshot(native_task={"id":"piece-A","status":"blocked","assignee":"implementer"}, parents=(), runs=(), comments=(), events=(), attachments=(), observed_at="now", digest="piece-digest")
+        def read_task(task_id):
+            if task_id == "anchor-A":
+                return anchor
+            if fault == "fresh-read" and acked:
+                raise OSError("injected fresh-read fault")
+            return piece
+        board.read_task = read_task
+        def create_held(action, **kwargs):
+            creates.append(action.key)
+            store.begin_effect_attempt(SCOPE, action.key)
+            return ActionResult(action.key, "verified", "created", piece.to_dict())
+        board.create_held = create_held
+        original_ack = store.ack_effect
+        def injected_ack(*args, **kwargs):
+            nonlocal acked
+            if fault == "ack":
+                raise RuntimeError("injected ack fault")
+            value = original_ack(*args, **kwargs)
+            acked = True
+            return value
+        store.ack_effect = injected_ack
+        original_scope = store.read_scope
+        def injected_scope(scope):
+            if fault == "post-ack-scope" and acked:
+                raise RuntimeError("injected post-ack scope fault")
+            return original_scope(scope)
+        store.read_scope = injected_scope
+        original_register = store.register_member
+        def injected_register(member):
+            if fault == "member-valueerror":
+                raise ValueError("injected member ValueError")
+            return original_register(member)
+        store.register_member = injected_register
+        before_budget = tuple(original_scope(SCOPE)["budget_events"])
+        result = ctl.prepare_active_tranche("plan-1")
+        assert result["outcome"] == "partial"
+        assert result["completed"] == 0 and result["actions_attempted"] == 1
+        assert result["pieces"][0]["actions_attempted"] == 1
+        assert result["pieces"][0]["reason"]
+        assert len(creates) == 1
+        state = original_scope(SCOPE)
+        operation = next(op for op in state["operations"] if op.key == creates[0])
+        assert operation.phase == ("unknown" if fault == "ack" else "applied")
+        assert not [m for m in state["members"] if m.role == "implementation"]
+        assert tuple(state["budget_events"]) == before_budget
+        if fault != "ack":
+            assert operation.readback["native_task"] == piece.native_task
+            assert operation.readback["digest"] == piece.digest
+    finally:
+        store.close()
 
 
 def test_active_piece_root_gate_counts_all_root_role_members_before_ticket_filter(tmp_path):
@@ -312,6 +559,40 @@ def test_pure_active_piece_rejects_forged_acknowledged_receipt_read_only(
         after = next(op for op in state["operations"] if op.key == target.operation_key)
         assert after.phase == "applied"
         assert after.readback == before.readback
+    finally:
+        store.close()
+
+
+def test_native_active_tranche_batch_and_replay_are_held_only(tmp_path, native_fixture, monkeypatch):
+    (board, anchor, workspace, adapter, membership, cli, controller, store, scope,
+     accepted, request_id) = _accepted_plan(tmp_path, native_fixture, monkeypatch, proposal_factory=_batch_proposal)
+    plan_id = accepted["plan_id"]
+    try:
+        before = _piece_task_ids(cli)
+        budget_before = tuple(store.read_scope(scope)["budget_events"])
+        first = controller.prepare_active_tranche(plan_id, request_id=request_id)
+        assert first["outcome"] == "held", first
+        assert first["completed"] == first["total"] == 2
+        assert tuple(p["ticket_id"] for p in first["pieces"]) == ("TK-A", "TK-B")
+        assert all(p["outcome"] == "held" for p in first["pieces"])
+        assert sum(p["actions_attempted"] for p in first["pieces"]) == 2
+        state = store.read_scope(scope)
+        members = []
+        for piece in first["pieces"]:
+            operation = next(op for op in state["operations"] if op.key == piece["operation_key"])
+            member = next(m for m in state["members"] if m.work_association == operation.target["association"])
+            card = adapter.read_task(member.task_id)
+            assert card.native_task["status"] == "blocked" and not card.parents and not card.runs
+            assert member.generation == 0 and member.task_id not in before
+            members.append(member)
+        assert tuple(state["budget_events"]) == budget_before
+        after_create = _piece_task_ids(cli)
+        replay = controller.prepare_active_tranche(plan_id, request_id=request_id)
+        assert replay["outcome"] == "held" and replay["completed"] == replay["total"] == 2
+        assert tuple(p["task_id"] for p in replay["pieces"]) == tuple(m.task_id for m in members)
+        assert replay["actions_attempted"] == 0
+        assert _piece_task_ids(cli) == after_create
+        assert tuple(store.read_scope(scope)["budget_events"]) == budget_before
     finally:
         store.close()
 
