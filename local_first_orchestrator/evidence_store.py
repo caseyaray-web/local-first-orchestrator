@@ -16,8 +16,10 @@ import stat
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .budgets import CATEGORIES, GENERAL_ATTEMPT, PAID_CAPACITY
 from .contracts import (
     ActionResult,
+    BoardSnapshot,
     CandidateIdentity,
     ConflictError,
     ManagedMember,
@@ -108,6 +110,124 @@ def _canonical_identity(value: Any) -> str:
 
 def _sha256(value: Any) -> str:
     return "sha256:" + _canonical_identity(value)
+
+
+def _paid_release_sources(connection: sqlite3.Connection, board: str, anchor: str, key: str) -> tuple[OperationIntent, dict[str, Any], sqlite3.Row]:
+    """Reconstruct and cross-check the complete immutable reservation source."""
+    op = connection.execute("SELECT board_id,anchor_task_id,operation_key,intent_json FROM operation_intents WHERE board_id=? AND anchor_task_id=? AND operation_key=?", (board, anchor, key)).fetchone()
+    if op is None:
+        raise ValueError("paid release intent is missing")
+    if (op["board_id"] != board or op["anchor_task_id"] != anchor or op["operation_key"] != key
+            or not all(_nonempty_string(op[name]) for name in ("board_id", "anchor_task_id", "operation_key", "intent_json"))):
+        raise ValueError("paid release intent row identity is malformed")
+    raw_intent = op["intent_json"]
+    intent_data = _decode(raw_intent)
+    if not isinstance(intent_data, dict) or _json(intent_data) != raw_intent:
+        raise ValueError("paid release intent is not canonical")
+    intent = OperationIntent.from_dict(intent_data)
+    if intent.to_dict() != intent_data:
+        raise ValueError("paid release intent encoding is malformed")
+    target = dict(intent.target)
+    if (intent.key != key or dict(intent.scope) != {"board_id": board, "anchor_task_id": anchor}
+            or intent.effect != "release" or set(target) != {"task_id", "request_id", "member_generation", "profile"}
+            or not all(_nonempty_string(target.get(k)) for k in ("task_id", "request_id", "profile"))
+            or type(target.get("member_generation")) is not int or target["member_generation"] < 0):
+        raise ValueError("paid release intent identity is malformed")
+    rows = connection.execute("SELECT board_id,anchor_task_id,event_id,source_kind,native_source_id,event_json FROM budget_events WHERE board_id=? AND anchor_task_id=? AND source_kind='native_operation' AND native_source_id=?", (board, anchor, key)).fetchall()
+    if len(rows) != 1:
+        raise ValueError("paid release must have exactly one native operation charge")
+    row = rows[0]
+    raw_event = row["event_json"]
+    event = _decode(raw_event)
+    required = {"event_id", "lineage_id", "root_task_id", "finding_id", "generation", "source_task_id", "source_kind", "native_source_id", "count"}
+    expected_id = f"paid_capacity:{key}"
+    if (not isinstance(event, dict) or not _nonempty_string(raw_event) or _json(event) != raw_event or set(event) != required
+            or event != {"event_id": expected_id, "lineage_id": f"{anchor}:__general_attempt__", "root_task_id": anchor,
+                         "finding_id": "__general_attempt__", "generation": target["member_generation"],
+                         "source_task_id": target["task_id"], "source_kind": "native_operation", "native_source_id": key, "count": 1}
+            or row["event_id"] != expected_id or row["source_kind"] != "native_operation" or row["native_source_id"] != key):
+        raise ValueError("paid release charge does not reconstruct exactly")
+    member = connection.execute("SELECT role,generation,work_association FROM managed_members WHERE board_id=? AND anchor_task_id=? AND task_id=?", (board, anchor, target["task_id"])).fetchone()
+    if (member is None or not all(_nonempty_string(member[name]) for name in ("role", "work_association"))
+            or member["role"] != "planner" or type(member["generation"]) is not int
+            or member["generation"] != target["member_generation"] or member["work_association"] != target["request_id"]):
+        raise ValueError("paid release member association is malformed")
+    return intent, event, member
+
+
+def _paid_capacity_total(connection: sqlite3.Connection, board: str, anchor: str) -> int:
+    """Validate every scoped budget row before counting all paid-capacity charges."""
+    rows = connection.execute("SELECT board_id,anchor_task_id,event_id,source_kind,native_source_id,event_json FROM budget_events WHERE board_id=? AND anchor_task_id=?", (board, anchor)).fetchall()
+    total = 0
+    required = {"event_id", "lineage_id", "root_task_id", "finding_id", "generation", "source_task_id", "source_kind", "native_source_id", "count"}
+    for row in rows:
+        try:
+            raw = row["event_json"]
+            event = _decode(raw)
+            if (not isinstance(event, dict) or not _nonempty_string(raw) or _json(event) != raw or set(event) != required
+                    or not all(_nonempty_string(event.get(name)) for name in ("event_id", "lineage_id", "root_task_id", "finding_id", "source_task_id", "source_kind", "native_source_id"))
+                    or type(event.get("generation")) is not int or event["generation"] < 0
+                    or type(event.get("count")) is not int or event["count"] <= 0
+                    or event["source_kind"] not in {"native_run", "native_operation"}
+                    or row["board_id"] != board or row["anchor_task_id"] != anchor
+                    or row["event_id"] != event["event_id"] or row["source_kind"] != event["source_kind"]
+                    or row["native_source_id"] != event["native_source_id"]
+                    or event["root_task_id"] != anchor or event["lineage_id"] != f"{anchor}:{event['finding_id']}"):
+                raise ValueError("budget event fields or row correspondence are malformed")
+            member = connection.execute("SELECT generation,finding_ids_json FROM managed_members WHERE board_id=? AND anchor_task_id=? AND task_id=?", (board, anchor, event["source_task_id"])).fetchone()
+            if member is None or type(member["generation"]) is not int or member["generation"] != event["generation"]:
+                raise ValueError("budget event member generation is malformed")
+            findings_raw = member["finding_ids_json"]
+            findings = _decode(findings_raw)
+            if not isinstance(findings, list) or _json(findings) != findings_raw or (event["finding_id"] != "__general_attempt__" and event["finding_id"] not in findings):
+                raise ValueError("budget event member finding association is malformed")
+            category, separator, suffix = event["event_id"].partition(":")
+            if not separator or category not in CATEGORIES or not suffix or suffix != event["native_source_id"]:
+                raise ValueError("budget event category or native source suffix is malformed")
+            is_paid_capacity = category == PAID_CAPACITY
+            if is_paid_capacity:
+                if (event["finding_id"] != GENERAL_ATTEMPT or event["lineage_id"] != f"{anchor}:{GENERAL_ATTEMPT}"
+                        or type(event["count"]) is not int or event["count"] != 1):
+                    raise ValueError("paid capacity event must be one general-attempt charge")
+                if event["source_kind"] == "native_operation":
+                    source = connection.execute("SELECT intent_json FROM operation_intents WHERE board_id=? AND anchor_task_id=? AND operation_key=?", (board, anchor, event["native_source_id"])).fetchone()
+                    if source is None:
+                        raise ValueError("paid capacity operation intent is missing")
+                    intent_data = _decode(source[0])
+                    if not isinstance(intent_data, dict) or _json(intent_data) != source[0]:
+                        raise ValueError("paid capacity operation intent is noncanonical")
+                    intent = OperationIntent.from_dict(intent_data)
+                    target = dict(intent.target)
+                    if (intent.effect != "release" or intent.key != event["native_source_id"] or event["event_id"] != f"paid_capacity:{intent.key}"
+                            or intent.phase not in {"pending", "unknown", "applied"} or target.get("task_id") != event["source_task_id"]
+                            or target.get("member_generation") != event["generation"] or event["count"] != 1):
+                        raise ValueError("paid capacity operation attribution is malformed")
+                total += event["count"]
+        except (TypeError, KeyError, ValueError, UnicodeError) as error:
+            raise SchemaError("existing paid capacity evidence is malformed") from error
+    return total
+
+
+def _validate_paid_receipt(intent: OperationIntent) -> dict[str, Any]:
+    """Require the canonical transport snapshot receipt and release proof."""
+    try:
+        receipt = intent.to_dict()["readback"]
+        if not isinstance(receipt, dict) or set(receipt) != set(BoardSnapshot.__dataclass_fields__):
+            raise ValueError("receipt fields mismatch")
+        snapshot = BoardSnapshot.from_dict(receipt)
+        target = dict(intent.target)
+        task = dict(snapshot.native_task)
+        if (task.get("id") != target["task_id"] or task.get("assignee") != target["profile"]
+                or task.get("status") not in {"ready", "todo"}):
+            raise ValueError("receipt task/profile/lane mismatch")
+        marker_data = _json({"action_key": intent.key, "anchor_task_id": intent.scope["anchor_task_id"], "board_id": intent.scope["board_id"], "effect": "release"})
+        marker = "<!-- local-first-native:v1:sha256:" + hashlib.sha256(marker_data.encode("utf-8")).hexdigest() + " -->"
+        comments = [c for c in snapshot.comments if c.get("body") == f"UNBLOCK: {marker}"]
+        if len(comments) != 1 or any(marker in str(c.get("body", "")) for c in snapshot.comments if c not in comments):
+            raise ValueError("receipt release proof is not exact")
+        return snapshot.to_dict()
+    except (TypeError, KeyError, ValueError) as error:
+        raise ConflictError("paid release requires an exact canonical BoardSnapshot release receipt") from error
 
 
 def _validate_records(value: Any, *, fields: tuple[str, ...], name: str, outcomes: frozenset[str] | None = None) -> list[dict[str, str]]:
@@ -811,6 +931,188 @@ class EvidenceStore:
             self.connection.rollback()
             raise
         return intent
+
+    def reserve_paid_release(
+        self, scope: Mapping[str, Any], intent: OperationIntent,
+        event: Mapping[str, Any], *, policy_limit: int,
+    ) -> OperationIntent:
+        """Atomically journal a paid-release intent and retain its capacity charge.
+
+        This only reserves evidence before native I/O; it neither performs nor
+        authorizes a release. Caller-supplied data is validated as attribution,
+        not treated as native verification.
+        """
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        if not isinstance(intent, OperationIntent):
+            raise ValueError("paid release requires an OperationIntent")
+        if not isinstance(policy_limit, int) or isinstance(policy_limit, bool) or policy_limit < 0:
+            raise ValueError("paid release policy limit must be a non-negative integer")
+        if intent.effect != "release" or dict(intent.scope) != {"board_id": board, "anchor_task_id": anchor}:
+            raise ConflictError("paid release intent effect or scope is invalid")
+        target = dict(intent.target)
+        fields = {"task_id", "request_id", "member_generation", "profile"}
+        if set(target) != fields or not all(_nonempty_string(target.get(k)) for k in ("task_id", "request_id", "profile")):
+            raise ValueError("paid release target must bind task, request, generation, and profile")
+        generation = target["member_generation"]
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+            raise ValueError("paid release member generation must be a non-negative integer")
+        if intent.phase != "pending" or intent.outcome is not None or intent.readback is not None:
+            raise ConflictError("paid release reservation must be pending before native I/O")
+        if not isinstance(event, Mapping) or set(event) != {"event_id", "lineage_id", "root_task_id", "finding_id", "generation", "source_task_id", "source_kind", "native_source_id", "count"}:
+            raise ValueError("paid release event has an invalid attribution shape")
+        if not all(_nonempty_string(event.get(k)) for k in ("event_id", "lineage_id", "root_task_id", "finding_id", "source_task_id", "source_kind", "native_source_id")):
+            raise ValueError("paid release event requires non-empty attribution identities")
+        if event["source_kind"] != "native_operation" or event["native_source_id"] != intent.key or type(event["count"]) is not int or event["count"] != 1:
+            raise ConflictError("paid release event must charge one unit to its operation key")
+        if not isinstance(event["generation"], int) or isinstance(event["generation"], bool) or event["generation"] < 0:
+            raise ValueError("paid release event generation must be a non-negative integer")
+        if event["event_id"] != f"paid_capacity:{intent.key}" or event["root_task_id"] != anchor or event["finding_id"] != "__general_attempt__" or event["lineage_id"] != f"{anchor}:__general_attempt__":
+            raise ConflictError("paid release event category, root, or lineage is invalid")
+        if event["source_task_id"] != target["task_id"] or event["generation"] != generation:
+            raise ConflictError("paid release event planner task or generation differs from intent")
+        op_payload, event_payload = _json(intent.to_dict()), _json(dict(event))
+        member = self.connection.execute(
+            "SELECT role, generation, work_association FROM managed_members WHERE board_id=? AND anchor_task_id=? AND task_id=?",
+            (board, anchor, target["task_id"]),
+        ).fetchone()
+        if member is None or member["role"] != "planner" or member["generation"] != generation:
+            raise ConflictError("paid release task is not the matching managed planner member")
+        if member["work_association"] != target["request_id"]:
+            raise ConflictError("paid release request does not match planner work association")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            old = self.connection.execute("SELECT intent_json FROM operation_intents WHERE board_id=? AND anchor_task_id=? AND operation_key=?", (board, anchor, intent.key)).fetchone()
+            charge = self.connection.execute("SELECT event_json FROM budget_events WHERE board_id=? AND anchor_task_id=? AND event_id=?", (board, anchor, event["event_id"])).fetchone()
+            if old is not None:
+                stored = OperationIntent.from_dict(_decode(old[0]))
+                stored_identity, requested_identity = stored.to_dict(), intent.to_dict()
+                for field in ("outcome", "readback", "phase"):
+                    stored_identity.pop(field)
+                    requested_identity.pop(field)
+                if stored_identity != requested_identity or charge is None or charge[0] != event_payload:
+                    raise ConflictError("paid release retry conflicts with existing intent or charge")
+                self.connection.commit()
+                return stored
+            source = self.connection.execute("SELECT event_json FROM budget_events WHERE board_id=? AND anchor_task_id=? AND source_kind=? AND native_source_id=?", (board, anchor, "native_operation", intent.key)).fetchone()
+            if source is not None or charge is not None:
+                raise ConflictError("paid release source or event identity is already attributed")
+            charged = _paid_capacity_total(self.connection, board, anchor)
+            if charged + 1 > policy_limit:
+                raise ConflictError("paid release capacity policy limit is exhausted")
+            self.connection.execute("INSERT INTO budget_events VALUES (?, ?, ?, ?, ?, ?)", (board, anchor, event["event_id"], "native_operation", intent.key, event_payload))
+            self.connection.execute("INSERT INTO operation_intents VALUES (?, ?, ?, ?)", (board, anchor, intent.key, op_payload))
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
+        return intent
+
+    def bind_paid_release_to_native_run(
+        self, scope: Mapping[str, Any], release_operation_key: str, task_id: str,
+        member_generation: int, profile: str, run_id: str, session_id: str,
+        native_run: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Immutably corroborate one already charged, applied release with a run.
+
+        This records evidence only; ownership/authorization of the native run is
+        the coordinator's responsibility. The observed run payload is immutable.
+        """
+        from .budgets import classify_run_start
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        if not all(_nonempty_string(value) for value in (release_operation_key, task_id, profile, run_id, session_id)):
+            raise ValueError("release, task, profile, run, and session identities must be non-empty strings")
+        if not isinstance(member_generation, int) or isinstance(member_generation, bool) or member_generation < 0:
+            raise ValueError("member_generation must be a non-negative integer")
+        if not isinstance(native_run, Mapping):
+            raise ValueError("native_run must be a mapping")
+        run = dict(native_run)
+        if not all(_nonempty_string(run.get(field)) for field in ("id", "task_id", "profile", "status")):
+            raise ConflictError("native run requires exact non-empty id, task, profile, and status")
+        if run["id"] != run_id or run["task_id"] != task_id or run["profile"] != profile:
+            raise ConflictError("native run identity differs from requested binding")
+        if "worker_session_id" in run and run["worker_session_id"] != session_id:
+            raise ConflictError("native run session differs from requested binding")
+        classification = classify_run_start(run)
+        if classification == "pre_start_failure":
+            raise ConflictError("a pre-start failure cannot be bound to paid capacity")
+        canonical = _json(run)
+        digest = _sha256(run)
+        request_identity = None
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            intent_row = self.connection.execute("SELECT intent_json FROM operation_intents WHERE board_id=? AND anchor_task_id=? AND operation_key=?", (board, anchor, release_operation_key)).fetchone()
+            if intent_row is None:
+                raise ConflictError("paid release reservation is missing")
+            intent = OperationIntent.from_dict(_decode(intent_row[0]))
+            target = dict(intent.target)
+            event_row = self.connection.execute("SELECT event_json FROM budget_events WHERE board_id=? AND anchor_task_id=? AND source_kind='native_operation' AND native_source_id=?", (board, anchor, release_operation_key)).fetchone()
+            if (intent.effect != "release" or intent.phase != "applied" or intent.outcome not in {"verified", "no-op"}
+                    or target.get("task_id") != task_id or target.get("member_generation") != member_generation
+                    or target.get("profile") != profile or not _nonempty_string(target.get("request_id")) or event_row is None):
+                raise ConflictError("binding requires the exact applied paid release and reservation")
+            _validate_paid_receipt(intent)
+            intent, event, member = _paid_release_sources(self.connection, board, anchor, release_operation_key)
+            if intent.phase != "applied" or intent.outcome not in {"verified", "no-op"}:
+                raise ConflictError("paid release reservation event is malformed")
+            request_identity = target["request_id"]
+
+            existing = self.connection.execute("SELECT * FROM paid_release_run_bindings WHERE board_id=? AND anchor_task_id=? AND release_operation_key=?", (board, anchor, release_operation_key)).fetchone()
+            identity = (task_id, member_generation, request_identity, run_id, session_id, profile, classification, canonical, digest)
+            if existing is not None:
+                stored = tuple(existing[k] for k in ("task_id", "member_generation", "request_identity", "native_run_id", "native_session_id", "native_profile", "run_classification", "native_run_json", "native_run_sha256"))
+                if stored != identity:
+                    raise ConflictError("paid release binding conflicts with immutable existing evidence")
+                self.connection.commit()
+                return self.read_paid_release_run_binding(scope, release_operation_key)
+            self.connection.execute("INSERT INTO paid_release_run_bindings VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (board, anchor, release_operation_key, *identity))
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
+        return self.read_paid_release_run_binding(scope, release_operation_key)
+
+    def read_paid_release_run_binding(self, scope: Mapping[str, Any], release_operation_key: str) -> Mapping[str, Any]:
+        """Read and strictly validate a binding against its immutable source rows."""
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        if not _nonempty_string(release_operation_key):
+            raise ValueError("release_operation_key must be non-empty")
+        row = self.connection.execute("SELECT * FROM paid_release_run_bindings WHERE board_id=? AND anchor_task_id=? AND release_operation_key=?", (board, anchor, release_operation_key)).fetchone()
+        if row is None:
+            raise KeyError("paid release run binding does not exist")
+        try:
+            required_text = ("board_id", "anchor_task_id", "release_operation_key", "task_id", "request_identity", "native_run_id", "native_session_id", "native_profile", "run_classification", "native_run_json", "native_run_sha256")
+            if any(not _nonempty_string(row[field]) for field in required_text) or type(row["member_generation"]) is not int or row["member_generation"] < 0:
+                raise ValueError("binding row fields are malformed")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", row["native_run_id"]):
+                raise ValueError("binding run identifier is malformed")
+            raw = row["native_run_json"]
+            run = _decode(raw)
+            if not isinstance(run, dict) or _json(run) != raw or _sha256(run) != row["native_run_sha256"]:
+                raise ValueError("paid release binding run payload or hash is corrupt")
+            if not all(_nonempty_string(run.get(field)) for field in ("id", "task_id", "profile", "status")):
+                raise ValueError("native run fields are malformed")
+            intent, event, member = _paid_release_sources(self.connection, board, anchor, release_operation_key)
+            target = dict(intent.target)
+            _validate_paid_receipt(intent)
+            if (intent.effect != "release" or intent.phase != "applied" or intent.outcome not in {"verified", "no-op"}
+                    or target != {"task_id": row["task_id"], "request_id": row["request_identity"], "member_generation": row["member_generation"], "profile": row["native_profile"]}
+
+                    or member is None or member["role"] != "planner" or member["generation"] != row["member_generation"] or member["work_association"] != row["request_identity"]
+                    or run.get("id") != row["native_run_id"] or run.get("task_id") != row["task_id"] or run.get("profile") != row["native_profile"]
+                    or ("worker_session_id" in run and (not _nonempty_string(run["worker_session_id"]) or run["worker_session_id"] != row["native_session_id"]))):
+                raise ValueError("binding identities do not reconstruct from immutable source evidence")
+            from .budgets import classify_run_start
+            if classify_run_start(run) != row["run_classification"] or row["run_classification"] == "pre_start_failure":
+                raise ValueError("binding run classification is inconsistent")
+        except (TypeError, KeyError, ValueError, IndexError, UnicodeError) as error:
+            raise SchemaError("paid release binding source evidence is malformed") from error
+        return {"scope": {"board_id": board, "anchor_task_id": anchor}, "release_operation_key": release_operation_key,
+                "task_id": row["task_id"], "member_generation": row["member_generation"], "request_identity": row["request_identity"],
+                "run_id": row["native_run_id"], "session_id": row["native_session_id"], "profile": row["native_profile"],
+                "classification": row["run_classification"], "native_run": run, "native_run_sha256": row["native_run_sha256"]}
 
     def _operation(self, scope: Mapping[str, Any], key: str) -> OperationIntent:
         board, anchor = _scope_values(scope)
