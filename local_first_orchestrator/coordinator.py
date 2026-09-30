@@ -170,6 +170,110 @@ class Coordinator:
             self.store.register_member(member)
             return {"outcome": "held", "task_id": member.task_id}
 
+    def release_planner(self, *, request_id: str | None = None,
+                        planning_profile: str | None = None) -> Mapping[str, Any]:
+        """Reserve paid capacity, then release one exact managed held planner.
+
+        This seam stops at native ready state; worker-run registration and
+        paid-release binding are intentionally not integrated here.
+        """
+        from .planning_coordinator import request_from_payload
+        profile = self._planning_roles()
+        if planning_profile is not None and planning_profile != profile:
+            raise ValueError("requested planner profile does not match configured planner role")
+        if self.planning_profile is not None and self.planning_profile != profile:
+            raise ValueError("configured planner profile changed")
+        if self.planning_observer is None or not isinstance(self.budget_policy, BudgetPolicy):
+            raise ValueError("trusted planning observer and explicit finite budgets are required")
+        workspace = self.planning_workspace
+        if (not isinstance(workspace, str) or not os.path.isabs(workspace)
+                or os.path.realpath(workspace) != workspace or not os.path.isdir(workspace)
+                or os.path.islink(workspace)):
+            raise ValueError("trusted persistent planning workspace must be an existing canonical absolute directory")
+        with self.lock:
+            self._assert_lock()
+            state = self.store.read_scope(self.scope)
+            pause = state["operator_intent"]
+            if pause is not None and pause.active:
+                raise ValueError("planner release is fenced by active pause/cancellation")
+            observed = self.planning_observer(dict(self.scope))
+            if not isinstance(observed, Mapping) or set(observed) != {"request"}:
+                raise ValueError("trusted planning observer returned malformed observation")
+            request = request_from_payload(observed["request"])
+            if request.board_id != self.scope["board_id"] or request.anchor_id != self.scope["anchor_task_id"]:
+                raise ValueError("trusted planning request has wrong scope")
+            identity = request.identity
+            if request_id is not None and (type(request_id) is not str or not request_id.strip() or len(request_id) > 256):
+                raise ValueError("request_id must be a non-empty string of at most 256 characters")
+            creates = [op for op in state["operations"] if op.effect == "create_held" and op.phase == "applied"
+                       and op.target.get("request_identity") == identity
+                       and op.target.get("task_id") == self.scope["anchor_task_id"]
+                       and op.target.get("request_id") == request_id]
+            members = [m for m in state["members"] if m.role == "planner" and m.work_association == identity]
+            if len(creates) != 1 or len(members) != 1:
+                raise ValueError("exact held planner creation proof and request association are required")
+            create, member = creates[0], members[0]
+            proof = self._snapshot_from_readback(create.readback)
+            if proof is None or proof.native_task.get("id") != member.task_id:
+                raise ValueError("planner creation proof readback is invalid")
+            marker, body = create.target.get("planner_marker"), create.target.get("create_body")
+            current = self.board.read_task(member.task_id)
+            canonical = json.dumps({"scope": self.scope, "task_id": member.task_id, "request_identity": identity,
+                                    "generation": member.generation, "create_key": create.key, "action": "release_planner"},
+                                   sort_keys=True, separators=(",", ":"))
+            key = "planner-release:" + hashlib.sha256(canonical.encode()).hexdigest()
+            prior_release = next((op for op in state["operations"] if op.key == key and op.effect == "release"), None)
+            if prior_release is not None and prior_release.phase == "applied":
+                released_proof = self._snapshot_from_readback(prior_release.readback)
+                if (released_proof is None or current.digest != released_proof.digest
+                        or current.native_task.get("id") != member.task_id
+                        or current.native_task.get("status") not in {"ready", "todo"}
+                        or not any(item.get("body") == f"UNBLOCK: {self.board._native_marker(self._action_from_intent(prior_release))}"
+                                   for item in current.comments)):
+                    raise ValueError("applied release readback no longer matches exact native state")
+                return {"outcome": "released", "task_id": member.task_id, "operation_key": key, "actions_attempted": 0}
+            if (prior_release is None and (current.digest != proof.digest or current.native_task.get("status") != "blocked"
+                    or current.native_task.get("assignee") != profile or current.parents or current.runs
+                    or self.board._workspace_routing(current.native_task, f"dir:{workspace}") is not None
+                    or not isinstance(marker, Mapping) or marker.get("request_identity") != identity
+                    or marker.get("profile") != profile or marker.get("workspace") != workspace
+                    or not isinstance(body, str) or body not in current.native_task.get("body", ""))):
+                raise ValueError("planner card differs from exact held creation readback")
+            action = (self._action_from_intent(prior_release) if prior_release is not None else
+                      Action(key, self.scope, {"task_id": member.task_id, "request_id": identity,
+                                               "member_generation": member.generation, "profile": profile},
+                             "release", current.digest))
+            event = {"event_id": f"{PAID_CAPACITY}:{key}", "lineage_id": f"{self.scope['anchor_task_id']}:{GENERAL_ATTEMPT}",
+                     "root_task_id": self.scope["anchor_task_id"], "finding_id": GENERAL_ATTEMPT,
+                     "generation": member.generation, "source_task_id": member.task_id,
+                     "source_kind": "native_operation", "native_source_id": key, "count": 1}
+            stored = self.store.reserve_paid_release(self.scope, self._intent_for(action), event,
+                                                     policy_limit=self.budget_policy.paid_capacity)
+            if stored.phase == "applied":
+                latest = self.board.read_task(member.task_id)
+                if (latest.native_task.get("status") not in {"ready", "todo"}
+                        or self.board._native_marker(action) not in json.dumps(latest.comments)):
+                    raise ValueError("applied release lacks matching exact native marker/state")
+                return {"outcome": "released", "task_id": member.task_id, "operation_key": key, "actions_attempted": 0}
+            if stored.phase == "unknown":
+                verifier = getattr(self.board, "verify_effect", None)
+                result = verifier(action) if callable(verifier) else ActionResult(key, "unsupported", "marker verifier unavailable", None)
+            else:
+                self.store.begin_effect_attempt(self.scope, key)
+                try:
+                    result = self.board.release(action, member.task_id, f"local-first planner release {self.board._native_marker(action)}")
+                except Exception as error:
+                    result = ActionResult(key, "unknown", f"native release exception: {error}", None)
+            readback = self._portable_readback(result.readback)
+            self.store.record_effect_observation(self.scope, key, outcome=result.outcome, details=result.details, readback=readback)
+            if result.outcome not in {"verified", "no-op"} or not self._readback_proves(action, result):
+                return {"outcome": "partial", "reason": result.details, "task_id": member.task_id,
+                        "operation_key": key, "actions_attempted": 0 if stored.phase == "unknown" else 1}
+            assert readback is not None
+            self.store.ack_effect(self.scope, key, readback=readback, outcome=result.outcome)
+            return {"outcome": "released", "task_id": member.task_id, "operation_key": key,
+                    "actions_attempted": 0 if stored.phase == "unknown" else 1}
+
     def register_planning_request(self, planner_task_id: str, *, request_id: str | None = None) -> Mapping[str, Any]:
         """Register only the canonical request freshly observed by trusted root."""
         from .planning_coordinator import request_from_payload
