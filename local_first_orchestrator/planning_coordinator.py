@@ -8,6 +8,7 @@ import unicodedata
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping
+from .ticket import contract_payload
 from .decomposition_planner import PlanningRequest, PlanProposal, parse_proposal, request_payload, serialize_proposal
 from .decomposition_planner import topological_ticket_order
 
@@ -137,7 +138,8 @@ def _evidence_snapshot(value):
             if budget[0] > _SNAPSHOT_MAX_NODES:
                 raise ValueError("plan evidence exceeds snapshot node limit")
             result = {}
-            for key, child in dict.items(item):
+            entries = dict.items(item)
+            for key, child in entries:
                 if type(key) is not str:
                     raise ValueError("plan evidence mapping keys must be strings")
                 visit(key, depth + 1, True)
@@ -153,6 +155,7 @@ def _evidence_snapshot(value):
             if budget[0] > _SNAPSHOT_MAX_NODES:
                 raise ValueError("plan evidence exceeds snapshot node limit")
             return [visit(child, depth + 1, True) for child in list.__iter__(item)]
+
         if type(item) is str:
             if len(item) > _SNAPSHOT_MAX_STRING_CHARS:
                 raise ValueError("plan evidence string exceeds snapshot character limit")
@@ -230,6 +233,121 @@ def first_active_tranche_materialization(evidence: Mapping[str, Any], route: Act
             association=association, operation_key="active-tranche-held:" + _canonical_digest(operation_payload),
         ))
     return ActiveTrancheMaterialization(_deep_freeze(source), tranche.tranche_id, 0, tuple(targets))
+
+
+@dataclass(frozen=True)
+class AcceptedActiveTrancheCreatePayload:
+    """Pure bounded description; does not prove token store authority or perform effects."""
+    title: str
+    body: str
+    target: Mapping[str, Any]
+    idempotency_key: str
+
+
+def accepted_active_tranche_create_payload(accepted_token, evidence, target: HeldCardTarget) -> AcceptedActiveTrancheCreatePayload:
+    """Build a deterministic description from plain-JSON token/evidence transport.
+
+    Caller invokes the store's strict reader, then explicitly constructs detached
+    plain-JSON transport from that trusted read. This builder validates transport
+    self-consistency only; it establishes no acceptance authority.
+    """
+    if type(target) is not HeldCardTarget:
+        raise ValueError("exact HeldCardTarget required")
+    target_fields = tuple(HeldCardTarget.__dataclass_fields__)
+    try:
+        target_values = {name: object.__getattribute__(target, name) for name in target_fields}
+        target_dict = object.__getattribute__(target, "__dict__")
+    except AttributeError as error:
+        raise ValueError("HeldCardTarget fields are incomplete") from error
+    if type(target_dict) is not dict:
+        raise ValueError("HeldCardTarget fields are incomplete or contain extras")
+    target_keys = tuple(dict.keys(target_dict))
+    if any(type(key) is not str for key in target_keys) or set(target_keys) != set(target_fields):
+        raise ValueError("HeldCardTarget fields are incomplete or contain extras")
+    for name in ("ticket_id", "ticket_contract_hash", "tranche_id", "implementation_profile", "workspace", "association", "operation_key", "initial_status"):
+        value = target_values[name]
+        if type(value) is not str:
+            raise ValueError("HeldCardTarget string fields must be exact strings")
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError("HeldCardTarget string field is not UTF-8") from error
+    if type(target_values["tranche_ordinal"]) is not int:
+        raise ValueError("HeldCardTarget ordinal must be an exact integer")
+    if target_values["native_parent"] is not False:
+        raise ValueError("HeldCardTarget native_parent must be false")
+    for name in ("criterion_ids", "declared_dependencies"):
+        value = target_values[name]
+        if type(value) is not tuple or any(type(item) is not str for item in value):
+            raise ValueError("HeldCardTarget identifier collections must be exact string tuples")
+    if type(accepted_token) is not dict:
+        raise ValueError("accepted token must be plain-JSON transport")
+    token = _evidence_snapshot(accepted_token)
+    snapshot = _evidence_snapshot(evidence)
+    fields = {"schema_version", "plan_id", "request_identity", "proposal_hash", "plan_contract_hash", "planner",
+              "repository_identity", "base_sha", "snapshot_hash", "root_contract_hash", "active_tranche", "route",
+              "acceptance_identity"}
+    if type(token) is not dict or set(token) != fields:
+        raise ValueError("accepted token schema mismatch")
+    if type(token["schema_version"]) is not int or token["schema_version"] != 1:
+        raise ValueError("accepted token schema version invalid")
+    identity = token["acceptance_identity"]
+    if type(identity) is not str or len(identity) != 71 or not identity.startswith("sha256:") or any(c not in "0123456789abcdef" for c in identity[7:]):
+        raise ValueError("accepted token identity malformed")
+    expected_identity = "sha256:" + _canonical_digest({k: v for k, v in token.items() if k != "acceptance_identity"})
+    if identity != expected_identity:
+        raise ValueError("accepted token identity mismatch")
+    if type(token["active_tranche"]) is not dict or set(token["active_tranche"]) != {"tranche_id", "ordinal"} or type(token["active_tranche"]["ordinal"]) is not int or token["active_tranche"]["ordinal"] != 0:
+        raise ValueError("accepted token tranche invalid")
+    if type(token["route"]) is not dict or set(token["route"]) != {"implementation_profile", "workspace"}:
+        raise ValueError("accepted token route invalid")
+    route = ActiveTrancheRoute(token["route"]["implementation_profile"], token["route"]["workspace"])
+    materialized = first_active_tranche_materialization(snapshot, route)
+    request, proposal = reconstruct_evidence(snapshot)
+    tranche = proposal.plan.tranches[0]
+    expected = {"schema_version": 1, "plan_id": proposal.plan.plan_id, "request_identity": request.identity,
+        "proposal_hash": proposal.proposal_hash, "plan_contract_hash": proposal.plan.contract_hash,
+        "planner": snapshot["planner"], "repository_identity": request.repository_identity,
+        "base_sha": request.base_sha, "snapshot_hash": request.snapshot_hash,
+        "root_contract_hash": request.root_contract_hash,
+        "active_tranche": {"tranche_id": tranche.tranche_id, "ordinal": 0}, "route": token["route"]}
+    if any(type(token[k]) is not type(v) or token[k] != v for k, v in expected.items()):
+        raise ValueError("accepted token/source mismatch")
+    selected = next((item for item in materialized.targets if item.ticket_id == target_values["ticket_id"]), None)
+    if selected is None:
+        raise ValueError("target is not a selected first-tranche ticket")
+    for name in target_fields:
+        actual, wanted = target_values[name], object.__getattribute__(selected, name)
+        if type(actual) is not type(wanted) or actual != wanted:
+            raise ValueError("target does not exactly match reconstructed selected ticket")
+    ticket = next(t for t in tranche.tickets if t.ticket_id == selected.ticket_id)
+    semantic = proposal.tranche_semantics[0]
+    statements = dict(request.criterion_statements)
+    body_obj = {"schema_version": 1, "kind": "accepted_active_tranche_piece_v1",
+        "accepted_token_key": "accept-plan:" + identity, "accepted_token": token,
+        "ticket": contract_payload(ticket), "ticket_contract_hash": ticket.contract_hash,
+        "criterion_statements": [{"criterion": c, "statement": statements[c]} for c in ticket.criterion_ids],
+        "tranche_semantics": {"objective": semantic.objective, "non_goals": list(semantic.non_goals)},
+        "repository": {"repository_identity": request.repository_identity, "base_sha": request.base_sha,
+            "snapshot_hash": request.snapshot_hash, "root_contract_hash": request.root_contract_hash},
+        "association": {"operation_key": selected.operation_key,
+            "declared_dependencies": list(ticket.dependencies), "native_parent": False,
+            "native_dependencies": [], "initial_status": "blocked"},
+        "route": {"implementation_profile": route.implementation_profile, "workspace": selected.workspace}}
+    body = json.dumps(body_obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    title = ticket.ticket_id + ": " + ticket.objective
+    if len(title) > 512:
+        raise ValueError("ticket title exceeds bounded display limit")
+    target_payload = _deep_freeze({"kind": "accepted_active_tranche_piece_v1", "title": title, "body": body,
+        "assignee": route.implementation_profile, "workspace": selected.workspace,
+        "idempotency_key": selected.operation_key, "association": selected.association,
+        "accepted_token_key": "accept-plan:" + identity, "ticket_id": ticket.ticket_id,
+        "ticket_contract_hash": ticket.contract_hash, "tranche_id": tranche.tranche_id,
+        "tranche_ordinal": 0, "source_hashes": {"request_identity": request.identity,
+            "proposal_hash": proposal.proposal_hash, "plan_contract_hash": proposal.plan.contract_hash,
+            "acceptance_identity": identity}, "role": "implementation", "native_parent": False,
+        "eligibility": "future_adapter_review_required"})
+    return AcceptedActiveTrancheCreatePayload(title, body, target_payload, selected.operation_key)
 
 def request_from_payload(value: Mapping[str, Any]) -> PlanningRequest:
     if not isinstance(value, Mapping) or set(value) != set(PlanningRequest.__dataclass_fields__): raise ValueError("planning request fields mismatch")

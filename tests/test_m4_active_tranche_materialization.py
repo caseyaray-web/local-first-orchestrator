@@ -341,3 +341,216 @@ def test_snapshot_rejects_string_and_integer_subclasses_without_hooks():
         _evidence_snapshot(HostileInt(1))
     assert HostileString.called is False
     assert HostileInt.called is False
+
+
+def accepted_fixture():
+    req, proposal, evidence = fixture()
+    from local_first_orchestrator.planning_coordinator import ActiveTrancheRoute
+    route_value = ActiveTrancheRoute("local-coder", "/work/repo")
+    materialized = first_active_tranche_materialization(evidence, route_value)
+    token = {"schema_version": 1, "plan_id": proposal.plan.plan_id,
+        "request_identity": req.identity, "proposal_hash": proposal.proposal_hash,
+        "plan_contract_hash": proposal.plan.contract_hash, "planner": evidence["planner"],
+        "repository_identity": req.repository_identity, "base_sha": req.base_sha,
+        "snapshot_hash": req.snapshot_hash, "root_contract_hash": req.root_contract_hash,
+        "active_tranche": {"tranche_id": "TR-A", "ordinal": 0},
+        "route": {"implementation_profile": "local-coder", "workspace": "/work/repo"}}
+    token["acceptance_identity"] = "sha256:" + hashlib.sha256(json.dumps(token, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    return evidence, token, materialized.targets[0]
+
+
+def test_accepted_create_payload_is_pure_complete_immutable_and_deterministic():
+    from local_first_orchestrator.planning_coordinator import accepted_active_tranche_create_payload
+    evidence, token, target = accepted_fixture()
+    before = copy.deepcopy(evidence)
+    one = accepted_active_tranche_create_payload(token, evidence, target)
+    two = accepted_active_tranche_create_payload(token, evidence, target)
+    assert one == two and evidence == before
+    body = json.loads(one.body)
+    assert body["kind"] == "accepted_active_tranche_piece_v1"
+    ticket = body["ticket"]
+    assert ticket["ticket_id"] == target.ticket_id
+    assert ticket["verification"]["working_directory"] == "."
+    assert body["tranche_semantics"] == {"objective": "First", "non_goals": ["No unrelated changes"]}
+    assert body["criterion_statements"] == [{"criterion": "AC-1", "statement": "First criterion"}]
+    assert body["repository"]["repository_identity"] == "repo-A"
+    assert body["association"]["declared_dependencies"] == []
+    assert body["association"]["native_parent"] is False
+    assert one.target["eligibility"] == "future_adapter_review_required"
+    with pytest.raises((AttributeError, TypeError)):
+        one.target["ticket_id"] = "changed"
+    assert "action" not in body and "create_action" not in body
+
+
+def test_actual_store_accepted_token_materializes_without_normalizing_authority(tmp_path):
+    import importlib.util
+    acceptance_tests = importlib.util.spec_from_file_location("m4_acceptance_fixture", __import__("pathlib").Path(__file__).with_name("test_m4_plan_acceptance.py"))
+    acceptance_module = importlib.util.module_from_spec(acceptance_tests)
+    acceptance_tests.loader.exec_module(acceptance_module)
+    _pure_acceptance_fixture, SCOPE = acceptance_module._pure_acceptance_fixture, acceptance_module.SCOPE
+    from local_first_orchestrator.planning_coordinator import accepted_active_tranche_create_payload, ActiveTrancheRoute
+    ctl, store, _board, _observed = _pure_acceptance_fixture(tmp_path)
+    try:
+        ctl.accept_validated_plan("plan-1")
+        token = store.read_accepted_plan(SCOPE, "plan-1")
+        evidence = store.read_plan(SCOPE, "plan-1")
+        assert type(token).__name__ == "mappingproxy"
+        assert token["acceptance_identity"].startswith("sha256:")
+        route_value = ActiveTrancheRoute(token["route"]["implementation_profile"], token["route"]["workspace"])
+        target = first_active_tranche_materialization(evidence, route_value).targets[0]
+        from types import MappingProxyType
+        def trusted_thaw(value):
+            if type(value) is MappingProxyType:
+                return {key: trusted_thaw(child) for key, child in value.items()}
+            if type(value) is dict:
+                return {key: trusted_thaw(child) for key, child in value.items()}
+            if type(value) is list:
+                return [trusted_thaw(child) for child in value]
+            if type(value) is tuple:
+                return [trusted_thaw(child) for child in value]
+            return value
+        transport = trusted_thaw(token)
+        assert transport == trusted_thaw(token)
+        assert transport is not token and transport["planner"] is not token["planner"]
+        payload = accepted_active_tranche_create_payload(transport, evidence, target)
+        body = json.loads(payload.body)
+        assert body["accepted_token"] == transport
+        assert body["accepted_token"]["acceptance_identity"] == token["acceptance_identity"]
+        assert body["accepted_token_key"] == "accept-plan:" + token["acceptance_identity"]
+        assert payload.target["accepted_token_key"] == body["accepted_token_key"]
+        assert type(token["planner"]).__name__ == "mappingproxy"
+        assert type(evidence) is dict
+        with pytest.raises(ValueError, match="plain-JSON transport"):
+            accepted_active_tranche_create_payload(token, evidence, target)
+        bad = dict(transport)
+        bad["acceptance_identity"] = token["acceptance_identity"][7:]
+        with pytest.raises(ValueError):
+            accepted_active_tranche_create_payload(bad, evidence, target)
+    finally:
+        store.close()
+
+
+def test_snapshot_rejects_mappingproxy_and_hostile_proxy_without_hooks():
+    from types import MappingProxyType
+    from local_first_orchestrator.planning_coordinator import _evidence_snapshot
+    class HostileDict(dict):
+        called = False
+        def items(self):
+            type(self).called = True
+            raise AssertionError("items hook invoked")
+    class HostileProxy:
+        calls = 0
+        def items(self): type(self).calls += 1; raise AssertionError("items hook invoked")
+        def __getitem__(self, key): type(self).calls += 1; raise AssertionError("getitem hook invoked")
+        def __iter__(self): type(self).calls += 1; raise AssertionError("iter hook invoked")
+    proxy = MappingProxyType({"nested": {"array": (1, {"ok": True})}})
+    with pytest.raises(ValueError):
+        _evidence_snapshot(proxy)
+    with pytest.raises(ValueError):
+        _evidence_snapshot(HostileProxy())
+    assert HostileProxy.calls == 0
+    with pytest.raises(ValueError):
+        _evidence_snapshot(MappingProxyType({"nested": HostileDict()}))
+    assert HostileDict.called is False
+
+
+@pytest.mark.parametrize("field", ["ticket_id", "ticket_contract_hash", "tranche_id", "tranche_ordinal", "criterion_ids", "declared_dependencies", "implementation_profile", "workspace", "association", "operation_key", "native_parent", "initial_status"])
+def test_accepted_builder_rejects_tampered_or_bypassed_target(field):
+    from local_first_orchestrator.planning_coordinator import accepted_active_tranche_create_payload
+    evidence, token, target = accepted_fixture()
+    value = getattr(target, field)
+    if field == "native_parent": value = True
+    elif field == "tranche_ordinal": value = 1
+    elif field == "criterion_ids": value = ("AC-2",)
+    elif field == "declared_dependencies": value = ("TK-C",)
+    elif type(value) is str: value = "tampered"
+    with pytest.raises((TypeError, ValueError)):
+        accepted_active_tranche_create_payload(token, evidence, dataclasses.replace(target, **{field: value}))
+    bypass = object.__new__(type(target))
+    for name in target.__dataclass_fields__:
+        object.__setattr__(bypass, name, getattr(target, name))
+    object.__setattr__(bypass, field, value)
+    with pytest.raises((TypeError, ValueError)):
+        accepted_active_tranche_create_payload(token, evidence, bypass)
+
+
+@pytest.mark.parametrize("edit", [
+    lambda t: t.update(acceptance_identity="0"*64),
+    lambda t: t["route"].update(implementation_profile="paid-planner"),
+    lambda t: t["active_tranche"].update(tranche_id="TR-B"),
+    lambda t: t.update(base_sha="d"*40),
+])
+def test_accepted_builder_rejects_token_inconsistency(edit):
+    from local_first_orchestrator.planning_coordinator import accepted_active_tranche_create_payload
+    evidence, token, target = accepted_fixture()
+    bad = copy.deepcopy(token); edit(bad)
+    with pytest.raises((TypeError, ValueError)):
+        accepted_active_tranche_create_payload(bad, evidence, target)
+
+
+def test_snapshot_rejects_tuple_without_iterating_it():
+    from local_first_orchestrator.planning_coordinator import _evidence_snapshot
+    class HostileTuple(tuple):
+        called = False
+        def __iter__(self):
+            type(self).called = True
+            raise AssertionError("tuple iteration hook invoked")
+    with pytest.raises(ValueError):
+        _evidence_snapshot({"nested": (1, {"ok": True})})
+    with pytest.raises(ValueError):
+        _evidence_snapshot({"nested": HostileTuple((1,))})
+    assert HostileTuple.called is False
+
+
+@pytest.mark.parametrize("field", ["ticket_id", "ticket_contract_hash", "tranche_id", "implementation_profile", "workspace", "association", "operation_key", "initial_status"])
+def test_accepted_builder_rejects_hostile_target_string_before_hooks(field):
+    from local_first_orchestrator.planning_coordinator import accepted_active_tranche_create_payload
+    evidence, token, target = accepted_fixture()
+    class HostileString(str):
+        calls = 0
+        def __eq__(self, other): type(self).calls += 1; raise AssertionError("eq hook")
+        def __hash__(self): type(self).calls += 1; raise AssertionError("hash hook")
+        def encode(self, *args, **kwargs): type(self).calls += 1; raise AssertionError("encode hook")
+    bypass = object.__new__(type(target))
+    for name in target.__dataclass_fields__:
+        object.__setattr__(bypass, name, object.__getattribute__(target, name))
+    object.__setattr__(bypass, field, HostileString("hostile"))
+    with pytest.raises(ValueError):
+        accepted_active_tranche_create_payload(token, evidence, bypass)
+    assert HostileString.calls == 0
+
+
+def test_accepted_builder_rejects_hostile_nested_tuple_values_and_missing_fields():
+    from local_first_orchestrator.planning_coordinator import accepted_active_tranche_create_payload
+    evidence, token, target = accepted_fixture()
+    class HostileString(str):
+        calls = 0
+        def __eq__(self, other): type(self).calls += 1; raise AssertionError("eq hook")
+        def __hash__(self): type(self).calls += 1; raise AssertionError("hash hook")
+        def encode(self, *args, **kwargs): type(self).calls += 1; raise AssertionError("encode hook")
+    for field in ("criterion_ids", "declared_dependencies"):
+        bypass = object.__new__(type(target))
+        for name in target.__dataclass_fields__:
+            object.__setattr__(bypass, name, object.__getattribute__(target, name))
+        object.__setattr__(bypass, field, (HostileString("hostile"),))
+        with pytest.raises(ValueError):
+            accepted_active_tranche_create_payload(token, evidence, bypass)
+    bypass = object.__new__(type(target))
+    for name in target.__dataclass_fields__:
+        if name != "native_parent":
+            object.__setattr__(bypass, name, object.__getattribute__(target, name))
+    with pytest.raises(ValueError):
+        accepted_active_tranche_create_payload(token, evidence, bypass)
+    bypass = object.__new__(type(target))
+    for name in target.__dataclass_fields__:
+        object.__setattr__(bypass, name, object.__getattribute__(target, name))
+    object.__setattr__(bypass, "native_parent", 0)
+    with pytest.raises(ValueError):
+        accepted_active_tranche_create_payload(token, evidence, bypass)
+    class HostileInt(int):
+        calls = 0
+        def __eq__(self, other): type(self).calls += 1; raise AssertionError("eq hook")
+    object.__setattr__(bypass, "tranche_ordinal", HostileInt(0))
+    with pytest.raises(ValueError):
+        accepted_active_tranche_create_payload(token, evidence, bypass)
+    assert HostileString.calls == 0 and HostileInt.calls == 0
