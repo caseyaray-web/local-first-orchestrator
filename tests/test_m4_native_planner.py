@@ -76,15 +76,26 @@ def _controller(tmp_path, store, adapter, anchor, task, run_id, req, *, observer
     return controller, scope
 
 
+
+def _released_fixture(tmp_path):
+    from tests.test_m4_planner_creation import native_fixture, setup
+    from tests.test_m4_planner_run_binding import _claim
+    fixture = native_fixture.__wrapped__(tmp_path)
+    controller, store, scope, req = setup(tmp_path, fixture, profile="default")
+    task = controller.prepare_planner()["task_id"]
+    assert controller.release_planner()["outcome"] == "released"
+    run_id = _claim(scope["board_id"], task, tmp_path / "home")
+    return controller, store, scope, req, task, run_id, fixture
+
+
+def _paid_events(store, scope):
+    return [event for event in store.read_scope(scope)["budget_events"]
+            if event["event_id"].startswith(PAID_CAPACITY + ":")]
+
 def test_native_running_planner_registration_and_submit_are_readback_bound(tmp_path, native_board, monkeypatch):
-    req = request()
-    # Bind the pure request fixture to the actual disposable native scope.
-    executable, board, home, env, cli = native_board
-    anchor, task, run_id, adapter, _ = _native_task(tmp_path, native_board)
-    req = dataclasses.replace(req, board_id=board, anchor_id=anchor)
-    store = EvidenceStore.open(tmp_path / "evidence.sqlite", create_new=True); store.migrate()
+    controller, store, scope, req, task, run_id, fixture = _released_fixture(tmp_path)
+    board, anchor, workspace, adapter, membership, cli = fixture
     try:
-        controller, scope = _controller(tmp_path, store, adapter, anchor, task, run_id, req)
         monkeypatch.setenv("HERMES_KANBAN_TASK", task); monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_id)
         monkeypatch.setenv("HERMES_SESSION_ID", "m4-active-session")
         registration = controller.register_planning_request(task)
@@ -135,23 +146,23 @@ def test_store_registration_replay_changed_request_and_multiple_explicit_ids(tmp
         store.close()
 
 
-def test_submit_rejects_missing_or_wrong_worker_context_stale_observer_and_pause(tmp_path, monkeypatch):
-    req = request(); task = "planner"; run_id = "run-1"
-    class Board:
+def test_submit_rejects_missing_or_wrong_worker_context_stale_observer_and_pause(tmp_path, native_board, monkeypatch):
+    ctl, store, scope, req, task, run_id, fixture = _released_fixture(tmp_path)
+    adapter = fixture[3]
+    observed = {"request": request_payload(req)}
+    ctl.planning_observer = lambda _: observed
+    class BoardProxy:
         is_fake = True
-        observed_run = {"id": run_id, "task_id": task, "status": "running", "profile": "profile"}
-        def read_task(self, task_id): return {"id": task_id}
-        def hold(self, *args, **kwargs): return None
-        def release(self, *args, **kwargs): return None
-        def stop_run(self, *args, **kwargs): return None
-        def read_scoped_run(self, scope, task_id, rid):
-            return dict(self.observed_run)
-    board = Board()
-    store = EvidenceStore.open(tmp_path / "evidence.sqlite", create_new=True); store.migrate()
+        observed_run = adapter.read_scoped_run(scope, task, run_id)
+        def read_task(self, task_id): return adapter.read_task(task_id)
+        def _native_marker(self, action): return adapter._native_marker(action)
+        def hold(self, *args, **kwargs): return adapter.hold(*args, **kwargs)
+        def release(self, *args, **kwargs): return adapter.release(*args, **kwargs)
+        def stop_run(self, *args, **kwargs): return adapter.stop_run(*args, **kwargs)
+        def read_scoped_run(self, scope, task_id, rid): return dict(self.observed_run)
+    board = BoardProxy()
+    ctl.board = board
     try:
-        store.register_member(ManagedMember("board-A", "anchor-A", task, "planner", 0, (), "planner"))
-        observed = {"request": request_payload(req)}
-        ctl = Coordinator(SCOPE, board=board, store=store, lock=instance_lock(tmp_path / "lock"), budget_policy=BudgetPolicy(2, 2, 2, 2, 1), configured_roles={"implementation_profile": "implementer", "local_review_profile": "reviewer", "planning_profile": "profile"}, planning_observer=lambda _: observed, planning_profile="profile")
         monkeypatch.setenv("HERMES_KANBAN_TASK", task); monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_id); monkeypatch.setenv("HERMES_SESSION_ID", "session")
         ctl.register_planning_request(task)
         raw = serialize_proposal(proposal(req))
@@ -165,7 +176,7 @@ def test_submit_rejects_missing_or_wrong_worker_context_stale_observer_and_pause
         monkeypatch.setenv("HERMES_KANBAN_TASK", task)
         board.observed_run["profile"] = "wrong-profile"
         with pytest.raises((ValueError, ConflictError)): ctl.submit_plan(raw)
-        board.observed_run["profile"] = "profile"
+        board.observed_run["profile"] = "default"
         board.observed_run["status"] = "completed"
         with pytest.raises((ValueError, ConflictError)): ctl.submit_plan(raw)
         board.observed_run["status"] = "running"
@@ -173,7 +184,7 @@ def test_submit_rejects_missing_or_wrong_worker_context_stale_observer_and_pause
         with pytest.raises((ValueError, ConflictError)): ctl.submit_plan(raw)
         observed["request"] = request_payload(req)
         from local_first_orchestrator.contracts import PauseIntent
-        store.set_operator_intent(PauseIntent(SCOPE, "operator", 1, False, False))
+        store.set_operator_intent(PauseIntent(scope, "operator", 1, False, False))
         with pytest.raises((ValueError, ConflictError)): ctl.submit_plan(raw)
     finally:
         store.close()
@@ -266,33 +277,41 @@ def test_invalid_planning_roles_reject_before_any_evidence_write(
         store.close()
 
 
-def test_native_run_budget_charged_once_and_new_run_refused(tmp_path, monkeypatch):
-    req = request(); task = "planner"; run_id = "run-1"
-    class Board:
+def test_native_run_budget_charged_once_and_new_run_refused(tmp_path, native_board, monkeypatch):
+    ctl, store, scope, req, task, run_id, fixture = _released_fixture(tmp_path)
+    adapter = fixture[3]
+    class BoardProxy:
         is_fake = True
-        def read_task(self, task_id): return {"id": task_id}
-        def hold(self, *args, **kwargs): pass
-        def release(self, *args, **kwargs): pass
-        def stop_run(self, *args, **kwargs): pass
-        def read_scoped_run(self, scope, task_id, rid): return {"id": rid, "task_id": task_id, "status": "running", "profile": "profile"}
-    store = EvidenceStore.open(tmp_path / "charged.sqlite", create_new=True); store.migrate()
+        original_run = adapter.read_scoped_run(scope, task, run_id)
+        def read_task(self, task_id): return adapter.read_task(task_id)
+        def _native_marker(self, action): return adapter._native_marker(action)
+        def hold(self, *args, **kwargs): return adapter.hold(*args, **kwargs)
+        def release(self, *args, **kwargs): return adapter.release(*args, **kwargs)
+        def stop_run(self, *args, **kwargs): return adapter.stop_run(*args, **kwargs)
+        def read_scoped_run(self, scope, task_id, rid):
+            result = dict(self.original_run)
+            result.update({"id": rid, "task_id": task, "status": "running", "profile": "default"})
+            return result
+    ctl.board = BoardProxy()
+    ctl.budget_policy = BudgetPolicy(1, 1, 1, 1, 1)
     try:
-        store.register_member(ManagedMember("board-A", "anchor-A", task, "planner", 0, (), "planner"))
-        ctl = Coordinator(SCOPE, board=Board(), store=store, lock=instance_lock(tmp_path / "lock"), budget_policy=BudgetPolicy(1, 1, 1, 1, 1), configured_roles={"implementation_profile": "implementer", "local_review_profile": "reviewer", "planning_profile": "profile"},
-                          planning_observer=lambda _: {"request": request_payload(req)}, planning_profile="profile")
         monkeypatch.setenv("HERMES_KANBAN_TASK", task); monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_id); monkeypatch.setenv("HERMES_SESSION_ID", "session")
         ctl.register_planning_request(task)
-        events = store.read_scope(SCOPE)["budget_events"]
-        assert len(events) == 1 and events[0]["event_id"] == f"{PAID_CAPACITY}:{run_id}"
+        events = _paid_events(store, scope)
+        assert len(events) == 1
+        assert events[0]["event_id"].startswith(f"{PAID_CAPACITY}:")
+        assert events[0]["source_kind"] == "native_operation"
+        assert events[0]["native_source_id"]
+        assert events[0]["native_source_id"] != run_id
         revision = ctl.register_planning_request(task, request_id="revision-2")
-        assert store.read_planning_request(SCOPE, request_id="revision-2") == revision
+        assert store.read_planning_request(scope, request_id="revision-2") == revision
         ctl.register_planning_request(task)
         ctl.submit_plan(serialize_proposal(proposal(req)))
-        assert len(store.read_scope(SCOPE)["budget_events"]) == 1
+        assert len(_paid_events(store, scope)) == 1
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "run-2")
         with pytest.raises((ValueError, ConflictError)):
             ctl.register_planning_request(task)
-        assert len(store.read_scope(SCOPE)["budget_events"]) == 1
+        assert len(_paid_events(store, scope)) == 1
     finally:
         store.close()
 
@@ -326,32 +345,31 @@ def test_pause_and_cancel_block_registration_without_accounting_writes(tmp_path,
 def test_native_planner_restart_and_completion_lifecycle(tmp_path, native_board, monkeypatch):
     from local_first_orchestrator.contracts import PauseIntent
 
-    req = request()
-    executable, board, _home, env, _cli = native_board
-    anchor, task, run_id, adapter, _ = _native_task(tmp_path, native_board)
-    req = dataclasses.replace(req, board_id=board, anchor_id=anchor)
-    scope = {"board_id": board, "anchor_task_id": anchor}
+    ctl, store, scope, req, task, run_id, fixture = _released_fixture(tmp_path)
+    board, anchor, workspace, adapter, membership, cli = fixture
     observed = {"request": request_payload(req)}
-    db = tmp_path / "native-restart.sqlite"
+    db = tmp_path / "evidence.sqlite"
     session = "native-restart-session"
+    env = dict(os.environ)
+    env.update(HERMES_HOME=str(tmp_path / "home"), HERMES_KANBAN_HOME=str(tmp_path / "home"), HERMES_KANBAN_BOARD=board)
     for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_SESSION_ID"):
         monkeypatch.delenv(key, raising=False)
 
     def ctl_for(store, profile="default"):
+        membership["store"] = store
         return Coordinator(scope, board=adapter, store=store,
             lock=instance_lock(tmp_path / "native-restart.lock"),
             budget_policy=BudgetPolicy(2, 2, 2, 2, 1),
             configured_roles={"implementation_profile": "implementer", "local_review_profile": "reviewer", "planning_profile": profile},
-            planning_observer=lambda _scope: observed, planning_profile=profile)
+            planning_observer=lambda _scope: observed, planning_profile=profile,
+            planning_workspace=workspace)
 
     def counts(store):
         state = store.read_scope(scope)
-        return (len(state["budget_events"]), len(state["operations"]),
+        return (len(_paid_events(store, scope)), len(state["operations"]),
                 state.get("planning_requests"), state.get("plans"))
 
-    store = EvidenceStore.open(db, create_new=True); store.migrate()
     try:
-        store.register_member(ManagedMember(board, anchor, task, "planner", 0, (), "planner"))
         ctl = ctl_for(store)
         initial = counts(store)
         for missing in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_SESSION_ID"):

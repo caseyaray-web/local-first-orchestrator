@@ -303,35 +303,54 @@ class Coordinator:
             native_session = self._worker_session(run)
             if native_session is not None and native_session != session:
                 raise ValueError("active worker session does not match native run receipt")
-            self._record_planner_capacity(planner_task_id, run_id, run)
             observed = self.planning_observer(self.scope)
             if not isinstance(observed, Mapping) or set(observed) != {"request"}:
                 raise ValueError("trusted planning observer returned malformed observation")
             request = request_from_payload(observed["request"])
             if request.board_id != self.scope["board_id"] or request.anchor_id != self.scope["anchor_task_id"]:
                 raise ValueError("observed planning request has wrong scope")
+            self._bind_planner_run(planner_task_id, run_id, session, planner_profile, request.identity, run)
             return self.store.register_planning_request(self.scope, request, planner_task_id, planner_profile, request_id=request_id)
 
-    def _record_planner_capacity(self, task_id: str, run_id: str, run: Mapping[str, Any]) -> None:
-        policy = self.budget_policy
-        if not isinstance(policy, BudgetPolicy):
-            raise ValueError("explicit finite planner paid-capacity BudgetPolicy is required")
+    def _bind_planner_run(self, task_id: str, run_id: str, session: str, profile: str,
+                          request_identity: str, run: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Bind a live worker run only to its exact applied paid release proof."""
         member = next((item for item in self._members() if item.task_id == task_id and item.role == "planner"), None)
-        if member is None:
-            raise ValueError("planner capacity source is not an exact managed planner")
-        event = {
-            "event_id": f"{PAID_CAPACITY}:{run_id}",
-            "lineage_id": f"{self.scope['anchor_task_id']}:{GENERAL_ATTEMPT}",
-            "root_task_id": self.scope["anchor_task_id"],
-            "finding_id": GENERAL_ATTEMPT,
-            "generation": member.generation,
-            "source_task_id": task_id,
-            "source_kind": "native_run",
-            "native_source_id": run_id,
-            "count": 1,
-            "run": run,
-        }
-        policy.record_once(self.store, self.scope, event)
+        if member is None or member.work_association != request_identity:
+            raise ValueError("planner run is not bound to the current managed request association")
+        state = self.store.read_scope(self.scope)
+        releases = [op for op in state["operations"] if op.effect == "release"
+                    and op.phase == "applied" and op.outcome in {"verified", "no-op"}
+                    and op.target == {"task_id": task_id, "request_id": request_identity,
+                                      "member_generation": member.generation, "profile": profile}]
+        if len(releases) != 1:
+            raise ValueError("exact applied paid planner release proof is required before run binding")
+        release = releases[0]
+        proof = self._snapshot_from_readback(release.readback)
+        if (proof is None or proof.native_task.get("id") != task_id
+                or proof.native_task.get("status") not in {"ready", "todo"}
+                or proof.native_task.get("assignee") != profile
+                or not any(item.get("body") == f"UNBLOCK: {self.board._native_marker(self._action_from_intent(release))}"
+                           for item in proof.comments)):
+            raise ValueError("applied release does not contain an exact canonical native readback")
+        current = self.board.read_task(task_id)
+        current_runs = [item for item in current.runs if str(item.get("id")) == run_id]
+        if (current.native_task.get("id") != task_id or current.native_task.get("assignee") != profile
+                or len(current_runs) != 1 or current_runs[0].get("profile") != profile
+                or current_runs[0].get("status") not in {"running", "active"}):
+            raise ValueError("current native planner task/run attribution is not exact")
+        binder = getattr(self.store, "bind_paid_release_to_native_run", None)
+        if not callable(binder):
+            raise ValueError("evidence store cannot bind a paid release to a native run")
+        bound_run = dict(run)
+        # The scoped reader authenticates task/run attribution but Hermes v0.21
+        # omits task_id from its per-run payload and may encode the numeric ID.
+        # Persist the already-verified request identities in canonical form.
+        bound_run.update(id=run_id, task_id=task_id, profile=profile)
+        binding = binder(self.scope, release.key, task_id, member.generation, profile, run_id, session, bound_run)
+        if not isinstance(binding, Mapping):
+            raise ValueError("evidence store returned malformed paid release binding")
+        return binding
 
     def submit_plan(self, proposal_json: str, *, request_id: str | None = None) -> Mapping[str, Any]:
         """Accept evidence from the active native planner run; never creates work."""
@@ -373,7 +392,7 @@ class Coordinator:
             native_session = self._worker_session(run)
             if native_session is not None and native_session != session:
                 raise ValueError("active worker session does not match native run receipt")
-            self._record_planner_capacity(task_id, run_id, run)
+            self._bind_planner_run(task_id, run_id, session, profile, request.identity, run)
             proposal = parse_proposal(proposal_json, request)
             evidence = evidence_payload(request, proposal, planner_task_id=task_id, planner_run_id=run_id,
                                         planner_session_id=session, planner_profile=profile)
