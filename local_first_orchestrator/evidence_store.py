@@ -26,7 +26,7 @@ from .contracts import (
     validate_scope,
 )
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _TABLES = frozenset(
     {
         "schema_metadata",
@@ -39,6 +39,7 @@ _TABLES = frozenset(
         "effect_observations",
         "operator_intents",
         "plan_proposals",
+        "paid_release_run_bindings",
     }
 )
 _TABLE_COLUMNS = {
@@ -52,6 +53,7 @@ _TABLE_COLUMNS = {
     "effect_observations": (("board_id", "TEXT", 1, 1), ("anchor_task_id", "TEXT", 1, 2), ("operation_key", "TEXT", 1, 3), ("observation_identity", "TEXT", 1, 4), ("observation_json", "TEXT", 1, 0)),
     "operator_intents": (("board_id", "TEXT", 1, 1), ("anchor_task_id", "TEXT", 1, 2), ("intent_json", "TEXT", 1, 0)),
     "plan_proposals": (("board_id", "TEXT", 1, 1), ("anchor_task_id", "TEXT", 1, 2), ("plan_id", "TEXT", 1, 3), ("evidence_json", "TEXT", 1, 0)),
+    "paid_release_run_bindings": (("board_id", "TEXT", 1, 1), ("anchor_task_id", "TEXT", 1, 2), ("release_operation_key", "TEXT", 1, 3), ("task_id", "TEXT", 1, 0), ("member_generation", "INTEGER", 1, 0), ("request_identity", "TEXT", 1, 0), ("native_run_id", "TEXT", 1, 0), ("native_session_id", "TEXT", 1, 0), ("native_profile", "TEXT", 1, 0), ("run_classification", "TEXT", 1, 0), ("native_run_json", "TEXT", 1, 0), ("native_run_sha256", "TEXT", 1, 0)),
 }
 _REVIEW_EVIDENCE_FOREIGN_KEYS = (
     ("candidates", "board_id", "board_id"),
@@ -61,6 +63,10 @@ _REVIEW_EVIDENCE_FOREIGN_KEYS = (
 _PLAN_TRIGGERS = {
     "plan_proposals_immutable_update": "CREATE TRIGGER plan_proposals_immutable_update BEFORE UPDATE ON plan_proposals BEGIN SELECT RAISE(ABORT, 'plan evidence is immutable'); END",
     "plan_proposals_immutable_delete": "CREATE TRIGGER plan_proposals_immutable_delete BEFORE DELETE ON plan_proposals BEGIN SELECT RAISE(ABORT, 'plan evidence is immutable'); END",
+}
+_PAID_BINDING_TRIGGERS = {
+    "paid_release_run_bindings_immutable_update": "CREATE TRIGGER paid_release_run_bindings_immutable_update BEFORE UPDATE ON paid_release_run_bindings BEGIN SELECT RAISE(ABORT, 'paid release run binding is immutable'); END",
+    "paid_release_run_bindings_immutable_delete": "CREATE TRIGGER paid_release_run_bindings_immutable_delete BEFORE DELETE ON paid_release_run_bindings BEGIN SELECT RAISE(ABORT, 'paid release run binding is immutable'); END",
 }
 _RECONCILIATION_TRIGGER_SQL = {
     "budget_reconciliation_evidence_immutable_update": "CREATE TRIGGER budget_reconciliation_evidence_immutable_update BEFORE UPDATE ON budget_reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'budget reconciliation evidence is immutable'); END",
@@ -133,6 +139,8 @@ def _validate_indexes(connection: sqlite3.Connection) -> None:
         for row in connection.execute(f"PRAGMA index_list({table})"):
             if row["origin"] == "pk":
                 continue
+            if table == "paid_release_run_bindings" and row["unique"] and row["origin"] == "u" and tuple(column["name"] for column in connection.execute(f"PRAGMA index_info('{row['name']}')")) == ("board_id", "anchor_task_id", "native_run_id"):
+                continue
             if table == "budget_events" and row["name"] == "budget_events_native_source_unique" and row["unique"] and tuple(column["name"] for column in connection.execute("PRAGMA index_info(budget_events_native_source_unique)")) == ("board_id", "anchor_task_id", "source_kind", "native_source_id"):
                 found_native_source_index = True
                 continue
@@ -162,6 +170,8 @@ def _canonical_table_sql(table: str) -> str:
         definitions.append(f"PRIMARY KEY ({', '.join(primary)})")
     if table == "review_evidence":
         definitions.append("FOREIGN KEY (board_id, anchor_task_id, candidate_content_identity) REFERENCES candidates (board_id, anchor_task_id, content_identity)")
+    if table == "paid_release_run_bindings":
+        definitions.append("UNIQUE (board_id, anchor_task_id, native_run_id)")
     return f"CREATE TABLE {table} ({', '.join(definitions)})"
 
 
@@ -277,7 +287,7 @@ class EvidenceStore:
         if metadata != (("schema_version", str(_SCHEMA_VERSION)),):
             raise SchemaError("evidence-store schema version is unsupported")
         triggers = {row["name"]: row["sql"] for row in self.connection.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger'")}
-        expected_triggers = {**_RECONCILIATION_TRIGGER_SQL, **_PLAN_TRIGGERS}
+        expected_triggers = {**_RECONCILIATION_TRIGGER_SQL, **_PLAN_TRIGGERS, **_PAID_BINDING_TRIGGERS}
         if set(triggers) != set(expected_triggers) or any(" ".join(triggers[name].split()).upper() != " ".join(sql.split()).upper() for name, sql in expected_triggers.items()):
             raise SchemaError("evidence-store schema reconciliation triggers are unrecognized")
         self._migrated = True
@@ -292,10 +302,11 @@ class EvidenceStore:
         }
         if names:
             metadata = tuple(tuple(row) for row in self.connection.execute("SELECT key, value FROM schema_metadata ORDER BY key")) if "schema_metadata" in names else ()
-            v1 = _TABLES - {"plan_proposals", "budget_reconciliation_evidence", "effect_observations"}
-            v2 = _TABLES - {"plan_proposals", "effect_observations"}
-            v3 = _TABLES - {"plan_proposals"}
-            versions = {1: v1, 2: v2, 3: v3}
+            v4 = _TABLES - {"paid_release_run_bindings"}
+            v1 = v4 - {"plan_proposals", "budget_reconciliation_evidence", "effect_observations"}
+            v2 = v4 - {"plan_proposals", "effect_observations"}
+            v3 = v4 - {"plan_proposals"}
+            versions = {1: v1, 2: v2, 3: v3, 4: v4}
             version = next((number for number, expected_names in versions.items() if names == expected_names and metadata == (("schema_version", str(number)),)), None)
             if names == _TABLES:
                 self._require_schema()
@@ -318,6 +329,8 @@ class EvidenceStore:
                     expected_triggers.update({name: sql for name, sql in _RECONCILIATION_TRIGGER_SQL.items() if name.startswith("budget_")})
                 if version >= 3:
                     expected_triggers.update({name: sql for name, sql in _RECONCILIATION_TRIGGER_SQL.items() if name.startswith("effect_")})
+                if version >= 4:
+                    expected_triggers.update(_PLAN_TRIGGERS)
                 triggers = {row["name"]: row["sql"] for row in self.connection.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger'")}
                 if set(triggers) != set(expected_triggers) or any(" ".join(triggers[name].split()).upper() != " ".join(sql.split()).upper() for name, sql in expected_triggers.items()):
                     raise SchemaError("evidence-store schema triggers are unrecognized")
@@ -334,10 +347,14 @@ class EvidenceStore:
                         for name, sql in _RECONCILIATION_TRIGGER_SQL.items():
                             if name.startswith("effect_"):
                                 self.connection.execute(sql)
-                    self.connection.execute("CREATE TABLE plan_proposals (board_id TEXT NOT NULL, anchor_task_id TEXT NOT NULL, plan_id TEXT NOT NULL, evidence_json TEXT NOT NULL, PRIMARY KEY (board_id, anchor_task_id, plan_id))")
-                    for sql in _PLAN_TRIGGERS.values():
+                    if version <= 3:
+                        self.connection.execute(_canonical_table_sql("plan_proposals"))
+                        for sql in _PLAN_TRIGGERS.values():
+                            self.connection.execute(sql)
+                    self.connection.execute(_canonical_table_sql("paid_release_run_bindings"))
+                    for sql in _PAID_BINDING_TRIGGERS.values():
                         self.connection.execute(sql)
-                    self.connection.execute("UPDATE schema_metadata SET value='4' WHERE key='schema_version'")
+                    self.connection.execute("UPDATE schema_metadata SET value='5' WHERE key='schema_version'")
                     self._migrated = False
                     self._require_schema()
                     self.connection.commit()
@@ -439,7 +456,10 @@ class EvidenceStore:
                     CREATE TABLE plan_proposals (board_id TEXT NOT NULL, anchor_task_id TEXT NOT NULL, plan_id TEXT NOT NULL, evidence_json TEXT NOT NULL, PRIMARY KEY (board_id, anchor_task_id, plan_id));
                     CREATE TRIGGER plan_proposals_immutable_update BEFORE UPDATE ON plan_proposals BEGIN SELECT RAISE(ABORT, 'plan evidence is immutable'); END;
                     CREATE TRIGGER plan_proposals_immutable_delete BEFORE DELETE ON plan_proposals BEGIN SELECT RAISE(ABORT, 'plan evidence is immutable'); END;
-                    INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '4');
+                    CREATE TABLE paid_release_run_bindings (board_id TEXT NOT NULL, anchor_task_id TEXT NOT NULL, release_operation_key TEXT NOT NULL, task_id TEXT NOT NULL, member_generation INTEGER NOT NULL, request_identity TEXT NOT NULL, native_run_id TEXT NOT NULL, native_session_id TEXT NOT NULL, native_profile TEXT NOT NULL, run_classification TEXT NOT NULL, native_run_json TEXT NOT NULL, native_run_sha256 TEXT NOT NULL, PRIMARY KEY (board_id, anchor_task_id, release_operation_key), UNIQUE (board_id, anchor_task_id, native_run_id));
+                    CREATE TRIGGER paid_release_run_bindings_immutable_update BEFORE UPDATE ON paid_release_run_bindings BEGIN SELECT RAISE(ABORT, 'paid release run binding is immutable'); END;
+                    CREATE TRIGGER paid_release_run_bindings_immutable_delete BEFORE DELETE ON paid_release_run_bindings BEGIN SELECT RAISE(ABORT, 'paid release run binding is immutable'); END;
+                    INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '5');
                     """
                 )
         except sqlite3.DatabaseError as error:
