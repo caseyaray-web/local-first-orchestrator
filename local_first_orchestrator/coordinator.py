@@ -398,6 +398,82 @@ class Coordinator:
                                         planner_session_id=session, planner_profile=profile)
             return self.store.record_plan(self.scope, evidence)
 
+    def accept_validated_plan(self, plan_id: str, *, request_id: str | None = None) -> Mapping[str, Any]:
+        """Record bounded automatic acceptance of one fully validated planner proposal.
+
+        This is coordinator-owned local evidence only. It performs no board mutation,
+        budget admission, or planner-run binding.
+        """
+        from .planning_coordinator import (request_from_payload, request_payload,
+            ActiveTrancheRoute, first_active_tranche_materialization)
+        planner_profile = self._planning_roles()
+        if self.planning_observer is None:
+            raise ValueError("trusted planning observer is not configured")
+        workspace = self.planning_workspace
+        if (not isinstance(workspace, str) or not os.path.isabs(workspace)
+                or os.path.realpath(workspace) != workspace or not os.path.isdir(workspace)
+                or os.path.islink(workspace)):
+            raise ValueError("trusted persistent planning workspace must be an existing canonical absolute directory")
+        implementation, _reviewer = self._local_review_roles()
+        if implementation == planner_profile:
+            raise ValueError("implementation and planner roles must differ")
+        with self.lock:
+            self._assert_lock()
+            state = self.store.read_scope(self.scope)
+            pause = state["operator_intent"]
+            if pause is not None and pause.active:
+                raise ValueError("plan acceptance is fenced by active pause/cancellation")
+            registration = self.store.read_planning_request(self.scope, request_id=request_id)
+            evidence = self.store.read_plan(self.scope, plan_id)
+            request, proposal = __import__("local_first_orchestrator.planning_coordinator", fromlist=["reconstruct_evidence"]).reconstruct_evidence(evidence)
+            observed = self.planning_observer(dict(self.scope))
+            if not isinstance(observed, Mapping) or set(observed) != {"request"}:
+                raise ValueError("trusted planning observer returned malformed observation")
+            current_request = request_from_payload(observed["request"])
+            registered_request = request_from_payload(registration["request"])
+            if (request_payload(current_request) != request_payload(registered_request)
+                    or request_payload(current_request) != request_payload(request)):
+                raise ValueError("current trusted request, registration, and recorded plan differ")
+            if (registration.get("planner_task_id") != evidence["planner"]["task_id"]
+                    or registration.get("planner_profile") != planner_profile):
+                raise ValueError("recorded planner provenance differs from registered planner")
+            route = ActiveTrancheRoute(implementation, workspace)
+            first_active_tranche_materialization(evidence, route)
+            bindings = []
+            for op in state["operations"]:
+                if op.effect == "release" and op.phase == "applied" and op.outcome in {"verified", "no-op"}:
+                    try:
+                        binding = self.store.read_paid_release_run_binding(self.scope, op.key)
+                    except KeyError:
+                        continue
+                    if (binding["task_id"], binding["run_id"], binding["session_id"], binding["profile"]) == (
+                        evidence["planner"]["task_id"], evidence["planner"]["run_id"],
+                        evidence["planner"]["session_id"], evidence["planner"]["profile"]):
+                        bindings.append(binding)
+            if len(bindings) != 1:
+                raise ValueError("exact immutable paid planner release/run binding is required")
+            binding = bindings[0]
+            run_reader = getattr(self.board, "read_scoped_run", None)
+            current_run = run_reader(self.scope, binding["task_id"], binding["run_id"]) if callable(run_reader) else None
+            self._exact_run(current_run, run_id=binding["run_id"], profile=planner_profile)
+            if (not isinstance(current_run, Mapping) or type(current_run.get("task_id")) is not str
+                    or current_run.get("task_id") != binding["task_id"]
+                    or current_run.get("status") not in {"running", "active"}):
+                raise ValueError("planner run is no longer active; acceptance is stopped")
+            native_session = self._worker_session(current_run)
+            if native_session is not None and native_session != binding["session_id"]:
+                raise ValueError("current native run session differs from immutable binding")
+            current_task = self.board.read_task(binding["task_id"])
+            matches = [item for item in current_task.runs if str(item.get("id")) == binding["run_id"]]
+            if (type(current_task.native_task.get("id")) is not str
+                    or current_task.native_task.get("id") != binding["task_id"]
+                    or current_task.native_task.get("assignee") != planner_profile or len(matches) != 1
+                    or matches[0].get("profile") != planner_profile
+                    or matches[0].get("status") not in {"running", "active"}):
+                raise ValueError("current planner task/run is not exact and active")
+            return self.store.record_accepted_plan(self.scope, plan_id,
+                route={"implementation_profile": implementation, "workspace": workspace}, request_id=request_id)
+
     def _local_review_roles(self) -> tuple[str, str]:
         """Return immutable operator-selected roles or fail closed for M3 work."""
         roles = self.configured_roles

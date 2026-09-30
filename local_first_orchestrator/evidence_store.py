@@ -631,6 +631,123 @@ class EvidenceStore:
             raise SchemaError("stored plan evidence identity does not match its row")
         return value
 
+    def record_accepted_plan(self, scope: Mapping[str, Any], plan_id: str, *, route: Mapping[str, Any], request_id: str | None = None) -> Mapping[str, Any]:
+        """Atomically record coordinator-validated acceptance, never a native effect."""
+        from .planning_coordinator import reconstruct_evidence, ActiveTrancheRoute, first_active_tranche_materialization
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        evidence = self.read_plan(scope, plan_id)
+        request, proposal = reconstruct_evidence(evidence)
+        from .planning_coordinator import request_from_payload, request_payload
+        registration = self.read_planning_request(scope, request_id=request_id)
+        registered = request_from_payload(registration["request"])
+        if request_payload(registered) != request_payload(request):
+            raise ConflictError("accepted plan differs from registered request")
+        binding_rows = self.connection.execute("SELECT release_operation_key FROM paid_release_run_bindings WHERE board_id=? AND anchor_task_id=?", (board, anchor)).fetchall()
+        bindings = [self.read_paid_release_run_binding(scope, row[0]) for row in binding_rows]
+        matched = [b for b in bindings if (b["task_id"], b["run_id"], b["session_id"], b["profile"]) ==
+                   (evidence["planner"]["task_id"], evidence["planner"]["run_id"], evidence["planner"]["session_id"], evidence["planner"]["profile"])]
+        if len(matched) != 1:
+            raise ConflictError("accepted plan lacks exact registered request and paid run binding")
+        root_rows = self.connection.execute("SELECT task_id,role FROM managed_members WHERE board_id=? AND anchor_task_id=? AND role='root'", (board, anchor)).fetchall()
+        if len(root_rows) != 1 or root_rows[0]["task_id"] != anchor:
+            raise ConflictError("acceptance requires exactly one enrolled scope root")
+        member = self.connection.execute("SELECT role,work_association FROM managed_members WHERE board_id=? AND anchor_task_id=? AND task_id=?", (board, anchor, evidence["planner"]["task_id"])).fetchone()
+        if member is None or member["role"] != "planner" or member["work_association"] != request.identity:
+            raise ConflictError("accepted plan planner membership is inconsistent")
+        if not isinstance(route, Mapping) or set(route) != {"implementation_profile", "workspace"}:
+            raise ValueError("acceptance route has an invalid schema")
+        first_active_tranche_materialization(evidence, ActiveTrancheRoute(route["implementation_profile"], route["workspace"]))
+        tranche = proposal.plan.tranches[0]
+        digest = _sha256({"schema_version": 1, "plan_id": plan_id, "request_identity": request.identity,
+            "proposal_hash": proposal.proposal_hash, "plan_contract_hash": proposal.plan.contract_hash,
+            "planner": dict(evidence["planner"]), "repository_identity": request.repository_identity,
+            "base_sha": request.base_sha, "snapshot_hash": request.snapshot_hash,
+            "root_contract_hash": request.root_contract_hash,
+            "active_tranche": {"tranche_id": tranche.tranche_id, "ordinal": 0},
+            "route": dict(route)})
+        token = {"schema_version": 1, "plan_id": plan_id, "request_identity": request.identity,
+            "proposal_hash": proposal.proposal_hash, "plan_contract_hash": proposal.plan.contract_hash,
+            "planner": dict(evidence["planner"]), "repository_identity": request.repository_identity,
+            "base_sha": request.base_sha, "snapshot_hash": request.snapshot_hash,
+            "root_contract_hash": request.root_contract_hash,
+            "active_tranche": {"tranche_id": tranche.tranche_id, "ordinal": 0},
+            "route": dict(route), "acceptance_identity": digest}
+        key = "accept-plan:" + digest
+        intent = OperationIntent(key, scope, {"plan_id": plan_id, "token": token}, "accept_validated_plan", digest,
+            {"source_plan_id": plan_id, "authority_writer": "record_accepted_plan:v1"}, "verified", {"token": token}, {}, "applied")
+        payload = _json(intent.to_dict())
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.connection.execute("SELECT operation_key,intent_json FROM operation_intents WHERE board_id=? AND anchor_task_id=?", (board, anchor)).fetchall()
+            existing = []
+            for row in rows:
+                parsed = OperationIntent.from_dict(_decode(row["intent_json"]))
+                if parsed.effect == "accept_validated_plan" and parsed.target.get("plan_id") == plan_id:
+                    existing.append((row["operation_key"], row["intent_json"], parsed))
+            if len(existing) > 1:
+                raise SchemaError("duplicate plan acceptance receipts")
+            if existing:
+                if existing[0][0] != key or existing[0][1] != payload:
+                    raise ConflictError("accepted plan conflicts with immutable authority receipt")
+            else:
+                self.connection.execute("INSERT INTO operation_intents VALUES (?, ?, ?, ?)", (board, anchor, key, payload))
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
+        return self.read_accepted_plan(scope, plan_id)
+
+    def read_accepted_plan(self, scope: Mapping[str, Any], plan_id: str) -> Mapping[str, Any]:
+        """Strictly reconstruct the accepted authority receipt and its immutable sources."""
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        rows = self.connection.execute("SELECT operation_key,intent_json FROM operation_intents WHERE board_id=? AND anchor_task_id=?", (board, anchor)).fetchall()
+        matches = []
+        for row in rows:
+            try: intent = OperationIntent.from_dict(_decode(row["intent_json"]))
+            except (TypeError, ValueError) as error: raise SchemaError("acceptance intent malformed") from error
+            if intent.effect == "accept_validated_plan" and intent.target.get("plan_id") == plan_id: matches.append((row["operation_key"], intent))
+        if not matches: raise KeyError("accepted plan authority does not exist")
+        if len(matches) != 1: raise SchemaError("duplicate accepted plan authority")
+        key, intent = matches[0]
+        if intent.phase != "applied" or intent.outcome != "verified" or intent.readback != {"token": intent.target.get("token")} or set(intent.target) != {"plan_id", "token"}:
+            raise SchemaError("accepted plan receipt phase or duplicated payload is corrupt")
+        try:
+            token = intent.target["token"]
+            evidence = self.read_plan(scope, plan_id)
+            request, proposal = __import__("local_first_orchestrator.planning_coordinator", fromlist=["reconstruct_evidence"]).reconstruct_evidence(evidence)
+            route = token["route"]
+            expected = self.record_accepted_plan  # do not invoke writer during read
+            from .planning_coordinator import first_active_tranche_materialization, ActiveTrancheRoute
+            first_active_tranche_materialization(evidence, ActiveTrancheRoute(route["implementation_profile"], route["workspace"]))
+            tranche = proposal.plan.tranches[0]
+            expected_fields = {"schema_version": 1, "plan_id": plan_id, "request_identity": request.identity,
+                "proposal_hash": proposal.proposal_hash, "plan_contract_hash": proposal.plan.contract_hash,
+                "planner": evidence["planner"], "repository_identity": request.repository_identity,
+                "base_sha": request.base_sha, "snapshot_hash": request.snapshot_hash,
+                "root_contract_hash": request.root_contract_hash,
+                "active_tranche": {"tranche_id": tranche.tranche_id, "ordinal": 0}, "route": dict(route)}
+            if set(token) != set(expected_fields) | {"acceptance_identity"} or any(token.get(k) != v for k,v in expected_fields.items()): raise ValueError("token/source mismatch")
+            digest = _sha256(expected_fields)
+            if token["acceptance_identity"] != digest or key != "accept-plan:" + digest or intent.expected_observed_identity != digest: raise ValueError("authority digest mismatch")
+            if intent.before_evidence != {"source_plan_id": plan_id, "authority_writer": "record_accepted_plan:v1"}: raise ValueError("source reference or authority provenance mismatch")
+            binding_rows = self.connection.execute("SELECT release_operation_key FROM paid_release_run_bindings WHERE board_id=? AND anchor_task_id=?", (board, anchor)).fetchall()
+            bound = [self.read_paid_release_run_binding(scope, item[0]) for item in binding_rows]
+            planner = token["planner"]
+            if len([item for item in bound if (item["task_id"], item["run_id"], item["session_id"], item["profile"]) == (planner["task_id"], planner["run_id"], planner["session_id"], planner["profile"])]) != 1:
+                raise ValueError("planner paid-release source mismatch")
+            root_rows = self.connection.execute("SELECT task_id FROM managed_members WHERE board_id=? AND anchor_task_id=? AND role='root'", (board, anchor)).fetchall()
+            if len(root_rows) != 1 or root_rows[0]["task_id"] != anchor:
+                raise ValueError("scope root source mismatch")
+            member = self.connection.execute("SELECT role,work_association FROM managed_members WHERE board_id=? AND anchor_task_id=? AND task_id=?", (board, anchor, planner["task_id"])).fetchone()
+            if member is None or member["role"] != "planner" or member["work_association"] != request.identity:
+                raise ValueError("planner member source mismatch")
+            from .planning_coordinator import _deep_freeze
+            return _deep_freeze(token)
+        except (KeyError, TypeError, ValueError, IndexError) as error:
+            raise SchemaError("accepted plan authority failed strict reconstruction") from error
+
     def plan_evidence(self, scope: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
         self._require_schema()
         board, anchor = _scope_values(scope)
@@ -821,6 +938,7 @@ class EvidenceStore:
 
     def reserve_operation(self, intent: OperationIntent) -> OperationIntent:
         self._require_schema()
+        self._reject_local_authority_effect(intent)
         board, anchor = _scope_values(intent.scope)
         payload = _json(intent.to_dict())
         self.connection.execute("BEGIN IMMEDIATE")
@@ -854,6 +972,7 @@ class EvidenceStore:
     ) -> OperationIntent:
         """Atomically reserve a classified repair operation and its one-unit charge."""
         self._require_schema()
+        self._reject_local_authority_effect(intent)
         board, anchor = _scope_values(intent.scope)
         if not isinstance(policy_limit, int) or isinstance(policy_limit, bool) or policy_limit < 0:
             raise ValueError("budget policy limit must be a non-negative integer")
@@ -946,6 +1065,7 @@ class EvidenceStore:
         board, anchor = _scope_values(scope)
         if not isinstance(intent, OperationIntent):
             raise ValueError("paid release requires an OperationIntent")
+        self._reject_local_authority_effect(intent)
         if not isinstance(policy_limit, int) or isinstance(policy_limit, bool) or policy_limit < 0:
             raise ValueError("paid release policy limit must be a non-negative integer")
         if intent.effect != "release" or dict(intent.scope) != {"board_id": board, "anchor_task_id": anchor}:
@@ -1134,6 +1254,7 @@ class EvidenceStore:
         self._require_schema()
         board, anchor = _scope_values(scope)
         supported = frozenset({"create_held", "hold", "hold_task", "release", "unhold_task", "stop_run", "comment", "link", "request_review"})
+        self._reject_local_authority_effect(self._operation({"board_id": board, "anchor_task_id": anchor}, key))
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             current = self._operation({"board_id": board, "anchor_task_id": anchor}, key)
@@ -1165,7 +1286,7 @@ class EvidenceStore:
         if readback is not None and not isinstance(readback, Mapping):
             raise ValueError("effect observation readback must be a mapping or null")
         ActionResult(key, outcome, details, readback)
-        self._operation({"board_id": board, "anchor_task_id": anchor}, key)
+        self._reject_local_authority_effect(self._operation({"board_id": board, "anchor_task_id": anchor}, key))
         observation = {"operation_key": key, "outcome": outcome, "details": details,
                        "readback": None if readback is None else dict(readback)}
         payload = _json(observation)
@@ -1189,6 +1310,7 @@ class EvidenceStore:
         if phase == "unknown" and (outcome != "ambiguous" or readback is not None):
             raise ValueError("unknown effects require an ambiguous outcome without verified readback")
         board, anchor = _scope_values(scope)
+        self._reject_local_authority_effect(self._operation({"board_id": board, "anchor_task_id": anchor}, key))
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             current = self._operation(scope, key)
@@ -1208,7 +1330,13 @@ class EvidenceStore:
             raise
 
     def ack_effect(self, scope: Mapping[str, Any], key: str, *, readback: Mapping[str, Any], outcome: str = "verified") -> OperationIntent:
+        self._reject_local_authority_effect(self._operation(scope, key))
         return self.observe_effect(scope, key, outcome=outcome, readback=readback, phase="applied")
+
+    @staticmethod
+    def _reject_local_authority_effect(intent: OperationIntent) -> None:
+        if intent.effect == "accept_validated_plan":
+            raise ConflictError("local plan acceptance authority cannot enter generic native-effect or admission APIs")
 
     def pending_operations(self, scope: Mapping[str, Any]) -> tuple[OperationIntent, ...]:
         self._require_schema()
@@ -1222,6 +1350,10 @@ class EvidenceStore:
     def record_budget_event(self, scope: Mapping[str, Any], event: Mapping[str, Any], *, policy_limit: int | None = None, run_classification: str | None = None) -> Mapping[str, Any]:
         self._require_schema()
         board, anchor = _scope_values(scope)
+        if isinstance(event, Mapping) and event.get("source_kind") == "native_operation" and _nonempty_string(event.get("native_source_id")):
+            source = self.connection.execute("SELECT intent_json FROM operation_intents WHERE board_id=? AND anchor_task_id=? AND operation_key=?", (board, anchor, event["native_source_id"])).fetchone()
+            if source is not None:
+                self._reject_local_authority_effect(OperationIntent.from_dict(_decode(source[0])))
         required = {"event_id", "lineage_id", "root_task_id", "finding_id", "generation", "source_task_id", "source_kind", "native_source_id", "count"}
         if not isinstance(event, Mapping) or set(event) != required:
             raise ValueError("budget event has an invalid attribution shape")
