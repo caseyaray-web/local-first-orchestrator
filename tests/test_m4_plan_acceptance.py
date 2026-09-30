@@ -55,6 +55,18 @@ def test_controlled_paid_planner_proposal_is_accepted_and_replayed(tmp_path, nat
         store.close()
 
 
+def test_prepare_active_piece_requires_accepted_tranche_zero_ticket(tmp_path):
+    ctl, store, _board, _observed = _pure_acceptance_fixture(tmp_path)
+    try:
+        ctl.accept_validated_plan("plan-1")
+        before = _authority_rows(store)
+        with pytest.raises(ValueError, match="ticket must uniquely belong to accepted tranche zero"):
+            ctl.prepare_active_piece("plan-1", "future-ticket")
+        assert _authority_rows(store) == before
+    finally:
+        store.close()
+
+
 def test_recorded_proposal_is_not_accepted_authority(tmp_path):
     path = tmp_path / "evidence.sqlite"
     with EvidenceStore.open(path, create_new=True) as store:

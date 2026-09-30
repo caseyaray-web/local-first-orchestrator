@@ -37,6 +37,7 @@ class Coordinator:
             # The adapter and coordinator must share this exact lock instance.
             board.create_lock_assertion = self._assert_native_lock
             board.claim_create_attempt = self._claim_native_create_attempt
+            board.accepted_piece_create_lookup = self._accepted_piece_description
         if configured_roles is not None and not isinstance(configured_roles, Mapping):
             raise ValueError("configured roles must be a mapping")
         self.configured_roles = MappingProxyType(dict(configured_roles or {}))
@@ -46,6 +47,203 @@ class Coordinator:
         self.planning_observer = planning_observer
         self.planning_profile = planning_profile
         self.planning_workspace = planning_workspace
+
+    def _accepted_piece_description(self, scope: Mapping[str, str], operation_key: str) -> Any:
+        """Resolve a native create solely from strict accepted-store authority."""
+        from .planning_coordinator import (ActiveTrancheRoute,
+            accepted_active_tranche_create_payload, first_active_tranche_materialization)
+        if validate_scope(scope) != self.scope or type(operation_key) is not str:
+            raise ValueError("accepted-piece resolver scope or key mismatch")
+        state = self.store.read_scope(self.scope)
+        matches = [op for op in state["operations"] if op.key == operation_key and op.effect == "create_held"]
+        if len(matches) != 1:
+            raise ValueError("accepted-piece operation intent is not uniquely reserved")
+        intent = matches[0]
+        token_key = intent.target.get("accepted_token_key")
+        plan_id = intent.target.get("plan_id")
+        if type(plan_id) is not str or type(token_key) is not str:
+            raise ValueError("accepted-piece intent lacks closed token identity")
+        token = self.store.read_accepted_plan(self.scope, plan_id)
+        if token_key != "accept-plan:" + token["acceptance_identity"]:
+            raise ValueError("accepted-piece intent token key mismatch")
+        evidence = self.store.read_plan(self.scope, plan_id)
+        route = ActiveTrancheRoute(token["route"]["implementation_profile"], token["route"]["workspace"])
+        material = first_active_tranche_materialization(evidence, route)
+        tickets = [target for target in material.targets if target.ticket_id == intent.target.get("ticket_id")]
+        if len(tickets) != 1 or tickets[0].operation_key != operation_key:
+            raise ValueError("accepted-piece ticket/key is not a unique tranche-zero target")
+        def thaw(value):
+            if type(value) is type(token):
+                return {key: thaw(child) for key, child in value.items()}
+            if type(value) is dict:
+                return {key: thaw(child) for key, child in value.items()}
+            if type(value) in (list, tuple):
+                return [thaw(child) for child in value]
+            return value
+        built = accepted_active_tranche_create_payload(thaw(token), evidence, tickets[0])
+        if intent.target.get("accepted_token_key") != built.target["accepted_token_key"]:
+            raise ValueError("reserved token identity does not match rebuilt payload")
+        return type("AcceptedPieceDescription", (), {
+            "title": built.title, "body": built.body, "target": built.target,
+            "idempotency_key": built.idempotency_key, "plan_evidence": evidence,
+        })()
+
+    def prepare_active_piece(self, plan_id: str, ticket_id: str, *, request_id: str | None = None) -> Mapping[str, Any]:
+        """Reserve/create at most one accepted tranche-zero held piece."""
+        from .contracts import ManagedMember, Action
+        from .planning_coordinator import ActiveTrancheRoute, first_active_tranche_materialization
+        if any(type(value) is not str or not value.strip() or len(value) > 256 for value in (plan_id, ticket_id)):
+            raise ValueError("bounded explicit plan and ticket IDs are required")
+        if request_id is not None and (type(request_id) is not str or not request_id.strip() or len(request_id) > 256):
+            raise ValueError("request_id must be a bounded explicit string")
+        implementation, _ = self._local_review_roles()
+        workspace = self.planning_workspace
+        if (not isinstance(workspace, str) or not os.path.isabs(workspace) or os.path.realpath(workspace) != workspace
+                or not os.path.isdir(workspace) or os.path.islink(workspace)):
+            raise ValueError("trusted persistent planning workspace must be canonical and existing")
+        with self.lock:
+            self._assert_lock()
+            state = self.store.read_scope(self.scope)
+            pause = state["operator_intent"]
+            if pause is not None and pause.active:
+                raise ValueError("active-piece creation is fenced by pause/cancellation")
+            token = self.store.read_accepted_plan(self.scope, plan_id)
+            # The store resolves an explicit alias in the immutable registration
+            # key; aliases are deliberately not duplicated in the registration
+            # payload. Successful strict lookup is the alias binding proof.
+            registration = self.store.read_planning_request(self.scope, request_id=request_id)
+            evidence = self.store.read_plan(self.scope, plan_id)
+            if self.planning_observer is None:
+                raise ValueError("trusted planning observer is required")
+            observed = self.planning_observer(dict(self.scope))
+            from .planning_coordinator import request_from_payload, request_payload
+            current = request_from_payload(observed["request"])
+            registered = request_from_payload(registration["request"])
+            if request_payload(current) != request_payload(registered) or current.identity != token["request_identity"]:
+                raise ValueError("trusted current and accepted plan requests differ")
+            route = token["route"]
+            if route != {"implementation_profile": implementation, "workspace": workspace}:
+                raise ValueError("accepted route differs from configured implementation role/workspace")
+            root = [m for m in state["members"] if m.role == "root"]
+            if len(root) != 1 or root[0].task_id != self.scope["anchor_task_id"]:
+                raise ValueError("exactly one scope root member required")
+            material = first_active_tranche_materialization(evidence, ActiveTrancheRoute(implementation, workspace))
+            selected = [item for item in material.targets if item.ticket_id == ticket_id]
+            if len(selected) != 1:
+                raise ValueError("ticket must uniquely belong to accepted tranche zero")
+            target = selected[0]
+            operation_key = target.operation_key
+            member_assoc = target.association
+            conflicts = [m for m in state["members"] if m.work_association == member_assoc]
+            prior = next((op for op in state["operations"] if op.key == operation_key), None)
+            if conflicts:
+                # Existing associations are authoritative only when the immutable
+                # applied create receipt independently binds the exact member.
+                if (prior is None or prior.phase != "applied" or prior.effect != "create_held"
+                        or prior.outcome not in {"verified", "no-op"}
+                        or prior.target.get("association") != member_assoc):
+                    raise ValueError("existing piece association has no applied creation authority")
+                receipt = self._snapshot_from_readback(prior.readback)
+                if (len(conflicts) != 1 or receipt is None
+                        or conflicts[0] != ManagedMember(self.scope["board_id"], self.scope["anchor_task_id"],
+                            str(receipt.native_task.get("id")), "implementation", 0, (), member_assoc)):
+                    raise ValueError("existing piece association conflicts with immutable creation receipt")
+                if (prior.target.get("task_id") != self.scope["anchor_task_id"]
+                        or prior.target.get("ticket_id") != ticket_id
+                        or prior.target.get("plan_id") != plan_id):
+                    raise ValueError("existing piece association belongs to another accepted task")
+            # Derive canonical action authority solely from the accepted token and
+            # evidence, then compare the complete durable intent before any board read.
+            def thaw_accepted(value):
+                if isinstance(value, Mapping):
+                    return {key: thaw_accepted(child) for key, child in value.items()}
+                if isinstance(value, (tuple, list)):
+                    return [thaw_accepted(child) for child in value]
+                return value
+            payload = __import__("local_first_orchestrator.planning_coordinator", fromlist=["accepted_active_tranche_create_payload"]).accepted_active_tranche_create_payload(
+                thaw_accepted(token), evidence, target)
+            full_target = {**dict(payload.target), "task_id": self.scope["anchor_task_id"],
+                "anchor_task_id": self.scope["anchor_task_id"], "native_parent": False, "native_deps": [],
+                "plan_id": plan_id, "ticket_id": ticket_id,
+                "accepted_token_key": payload.target["accepted_token_key"]}
+            if prior is not None and (thaw_accepted(prior.target) != full_target or prior.effect != "create_held"
+                    or prior.key != operation_key or dict(prior.scope) != dict(self.scope)
+                    or prior.target.get("task_id") != self.scope["anchor_task_id"]):
+                raise ValueError("persisted active-piece intent differs from canonical accepted target")
+            anchor = self.board.read_task(self.scope["anchor_task_id"])
+            if not isinstance(anchor, BoardSnapshot) or anchor.native_task.get("id") != self.scope["anchor_task_id"]:
+                raise ValueError("fresh exact native anchor required")
+            expected = anchor.digest if prior is None else prior.expected_observed_identity
+            built = payload
+            if prior is None:
+                intent = self._intent_for(Action(operation_key, self.scope, full_target, "create_held", expected))
+                prior = self.store.reserve_operation(intent)
+            action = self._action_from_intent(prior)
+            native_target = {key: value for key, value in action.target.items() if key != "plan_id"}
+            native_action = Action(action.key, action.scope, native_target, action.effect,
+                                   action.expected_observed_identity)
+            attempted = 0
+            if prior.phase == "applied":
+                verifier = getattr(self.board, "verify_effect", None)
+                if not callable(verifier):
+                    return {"outcome":"partial", "reason":"read-only applied receipt verifier unavailable", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":0}
+                result = verifier(native_action)
+            elif prior.phase == "unknown":
+                verifier = getattr(self.board, "verify_effect", None)
+                if callable(verifier) and action.target.get("kind") == "accepted_active_tranche_piece_v1":
+                    # plan_id is durable coordinator resolver context, not part of
+                    # the adapter's exact canonical accepted payload. ticket_id is canonical.
+                    native_target = {key: value for key, value in action.target.items()
+                                     if key != "plan_id"}
+                    native_action = Action(action.key, action.scope, native_target, action.effect,
+                                           action.expected_observed_identity)
+                    result = verifier(native_action)
+                else:
+                    result = verifier(action) if callable(verifier) else ActionResult(operation_key, "unknown", "read-only verifier unavailable", None)
+            else:
+                attempted = 1
+                # plan_id is coordinator-local resolver context, not part of the
+                # native adapter's canonical create target contract.
+                native_target = {key: value for key, value in action.target.items() if key != "plan_id"}
+                native_action = Action(action.key, action.scope, native_target, action.effect,
+                                       action.expected_observed_identity)
+                result = self.board.create_held(native_action, title=built.title, body=built.body,
+                    assignee=implementation, workspace=f"dir:{workspace}", idempotency_key=operation_key)
+            readback = self._portable_readback(result.readback)
+            self.store.record_effect_observation(self.scope, operation_key, outcome=result.outcome, details=result.details, readback=readback)
+            proof = self._snapshot_from_readback(readback)
+            if result.outcome not in {"verified", "no-op"} or proof is None:
+                return {"outcome":"partial", "reason":result.details, "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
+            if prior.phase != "applied":
+                self.store.ack_effect(self.scope, operation_key, readback=proof.to_dict(), outcome=result.outcome)
+            else:
+                saved = self._snapshot_from_readback(prior.readback)
+                if (saved is None or proof.digest != saved.digest or proof.native_task.get("id") != saved.native_task.get("id")):
+                    return {"outcome":"partial", "reason":"applied receipt differs from immutable acknowledgement readback", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":0}
+            # An operator pause may race a native acknowledgement. Preserve the
+            # receipt, but do not enroll work after the intent changes.
+            latest_state = self.store.read_scope(self.scope)
+            latest_pause = latest_state["operator_intent"]
+            if latest_pause is not None and latest_pause.active:
+                return {"outcome":"partial", "reason":"active-piece creation acknowledged while pause/cancellation became active", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
+            latest_root = [m for m in latest_state["members"] if m.role == "root"]
+            if len(latest_root) != 1 or latest_root[0].task_id != self.scope["anchor_task_id"]:
+                return {"outcome":"partial", "reason":"scope root enrollment changed after native acknowledgement", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
+            current_card = self.board.read_task(str(proof.native_task.get("id")))
+            if current_card.digest != proof.digest or current_card.native_task.get("status") != "blocked" or current_card.parents or current_card.runs or current_card.native_task.get("assignee") != implementation or (prior.phase == "applied" and current_card.digest != prior.readback.get("digest")):
+                return {"outcome":"partial", "reason":"fresh held-card readback conflicts", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
+            existing = [m for m in self.store.read_scope(self.scope)["members"] if m.work_association == member_assoc]
+            member = ManagedMember(self.scope["board_id"], self.scope["anchor_task_id"], str(proof.native_task["id"]), "implementation", 0, (), member_assoc)
+            if existing and existing != [member]:
+                return {"outcome":"partial", "reason":"existing member association conflicts", "plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
+            try:
+                # Membership is authorized only by a fresh exact readback above.
+                # A store failure after native acknowledgement remains recoverable
+                # from the immutable receipt; never report held without membership.
+                self.store.register_member(member)
+            except (OSError, RuntimeError) as error:
+                return {"outcome":"partial", "reason":f"membership registration failed after native acknowledgement: {error}","plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
+            return {"outcome":"held", "task_id":member.task_id,"plan_id":plan_id,"ticket_id":ticket_id,"operation_key":operation_key,"actions_attempted":attempted}
 
     def prepare_planner(self, *, request_id: str | None = None,
                         planning_profile: str | None = None) -> Mapping[str, Any]:
