@@ -17,7 +17,10 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .contracts import Action, ActionResult, BoardSnapshot, validate_scope
-from .planning_coordinator import request_from_payload
+from .planning_coordinator import (request_from_payload, _canonical_digest, _evidence_snapshot,
+    reconstruct_evidence, first_active_tranche_materialization, accepted_active_tranche_create_payload,
+    ActiveTrancheRoute, HeldCardTarget)
+from .ticket import parse_contract, contract_payload
 
 _AUTHOR = "local-first-orchestrator"
 _MAX_FIELD = 16_384
@@ -100,7 +103,8 @@ class HermesBoardAdapter:
                  managed_member_lookup: Callable[[Mapping[str, str], str], bool] | None = None,
                  completion_evidence_verifier: Callable[[Mapping[str, str], str, str], bool] | None = None,
                  create_lock_assertion: Callable[[Mapping[str, str], str], Any] | None = None,
-                 claim_create_attempt: Callable[[Mapping[str, str], str], Any] | None = None) -> None:
+                 claim_create_attempt: Callable[[Mapping[str, str], str], Any] | None = None,
+                 accepted_piece_create_lookup: Callable[[Mapping[str, str], str], Any] | None = None) -> None:
         if not all(isinstance(x, str) and x and x.replace("-", "").replace("_", "").isalnum() for x in (board, anchor_task_id)):
             raise ValueError("explicit board and anchor IDs required")
         executable_path = Path(executable)
@@ -117,7 +121,178 @@ class HermesBoardAdapter:
         self.create_lock_assertion = create_lock_assertion
         # The evidence store consumes this entitlement before any native send.
         self.claim_create_attempt = claim_create_attempt
+        # This resolver must re-read accepted-plan authority from its trusted store;
+        # caller-supplied Action JSON is never itself acceptance authority.
+        self.accepted_piece_create_lookup = accepted_piece_create_lookup
         self.capabilities = BoardCapabilities.native_m0()
+
+    def _accepted_piece_payload(self, action: Action):
+        if action.effect != "create_held" or action.target.get("kind") != "accepted_active_tranche_piece_v1":
+            return None
+        if self.accepted_piece_create_lookup is None:
+            raise ValueError("trusted accepted-piece resolver is required")
+        resolved = self.accepted_piece_create_lookup(action.scope, action.key)
+        if not all(hasattr(resolved, name) for name in ("title", "body", "target", "idempotency_key", "plan_evidence")):
+            raise ValueError("trusted accepted-piece resolver returned malformed payload")
+        if not isinstance(resolved.target, Mapping):
+            raise ValueError("trusted accepted-piece target must be a mapping")
+        canonical = dict(resolved.target)
+        expected_kind = "accepted_active_tranche_piece_v1"
+        if type(canonical.get("kind")) is not str or canonical.get("kind") != expected_kind:
+            raise ValueError("trusted accepted-piece target kind mismatch")
+        if type(resolved.title) is not str or type(resolved.body) is not str or type(resolved.idempotency_key) is not str:
+            raise ValueError("trusted accepted-piece payload fields must be strings")
+        target_fields = {"kind", "title", "body", "assignee", "workspace", "idempotency_key", "association",
+                         "accepted_token_key", "ticket_id", "ticket_contract_hash", "tranche_id", "tranche_ordinal",
+                         "source_hashes", "role", "native_parent", "eligibility"}
+        if set(canonical) != target_fields:
+            raise ValueError("trusted accepted-piece target schema mismatch")
+        if canonical.get("title") != resolved.title or canonical.get("body") != resolved.body or canonical.get("idempotency_key") != resolved.idempotency_key:
+            raise ValueError("trusted accepted-piece raw target fields mismatch")
+        string_fields = target_fields - {"tranche_ordinal", "native_parent", "source_hashes"}
+        for field in string_fields:
+            value = canonical.get(field)
+            if type(value) is not str or not value or len(value) > _MAX_FIELD or not _utf8_clean(value) or any(ord(c) < 32 or ord(c) == 127 for c in value):
+                raise ValueError(f"trusted accepted-piece {field} must be a bounded clean string")
+        if (type(canonical.get("tranche_ordinal")) is not int or canonical["tranche_ordinal"] != 0
+                or canonical.get("native_parent") is not False or canonical.get("role") != "implementation"
+                or canonical.get("eligibility") != "future_adapter_review_required"):
+            raise ValueError("trusted accepted-piece target field value mismatch")
+        try:
+            body_object = json.loads(resolved.body)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("trusted accepted-piece body is malformed") from exc
+        if (not isinstance(body_object, dict) or type(body_object.get("schema_version")) is not int
+                or body_object.get("schema_version") != 1 or type(body_object.get("kind")) is not str
+                or body_object.get("kind") != expected_kind):
+            raise ValueError("trusted accepted-piece body kind/schema mismatch")
+        if json.dumps(body_object, sort_keys=True, separators=(",", ":"), ensure_ascii=False) != resolved.body:
+            raise ValueError("trusted accepted-piece body is not canonical JSON")
+        # Reconstruct the accepted description from the trusted resolver's
+        # detached store evidence and the token actually carried in its body.
+        # Body hashes alone cannot establish criterion or tranche semantics.
+        evidence = _evidence_snapshot(resolved.plan_evidence)
+        reconstruct_evidence(evidence)
+        token = _evidence_snapshot(body_object.get("accepted_token"))
+        route_value = token.get("route") if isinstance(token, Mapping) else None
+        if not isinstance(route_value, Mapping) or set(route_value) != {"implementation_profile", "workspace"}:
+            raise ValueError("accepted token route malformed")
+        route = ActiveTrancheRoute(route_value["implementation_profile"], route_value["workspace"])
+        material = first_active_tranche_materialization(evidence, route)
+        selected = [item for item in material.targets if item.ticket_id == canonical.get("ticket_id")]
+        if len(selected) != 1:
+            raise ValueError("accepted-piece target is not a unique reconstructed ticket")
+        rebuilt = accepted_active_tranche_create_payload(token, evidence, selected[0])
+        if (resolved.title != rebuilt.title or resolved.body != rebuilt.body
+                or dict(canonical) != dict(rebuilt.target)
+                or resolved.idempotency_key != rebuilt.idempotency_key):
+            raise ValueError("trusted accepted-piece payload differs from reconstructed plan source")
+        token = body_object.get("accepted_token")
+        token_fields = {"schema_version", "plan_id", "request_identity", "proposal_hash", "plan_contract_hash", "planner",
+                        "repository_identity", "base_sha", "snapshot_hash", "root_contract_hash", "active_tranche", "route", "acceptance_identity"}
+        if not isinstance(token, Mapping) or set(token) != token_fields:
+            raise ValueError("accepted token schema mismatch")
+        planner_fields = {"task_id", "run_id", "session_id", "profile"}
+        if not isinstance(token.get("planner"), Mapping) or set(token["planner"]) != planner_fields:
+            raise ValueError("accepted token planner schema mismatch")
+        if (type(token.get("schema_version")) is not int or token["schema_version"] != 1
+                or any(type(token.get(k)) is not str or not token[k] for k in token_fields - {"schema_version", "planner", "active_tranche", "route"})
+                or any(type(token["planner"].get(k)) is not str or not token["planner"][k] for k in planner_fields)
+                or not isinstance(token.get("route"), Mapping) or set(token["route"]) != {"implementation_profile", "workspace"}
+                or not isinstance(token.get("active_tranche"), Mapping) or set(token["active_tranche"]) != {"tranche_id", "ordinal"}
+                or type(token["active_tranche"].get("ordinal")) is not int or token["active_tranche"]["ordinal"] != 0):
+            raise ValueError("accepted token fields malformed")
+        identity = token["acceptance_identity"]
+        if len(identity) != 71 or not identity.startswith("sha256:") or any(c not in "0123456789abcdef" for c in identity[7:]) or identity != "sha256:" + _canonical_digest({k:v for k,v in token.items() if k != "acceptance_identity"}):
+            raise ValueError("accepted token acceptance identity invalid")
+        source = canonical.get("source_hashes")
+        source_fields = {"request_identity", "proposal_hash", "plan_contract_hash", "acceptance_identity"}
+        body_fields = {"schema_version", "kind", "accepted_token_key", "accepted_token", "ticket",
+                       "ticket_contract_hash", "criterion_statements", "tranche_semantics", "repository",
+                       "association", "route"}
+        raw_digest_fields = {"proposal_hash", "plan_contract_hash"}
+        hashes_valid = (isinstance(source, Mapping) and set(source) == source_fields
+                        and all(type(source.get(name)) is str and len(source[name]) == 64
+                                and all(char in "0123456789abcdef" for char in source[name])
+                                for name in raw_digest_fields)
+                        and type(source.get("acceptance_identity")) is str
+                        and len(source["acceptance_identity"]) == 71
+                        and source["acceptance_identity"].startswith("sha256:")
+                        and all(char in "0123456789abcdef" for char in source["acceptance_identity"][7:])
+                        and type(source.get("request_identity")) is str and bool(source["request_identity"])
+                        and type(canonical.get("ticket_contract_hash")) is str
+                        and len(canonical["ticket_contract_hash"]) == 64
+                        and all(char in "0123456789abcdef" for char in canonical["ticket_contract_hash"]))
+        if set(body_object) != body_fields or not hashes_valid:
+            raise ValueError("accepted piece body schema or source hashes invalid")
+        nested = {"active_tranche": {"tranche_id", "ordinal"}, "route": {"implementation_profile", "workspace"},
+                  "repository": {"repository_identity", "base_sha", "snapshot_hash", "root_contract_hash"},
+                  "association": {"operation_key", "declared_dependencies", "native_parent", "native_dependencies", "initial_status"}}
+        if any(not isinstance(body_object.get(k), Mapping) or set(body_object[k]) != keys for k, keys in nested.items() if k != "active_tranche" and k != "route"):
+            raise ValueError("accepted piece nested body schema mismatch")
+        if (not isinstance(body_object.get("route"), Mapping) or set(body_object["route"]) != nested["route"]
+                or not isinstance(body_object.get("tranche_semantics"), Mapping) or set(body_object["tranche_semantics"]) != {"objective", "non_goals"}
+                or not isinstance(body_object.get("criterion_statements"), list)
+                or any(not isinstance(x, Mapping) or set(x) != {"criterion", "statement"} or any(type(x[k]) is not str or not x[k] for k in x) for x in body_object["criterion_statements"])):
+            raise ValueError("accepted piece body claims malformed")
+        try:
+            parsed_ticket = parse_contract(body_object.get("ticket"))
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError("accepted piece ticket contract malformed") from exc
+        if contract_payload(parsed_ticket) != body_object["ticket"] or parsed_ticket.contract_hash != body_object.get("ticket_contract_hash") or parsed_ticket.ticket_id != canonical.get("ticket_id"):
+            raise ValueError("accepted piece ticket identity/hash mismatch")
+        ticket_ids = list(parsed_ticket.criterion_ids)
+        if [x["criterion"] for x in body_object["criterion_statements"]] != ticket_ids:
+            raise ValueError("accepted piece criterion statement order mismatch")
+        assoc = body_object["association"]
+        if (assoc.get("native_parent") is not False or assoc.get("native_dependencies") != []
+                or assoc.get("initial_status") != "blocked" or assoc.get("operation_key") != canonical.get("idempotency_key")
+                or assoc.get("declared_dependencies") != list(parsed_ticket.dependencies)):
+            raise ValueError("accepted piece association mismatch")
+        expected_assoc = {"kind": "active_tranche_piece_v1", "board_id": self.board, "anchor_task_id": self.anchor_task_id,
+                          "plan_id": token["plan_id"], "request_identity": token["request_identity"],
+                          "proposal_hash": token["proposal_hash"], "plan_contract_hash": token["plan_contract_hash"],
+                          "tranche_id": token["active_tranche"]["tranche_id"], "tranche_ordinal": 0,
+                          "ticket_id": parsed_ticket.ticket_id, "ticket_contract_hash": parsed_ticket.contract_hash}
+        association = "active-tranche-piece:" + _canonical_digest(expected_assoc)
+        operation = {"kind": "active_tranche_held_create_v1", "association": association,
+                     "implementation_profile": canonical["assignee"], "workspace": canonical["workspace"],
+                     "declared_dependencies": list(parsed_ticket.dependencies)}
+        if (canonical.get("association") != association or canonical.get("idempotency_key") != "active-tranche-held:" + _canonical_digest(operation)
+                or canonical.get("tranche_id") != token["active_tranche"]["tranche_id"]
+                or canonical.get("accepted_token_key") != "accept-plan:" + identity
+                or canonical.get("ticket_contract_hash") != parsed_ticket.contract_hash
+                or canonical.get("source_hashes") != {"request_identity": token["request_identity"], "proposal_hash": token["proposal_hash"],
+                    "plan_contract_hash": token["plan_contract_hash"], "acceptance_identity": identity}
+                or body_object.get("accepted_token_key") != canonical.get("accepted_token_key")
+                or token.get("acceptance_identity") != source.get("acceptance_identity")
+                or token.get("request_identity") != source.get("request_identity")
+                or token.get("proposal_hash") != source.get("proposal_hash")
+                or token.get("plan_contract_hash") != source.get("plan_contract_hash")
+                or not isinstance(body_object.get("ticket"), Mapping)
+                or body_object["ticket"].get("ticket_id") != canonical.get("ticket_id")
+                or body_object.get("ticket_contract_hash") != canonical.get("ticket_contract_hash")
+                or body_object.get("route", {}).get("implementation_profile") != canonical.get("assignee")
+                or body_object.get("route", {}).get("workspace") != canonical.get("workspace")
+                or type(canonical.get("tranche_ordinal")) is not int or canonical.get("tranche_ordinal") != 0
+                or not isinstance(token.get("active_tranche"), Mapping)
+                or type(token["active_tranche"].get("ordinal")) is not int
+                or token["active_tranche"].get("ordinal") != canonical.get("tranche_ordinal")
+                or token["active_tranche"].get("tranche_id") != canonical.get("tranche_id")):
+            raise ValueError("trusted accepted-piece body provenance/target mismatch")
+        expected = canonical
+        supplied = action.to_dict()["target"]
+        required = {"task_id", "anchor_task_id", "native_parent", "native_deps"}
+        if not required <= set(supplied) or supplied.get("task_id") != self.anchor_task_id or supplied.get("anchor_task_id") != self.anchor_task_id:
+            raise ValueError("accepted-piece action scope/anchor target mismatch")
+        extra = {"task_id", "anchor_task_id", "native_deps"}
+        if set(supplied) != set(expected) | extra or {k: v for k, v in supplied.items() if k not in extra} != expected:
+            raise ValueError("accepted-piece action differs from trusted canonical payload")
+        if supplied.get("native_parent") is not False or supplied.get("native_deps") != []:
+            raise ValueError("accepted-piece create must be parentless with no native dependencies")
+        if resolved.idempotency_key != action.key or action.scope.get("board_id") != self.board or action.scope.get("anchor_task_id") != self.anchor_task_id:
+            raise ValueError("accepted-piece resolver proof scope or operation key mismatch")
+        return resolved
 
     def _env(self) -> dict[str, str]:
         env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL") if os.environ.get(k)}
@@ -474,6 +649,15 @@ class HermesBoardAdapter:
         return self._result(action, "no-op", "exact marked held creation already present", snapshot)
 
     def create_held(self, action: Action, *, title: str, body: str, assignee: str, workspace: str, idempotency_key: str) -> ActionResult:
+        accepted_piece: Any = None
+        if action.target.get("kind") == "accepted_active_tranche_piece_v1":
+            try:
+                accepted_piece = self._accepted_piece_payload(action)
+            except Exception as exc:
+                return self._result(action, "conflict", f"trusted accepted-piece resolution failed: {exc}", None)
+            if (title, body, assignee, workspace, idempotency_key) != (accepted_piece.title, accepted_piece.body,
+                    accepted_piece.target["assignee"], accepted_piece.target["workspace"], accepted_piece.idempotency_key):
+                return self._result(action, "conflict", "accepted-piece create arguments differ from trusted payload", None)
         error = self._scope_and_target(action, "create_held")
         if error or action.target.get("anchor_task_id") != self.anchor_task_id: return self._result(action, "conflict", error or "create target must name exact anchor", None)
         if not all(isinstance(x, str) and x and len(x) <= _MAX_FIELD for x in (title, body, assignee, workspace, idempotency_key)): raise ValueError("bounded non-empty creation values required")
@@ -483,7 +667,11 @@ class HermesBoardAdapter:
         native_parent = action.target.get("native_parent", True)
         if not isinstance(native_parent, bool):
             return self._result(action, "conflict", "native_parent must be a boolean when supplied", None)
-        if not native_parent and ("planner_marker" in action.target or "request_identity" in action.target):
+        if accepted_piece is not None:
+            # Canonical accepted-piece payload was checked above; do not route it
+            # through legacy planner/correction authority branches.
+            pass
+        elif not native_parent and ("planner_marker" in action.target or "request_identity" in action.target):
             if not self._valid_parentless_planner(action, assignee=assignee, workspace=workspace, idempotency_key=idempotency_key):
                 return self._result(action, "conflict", "parentless planner create requires exact validated request association", None)
             if title != action.target.get("create_title") or body != action.target.get("create_body"):
@@ -531,6 +719,14 @@ class HermesBoardAdapter:
         if len(created_body) > _MAX_FIELD: raise ValueError("creation body plus stable marker exceeds bound")
         if not self._assert_create_lock(action):
             return self._result(action, "unsupported", "trusted singleton create lock assertion is required and must be held", None)
+        if accepted_piece is not None:
+            try:
+                accepted_piece = self._accepted_piece_payload(action)
+            except Exception as exc:
+                return self._result(action, "conflict", f"trusted accepted-piece revalidation failed under lock: {exc}", None)
+            if (title, body, assignee, workspace, idempotency_key) != (accepted_piece.title, accepted_piece.body,
+                    accepted_piece.target["assignee"], accepted_piece.target["workspace"], accepted_piece.idempotency_key):
+                return self._result(action, "conflict", "trusted accepted-piece payload changed under lock", None)
         try: before = self._snapshot(self.anchor_task_id)
         except _BoardUnavailable as exc: return self._result(action, "unknown", f"pre-create anchor read unavailable: {exc}", None)
         if action.expected_observed_identity != before.digest: return self._result(action, "conflict", "action observation identity is stale", before)
@@ -548,6 +744,14 @@ class HermesBoardAdapter:
             return self._result(action, outcome, "durable create attempt claim is required and must succeed before native create", before)
         if not self._assert_create_lock(action):
             return self._result(action, "unsupported", "trusted singleton create lock was not held immediately before native create", before)
+        if accepted_piece is not None:
+            try:
+                latest_piece: Any = self._accepted_piece_payload(action)
+            except Exception as exc:
+                return self._result(action, "conflict", f"trusted accepted-piece proof failed immediately before create: {exc}", before)
+            if (title, body, assignee, workspace, idempotency_key) != (latest_piece.title, latest_piece.body,
+                    latest_piece.target["assignee"], latest_piece.target["workspace"], latest_piece.idempotency_key):
+                return self._result(action, "conflict", "trusted accepted-piece payload changed immediately before create", before)
         argv = ("create", title, "--body", created_body, "--assignee", assignee, "--workspace", workspace)
         if native_parent:
             argv += ("--parent", self.anchor_task_id)
@@ -657,9 +861,29 @@ class HermesBoardAdapter:
         return self._mutate(action, task_id=task_id, argv=("complete", task_id, "--result", approval_evidence), verifier=lambda _b,a: None if a.native_task.get("status") == "done" else "conflict", description="anchor completion")
     def verify_effect(self, action: Action) -> ActionResult:
         if action.effect == "create_held":
+            accepted_piece: Any = None
+            if action.target.get("kind") == "accepted_active_tranche_piece_v1":
+                if not self._assert_create_lock(action):
+                    return self._result(action, "unsupported", "trusted singleton lock is required for accepted-piece reconciliation", None)
+                try:
+                    accepted_piece = self._accepted_piece_payload(action)
+                except Exception as exc:
+                    return self._result(action, "conflict", f"trusted accepted-piece reconciliation failed: {exc}", None)
             error = self._scope_and_target(action, "create_held")
             if error:
                 return self._result(action, "conflict", error, None)
+            if accepted_piece is not None:
+                marker = self._create_marker(action)
+                created_body = accepted_piece.body if marker in accepted_piece.body else f"{accepted_piece.body}\n\n{marker}"
+                try:
+                    count, matches = self._marked_create_matches(marker, idempotency_key=accepted_piece.idempotency_key)
+                except _BoardUnavailable as exc:
+                    return self._result(action, "unknown", f"accepted-piece marker reconciliation unavailable: {exc}", None)
+                if count != 1:
+                    return self._result(action, "conflict" if count > 1 else "unsupported", "exact accepted-piece marker is not uniquely present", None)
+                return self._verify_existing_create(action, matches[0], title=accepted_piece.title, body=created_body,
+                    assignee=accepted_piece.target["assignee"], workspace=accepted_piece.target["workspace"],
+                    idempotency_key=accepted_piece.idempotency_key, native_parent=False)
             fields = ("create_title", "create_body", "reviewer_profile", "create_workspace", "create_idempotency_key")
             if not all(isinstance(action.target.get(field), str) and action.target[field] for field in fields):
                 return self._result(action, "unsupported", "create recovery requires exact persisted create identity", None)
