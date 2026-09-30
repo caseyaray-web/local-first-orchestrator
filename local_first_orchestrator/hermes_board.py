@@ -1207,6 +1207,64 @@ class HermesBoardAdapter:
         except Exception: accepted = False
         if not accepted: return self._result(action, "conflict", "trusted verifier rejected acceptance evidence", before)
         return self._mutate(action, task_id=task_id, argv=("complete", task_id, "--result", approval_evidence), verifier=lambda _b,a: None if a.native_task.get("status") == "done" else "conflict", description="anchor completion")
+
+    def validate_accepted_piece_frozen_receipt(self, action: Action, readback: Any, native_task_id: str):
+        """Check a historical accepted-piece creation receipt without native I/O.
+
+        This certifies only that a bounded original readback is consistent with
+        the trusted accepted-plan description and its digest.  It is not native
+        truth or proof that a later effect occurred: a coordinator must still
+        validate a fresh post-link transition against the original raw barrier.
+        """
+        # Detach and bound untrusted transport before invoking the trusted plan
+        # resolver or constructing snapshot objects.  Only ordinary dict/list
+        # JSON transport is accepted; callers must thaw frozen store objects.
+        data = _plain_json_snapshot(readback)
+        if (type(native_task_id) is not str or not native_task_id or len(native_task_id) > _MAX_FIELD
+                or not _utf8_clean(native_task_id) or native_task_id != native_task_id.strip()
+                or any(ord(c) < 32 or ord(c) == 127 for c in native_task_id)):
+            raise ValueError("exact bounded literal native task ID required")
+        fields = {"native_task", "parents", "runs", "comments", "events", "attachments", "observed_at", "digest"}
+        if type(data) is not dict or set(data) != fields:
+            raise ValueError("frozen receipt snapshot schema mismatch")
+        try:
+            snapshot = BoardSnapshot.from_dict(data)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("frozen receipt snapshot is malformed") from exc
+        canonical_data = {name: data[name] for name in ("native_task", "parents", "runs", "comments", "events", "attachments")}
+        if (type(data["digest"]) is not str or len(data["digest"]) != 71 or not data["digest"].startswith("sha256:")
+                or any(c not in "0123456789abcdef" for c in data["digest"][7:])
+                or data["digest"] != self._digest(canonical_data)):
+            raise ValueError("frozen receipt digest does not bind exact snapshot")
+        if action.effect != "create_held" or action.target.get("kind") != "accepted_active_tranche_piece_v1":
+            raise ValueError("frozen receipt requires an accepted-piece create action")
+        # This reconstitutes the closed accepted description from trusted plan
+        # evidence and proves the supplied Action is exactly its adapter target.
+        accepted = self._accepted_piece_payload(action)
+        if accepted is None:
+            raise ValueError("frozen receipt requires a reconstructed accepted piece")
+        marker = self._create_marker(action)
+        expected_body = accepted.body if marker in accepted.body else f"{accepted.body}\n\n{marker}"
+        task = snapshot.native_task
+        required_task = {"id", "title", "body", "assignee", "status"}
+        if not required_task <= set(task):
+            raise ValueError("frozen receipt native task lacks canonical identity fields")
+        if (task.get("id") != native_task_id or task.get("title") != accepted.title
+                or task.get("body") != expected_body or task.get("assignee") != accepted.target["assignee"]
+                or self._workspace_routing(task, accepted.target["workspace"]) is not None
+                or task.get("status") != "blocked"):
+            raise ValueError("frozen receipt native task differs from canonical accepted piece")
+        if "idempotency_key" in task and task.get("idempotency_key") != accepted.idempotency_key:
+            raise ValueError("frozen receipt idempotency key differs from canonical accepted piece")
+        if snapshot.parents or snapshot.runs:
+            raise ValueError("frozen receipt must be parentless with no native runs")
+        return MappingProxyType({
+            "kind": "accepted_piece_frozen_receipt_validation_v1",
+            "requires_fresh_native_transition_validation": True,
+            "native_task_id": native_task_id,
+            "snapshot": snapshot,
+        })
+
     def verify_effect(self, action: Action) -> ActionResult:
         if action.effect == "link" and action.target.get("kind") == "accepted_active_tranche_native_link_v1":
             if not self._assert_create_lock(action):
