@@ -23,6 +23,35 @@ from .planning_coordinator import (request_from_payload, _canonical_digest, _evi
     ActiveTrancheRoute, HeldCardTarget)
 
 
+def _plain_json_snapshot(value, *, max_nodes=20_000, max_bytes=1_000_000, max_depth=64):
+    """Detach exact built-in JSON values without invoking subclass hooks."""
+    nodes = 0
+    stack = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > max_nodes or depth > max_depth:
+            raise ValueError("JSON transport exceeds traversal bounds")
+        if type(item) is dict:
+            for key, child in dict.items(item):
+                if type(key) is not str:
+                    raise ValueError("JSON object keys must be plain strings")
+                stack.append((key, depth + 1)); stack.append((child, depth + 1))
+        elif type(item) is list:
+            stack.extend((child, depth + 1) for child in list.__iter__(item))
+        elif type(item) is str:
+            if not _utf8_clean(item): raise ValueError("invalid UTF-8 JSON string")
+        elif item is None or type(item) in (bool, int, float):
+            if type(item) is float and not __import__("math").isfinite(item):
+                raise ValueError("non-finite JSON number")
+        else:
+            raise ValueError("transport contains a non-plain JSON value")
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    if len(encoded.encode("utf-8")) > max_bytes:
+        raise ValueError("JSON transport exceeds byte bound")
+    return json.loads(encoded)
+
+
 def _freeze_link_value(value):
     if type(value) is dict:
         return MappingProxyType({key: _freeze_link_value(item) for key, item in value.items()})
@@ -184,7 +213,9 @@ class HermesBoardAdapter:
                  completion_evidence_verifier: Callable[[Mapping[str, str], str, str], bool] | None = None,
                  create_lock_assertion: Callable[[Mapping[str, str], str], Any] | None = None,
                  claim_create_attempt: Callable[[Mapping[str, str], str], Any] | None = None,
-                 accepted_piece_create_lookup: Callable[[Mapping[str, str], str], Any] | None = None) -> None:
+                 accepted_piece_create_lookup: Callable[[Mapping[str, str], str], Any] | None = None,
+                 accepted_dependency_link_lookup: Callable[[Mapping[str, str], str], Any] | None = None,
+                 dependency_link_attempt_claim: Callable[[Mapping[str, str], str], Any] | None = None) -> None:
         if not all(isinstance(x, str) and x and x.replace("-", "").replace("_", "").isalnum() for x in (board, anchor_task_id)):
             raise ValueError("explicit board and anchor IDs required")
         executable_path = Path(executable)
@@ -204,6 +235,11 @@ class HermesBoardAdapter:
         # This resolver must re-read accepted-plan authority from its trusted store;
         # caller-supplied Action JSON is never itself acceptance authority.
         self.accepted_piece_create_lookup = accepted_piece_create_lookup
+        # These callbacks are intentionally separate from legacy link authority:
+        # the resolver returns a closed frozen first-edge proof wrapper, and the
+        # claim callback durably consumes its one-shot attempt immediately pre-send.
+        self.accepted_dependency_link_lookup = accepted_dependency_link_lookup
+        self.dependency_link_attempt_claim = dependency_link_attempt_claim
         self.capabilities = BoardCapabilities.native_m0()
 
     def _accepted_piece_payload(self, action: Action):
@@ -909,7 +945,239 @@ class HermesBoardAdapter:
         if result is not None: return result
         assert before is not None
         return self._result(action, "conflict" if not any(str(x.get("id")) == str(run_id) for x in before.runs) else "unsupported", "exact run stop is not supported by native CLI", before)
+    def _accepted_link_proof(self, action: Action):
+        """Resolve only the documented closed adapter wrapper, never raw Action authority.
+
+        Wrapper keys: target, authority, source_id, child_id, before_source,
+        before_child, expected_source, source_snapshot, child_snapshot, and
+        command_started_seconds. The complete transport is detached and bounded
+        as plain JSON before any schema validation or field access.
+        """
+        if self.accepted_dependency_link_lookup is None:
+            raise ValueError("trusted accepted-dependency resolver required")
+        value = _plain_json_snapshot(self.accepted_dependency_link_lookup(action.scope, action.key))
+        keys = {"target", "authority", "source_id", "child_id", "before_source", "before_child", "expected_source",
+                "source_snapshot", "child_snapshot", "command_started_seconds"}
+        if type(value) is not dict or set(value) != keys:
+            raise ValueError("accepted-link resolver wrapper schema mismatch")
+        authority = value["authority"]
+        authority_keys = {"kind", "acceptance_identity", "plan_id", "request_identity", "scope", "route",
+            "root_task_id", "tranche_ordinal", "tranche_id", "source_ticket_id", "target_ticket_id",
+            "source_association", "target_association", "source_task_id", "target_task_id",
+            "frozen_create_receipts", "operation_key", "read_only_first_edge_only"}
+        if type(authority) is not dict or set(authority) != authority_keys:
+            raise ValueError("accepted-link authority schema mismatch")
+        def clean_id(item):
+            return (type(item) is str and bool(item) and len(item.encode("utf-8")) <= _MAX_FIELD
+                    and item == item.strip() and not any(ord(c) < 32 or ord(c) == 127 for c in item))
+        id_fields = ("acceptance_identity", "plan_id", "request_identity", "root_task_id", "tranche_id",
+            "source_ticket_id", "target_ticket_id", "source_association", "target_association",
+            "source_task_id", "target_task_id", "operation_key")
+        if any(not clean_id(authority.get(field)) for field in id_fields):
+            raise ValueError("accepted-link authority identifiers malformed")
+        if (authority["kind"] != "accepted_active_tranche_native_link_v1"
+                or type(authority["tranche_ordinal"]) is not int or authority["tranche_ordinal"] != 0
+                or authority["read_only_first_edge_only"] is not True
+                or type(authority["scope"]) is not dict or authority["scope"] != dict(action.scope)
+                or authority["scope"] != {"board_id": self.board, "anchor_task_id": self.anchor_task_id}
+                or authority["root_task_id"] != self.anchor_task_id
+                or type(authority["route"]) is not dict
+                or set(authority["route"]) != {"implementation_profile", "workspace"}
+                or any(not clean_id(v) for v in authority["route"].values())):
+            raise ValueError("accepted-link authority scope, route, or root mismatch")
+        identity = {k: v for k, v in authority.items() if k not in {"operation_key", "read_only_first_edge_only"}}
+        expected_key = "native-link:" + _canonical_digest(identity)
+        if authority["operation_key"] != expected_key or action.key != expected_key:
+            raise ValueError("accepted-link operation key does not bind exact authority")
+        if (type(value["source_id"]) is not str or type(value["child_id"]) is not str
+                or not clean_id(value["source_id"]) or not clean_id(value["child_id"])
+                or value["source_id"] == value["child_id"]
+                or value["source_id"] != authority["source_task_id"]
+                or value["child_id"] != authority["target_task_id"]
+                or type(value["command_started_seconds"]) is not int or value["command_started_seconds"] <= 0):
+            raise ValueError("accepted-link IDs or time bound malformed")
+        value["before_source"] = _plain_json_snapshot(value["before_source"])
+        value["before_child"] = _plain_json_snapshot(value["before_child"])
+        value["expected_source"] = _plain_json_snapshot(value["expected_source"])
+        target = value["target"]
+        expected_keys = {"kind", "source_task_id", "child_task_id", "operation_key"}
+        if (type(target) is not dict or set(target) != expected_keys
+                or target.get("kind") != "accepted_active_tranche_native_link_v1"
+                or target.get("source_task_id") != value["source_id"]
+                or target.get("child_task_id") != value["child_id"] or target.get("operation_key") != action.key
+                or target != action.to_dict()["target"]):
+            raise ValueError("action target differs from trusted canonical link target")
+        if (value["source_id"] == self.anchor_task_id
+                or not self._trusted_member(action.scope, value["source_id"])
+                or not self._trusted_member(action.scope, value["child_id"])):
+            raise ValueError("accepted-link endpoints must be distinct managed generation-zero cards")
+        receipts = authority["frozen_create_receipts"]
+        if type(receipts) is not list or not receipts or len(receipts) > 256:
+            raise ValueError("accepted-link frozen receipts malformed")
+        receipt_keys = {"ticket_id", "task_id", "association", "operation_key", "digest", "readback"}
+        seen_tasks = set(); selected = {}
+        for receipt in receipts:
+            if type(receipt) is not dict or set(receipt) != receipt_keys:
+                raise ValueError("accepted-link receipt schema mismatch")
+            if any(not clean_id(receipt.get(k)) for k in ("ticket_id", "task_id", "association", "operation_key")):
+                raise ValueError("accepted-link receipt identity malformed")
+            if receipt["task_id"] in seen_tasks: raise ValueError("duplicate frozen receipt task identity")
+            seen_tasks.add(receipt["task_id"]); selected[receipt["ticket_id"]] = receipt
+            if not (type(receipt["digest"]) is str and receipt["digest"].startswith("sha256:")
+                    and len(receipt["digest"]) == 71 and all(c in "0123456789abcdef" for c in receipt["digest"][7:])):
+                raise ValueError("accepted-link receipt digest malformed")
+            raw_receipt = _plain_json_snapshot(receipt["readback"])
+            if raw_receipt != value["source_snapshot"] and raw_receipt != value["child_snapshot"]:
+                if receipt["task_id"] in {value["source_id"], value["child_id"]}:
+                    raise ValueError("accepted-link transport snapshot differs from immutable receipt")
+        if (authority["source_ticket_id"] not in selected or authority["target_ticket_id"] not in selected
+                or selected[authority["source_ticket_id"]]["task_id"] != value["source_id"]
+                or selected[authority["target_ticket_id"]]["task_id"] != value["child_id"]):
+            raise ValueError("accepted-link endpoints are not unique frozen tranche receipts")
+        snapshots = []
+        for field, receipt_key in (("source_snapshot", "source_ticket_id"), ("child_snapshot", "target_ticket_id")):
+            raw_snapshot = _plain_json_snapshot(value[field])
+            receipt = selected[authority[receipt_key]]
+            if raw_snapshot != receipt["readback"] or receipt["task_id"] != value["source_id" if field == "source_snapshot" else "child_id"]:
+                raise ValueError("accepted-link snapshot does not equal its frozen create receipt")
+            snapshot = BoardSnapshot.from_dict(raw_snapshot)
+            if snapshot.parents or snapshot.runs or snapshot.native_task.get("status") != "blocked":
+                raise ValueError("accepted-link immutable create snapshot malformed or active")
+            if snapshot.digest != receipt["digest"]: raise ValueError("receipt digest does not match frozen snapshot")
+            snapshots.append(snapshot)
+        if authority["source_association"] != selected[authority["source_ticket_id"]]["association"] or authority["target_association"] != selected[authority["target_ticket_id"]]["association"]:
+            raise ValueError("accepted-link ticket associations differ from receipts")
+        return value, snapshots
+
+    def _raw_show_and_runs(self, task_id: str):
+        raw = self._invoke("show", task_id, "--json", json_output=True)
+        runs = self._invoke("runs", task_id, "--json", json_output=True)
+        if (not isinstance(raw, dict) or not isinstance(raw.get("task"), dict)
+                or raw["task"].get("id") != task_id or not isinstance(runs, list)
+                or not all(isinstance(run, dict) for run in runs)):
+            raise _BoardUnavailable("accepted-link exact raw show or runs malformed")
+        return raw, runs
+
+    def _link_accepted_first_edge(self, action: Action, parent_task_id: str, child_task_id: str) -> ActionResult:
+        if action.effect != "link" or action.scope != {"board_id": self.board, "anchor_task_id": self.anchor_task_id}:
+            return self._result(action, "conflict", "accepted link requires exact link effect and adapter scope", None)
+        if self.dependency_link_attempt_claim is None:
+            return self._result(action, "unsupported", "durable first-link attempt claim is required", None)
+        if not self._assert_create_lock(action):
+            return self._result(action, "unsupported", "trusted singleton lock assertion required before proof resolution", None)
+        try:
+            proof, immutable = self._accepted_link_proof(action)
+        except Exception as exc:
+            return self._result(action, "conflict", f"trusted accepted-link resolution failed: {exc}", None)
+        source_id, target_id = proof["source_id"], proof["child_id"]
+        if (parent_task_id != source_id or child_task_id != target_id
+                or action.target["source_task_id"] != source_id or action.target["child_task_id"] != target_id):
+            return self._result(action, "conflict", "link arguments differ from canonical trusted endpoints", None)
+        if self.dependency_link_attempt_claim is None:
+            return self._result(action, "unsupported", "durable first-link attempt claim is required", None)
+        try:
+            before_source, source_runs = self._raw_show_and_runs(source_id)
+            before_child, child_runs = self._raw_show_and_runs(target_id)
+            if source_runs or child_runs:
+                raise ValueError("accepted-link endpoint has native run history")
+            bundle = _evidence_snapshot({"before_source": before_source, "before_child": before_child})
+            if (bundle["before_source"] != proof["before_source"]
+                    or bundle["before_child"] != proof["before_child"]):
+                raise ValueError("current raw before objects differ from frozen accepted proof")
+            for current, snapshot in zip((before_source, before_child), immutable):
+                snap = snapshot.to_dict()
+                snap.pop("observed_at", None)
+                raw_as_snapshot = self._snapshot_from_raw(current, [])
+                current_data = raw_as_snapshot.to_dict()
+                current_data.pop("observed_at", None)
+                if current_data != snap:
+                    raise ValueError("current native card differs from immutable held create receipt")
+            expected_source = dict(bundle["before_source"])
+            expected_source["children"] = [target_id]
+            if dict(proof["expected_source"]) != expected_source:
+                raise ValueError("trusted expected source is not exact single-child append")
+            if action.expected_observed_identity != immutable[1].digest:
+                raise ValueError("link action identity differs from frozen child receipt")
+        except _BoardUnavailable as exc:
+            return self._result(action, "unknown", f"accepted-link preflight read unavailable: {exc}", None)
+        except Exception as exc:
+            return self._result(action, "conflict", f"accepted-link preflight rejected: {exc}", None)
+        try:
+            self.create_lock_assertion(action.scope, self.anchor_task_id)
+        except Exception as exc:
+            return self._result(action, "unsupported", f"trusted singleton lock assertion required: {exc}", None)
+        try:
+            receipt = _plain_json_snapshot(self.dependency_link_attempt_claim(action.scope, action.key))
+            expected_keys = {"before_phase", "operation"}
+            if type(receipt) is not dict or set(receipt) != expected_keys or receipt.get("before_phase") != "pending":
+                raise ValueError("claim receipt must prove pending prior phase")
+            operation = receipt.get("operation")
+            if type(operation) is not dict or set(operation) != {"key", "scope", "target", "effect", "expected_observed_identity", "before_evidence", "outcome", "readback", "retry", "phase"}:
+                raise ValueError("claim receipt operation transport malformed")
+            # Strict bounded JSON round-trip rejects custom mappings/hooks and non-JSON values.
+            encoded = json.dumps(operation, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+            if len(encoded) > _MAX_FIELD or json.loads(encoded) != operation:
+                raise ValueError("claim receipt operation transport is not bounded plain JSON")
+            if (operation["key"] != action.key or operation["scope"] != dict(action.scope)
+                    or operation["effect"] != "link" or operation["target"] != action.to_dict()["target"]
+                    or operation["expected_observed_identity"] != action.expected_observed_identity
+                    or operation["phase"] != "unknown"):
+                raise ValueError("claim receipt does not bind this link action in unknown phase")
+        except Exception as exc:
+            return self._result(action, "unknown", f"durable link attempt claim receipt invalid: {exc}", None)
+        try:
+            self.create_lock_assertion(action.scope, self.anchor_task_id)
+        except Exception as exc:
+            return self._result(action, "unknown", f"link lock assertion failed after durable claim: {exc}", None)
+        started = int(time.time())
+        try:
+            self._invoke("link", source_id, target_id)
+        except (_BoardUnavailable, ValueError) as exc:
+            return self._result(action, "unknown", f"native accepted link outcome unknown: {exc}", None)
+        ended = int(time.time())
+        return self._reconcile_accepted_link(action, proof, immutable, started, ended, pending=True)
+
+    def _snapshot_from_raw(self, raw: Mapping[str, Any], runs: list[dict[str, Any]]) -> BoardSnapshot:
+        task = raw["task"]
+        data = {"native_task": task, "parents": [{"id": x} for x in raw.get("parents", [])],
+                "runs": runs, "comments": raw.get("comments", []), "events": raw.get("events", []),
+                "attachments": raw.get("attachments", [])}
+        return BoardSnapshot(native_task=data["native_task"], parents=tuple(data["parents"]),
+            runs=tuple(runs), comments=tuple(data["comments"]), events=tuple(data["events"]),
+            attachments=tuple(data["attachments"]), observed_at=datetime.now(timezone.utc).isoformat(),
+            digest=self._digest(data))
+
+    def _reconcile_accepted_link(self, action, proof, immutable, started, ended, *, pending):
+        try:
+            source_raw, source_runs = self._raw_show_and_runs(proof["source_id"])
+            child_raw, child_runs = self._raw_show_and_runs(proof["child_id"])
+            if (source_raw == proof["before_source"] and child_raw == proof["before_child"]
+                    and not source_runs and not child_runs):
+                outcome = "conflict" if pending else "unknown"
+                return self._result(action, outcome, "accepted link edge is absent; reconciliation is read-only and will not resend", None)
+            transition = validate_accepted_first_link_transition(
+                proof["before_source"], proof["before_child"], source_raw, child_raw,
+                source_id=proof["source_id"], child_id=proof["child_id"],
+                command_started_seconds=max(started, proof["command_started_seconds"]),
+                command_ended_seconds=ended)
+            if source_runs or child_runs:
+                raise ValueError("native runs appeared during accepted link")
+            after_source_snapshot = self._snapshot_from_raw(source_raw, source_runs)
+            after_child_snapshot = self._snapshot_from_raw(child_raw, child_runs)
+            readback = {"kind": "accepted_active_tranche_native_link_readback_v1",
+                "source": source_raw, "child": child_raw, "source_snapshot": after_source_snapshot.to_dict(),
+                "child_snapshot": after_child_snapshot.to_dict(), "time_window": {"started": started, "ended": ended},
+                "transition": {"source_id": transition.source_id, "child_id": transition.child_id,
+                    "event": transition.event}}
+            return ActionResult(action.key, "verified", "accepted first-edge linked append verified by two-card exact readback", readback)
+        except _BoardUnavailable as exc:
+            return self._result(action, "unknown", f"accepted-link readback unavailable: {exc}", None)
+        except Exception as exc:
+            return self._result(action, "conflict", f"accepted-link transition contradicts frozen proof: {exc}", None)
+
     def link(self, action: Action, parent_task_id: str, child_task_id: str) -> ActionResult:
+        if action.target.get("kind") == "accepted_active_tranche_native_link_v1":
+            return self._link_accepted_first_edge(action, parent_task_id, child_task_id)
         if parent_task_id != self.anchor_task_id or parent_task_id == child_task_id or action.target.get("parent_task_id") != parent_task_id or action.target.get("child_task_id") != child_task_id: return self._result(action, "conflict", "links must originate at exact anchor with distinct endpoints", None)
         error = self._scope_and_target(action, "link")
         if error: return self._result(action, "conflict", error, None)
@@ -940,6 +1208,15 @@ class HermesBoardAdapter:
         if not accepted: return self._result(action, "conflict", "trusted verifier rejected acceptance evidence", before)
         return self._mutate(action, task_id=task_id, argv=("complete", task_id, "--result", approval_evidence), verifier=lambda _b,a: None if a.native_task.get("status") == "done" else "conflict", description="anchor completion")
     def verify_effect(self, action: Action) -> ActionResult:
+        if action.effect == "link" and action.target.get("kind") == "accepted_active_tranche_native_link_v1":
+            if not self._assert_create_lock(action):
+                return self._result(action, "unsupported", "trusted singleton lock required for accepted-link reconciliation", None)
+            try:
+                proof, immutable = self._accepted_link_proof(action)
+                return self._reconcile_accepted_link(action, proof, immutable,
+                    proof["command_started_seconds"], int(time.time()), pending=False)
+            except Exception as exc:
+                return self._result(action, "conflict", f"trusted accepted-link reconciliation failed: {exc}", None)
         if action.effect == "create_held":
             accepted_piece: Any = None
             if action.target.get("kind") == "accepted_active_tranche_piece_v1":
