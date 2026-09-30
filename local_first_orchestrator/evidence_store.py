@@ -617,6 +617,68 @@ class EvidenceStore:
             )
         return dict(review)
 
+    def register_planning_request(self, scope: Mapping[str, Any], request: Any, planner_task_id: str, planner_profile: str | None = None, *, request_id: str | None = None) -> Mapping[str, Any]:
+        """Bind one canonical planner request to one managed native planner task.
+
+        The operation-intent journal is used as the immutable evidence container;
+        no lifecycle state is mirrored and no schema migration is needed.
+        """
+        from .decomposition_planner import PlanningRequest, request_payload
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        if type(request) is not PlanningRequest:
+            raise ValueError("PlanningRequest required")
+        payload = request_payload(request)
+        if request.board_id != board or request.anchor_id != anchor:
+            raise ConflictError("planning request scope does not match registration scope")
+        if not _nonempty_string(planner_task_id):
+            raise ValueError("planner task ID must be non-empty")
+        if planner_profile is None or not _nonempty_string(planner_profile):
+            raise ValueError("planner profile must be non-empty")
+        if request_id is not None and not _nonempty_string(request_id):
+            raise ValueError("request_id must be non-empty when supplied")
+        member = self.connection.execute("SELECT role FROM managed_members WHERE board_id=? AND anchor_task_id=? AND task_id=?", (board, anchor, planner_task_id)).fetchone()
+        if member is None or member["role"] != "planner":
+            raise ConflictError("planner task is not an enrolled planner member")
+        identity = {"request": payload, "planner_task_id": planner_task_id, "planner_profile": planner_profile}
+        scope_identity = {"board_id": board, "anchor_task_id": anchor}
+        key = "planning-request:" + _canonical_identity(scope_identity)
+        if request_id is not None:
+            key += ":" + _canonical_identity({"request_id": request_id})
+        intent = OperationIntent(key, {"board_id": board, "anchor_task_id": anchor}, identity, "register_planning_request", request.identity, {"request_identity": request.identity, "planner_task_id": planner_task_id, "planner_profile": planner_profile}, "verified", {"immutable": True, "request_identity": request.identity}, {"immutable": True}, "applied")
+        stored = self.reserve_operation(intent)
+        return stored.to_dict()["target"]
+
+    def read_planning_request(self, scope: Mapping[str, Any], *, request_id: str | None = None) -> Mapping[str, Any]:
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        if request_id is not None and not _nonempty_string(request_id):
+            raise ValueError("request_id must be non-empty when supplied")
+        key = "planning-request:" + _canonical_identity({"board_id": board, "anchor_task_id": anchor})
+        if request_id is not None:
+            key += ":" + _canonical_identity({"request_id": request_id})
+        intent = self._operation({"board_id": board, "anchor_task_id": anchor}, key)
+        if intent.effect != "register_planning_request" or intent.phase != "applied" or intent.outcome != "verified":
+            raise SchemaError("planning request registration evidence is malformed")
+        from .planning_coordinator import request_from_payload
+        target = intent.to_dict()["target"]
+        if intent.readback != {"immutable": True, "request_identity": intent.expected_observed_identity} or intent.before_evidence != {"request_identity": intent.expected_observed_identity, "planner_task_id": target.get("planner_task_id"), "planner_profile": target.get("planner_profile")}:
+            raise SchemaError("planning request registration readback is malformed")
+        try:
+            if set(target) != {"request", "planner_task_id", "planner_profile"}:
+                raise ValueError("registration target fields mismatch")
+            if not _nonempty_string(target["planner_task_id"]) or not _nonempty_string(target["planner_profile"]):
+                raise ValueError("registration planner binding is malformed")
+            request = request_from_payload(target["request"])
+            member = self.connection.execute("SELECT role FROM managed_members WHERE board_id=? AND anchor_task_id=? AND task_id=?", (board, anchor, target["planner_task_id"])).fetchone()
+            if member is None or member["role"] != "planner":
+                raise ValueError("registration planner is not an enrolled planner")
+            if request.identity != intent.expected_observed_identity or request.board_id != board or request.anchor_id != anchor:
+                raise ValueError("registration identity or scope is inconsistent")
+        except (TypeError, KeyError, ValueError) as error:
+            raise SchemaError("planning request registration evidence is malformed") from error
+        return target
+
     def reserve_operation(self, intent: OperationIntent) -> OperationIntent:
         self._require_schema()
         board, anchor = _scope_values(intent.scope)

@@ -8,7 +8,7 @@ import os
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
-from .budgets import GENERAL_ATTEMPT, REVIEW_CORRECTIONS, BudgetPolicy, WORKFLOW_REPAIRS, admit_repair_operation, permit_action
+from .budgets import GENERAL_ATTEMPT, PAID_CAPACITY, REVIEW_CORRECTIONS, BudgetPolicy, WORKFLOW_REPAIRS, admit_repair_operation, permit_action
 from .contracts import Action, ActionResult, BoardSnapshot, OperationIntent, PauseIntent, validate_scope
 from .daemon import InstanceLock
 from .operator_controls import (
@@ -23,7 +23,9 @@ class Coordinator:
     def __init__(self, scope: Mapping[str, Any], *, board: Any, store: Any,
                  lock: InstanceLock, git_observer: Callable[[Mapping[str, str]], Mapping[str, Any]] | None = None,
                  budget_policy: BudgetPolicy | None = None,
-                 configured_roles: Mapping[str, str] | None = None) -> None:
+                 configured_roles: Mapping[str, str] | None = None,
+                 planning_observer: Callable[[Mapping[str, str]], Mapping[str, Any]] | None = None,
+                 planning_profile: str | None = None) -> None:
         self.scope = validate_scope(scope)
         if board is None or store is None or not isinstance(lock, InstanceLock):
             raise ValueError("explicit board, store, and InstanceLock are required")
@@ -38,11 +40,122 @@ class Coordinator:
             raise ValueError("configured roles must be a mapping")
         self.configured_roles = MappingProxyType(dict(configured_roles or {}))
         self.git_observer, self.budget_policy = git_observer, budget_policy
+        # Trusted composition-root dependency. The callback observes current
+        # repository, base, contract and approved objective/configuration itself.
+        self.planning_observer = planning_observer
+        self.planning_profile = planning_profile
+
+    def register_planning_request(self, planner_task_id: str, *, request_id: str | None = None) -> Mapping[str, Any]:
+        """Register only the canonical request freshly observed by trusted root."""
+        from .planning_coordinator import request_from_payload
+        from .decomposition_planner import request_payload
+        planner_profile = self._planning_roles()
+        if self.planning_observer is None:
+            raise ValueError("trusted planning observer is not configured")
+        if not isinstance(planner_task_id, str) or not planner_task_id:
+            raise ValueError("planner task ID is required")
+        with self.lock:
+            self._assert_lock()
+            pause = self.store.read_scope(self.scope)["operator_intent"]
+            if pause is not None and pause.active:
+                raise ValueError("planning registration is fenced by active pause/cancellation")
+            members = [m for m in self._members() if m.task_id == planner_task_id and m.role == "planner"]
+            if len(members) != 1:
+                raise ValueError("planner task must be an exact managed planner member")
+            env_task, run_id, session = (os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_RUN_ID"), os.environ.get("HERMES_SESSION_ID"))
+            if env_task != planner_task_id or not run_id or not session:
+                raise ValueError("planner registration requires the active worker-owned task, run, and session")
+            run = self.board.read_scoped_run(self.scope, planner_task_id, run_id) if hasattr(self.board, "read_scoped_run") else None
+            if not isinstance(run, Mapping):
+                raise ValueError("exact native planner run observation is unavailable")
+            self._exact_run(run, run_id=run_id, profile=planner_profile)
+            if run.get("task_id", planner_task_id) != planner_task_id or run.get("status") not in {"running", "active"}:
+                raise ValueError("planner registration requires the exact currently running native task")
+            native_session = self._worker_session(run)
+            if native_session is not None and native_session != session:
+                raise ValueError("active worker session does not match native run receipt")
+            self._record_planner_capacity(planner_task_id, run_id, run)
+            observed = self.planning_observer(self.scope)
+            if not isinstance(observed, Mapping) or set(observed) != {"request"}:
+                raise ValueError("trusted planning observer returned malformed observation")
+            request = request_from_payload(observed["request"])
+            if request.board_id != self.scope["board_id"] or request.anchor_id != self.scope["anchor_task_id"]:
+                raise ValueError("observed planning request has wrong scope")
+            return self.store.register_planning_request(self.scope, request, planner_task_id, planner_profile, request_id=request_id)
+
+    def _record_planner_capacity(self, task_id: str, run_id: str, run: Mapping[str, Any]) -> None:
+        policy = self.budget_policy
+        if not isinstance(policy, BudgetPolicy):
+            raise ValueError("explicit finite planner paid-capacity BudgetPolicy is required")
+        member = next((item for item in self._members() if item.task_id == task_id and item.role == "planner"), None)
+        if member is None:
+            raise ValueError("planner capacity source is not an exact managed planner")
+        event = {
+            "event_id": f"{PAID_CAPACITY}:{run_id}",
+            "lineage_id": f"{self.scope['anchor_task_id']}:{GENERAL_ATTEMPT}",
+            "root_task_id": self.scope["anchor_task_id"],
+            "finding_id": GENERAL_ATTEMPT,
+            "generation": member.generation,
+            "source_task_id": task_id,
+            "source_kind": "native_run",
+            "native_source_id": run_id,
+            "count": 1,
+            "run": run,
+        }
+        policy.record_once(self.store, self.scope, event)
+
+    def submit_plan(self, proposal_json: str, *, request_id: str | None = None) -> Mapping[str, Any]:
+        """Accept evidence from the active native planner run; never creates work."""
+        from .decomposition_planner import parse_proposal, request_payload
+        from .planning_coordinator import request_from_payload, evidence_payload
+        planner_profile = self._planning_roles()
+        if self.planning_observer is None:
+            raise ValueError("trusted planning observer and explicit planning profile are required")
+        with self.lock:
+            self._assert_lock()
+            registration = self.store.read_planning_request(self.scope, request_id=request_id)
+            task_id = registration.get("planner_task_id")
+            profile = registration.get("planner_profile")
+            if profile != planner_profile or not isinstance(task_id, str):
+                raise ValueError("stored planner registration is malformed or profile-mismatched")
+            member = next((m for m in self._members() if m.task_id == task_id), None)
+            if member is None or member.role != "planner":
+                raise ValueError("registered planner is not an exact managed member")
+            observed = self.planning_observer(self.scope)
+            if not isinstance(observed, Mapping) or set(observed) != {"request"}:
+                raise ValueError("trusted planning observer returned malformed observation")
+            request = request_from_payload(observed["request"])
+            registered = request_from_payload(registration.get("request"))
+            if request_payload(request) != request_payload(registered):
+                raise ValueError("current trusted planning observation is stale")
+            env_task, run_id = os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_RUN_ID")
+            session = os.environ.get("HERMES_SESSION_ID")
+            if env_task != task_id or not run_id or not session:
+                raise ValueError("submission requires active worker-owned task, run, and session")
+            intent = self.store.read_scope(self.scope)["operator_intent"]
+            if intent is not None and intent.active:
+                raise ValueError("planning submission is fenced by active pause/cancellation")
+            run = self.board.read_scoped_run(self.scope, task_id, run_id) if hasattr(self.board, "read_scoped_run") else None
+            if not isinstance(run, Mapping):
+                raise ValueError("exact native planner run observation is unavailable")
+            self._exact_run(run, run_id=run_id, profile=profile)
+            if run.get("task_id", task_id) != task_id or run.get("status") not in {"running", "active"}:
+                raise ValueError("planner submission requires the exact currently running native task")
+            native_session = self._worker_session(run)
+            if native_session is not None and native_session != session:
+                raise ValueError("active worker session does not match native run receipt")
+            self._record_planner_capacity(task_id, run_id, run)
+            proposal = parse_proposal(proposal_json, request)
+            evidence = evidence_payload(request, proposal, planner_task_id=task_id, planner_run_id=run_id,
+                                        planner_session_id=session, planner_profile=profile)
+            return self.store.record_plan(self.scope, evidence)
 
     def _local_review_roles(self) -> tuple[str, str]:
         """Return immutable operator-selected roles or fail closed for M3 work."""
         roles = self.configured_roles
-        if set(roles) != {"implementation_profile", "local_review_profile"}:
+        two = {"implementation_profile", "local_review_profile"}
+        three = two | {"planning_profile"}
+        if set(roles) not in (two, three):
             raise ValueError("configured implementation and local-review roles are required")
         implementation, reviewer = roles["implementation_profile"], roles["local_review_profile"]
         if (not isinstance(implementation, str) or not implementation
@@ -50,6 +163,21 @@ class Coordinator:
                 or implementation == reviewer):
             raise ValueError("configured implementation and local-review roles must be distinct non-empty profiles")
         return implementation, reviewer
+
+    def _planning_roles(self) -> str:
+        roles = self.configured_roles
+        if set(roles) != {"implementation_profile", "local_review_profile", "planning_profile"}:
+            raise ValueError("configured planning role is required")
+        implementation, reviewer, planner = (roles[key] for key in
+            ("implementation_profile", "local_review_profile", "planning_profile"))
+        if any(not isinstance(role, str) or not role for role in (implementation, reviewer, planner)):
+            raise ValueError("configured roles must be non-empty profiles")
+        if len({implementation, reviewer, planner}) != 3:
+            raise ValueError("planning, implementation, and local-review roles must be distinct")
+        if self.planning_profile is not None and self.planning_profile != planner:
+            raise ValueError("explicit planning profile does not match configured role")
+        return planner
+
 
     def _assert_native_lock(self, scope: Mapping[str, str], anchor_task_id: str) -> None:
         if validate_scope(scope) != self.scope or anchor_task_id != self.scope["anchor_task_id"]:
@@ -606,7 +734,6 @@ class Coordinator:
     def recover(self) -> dict[str, Any]: return self.tick()
     def enroll(self, *args: Any, **kwargs: Any) -> None: raise NotImplementedError("M2 enrollment is not implemented")
     def report_issue(self, *args: Any, **kwargs: Any) -> None: raise NotImplementedError("M2 recovery reporting is not implemented")
-    def submit_plan(self, *args: Any, **kwargs: Any) -> None: raise NotImplementedError("M3 planning is not implemented")
     def _managed_task(self, task_id: str) -> None:
         if not isinstance(task_id, str) or task_id not in {member.task_id for member in self._members()}:
             raise ValueError("task must be an exact managed member")
