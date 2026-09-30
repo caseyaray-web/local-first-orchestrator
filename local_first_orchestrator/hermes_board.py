@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .contracts import Action, ActionResult, BoardSnapshot, validate_scope
+from .planning_coordinator import request_from_payload
 
 _AUTHOR = "local-first-orchestrator"
 _MAX_FIELD = 16_384
@@ -24,6 +25,14 @@ _MAX_MARKER_SEARCH_ROWS = 30
 _MAX_MARKER_SEARCH_CLI_CALLS = 64
 _MAX_NATIVE_MARKER_DEPTH = 64
 _MAX_NATIVE_MARKER_NODES = 1_000
+
+
+def _utf8_clean(value: str) -> bool:
+    try:
+        value.encode("utf-8", errors="strict")
+        return True
+    except UnicodeEncodeError:
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +51,47 @@ class _BoardUnavailable(RuntimeError): pass
 
 class HermesBoardAdapter:
     is_fake = False
+
+    @staticmethod
+    def _valid_parentless_planner(action: Action, *, assignee: str, workspace: str, idempotency_key: str) -> bool:
+        target = action.to_dict()["target"]
+        marker = target.get("planner_marker")
+        try:
+            request = request_from_payload(target.get("request"))
+        except (TypeError, ValueError, KeyError):
+            return False
+        required = {"task_id", "anchor_task_id", "request_identity", "request", "planner_marker",
+                    "association", "reviewer_profile", "native_parent", "create_title", "create_body",
+                    "create_workspace", "create_idempotency_key"}
+        allowed = required | {"request_id"}
+        request_id_valid = ("request_id" not in target or
+                            (type(target["request_id"]) is str and bool(target["request_id"])
+                             and len(target["request_id"]) <= 256
+                             and _utf8_clean(target["request_id"])))
+        route = workspace[4:] if isinstance(workspace, str) and workspace.startswith("dir:") else ""
+        canonical_route = (bool(route) and os.path.isabs(route) and os.path.normpath(route) == route
+                           and not any(part in {"", ".", ".."} for part in route.split("/")[1:]))
+        return (required <= set(target) and set(target) <= allowed and request_id_valid
+                and target.get("native_parent") is False
+                and target.get("association") == request.identity
+                and canonical_route and isinstance(marker, Mapping)
+                and marker.get("workspace") == route
+                and set(marker) == {"kind", "request_identity", "workspace", "profile", "operation_key"}
+                and marker.get("kind") == "planner_card"
+                and marker.get("request_identity") == target.get("request_identity") == request.identity
+                and request.board_id == action.scope.get("board_id")
+                and request.anchor_id == action.scope.get("anchor_task_id")
+                and target.get("task_id") == target.get("anchor_task_id") == action.scope.get("anchor_task_id")
+                and marker.get("operation_key") == action.key == idempotency_key == target.get("create_idempotency_key")
+                and marker.get("workspace") == route
+                and workspace == target.get("create_workspace")
+                and marker.get("profile") == assignee == target.get("reviewer_profile")
+                and target.get("create_title") == "Planning: " + request.identity[:48]
+                and target.get("create_body") == json.dumps(
+                    {"request_identity": request.identity, "marker": dict(marker)}, sort_keys=True)
+                and isinstance(target.get("create_title"), str) and 0 < len(target["create_title"]) <= _MAX_FIELD
+                and isinstance(target.get("create_body"), str) and 0 < len(target["create_body"]) <= _MAX_FIELD
+                and _utf8_clean(target["create_title"]) and _utf8_clean(target["create_body"]))
 
     def __init__(self, *, board: str, anchor_task_id: str, executable: str,
                  runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
@@ -427,11 +477,18 @@ class HermesBoardAdapter:
         error = self._scope_and_target(action, "create_held")
         if error or action.target.get("anchor_task_id") != self.anchor_task_id: return self._result(action, "conflict", error or "create target must name exact anchor", None)
         if not all(isinstance(x, str) and x and len(x) <= _MAX_FIELD for x in (title, body, assignee, workspace, idempotency_key)): raise ValueError("bounded non-empty creation values required")
+        if not all(_utf8_clean(x) for x in (title, body, assignee, workspace, idempotency_key)):
+            raise ValueError("creation values must be valid UTF-8 strings")
         marker = self._create_marker(action)
         native_parent = action.target.get("native_parent", True)
         if not isinstance(native_parent, bool):
             return self._result(action, "conflict", "native_parent must be a boolean when supplied", None)
-        if not native_parent:
+        if not native_parent and ("planner_marker" in action.target or "request_identity" in action.target):
+            if not self._valid_parentless_planner(action, assignee=assignee, workspace=workspace, idempotency_key=idempotency_key):
+                return self._result(action, "conflict", "parentless planner create requires exact validated request association", None)
+            if title != action.target.get("create_title") or body != action.target.get("create_body"):
+                return self._result(action, "conflict", "planner create title/body differ from persisted action identity", None)
+        elif not native_parent:
             source_task = action.target.get("source_task_id")
             candidate = action.target.get("candidate")
             association = action.target.get("association")

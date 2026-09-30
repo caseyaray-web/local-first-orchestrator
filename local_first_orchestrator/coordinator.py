@@ -25,7 +25,8 @@ class Coordinator:
                  budget_policy: BudgetPolicy | None = None,
                  configured_roles: Mapping[str, str] | None = None,
                  planning_observer: Callable[[Mapping[str, str]], Mapping[str, Any]] | None = None,
-                 planning_profile: str | None = None) -> None:
+                 planning_profile: str | None = None,
+                 planning_workspace: str | None = None) -> None:
         self.scope = validate_scope(scope)
         if board is None or store is None or not isinstance(lock, InstanceLock):
             raise ValueError("explicit board, store, and InstanceLock are required")
@@ -44,6 +45,130 @@ class Coordinator:
         # repository, base, contract and approved objective/configuration itself.
         self.planning_observer = planning_observer
         self.planning_profile = planning_profile
+        self.planning_workspace = planning_workspace
+
+    def prepare_planner(self, *, request_id: str | None = None,
+                        planning_profile: str | None = None) -> Mapping[str, Any]:
+        """Create one durable, blocked planner card. This never dispatches work.
+
+        Paid-capacity eligibility is advisory only: held cards consume workflow
+        repairs, not paid capacity. A later release/admission slice must reserve
+        paid capacity atomically before any future start.
+        """
+        from .contracts import ManagedMember
+        from .decomposition_planner import request_payload
+        from .planning_coordinator import request_from_payload
+        profile = self._planning_roles()
+        if planning_profile is not None and planning_profile != profile:
+            raise ValueError("requested planner profile does not match configured planner role")
+        workspace = self.planning_workspace
+        if (not isinstance(workspace, str) or not os.path.isabs(workspace)
+                or os.path.realpath(workspace) != workspace or not os.path.isdir(workspace)
+                or os.path.islink(workspace)):
+            raise ValueError("trusted persistent planning workspace must be an existing canonical absolute directory")
+        if self.planning_observer is None:
+            raise ValueError("trusted planning observer is not configured")
+        policy = self.budget_policy
+        if not isinstance(policy, BudgetPolicy):
+            raise ValueError("explicit finite planning budgets are required")
+        with self.lock:
+            self._assert_lock()
+            state = self.store.read_scope(self.scope)
+            pause = state["operator_intent"]
+            if pause is not None and pause.active:
+                raise ValueError("planner creation is fenced by active pause/cancellation")
+            observed = self.planning_observer(dict(self.scope))
+            if not isinstance(observed, Mapping) or set(observed) != {"request"}:
+                raise ValueError("trusted planning observer returned malformed observation")
+            request = request_from_payload(observed["request"])
+            if request.board_id != self.scope["board_id"] or request.anchor_id != self.scope["anchor_task_id"]:
+                raise ValueError("trusted planning request has wrong scope")
+            if request_id is not None and (type(request_id) is not str or not request_id.strip() or len(request_id) > 256):
+                raise ValueError("request_id must be a non-empty string of at most 256 characters")
+            if request_id is not None:
+                try:
+                    request_id.encode("utf-8", errors="strict")
+                except UnicodeEncodeError as error:
+                    raise ValueError("request_id must be UTF-8 clean") from error
+            identity = request.identity
+            if request_id is not None:
+                bound = [op for op in state["operations"] if op.effect == "create_held"
+                         and op.target.get("request_id") == request_id]
+                if any(op.target.get("request_identity") != identity for op in bound):
+                    raise ValueError("explicit request_id is already bound to a different trusted planning request")
+            association = identity
+            existing = [m for m in state["members"] if m.role == "planner" and m.work_association == association]
+            if existing:
+                if len(existing) != 1:
+                    raise ValueError("duplicate planner association; refusing ambiguous reconciliation")
+                member = existing[0]
+                matches = [op for op in state["operations"] if op.effect == "create_held"
+                           and op.target.get("request_identity") == identity
+                           and op.target.get("task_id") == self.scope["anchor_task_id"]]
+                if len(matches) == 1 and matches[0].target.get("request_id") != request_id:
+                    raise ValueError("planner association is bound to a different request_id")
+                if len(matches) != 1 or matches[0].phase != "applied":
+                    raise ValueError("planner member has no exact durable creation proof")
+                proof = self._snapshot_from_readback(matches[0].readback)
+                if proof is None or proof.native_task.get("id") != member.task_id:
+                    raise ValueError("existing planner card has no exact durable held readback")
+                current = self.board.read_task(str(proof.native_task["id"]))
+                exact = (current.native_task.get("assignee") == profile
+                         and current.native_task.get("status") == "blocked"
+                         and not current.parents and not current.runs
+                         and self.board._workspace_routing(current.native_task, f"dir:{workspace}") is None)
+                if (current.digest != proof.digest or not exact
+                        or current.native_task.get("id") != member.task_id):
+                    raise ValueError("existing planner card conflicts with exact held readback; preserving existing card")
+                return {"outcome": "held", "task_id": member.task_id}
+            if not permit_action(policy, self.store, self.scope, PAID_CAPACITY, paid_authorized=True):
+                raise ValueError("no remaining paid-capacity eligibility for new held planner card")
+            if self.planning_profile is not None and self.planning_profile != profile:
+                raise ValueError("configured planner profile changed")
+            anchor = self.board.read_task(self.scope["anchor_task_id"])
+            canonical = json.dumps({"scope": self.scope, "request_identity": identity, "request_id": request_id, "action": "prepare_planner"}, sort_keys=True, separators=(",", ":"))
+            key = "planner-card:" + hashlib.sha256(canonical.encode()).hexdigest()
+            marker = {"kind": "planner_card", "request_identity": identity, "workspace": workspace, "profile": profile, "operation_key": key}
+            target = {"task_id": self.scope["anchor_task_id"],
+                "anchor_task_id": self.scope["anchor_task_id"], "request_identity": identity,
+                "request": request_payload(request), "planner_marker": marker, "association": association,
+                "reviewer_profile": profile, "native_parent": False, "create_title": "Planning: " + identity[:48],
+                "create_body": json.dumps({"request_identity": identity, "marker": marker}, sort_keys=True),
+                "create_workspace": f"dir:{workspace}", "create_idempotency_key": key}
+            if request_id is not None:
+                target["request_id"] = request_id
+            action = Action(key, self.scope, target, "create_held", anchor.digest)
+            event = {"event_id": f"{WORKFLOW_REPAIRS}:{key}", "lineage_id": f"{self.scope['anchor_task_id']}:{GENERAL_ATTEMPT}",
+                "root_task_id": self.scope["anchor_task_id"], "finding_id": GENERAL_ATTEMPT, "generation": 0,
+                "source_task_id": self.scope["anchor_task_id"], "source_kind": "native_operation", "native_source_id": key, "count": 1}
+            prior = next((op for op in state["operations"] if op.key == key), None)
+            stored = (prior if prior is not None else
+                      admit_repair_operation(policy, self.store, self.scope, self._intent_for(action), event))
+            if stored.phase == "unknown":
+                action = self._action_from_intent(stored)
+                verifier = getattr(self.board, "verify_effect", None)
+                result = verifier(action) if callable(verifier) else ActionResult(key, "unsupported", "marker verifier unavailable", None)
+            else:
+                if stored.phase != "applied":
+                    result = self.board.create_held(action, title=action.target["create_title"], body=action.target["create_body"],
+                        assignee=profile, workspace=f"dir:{workspace}", idempotency_key=key)
+                else:
+                    result = ActionResult(key, "verified", "existing durable held planner proof", stored.readback)
+            readback = self._portable_readback(result.readback)
+            self.store.record_effect_observation(self.scope, key, outcome=result.outcome, details=result.details, readback=readback)
+            created = self._snapshot_from_readback(readback)
+            if result.outcome not in {"verified", "no-op"} or created is None or not self._readback_proves(action, result):
+                raise ValueError("planner held-card creation is unverified; reconcile by exact marker")
+            if stored.phase != "applied":
+                self.store.ack_effect(self.scope, key, readback=created.to_dict(), outcome=result.outcome)
+            current = self.board.read_task(str(created.native_task["id"]))
+            current_result = ActionResult(key, "verified", "fresh held planner readback", current.to_dict())
+            if current.digest != created.digest or not self._readback_proves(action, current_result):
+                raise ValueError("planner card changed before membership registration; preserving existing card")
+            member = ManagedMember(self.scope["board_id"], self.scope["anchor_task_id"], str(created.native_task["id"]),
+                                  "planner", 0, (), association)
+            self.store.register_member(member)
+            return {"outcome": "held", "task_id": member.task_id}
 
     def register_planning_request(self, planner_task_id: str, *, request_id: str | None = None) -> Mapping[str, Any]:
         """Register only the canonical request freshly observed by trusted root."""
