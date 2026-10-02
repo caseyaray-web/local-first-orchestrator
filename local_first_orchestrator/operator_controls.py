@@ -13,6 +13,7 @@ from .contracts import Action, ActionResult, BoardSnapshot, ManagedMember, Pause
 
 _ACTIVE_RUN_STATUSES = frozenset({"active", "claimed", "running", "stopping"})
 _TERMINAL_RUN_STATUSES = frozenset({"cancelled", "completed", "done", "stopped"})
+_INERT_RUN_STATUSES = _TERMINAL_RUN_STATUSES | frozenset({"blocked"})
 _SUPPORTED_TASK_STATUSES = frozenset({"blocked", "ready", "todo", "review", "running", "done", "archived"})
 _HELD_TASK_STATUSES = frozenset({"blocked"})
 _TERMINAL_TASK_STATUSES = frozenset({"done", "archived"})
@@ -102,9 +103,13 @@ def _active_runs(snapshots: tuple[BoardSnapshot, ...], runs: tuple[Mapping[str, 
 
 
 def _runs_have_known_statuses(snapshots: tuple[BoardSnapshot, ...]) -> bool:
-    """Do not clear a pause while any observed native run has an unknown state."""
+    """Do not clear a pause while any observed native run has an unknown state.
+
+    A historical blocked run is inert evidence, not proof that a requested stop
+    succeeded; stop verification remains limited to terminal statuses below.
+    """
     return all(
-        isinstance(run.get("status"), str) and run["status"] in _ACTIVE_RUN_STATUSES | _TERMINAL_RUN_STATUSES
+        isinstance(run.get("status"), str) and run["status"] in _ACTIVE_RUN_STATUSES | _INERT_RUN_STATUSES
         for snapshot in snapshots for run in snapshot.runs
     )
 
@@ -237,10 +242,10 @@ def plan_pause(scope: Mapping[str, Any], stop: bool, *, generation: int = 0,
             elif status == "running":
                 # A hold may lose the independent-dispatch race; it is still the
                 # only supported proposed containment, with partial reported.
-                actions.append(Action(f"hold:{member.task_id}:{observed.digest}", resolved_scope,
+                actions.append(Action(f"hold:{member.task_id}:{observed.digest}:pause:{generation}", resolved_scope,
                                       {"task_id": member.task_id}, "hold", observed.digest))
         elif status not in _HELD_TASK_STATUSES and status not in _TERMINAL_TASK_STATUSES:
-            actions.append(Action(f"hold:{member.task_id}:{observed.digest}", resolved_scope,
+            actions.append(Action(f"hold:{member.task_id}:{observed.digest}:pause:{generation}", resolved_scope,
                                   {"task_id": member.task_id}, "hold", observed.digest))
     active_ids = tuple(sorted(set(active)))
     outcome = "partial" if partial else ("pending" if actions else "no-op")
@@ -480,8 +485,13 @@ def can_resume(scope: Mapping[str, Any], *, pause_intent: PauseIntent | None = N
             releases: list[Action] = []
             for member, observed in _member_snapshots(resolved_scope, members, snapshots):
                 if observed is not None and _task_status(observed) in _HELD_TASK_STATUSES:
-                    releases.append(Action(f"release:{member.task_id}:{observed.digest}", resolved_scope,
-                                           {"task_id": member.task_id}, "release", observed.digest))
+                    # Digest alone can recur after a later pause; the new durable
+                    # resuming generation prevents an old applied release receipt
+                    # from being mistaken for this explicit clear.
+                    releases.append(Action(
+                        f"release:{member.task_id}:{observed.digest}:resume:{pause_intent.generation + 1}",
+                        resolved_scope, {"task_id": member.task_id}, "release", observed.digest,
+                    ))
             release_ids = tuple(action.target["task_id"] for action in releases)
             release_keys = {str(action.target["task_id"]): action.key for action in releases}
             if not release_ids or set(release_ids) != set(scoped):

@@ -63,17 +63,38 @@ def validator(*, expected=("AC-1",), max_tickets=100):
     )
 
 
-def test_incomplete_plugin_entrypoint_refuses_registration():
+def test_plugin_entrypoint_registers_the_m6_composition_surfaces_without_activation():
     import importlib.util
     from pathlib import Path
+
+    class Context:
+        def __init__(self):
+            self.tools = {}
+            self.hooks = {}
+            self.cli = []
+
+        def register_tool(self, **kwargs):
+            self.tools[kwargs["name"]] = kwargs
+
+        def register_hook(self, name, callback):
+            self.hooks[name] = callback
+
+        def register_cli_command(self, *args, **kwargs):
+            self.cli.append((args, kwargs))
 
     entrypoint = Path(__file__).resolve().parents[1] / "__init__.py"
     spec = importlib.util.spec_from_file_location("m1_plugin_entrypoint", entrypoint)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    with pytest.raises(RuntimeError, match="not ready"):
-        module.register(object())
+    ctx = Context()
+    module.register(ctx)
+    assert set(ctx.tools) == {
+        "local_first_submit_plan", "local_first_submit_review",
+        "local_first_request_corrections", "local_first_report_issue", "local_first_status",
+    }
+    assert set(ctx.hooks) == {"pre_tool_call"}
+    assert len(ctx.cli) == 1
 
 
 def test_pure_destination_contract_imports_do_not_import_legacy_runtime():

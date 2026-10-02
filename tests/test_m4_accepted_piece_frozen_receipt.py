@@ -22,7 +22,11 @@ def _receipt(board, piece, native_task_id="native-piece-1"):
     data = {"native_task": task, "parents": [], "runs": [], "comments": [], "events": [], "attachments": []}
     snapshot = BoardSnapshot(native_task=task, parents=(), runs=(), comments=(), events=(), attachments=(),
         observed_at="2000-01-01T00:00:00+00:00", digest=board._digest(data))
-    return snapshot.to_dict()
+    show = {"task": copy.deepcopy(task), "parents": [], "children": [], "runs": [],
+            "comments": [], "events": [], "latest_summary": None}
+    return {**snapshot.to_dict(), "raw_capture_v1": {
+        "kind": "hermes_kanban_raw_capture_v1", "show": show, "runs": []}}
+
 
 
 def _board(tmp_path, piece):
@@ -31,6 +35,36 @@ def _board(tmp_path, piece):
     for name in ("_invoke", "read_task", "verify_effect", "create_held", "_marked_create_matches"):
         setattr(board, name, lambda *a, **k: (_ for _ in ()).throw(AssertionError("native access is forbidden")))
     return board
+
+
+def test_raw_creation_capture_preserves_divergent_show_runs_from_runs_endpoint(tmp_path):
+    from local_first_orchestrator.contracts import ActionResult
+
+    piece = payload()
+    board = _board(tmp_path, piece)
+    action = make_action(piece)
+    full_receipt = _receipt(board, piece)
+    readback = {key: value for key, value in full_receipt.items() if key != "raw_capture_v1"}
+    show = copy.deepcopy(full_receipt["raw_capture_v1"]["show"])
+    show["runs"] = [{"show_only": True}]
+    board._raw_show_and_runs = lambda _task_id: (show, [])
+    result = board._capture_accepted_piece_raw_readback(
+        action, ActionResult(action.key, "verified", "created", readback))
+    assert result.outcome == "verified", result.details
+    capture = result.readback["raw_capture_v1"]
+    assert tuple(dict(value) for value in capture["show"]["runs"]) == ({"show_only": True},)
+    assert capture["runs"] == ()
+
+    def thaw(value):
+        if isinstance(value, MappingProxyType):
+            return {key: thaw(child) for key, child in value.items()}
+        if isinstance(value, dict):
+            return {key: thaw(child) for key, child in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [thaw(child) for child in value]
+        return value
+
+    assert board.validate_accepted_piece_frozen_receipt(action, thaw(result.readback), "native-piece-1")
 
 
 def test_valid_historical_accepted_piece_receipt_is_detached_immutable_and_non_authorizing(tmp_path):
@@ -123,7 +157,7 @@ def test_native_coordinator_created_receipt_validates_without_native_reads(
         action = Action(original.key, original.scope, target, original.effect,
                         original.expected_observed_identity)
         snapshot = coordinator._snapshot_from_readback(intent.readback)
-        assert snapshot is not None
+        assert snapshot is not None and intent.readback is not None
         before = store.read_scope(scope)
         def forbidden(*args, **kwargs):
             raise AssertionError("historical validation attempted native access")
@@ -131,7 +165,7 @@ def test_native_coordinator_created_receipt_validates_without_native_reads(
             monkeypatch.setattr(board, name, forbidden)
         with coordinator.lock:
             result = board.validate_accepted_piece_frozen_receipt(
-                action, snapshot.to_dict(), prepared["task_id"])
+                action, dict(intent.readback), prepared["task_id"])
         assert result["requires_fresh_native_transition_validation"] is True
         assert result["snapshot"].to_dict() == snapshot.to_dict()
         assert store.read_scope(scope) == before

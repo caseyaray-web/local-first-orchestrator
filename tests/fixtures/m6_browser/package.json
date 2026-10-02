@@ -1,0 +1,12 @@
+{
+  "name": "m6-browser-regression-fixture",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Isolated dependencies for the M6 shipped-dashboard browser regression",
+  "dependencies": {
+    "esbuild": "0.27.3",
+    "playwright": "1.58.2",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  }
+}

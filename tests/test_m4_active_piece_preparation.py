@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import dataclasses
+from collections.abc import Mapping
+from typing import Any
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,31 @@ from tests.test_m4_planner_creation import native_fixture as _native_fixture, se
 from tests.test_m4_planner_run_binding import _claim
 from tests.test_m4_plan_acceptance import _pure_acceptance_fixture, _authority_rows
 from local_first_orchestrator.planning_coordinator import evidence_payload
+
+
+def _captured_piece_result(action, snapshot, details="verified"):
+    from local_first_orchestrator.contracts import ActionResult
+
+    def plain(value):
+        if isinstance(value, dict) or isinstance(value, Mapping):
+            return {key: plain(child) for key, child in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [plain(child) for child in value]
+        return value
+
+    task = plain(snapshot.native_task)
+    if ("workspace_path" not in task and isinstance(task.get("workspace"), str)
+            and task["workspace"].startswith("dir:")):
+        task["workspace_path"] = task["workspace"][4:]
+    show = {"task": task, "parents": [item["id"] for item in snapshot.parents],
+            "children": [], "runs": plain(snapshot.runs), "events": plain(snapshot.events),
+            "comments": plain(snapshot.comments), "latest_summary": None}
+    if snapshot.attachments:
+        show["attachments"] = plain(snapshot.attachments)
+    readback = dict(snapshot.to_dict())
+    readback["raw_capture_v1"] = {"kind": "hermes_kanban_raw_capture_v1",
+                                  "show": show, "runs": plain(snapshot.runs)}
+    return ActionResult(action.key, "verified", details, readback)
 
 
 def _batch_proposal(req):
@@ -68,7 +95,7 @@ def test_pure_batch_receipt_requires_final_replay_proof(tmp_path, monkeypatch):
     try:
         ctl.accept_validated_plan("plan-1")
         calls = []
-        def piece(plan_id, ticket_id, *, request_id=None):
+        def piece(plan_id, ticket_id, *, request_id=None, _already_locked=False):
             calls.append(ticket_id)
             return {"outcome": "held", "task_id": "piece-" + ticket_id,
                     "plan_id": plan_id, "ticket_id": ticket_id,
@@ -104,7 +131,7 @@ def test_pure_batch_partial_piece_resumes_without_replaying_held_piece(tmp_path,
     try:
         ctl.accept_validated_plan("plan-1")
 
-        def piece(plan_id, ticket_id, *, request_id=None):
+        def piece(plan_id, ticket_id, *, request_id=None, _already_locked=False):
             nonlocal fail_b
             calls.append(ticket_id)
             attempts = 0 if ticket_id in created else 1
@@ -161,7 +188,7 @@ def test_pure_batch_pause_after_first_piece_fences_next_piece(tmp_path, monkeypa
         def create_held(action, **kwargs):
             calls.append(action.key)
             receipt = read_task("piece-A")
-            return ActionResult(action.key, "verified", "verified", receipt.to_dict())
+            return _captured_piece_result(action, receipt)
         board.create_held = create_held
         original_register = store.register_member
         def register_then_pause(*args, **kwargs):
@@ -208,7 +235,7 @@ def test_pure_batch_post_create_observation_failure_counts_attempt(tmp_path, mon
         board.read_task = read_task
         def create_held(action, **kwargs):
             calls.append(action.key)
-            return ActionResult(action.key, "verified", "created", read_task("piece-A").to_dict())
+            return _captured_piece_result(action, read_task("piece-A"), "created")
         board.create_held = create_held
         original_observe = store.record_effect_observation
         def fail_after_create(*args, **kwargs):
@@ -249,7 +276,7 @@ def test_pure_active_piece_post_create_faults_preserve_conservative_authority(tm
         def create_held(action, **kwargs):
             creates.append(action.key)
             store.begin_effect_attempt(SCOPE, action.key)
-            return ActionResult(action.key, "verified", "created", piece.to_dict())
+            return _captured_piece_result(action, piece, "created")
         board.create_held = create_held
         original_ack = store.ack_effect
         def injected_ack(*args, **kwargs):
@@ -335,7 +362,7 @@ def test_pure_active_piece_post_ack_pause_or_cancel_fences_membership_and_retry(
             pending = next(op for op in store.read_scope(SCOPE)["operations"] if op.key == action.key)
             assert pending.effect == "create_held" and pending.phase == "pending"
             receipt = BoardSnapshot(native_task={"id":"pure-piece","status":"blocked","assignee":"implementer"}, parents=(), runs=(), comments=(), events=(), attachments=(), observed_at="now", digest="piece-digest")
-            return ActionResult(action.key, "verified", "pure verified held piece", receipt.to_dict())
+            return _captured_piece_result(action, receipt, "pure verified held piece")
 
         board.create_held = create_held
         original_ack = store.ack_effect

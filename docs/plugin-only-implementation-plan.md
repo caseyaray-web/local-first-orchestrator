@@ -81,7 +81,11 @@ Create plans and generated cards held until their association, profile, workspac
 
 `enroll(board, anchor)` accepts an explicitly selected non-running card after inspection. Reject live claim adoption in V1 with a recovery instruction; do not race the dispatcher to seize it. Hold the anchor through supported operations before creating managed work. A model-created planning ticket uses an existing configured paid profile; it returns a structured plan proposal rather than creating implementation cards independently.
 
+Planning and release require exactly one enrolled root member whose task identity is the selected anchor, plus one current matching durable supported native hold receipt. Verify its scoped native marker, comment, and event against a fresh blocked snapshot and complete immutable receipt content, excluding only observation time. Historical stale hold receipts remain preserved and do not count as current authority; terminal hold-run history is allowed, but active workers are not. Root associations are opaque and are not interpreted as a literal. Missing, ambiguous, stale, ready, or live anchor evidence is a pre-reservation rejection; unknown effects remain reconciliation-only and are never resent.
+
 Validate plan IDs, duplicate IDs, coverage, file limits, finite scope, dependencies and cycles. Use existing parsers but add missing checks. Bind plan to repository/base/contract. Plan changes invalidate affected downstream proposals. Only create active-tranche work; do not prebuild future tranches behind a gate that accidental done/archive can release.
+
+The root objective and non-goals remain authoritative requirements. Every proposed tranche and ticket preserves every root non-goal, and accepted implementation-card bodies carry the original root objective, root non-goals, and original criterion statements alongside any tranche elaboration. Objective elaboration is not lexical contradiction detection: deterministic path, criterion, command, budget, dependency, and non-goal boundaries enforce scope; paid planning cannot authorize unrelated work, and original requirements remain binding through local and paid review.
 
 ### Implementation and local review
 
@@ -194,6 +198,12 @@ Exercise every canonical acceptance scenario with failure injection before/after
 ### M6 — UI, CLI, packaging and legacy removal
 
 Wire dashboard/tool/CLI to the same coordinator. Replace operator configuration and remove unused crypto dependency after import verification. Delete legacy files only after behavior has been ported and no surviving imports/tests reference them. Regenerate command/config docs from implemented behavior; no stale examples. Run full replacement suite, packaging and plugin discovery checks in isolation. Existing runtime data remains untouched.
+
+**Current M6 slice (isolated only):** `local_first_orchestrator.cli` is the sole new CLI destination and packaging entry point. It has explicit `initialize-store`, real root enrollment through durable native hold/readback, scoped operator controls, and a persistent `run` loop with an explicit `--once` smoke mode. Runtime composition opens existing evidence only; it never creates or migrates a missing store. The five proposal tools use scoped lazy composition and close it after each invocation; local review/correction calls pass configured roles to the coordinator, which verifies native run/session provenance. Native CLI registration uses Hermes' current `register_cli_command(name, help, setup_fn, handler_fn, description)` contract.
+
+**Implemented/exercised in the current M6 isolated slice:** the dashboard/API uses the same scoped composition boundary and stale-observation guard; production Git/check/planning observers are configured only from trusted configuration; registration provides five lazy tools, the native CLI command, and the advisory pre-tool hook; the replacement command/config/operator documentation and explicit legacy-retirement inventory are present. The retained public-core M4/M5 fixture suite and a package-wide import/discovery regression exercise these replacement paths from a built artifact, not from the checkout.
+
+**Still pending (do not call M6 complete):** independent review renewal; browser fixture verification beyond the recorded bounded dashboard evidence; and M7 release/cutover authorization. The isolated discovery fixture uses a temporary Hermes home, temporary artifact environment, explicit enabled-plugin configuration, and no provider/board/profile activation. It is not a live plugin installation, enrollment, dispatch, or service activation.
 
 ### M7 — Release readiness, not implicit cutover
 

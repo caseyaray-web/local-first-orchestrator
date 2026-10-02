@@ -244,7 +244,8 @@ class AcceptedActiveTrancheCreatePayload:
     idempotency_key: str
 
 
-def accepted_active_tranche_create_payload(accepted_token, evidence, target: HeldCardTarget) -> AcceptedActiveTrancheCreatePayload:
+def accepted_active_tranche_create_payload(accepted_token, evidence, target: HeldCardTarget,
+                                          *, body_kind="accepted_active_tranche_piece_v2") -> AcceptedActiveTrancheCreatePayload:
     """Build a deterministic description from plain-JSON token/evidence transport.
 
     Caller invokes the store's strict reader, then explicitly constructs detached
@@ -323,10 +324,14 @@ def accepted_active_tranche_create_payload(accepted_token, evidence, target: Hel
     ticket = next(t for t in tranche.tickets if t.ticket_id == selected.ticket_id)
     semantic = proposal.tranche_semantics[0]
     statements = dict(request.criterion_statements)
-    body_obj = {"schema_version": 1, "kind": "accepted_active_tranche_piece_v1",
+    if body_kind not in {"accepted_active_tranche_piece_v1", "accepted_active_tranche_piece_v2"}:
+        raise ValueError("accepted piece body kind is unsupported")
+    body_obj = {"schema_version": 1, "kind": body_kind,
         "accepted_token_key": "accept-plan:" + identity, "accepted_token": token,
         "ticket": contract_payload(ticket), "ticket_contract_hash": ticket.contract_hash,
         "criterion_statements": [{"criterion": c, "statement": statements[c]} for c in ticket.criterion_ids],
+        **({"root_semantics": {"objective": request.objective, "non_goals": list(request.non_goals)}}
+           if body_kind == "accepted_active_tranche_piece_v2" else {}),
         "tranche_semantics": {"objective": semantic.objective, "non_goals": list(semantic.non_goals)},
         "repository": {"repository_identity": request.repository_identity, "base_sha": request.base_sha,
             "snapshot_hash": request.snapshot_hash, "root_contract_hash": request.root_contract_hash},
@@ -338,7 +343,7 @@ def accepted_active_tranche_create_payload(accepted_token, evidence, target: Hel
     title = ticket.ticket_id + ": " + ticket.objective
     if len(title) > 512:
         raise ValueError("ticket title exceeds bounded display limit")
-    target_payload = _deep_freeze({"kind": "accepted_active_tranche_piece_v1", "title": title, "body": body,
+    target_payload = _deep_freeze({"kind": body_kind, "title": title, "body": body,
         "assignee": route.implementation_profile, "workspace": selected.workspace,
         "idempotency_key": selected.operation_key, "association": selected.association,
         "accepted_token_key": "accept-plan:" + identity, "ticket_id": ticket.ticket_id,

@@ -151,6 +151,18 @@ def test_unknown_effect_preserved_and_never_returned_as_replayable(store):
     assert opened.ack_effect(SCOPE, reserved.key, readback={"stable_marker": "hold-1"}).phase == "applied"
 
 
+def test_read_scope_projects_operations_by_stable_operation_key(store):
+    opened, _ = store
+    # Insertion order is not a public ordering contract: SQLite rowids are
+    # storage implementation detail and do not survive table rebuilds.
+    opened.reserve_operation(operation(key="z-last"))
+    opened.reserve_operation(operation(key="a-first"))
+
+    assert tuple(item.key for item in opened.read_scope(SCOPE)["operations"]) == (
+        "a-first", "z-last",
+    )
+
+
 def create_operation(*, key="create-1", scope=SCOPE):
     return OperationIntent(
         key=key,

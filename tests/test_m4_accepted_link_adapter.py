@@ -97,6 +97,28 @@ def _claim_receipt(action):
     return {"before_phase": "pending", "operation": operation.to_dict()}
 
 
+def _reconstructed_claim_receipt(board, action):
+    """Build the same complete prebarrier retained by the production coordinator."""
+    from local_first_orchestrator.contracts import OperationIntent
+
+    proof = board.accepted_dependency_link_lookup(action.scope, action.key)
+    before = {
+        "kind": "accepted_active_tranche_native_link_prebarrier_v2",
+        "authority": proof["authority"],
+        "source_raw": proof["before_source"],
+        "child_raw": proof["before_child"],
+        "expected_source_raw": proof["expected_source"],
+        "source_snapshot": proof["source_snapshot"],
+        "child_snapshot": proof["child_snapshot"],
+        "request_id": "request-1",
+        "captured_clock_seconds": 100,
+        "event_lower_bound_seconds": 100,
+    }
+    operation = OperationIntent(action.key, action.scope, action.target, action.effect,
+        action.expected_observed_identity, before, None, None, {"reconcile_only": True}, "unknown")
+    return {"before_phase": "pending", "operation": operation.to_dict()}
+
+
 def _adapter(tmp_path, cli, *, claim=None):
     exe = tmp_path / "hermes"; exe.write_text("fixture")
     frozen_raws = (copy.deepcopy(cli.cards["native-A"]), copy.deepcopy(cli.cards["native-B"]))
@@ -109,9 +131,16 @@ def _adapter(tmp_path, cli, *, claim=None):
             digest=HermesBoardAdapter._digest({"native_task": raw["task"], "parents": [], "runs": [],
                 "comments": [], "events": raw["events"], "attachments": []}))
     frozen_snapshots = tuple(snap(x) for x in frozen_raws)
-    receipts = [{"ticket_id": t, "task_id": i, "association": "assoc-" + t,
-        "operation_key": "create-" + t, "digest": s.digest, "readback": s.to_dict()}
-        for t, i, s in (("TK-A", "native-A", frozen_snapshots[0]), ("TK-B", "native-B", frozen_snapshots[1]))]
+    receipt_rows = []
+    for ticket, task_id, snapshot, raw_show in zip(
+            ("TK-A", "TK-B"), ("native-A", "native-B"), frozen_snapshots, frozen_raws):
+        readback = snapshot.to_dict()
+        readback["raw_capture_v1"] = {"kind": "hermes_kanban_raw_capture_v1",
+                                      "show": copy.deepcopy(raw_show), "runs": []}
+        receipt_rows.append({"ticket_id": ticket, "task_id": task_id,
+            "association": "assoc-" + ticket, "operation_key": "create-" + ticket,
+            "digest": snapshot.digest, "readback": readback})
+    receipts = receipt_rows
     authority = {"kind": "accepted_active_tranche_native_link_v1", "acceptance_identity": "sha256:" + "a" * 64,
         "plan_id": "plan-1", "request_identity": "sha256:" + "b" * 64, "scope": dict(SCOPE),
         "route": {"implementation_profile": "worker", "workspace": "/repo"}, "root_task_id": "anchor-1",
@@ -287,6 +316,155 @@ def test_native_accepted_tranche_first_edge_is_claimed_and_readback_verified(tmp
         except Exception: pass
 
 
+def test_native_coordinator_accepted_first_edge_is_pending_unknown_applied_once(tmp_path, native_fixture, monkeypatch):
+    """Parent-only disposable proof through the coordinator's real accepted operation.
+
+    This deliberately does not hand-build an Action or reserve an intent: the
+    coordinator must derive the accepted first edge, claim pending to unknown,
+    invoke exactly one native link, and own the acknowledgement.
+    """
+    from tests.test_m4_active_piece_preparation import _accepted_plan, _batch_proposal
+
+    (_board, _anchor, _workspace, adapter, _membership, cli, controller, store, scope,
+     accepted, request_id) = _accepted_plan(tmp_path, native_fixture, monkeypatch,
+                                             proposal_factory=_batch_proposal)
+    try:
+        plan_id = accepted["plan_id"]
+        assert controller.prepare_active_tranche(plan_id, request_id=request_id)["outcome"] == "held"
+        authority = controller.active_piece_dependency_authority(plan_id, "TK-B", "TK-A", request_id=request_id)
+        source_id, child_id = authority["source_task_id"], authority["target_task_id"]
+        before_source = json.loads(cli("show", source_id, "--json").stdout)
+        before_child = json.loads(cli("show", child_id, "--json").stdout)
+        state_before = store.read_scope(scope)
+        members_before = tuple(state_before["members"])
+        budgets_before = tuple(state_before["budget_events"])
+        link_phases = []
+        native_commands = []
+        original_invoke = adapter._invoke
+
+        def counted(command, *args, **kwargs):
+            native_commands.append((command, *args))
+            if command == "link":
+                operation = next(op for op in store.read_scope(scope)["operations"]
+                                 if op.key == authority["operation_key"])
+                link_phases.append(operation.phase)
+            return original_invoke(command, *args, **kwargs)
+
+        monkeypatch.setattr(adapter, "_invoke", counted)
+        first = controller.execute_accepted_first_link(plan_id, "TK-B", "TK-A", request_id=request_id)
+        assert first == {"outcome": "linked", "operation_key": authority["operation_key"], "actions_attempted": 1}
+        operation = next(op for op in store.read_scope(scope)["operations"] if op.key == authority["operation_key"])
+        assert link_phases == ["unknown"] and operation.phase == "applied"
+        # OperationIntent retains immutable MappingProxy/tuple evidence; compare
+        # the persisted canonical JSON transport to the CLI's dict/list output.
+        receipt = operation.to_dict()["readback"]
+        assert receipt["kind"] == "accepted_active_tranche_native_link_readback_v1"
+        assert receipt["source"] == json.loads(cli("show", source_id, "--json").stdout)
+        assert receipt["child"] == json.loads(cli("show", child_id, "--json").stdout)
+        validate_accepted_first_link_transition(
+            before_source, before_child, receipt["source"], receipt["child"],
+            source_id=source_id, child_id=child_id,
+            command_started_seconds=receipt["time_window"]["started"],
+            command_ended_seconds=receipt["time_window"]["ended"],
+        )
+        assert receipt["source"]["task"] == before_source["task"]
+        assert receipt["child"]["task"] == before_child["task"]
+        assert receipt["source"]["parents"] == before_source["parents"]
+        assert receipt["child"]["children"] == before_child["children"]
+        assert receipt["source"]["comments"] == before_source["comments"]
+        assert receipt["child"]["comments"] == before_child["comments"]
+        # Public raw show may omit attachments; absence must remain absence,
+        # not be normalized into an empty attachment list.
+        for endpoint, before in (("source", before_source), ("child", before_child)):
+            after = receipt[endpoint]
+            assert ("attachments" in after) == ("attachments" in before)
+            if "attachments" in before:
+                assert after["attachments"] == before["attachments"]
+        assert tuple(store.read_scope(scope)["members"]) == members_before
+        assert tuple(store.read_scope(scope)["budget_events"]) == budgets_before
+        assert [command for command, *_ in native_commands].count("link") == 1
+        assert not ({"claim", "release", "unblock", "dispatch", "accept", "complete"}
+                    & {command for command, *_ in native_commands})
+
+        store_rows_before_replay = tuple(store.connection.iterdump())
+        replay = controller.execute_accepted_first_link(plan_id, "TK-B", "TK-A", request_id=request_id)
+        assert replay == {"outcome": "linked", "operation_key": authority["operation_key"], "actions_attempted": 0}
+        assert link_phases == ["unknown"]
+        assert tuple(store.connection.iterdump()) == store_rows_before_replay
+        assert tuple(store.read_scope(scope)["members"]) == members_before
+        assert tuple(store.read_scope(scope)["budget_events"]) == budgets_before
+        assert receipt == operation.to_dict()["readback"]
+        assert receipt["source"] == json.loads(cli("show", source_id, "--json").stdout)
+        assert receipt["child"] == json.loads(cli("show", child_id, "--json").stdout)
+        assert [command for command, *_ in native_commands].count("link") == 1
+        assert not ({"claim", "release", "unblock", "dispatch", "accept", "complete"}
+                    & {command for command, *_ in native_commands})
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("boundary", ("lost-response", "pause", "cancel", "unsupported", "raw-drift"))
+def test_native_coordinator_first_link_production_adapter_recovery_boundaries(
+    tmp_path, native_fixture, monkeypatch, boundary,
+):
+    """Parent-only real coordinator/adapter proof: every non-happy path is link-only or zero-link."""
+    from local_first_orchestrator.contracts import PauseIntent
+    from tests.test_m4_active_piece_preparation import _accepted_plan, _batch_proposal
+
+    (_board, _anchor, _workspace, adapter, _membership, cli, controller, store, scope,
+     accepted, request_id) = _accepted_plan(tmp_path, native_fixture, monkeypatch,
+                                             proposal_factory=_batch_proposal)
+    try:
+        plan_id = accepted["plan_id"]
+        assert controller.prepare_active_tranche(plan_id, request_id=request_id)["outcome"] == "held"
+        authority = controller.active_piece_dependency_authority(plan_id, "TK-B", "TK-A", request_id=request_id)
+        source_id, child_id = authority["source_task_id"], authority["target_task_id"]
+        members_before = tuple(store.read_scope(scope)["members"])
+        budgets_before = tuple(store.read_scope(scope)["budget_events"])
+        commands = []
+        original_invoke = adapter._invoke
+
+        def capture(command, *args, **kwargs):
+            commands.append((command, *args))
+            result = original_invoke(command, *args, **kwargs)
+            if boundary == "lost-response" and command == "link":
+                raise RuntimeError("lost transport response after native link")
+            return result
+
+        monkeypatch.setattr(adapter, "_invoke", capture)
+        if boundary in {"pause", "cancel"}:
+            store.set_operator_intent(PauseIntent(scope, "operator", 1, True, boundary == "cancel"))
+            with pytest.raises(ValueError, match="pause|cancellation|fenced"):
+                controller.execute_accepted_first_link(plan_id, "TK-B", "TK-A", request_id=request_id)
+        elif boundary == "unsupported":
+            adapter.dependency_link_attempt_claim = None
+            result = controller.execute_accepted_first_link(plan_id, "TK-B", "TK-A", request_id=request_id)
+            assert result["outcome"] == "partial" and result["actions_attempted"] == 1
+        elif boundary == "raw-drift":
+            cli("comment", source_id, "preflight drift")
+            with pytest.raises(ValueError, match="differs|drift|prebarrier"):
+                controller.execute_accepted_first_link(plan_id, "TK-B", "TK-A", request_id=request_id)
+        else:
+            first = controller.execute_accepted_first_link(plan_id, "TK-B", "TK-A", request_id=request_id)
+            assert first["outcome"] == "partial" and first["actions_attempted"] == 1
+            operation = next(op for op in store.read_scope(scope)["operations"] if op.key == authority["operation_key"])
+            assert operation.phase == "unknown"
+            replay = controller.execute_accepted_first_link(plan_id, "TK-B", "TK-A", request_id=request_id)
+            assert replay == {"outcome": "linked", "operation_key": authority["operation_key"], "actions_attempted": 0}
+            operation = next(op for op in store.read_scope(scope)["operations"] if op.key == authority["operation_key"])
+            assert operation.phase == "applied"
+        assert [command for command, *_ in commands].count("link") == (1 if boundary == "lost-response" else 0)
+        assert not ({"claim", "release", "unblock", "dispatch", "accept", "complete"}
+                    & {command for command, *_ in commands})
+        assert tuple(store.read_scope(scope)["members"]) == members_before
+        assert tuple(store.read_scope(scope)["budget_events"]) == budgets_before
+        if boundary != "lost-response":
+            assert json.loads(cli("show", source_id, "--json").stdout)["children"] == []
+            assert json.loads(cli("show", child_id, "--json").stdout)["parents"] == []
+    finally:
+        store.close()
+
+
 def test_pending_first_edge_claims_once_and_verifies_exact_two_card_readback(tmp_path):
     cli, claims = _RawCli(), []
     board, action = _adapter(tmp_path, cli)
@@ -295,6 +473,108 @@ def test_pending_first_edge_claims_once_and_verifies_exact_two_card_readback(tmp
     assert result.outcome == "verified", result.details
     assert len(claims) == 1
     assert result.readback["kind"] == "accepted_active_tranche_native_link_readback_v1"
+
+
+def test_claim_admits_reconstructed_multibyte_aggregate_evidence_over_scalar_limit(tmp_path):
+    """A valid two-card proof is aggregate evidence, not one scalar transport field."""
+    cli = _RawCli()
+    cli.cards["native-A"]["task"]["body"] = "é" * 2_800
+    cli.cards["native-B"]["task"]["body"] = "中" * 2_800
+    board, action = _adapter(tmp_path, cli)
+    receipt = _reconstructed_claim_receipt(board, action)
+    operation_bytes = len(json.dumps(receipt["operation"], sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=True, allow_nan=False).encode("utf-8"))
+    assert operation_bytes > 16_384
+    board.dependency_link_attempt_claim = lambda *_: receipt
+
+    result = board.link(action, "native-A", "native-B")
+
+    assert result.outcome == "verified", result.details
+    assert [call[0] for call in cli.calls].count("link") == 1
+
+
+def test_claim_rejects_oversized_aggregate_evidence_before_native_link(tmp_path):
+    cli = _RawCli()
+    board, action = _adapter(tmp_path, cli)
+    receipt = _reconstructed_claim_receipt(board, action)
+    receipt["operation"]["before_evidence"]["aggregate"] = "x" * 1_000_001
+    board.dependency_link_attempt_claim = lambda *_: receipt
+
+    result = board.link(action, "native-A", "native-B")
+
+    assert result.outcome == "unknown"
+    assert "bounded plain JSON" in result.details or "byte bound" in result.details
+    assert not any(call[0] == "link" for call in cli.calls)
+
+
+def test_claim_preserves_global_node_limit_before_native_link(tmp_path):
+    cli = _RawCli()
+    board, action = _adapter(tmp_path, cli)
+    receipt = _reconstructed_claim_receipt(board, action)
+    receipt["operation"]["before_evidence"]["many"] = [None] * 20_000
+    board.dependency_link_attempt_claim = lambda *_: receipt
+
+    result = board.link(action, "native-A", "native-B")
+
+    assert result.outcome == "unknown"
+    assert "traversal bounds" in result.details
+    assert not any(call[0] == "link" for call in cli.calls)
+
+
+def test_adapter_normalizes_full_resolver_snapshots_but_validates_retained_raw_capture(tmp_path):
+    cli = _RawCli()
+    board, action = _adapter(tmp_path, cli)
+    original_resolver = board.accepted_dependency_link_lookup
+
+    def plain(value):
+        if isinstance(value, (dict, MappingProxyType)):
+            return {key: plain(child) for key, child in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [plain(child) for child in value]
+        return value
+
+    def resolver(scope, key):
+        proof = plain(original_resolver(scope, key))
+        receipts = proof["authority"]["frozen_create_receipts"]
+        proof["source_snapshot"] = next(item["readback"] for item in receipts
+                                          if item["ticket_id"] == "TK-A")
+        proof["child_snapshot"] = next(item["readback"] for item in receipts
+                                         if item["ticket_id"] == "TK-B")
+        return proof
+
+    board.accepted_dependency_link_lookup = resolver
+    claim = _reconstructed_claim_receipt(board, action)
+    board.dependency_link_attempt_claim = lambda *_: claim
+
+    result = board.link(action, "native-A", "native-B")
+
+    assert result.outcome == "verified", result.details
+    assert [call[0] for call in cli.calls].count("link") == 1
+
+
+def test_coordinator_canonicalizes_nested_frozen_production_link_readback(tmp_path):
+    """The coordinator consumes the adapter's immutable ActionResult, not a lookalike dict."""
+    from local_first_orchestrator.contracts import OperationIntent
+    from local_first_orchestrator.coordinator import Coordinator
+
+    cli = _RawCli()
+    board, action = _adapter(tmp_path, cli)
+    claim = _reconstructed_claim_receipt(board, action)
+    board.dependency_link_attempt_claim = lambda *_: claim
+    result = board.link(action, "native-A", "native-B")
+    assert result.outcome == "verified"
+    assert isinstance(result.readback, MappingProxyType)
+    assert isinstance(result.readback["source"]["children"], tuple)
+
+    operation = OperationIntent(action.key, action.scope, action.target, action.effect,
+                                action.expected_observed_identity, claim["operation"]["before_evidence"],
+                                None, result.readback, {}, "unknown")
+    readback = Coordinator._checked_accepted_link_readback(
+        operation, result.readback, source_task_id="native-A", child_task_id="native-B",
+    )
+    assert readback == operation.to_dict()["readback"]
+    assert readback["source"]["children"] == ["native-B"]
+    assert readback["child"]["parents"] == ["native-A"]
     assert [c[0] for c in cli.calls].count("link") == 1
 
 
@@ -437,5 +717,3 @@ def test_wrapper_rejects_hostile_dict_subclass_without_invoking_hooks(tmp_path):
     assert Hostile.calls == 0
     assert claims == []
     assert not any(call[0] == "link" for call in cli.calls)
-
-

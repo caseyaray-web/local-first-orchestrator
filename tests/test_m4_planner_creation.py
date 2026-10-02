@@ -21,6 +21,8 @@ from tests.test_m4_plan_evidence import request
 
 @pytest.fixture
 def native_fixture(tmp_path):
+    if os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"):
+        pytest.skip("native fixture mutations require the authorized parent context")
     executable = os.environ.get("HERMES_M0_CLI")
     if not executable or not Path(executable).is_file():
         pytest.skip("set HERMES_M0_CLI to pinned Hermes CLI")
@@ -28,10 +30,10 @@ def native_fixture(tmp_path):
     home = tmp_path / "home"; home.mkdir(mode=0o700)
     board = "m4plannercreate"
     env = os.environ.copy(); env.update(HERMES_HOME=str(home), HERMES_KANBAN_HOME=str(home), HERMES_KANBAN_BOARD=board)
-    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_ATTACHMENTS_ROOT", "HERMES_KANBAN_LOGS_ROOT", "HERMES_PROFILE", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_SESSION_ID", "HERMES_DELEGATED_CHILD_CONTEXT"):
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_ATTACHMENTS_ROOT", "HERMES_KANBAN_LOGS_ROOT", "HERMES_PROFILE", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_SESSION_ID"):
         env.pop(key, None)
     def cli(*args):
-        result = subprocess.run([executable, "kanban", "--board", board, *args], env=env, text=True, capture_output=True, timeout=30)
+        result = subprocess.run([executable, "kanban", "--board", board, *args], env=env, cwd=tmp_path, text=True, capture_output=True, timeout=30)
         assert result.returncode == 0, result.stdout + result.stderr
         return result
     cli("boards", "create", board)
@@ -61,6 +63,12 @@ def setup(tmp_path, native_fixture, *, observed=None, profile="planner"):
         planning_observer=lambda _scope: {"request": request_payload(req) if observed is None else observed["request"]}, planning_profile=profile,
         planning_workspace=workspace)
     membership["store"] = store
+    from local_first_orchestrator.contracts import Action
+    with controller.lock:
+        anchor_snapshot = adapter.read_task(anchor)
+        held = controller._apply(Action("fixture-root-hold:" + anchor_snapshot.digest, scope,
+            {"task_id": anchor}, "hold", anchor_snapshot.digest))
+        assert held.outcome in {"verified", "no-op"}
     return controller, store, scope, req
 
 

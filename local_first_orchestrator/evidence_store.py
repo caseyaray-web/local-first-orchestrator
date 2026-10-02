@@ -16,7 +16,7 @@ import stat
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .budgets import CATEGORIES, GENERAL_ATTEMPT, PAID_CAPACITY
+from .budgets import CATEGORIES, GENERAL_ATTEMPT, IMPLEMENTATION_ATTEMPTS, PAID_CAPACITY
 from .contracts import (
     ActionResult,
     BoardSnapshot,
@@ -1096,8 +1096,8 @@ class EvidenceStore:
             "SELECT role, generation, work_association FROM managed_members WHERE board_id=? AND anchor_task_id=? AND task_id=?",
             (board, anchor, target["task_id"]),
         ).fetchone()
-        if member is None or member["role"] != "planner" or member["generation"] != generation:
-            raise ConflictError("paid release task is not the matching managed planner member")
+        if member is None or member["role"] not in {"planner", "paid_review"} or member["generation"] != generation:
+            raise ConflictError("paid release task is not the matching managed paid member")
         if member["work_association"] != target["request_id"]:
             raise ConflictError("paid release request does not match planner work association")
         self.connection.execute("BEGIN IMMEDIATE")
@@ -1122,6 +1122,58 @@ class EvidenceStore:
                 raise ConflictError("paid release capacity policy limit is exhausted")
             self.connection.execute("INSERT INTO budget_events VALUES (?, ?, ?, ?, ?, ?)", (board, anchor, event["event_id"], "native_operation", intent.key, event_payload))
             self.connection.execute("INSERT INTO operation_intents VALUES (?, ?, ?, ?)", (board, anchor, intent.key, op_payload))
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
+        return intent
+
+    def reserve_active_piece_release(self, scope: Mapping[str, Any], intent: OperationIntent, event: Mapping[str, Any], *, policy_limit: int) -> OperationIntent:
+        """Atomically admit one held implementation piece before its native unblock."""
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        target = dict(intent.target)
+        target_fields = {"task_id", "ticket_id", "plan_id", "member_generation", "profile", "held_digest"}
+        event_fields = {"event_id", "lineage_id", "root_task_id", "finding_id", "generation", "source_task_id", "source_kind", "native_source_id", "count"}
+        if (intent.effect != "release" or dict(intent.scope) != {"board_id": board, "anchor_task_id": anchor}
+                or set(target) != target_fields or intent.phase != "pending" or intent.outcome is not None or intent.readback is not None):
+            raise ConflictError("active-piece release intent is malformed")
+        if (not all(_nonempty_string(target.get(k)) for k in ("task_id", "ticket_id", "plan_id", "profile", "held_digest"))
+                or type(target["member_generation"]) is not int or target["member_generation"] < 0):
+            raise ConflictError("active-piece release target is malformed")
+        if (not isinstance(event, Mapping) or set(event) != event_fields
+                or event.get("event_id") != f"{IMPLEMENTATION_ATTEMPTS}:{intent.key}"
+                or event.get("lineage_id") != f"{anchor}:{GENERAL_ATTEMPT}"
+                or event.get("root_task_id") != anchor or event.get("finding_id") != GENERAL_ATTEMPT
+                or event.get("source_kind") != "native_operation" or event.get("native_source_id") != intent.key
+                or event.get("source_task_id") != target["task_id"] or event.get("generation") != target["member_generation"]
+                or event.get("count") != 1):
+            raise ConflictError("active-piece release budget attribution is malformed")
+        if not isinstance(policy_limit, int) or isinstance(policy_limit, bool) or policy_limit < 0:
+            raise ValueError("active-piece release policy limit must be non-negative")
+        member = self.connection.execute("SELECT role,generation FROM managed_members WHERE board_id=? AND anchor_task_id=? AND task_id=?", (board, anchor, target["task_id"])).fetchone()
+        if member is None or member["role"] != "implementation" or member["generation"] != target["member_generation"]:
+            raise ConflictError("active-piece release member is not the exact held implementation member")
+        payload, event_payload = _json(intent.to_dict()), _json(dict(event))
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            old = self.connection.execute("SELECT intent_json FROM operation_intents WHERE board_id=? AND anchor_task_id=? AND operation_key=?", (board, anchor, intent.key)).fetchone()
+            charge = self.connection.execute("SELECT event_json FROM budget_events WHERE board_id=? AND anchor_task_id=? AND event_id=?", (board, anchor, event["event_id"])).fetchone()
+            if old is not None:
+                stored = OperationIntent.from_dict(_decode(old[0]))
+                previous, requested = stored.to_dict(), intent.to_dict()
+                for field in ("outcome", "readback", "phase"):
+                    previous.pop(field); requested.pop(field)
+                if previous != requested or charge is None or charge[0] != event_payload:
+                    raise ConflictError("active-piece release retry conflicts with immutable admission")
+                self.connection.commit()
+                return stored
+            rows = (_decode(row[0]) for row in self.connection.execute("SELECT event_json FROM budget_events WHERE board_id=? AND anchor_task_id=?", (board, anchor)))
+            used = sum(row["count"] for row in rows if row["event_id"].split(":", 1)[0] == IMPLEMENTATION_ATTEMPTS and row["finding_id"] == GENERAL_ATTEMPT)
+            if used + 1 > policy_limit:
+                raise ConflictError("implementation attempt capacity is exhausted")
+            self.connection.execute("INSERT INTO operation_intents VALUES (?, ?, ?, ?)", (board, anchor, intent.key, payload))
+            self.connection.execute("INSERT INTO budget_events VALUES (?, ?, ?, ?, ?, ?)", (board, anchor, event["event_id"], "native_operation", intent.key, event_payload))
             self.connection.commit()
         except BaseException:
             self.connection.rollback()
@@ -1253,7 +1305,7 @@ class EvidenceStore:
         """
         self._require_schema()
         board, anchor = _scope_values(scope)
-        supported = frozenset({"create_held", "hold", "hold_task", "release", "unhold_task", "stop_run", "comment", "link", "request_review"})
+        supported = frozenset({"create_held", "hold", "hold_task", "release", "unhold_task", "stop_run", "comment", "link", "request_review", "git_integrate"})
         self._reject_local_authority_effect(self._operation({"board_id": board, "anchor_task_id": anchor}, key))
         self.connection.execute("BEGIN IMMEDIATE")
         try:
@@ -1276,6 +1328,130 @@ class EvidenceStore:
         except BaseException:
             self.connection.rollback()
             raise
+
+    def record_pre_send_attempt(self, scope: Mapping[str, Any], key: str, *,
+                                native_operation_identity: Mapping[str, Any], command_started: int) -> dict[str, Any]:
+        """Append the v2 command lower bound before a supported native send.
+
+        This is immutable timing evidence, not an observation or effect authority.
+        A pending operation may retain it after a crash before the unknown claim;
+        an unknown operation can be verified only when the exact same evidence is
+        present on reopen.
+        """
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        operation = self._operation({"board_id": board, "anchor_task_id": anchor}, key)
+        if (operation.effect != "link" or operation.target.get("kind") != "accepted_active_tranche_native_link_v2"
+                or operation.phase not in {"pending", "unknown"}):
+            raise ConflictError("pre-send timing is only supported for a v2 accepted link")
+        if not isinstance(native_operation_identity, Mapping) or type(command_started) is not int or command_started < 0:
+            raise ValueError("pre-send timing evidence is malformed")
+        identity = dict(native_operation_identity)
+        required = {"action_key", "effect", "source_task_id", "target_task_id"}
+        if (set(identity) != required or identity["action_key"] != key or identity["effect"] != "link"
+                or not all(_nonempty_string(identity[name]) for name in required)):
+            raise ValueError("pre-send native operation identity is malformed")
+        observation = {"kind": "accepted_active_tranche_native_link_v2_pre_send",
+                       "operation_key": key, "native_operation_identity": identity,
+                       "command_started": command_started}
+        payload, observation_id = _json(observation), _canonical_identity(observation)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.connection.execute("INSERT OR IGNORE INTO effect_observations VALUES (?, ?, ?, ?, ?)",
+                                    (board, anchor, key, observation_id, payload))
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
+        return observation
+
+    def read_pre_send_attempt(self, scope: Mapping[str, Any], key: str) -> dict[str, Any] | None:
+        """Return one exact v2 timing record; legacy/ambiguous journals return none."""
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        rows = self.connection.execute(
+            "SELECT observation_json FROM effect_observations WHERE board_id=? AND anchor_task_id=? AND operation_key=?",
+            (board, anchor, key),
+        ).fetchall()
+        matches = []
+        for row in rows:
+            value = _decode(row[0])
+            if isinstance(value, dict) and value.get("kind") == "accepted_active_tranche_native_link_v2_pre_send":
+                matches.append(value)
+        if len(matches) != 1:
+            return None
+        value = matches[0]
+        try:
+            identity = value["native_operation_identity"]
+            if (set(value) != {"kind", "operation_key", "native_operation_identity", "command_started"}
+                    or value["operation_key"] != key or not isinstance(identity, dict)
+                    or type(value["command_started"]) is not int or value["command_started"] < 0):
+                return None
+            return {"kind": value["kind"], "operation_key": value["operation_key"],
+                    "native_operation_identity": dict(identity), "command_started": value["command_started"]}
+        except (KeyError, TypeError):
+            return None
+
+    def record_validated_link_receipt_checkpoint(self, scope: Mapping[str, Any], key: str,
+                                                 receipt: Mapping[str, Any]) -> dict[str, Any]:
+        """Durably retain one already-validated v2 link completion receipt.
+
+        This is deliberately separate from generic observation timing.  It is
+        written only after the coordinator has validated the adapter's exact
+        returned transition and before acknowledgement, so an unknown operation
+        can never be acknowledged from a later equivalent native edge alone.
+        """
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        operation = self._operation({"board_id": board, "anchor_task_id": anchor}, key)
+        if (operation.effect != "link" or operation.target.get("kind") != "accepted_active_tranche_native_link_v2"
+                or operation.phase != "unknown" or not isinstance(receipt, Mapping)):
+            raise ConflictError("validated receipt checkpoint requires an attempted v2 accepted link")
+        checkpoint = {"kind": "accepted_active_tranche_native_link_v2_receipt_checkpoint",
+                      "operation_key": key, "receipt": dict(receipt)}
+        payload, identity = _json(checkpoint), _canonical_identity(checkpoint)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.connection.execute(
+                "SELECT observation_json FROM effect_observations WHERE board_id=? AND anchor_task_id=? AND operation_key=?",
+                (board, anchor, key),
+            ).fetchall()
+            prior = [_decode(row[0]) for row in rows]
+            matches = [item for item in prior if isinstance(item, dict)
+                       and item.get("kind") == checkpoint["kind"]]
+            if len(matches) > 1 or (matches and matches[0] != checkpoint):
+                raise ConflictError("validated receipt checkpoint conflicts with existing immutable evidence")
+            if not matches:
+                self.connection.execute("INSERT INTO effect_observations VALUES (?, ?, ?, ?, ?)",
+                                        (board, anchor, key, identity, payload))
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
+        return checkpoint
+
+    def read_validated_link_receipt_checkpoint(self, scope: Mapping[str, Any], key: str) -> dict[str, Any] | None:
+        """Reconstruct exactly one completion checkpoint; malformed history is unusable."""
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        rows = self.connection.execute(
+            "SELECT observation_json FROM effect_observations WHERE board_id=? AND anchor_task_id=? AND operation_key=?",
+            (board, anchor, key),
+        ).fetchall()
+        matches = []
+        for row in rows:
+            value = _decode(row[0])
+            if isinstance(value, dict) and value.get("kind") == "accepted_active_tranche_native_link_v2_receipt_checkpoint":
+                matches.append(value)
+        if len(matches) != 1:
+            return None
+        checkpoint = matches[0]
+        if (set(checkpoint) != {"kind", "operation_key", "receipt"} or checkpoint.get("operation_key") != key
+                or not isinstance(checkpoint.get("receipt"), dict)
+                or _json(checkpoint) != _json({"kind": checkpoint["kind"], "operation_key": key,
+                                                "receipt": checkpoint["receipt"]})):
+            return None
+        return {"kind": checkpoint["kind"], "operation_key": key, "receipt": dict(checkpoint["receipt"])}
 
     def record_effect_observation(self, scope: Mapping[str, Any], key: str, *, outcome: str, details: str, readback: Mapping[str, Any] | None) -> dict[str, Any]:
         """Append exact native result evidence without falsifying journal phase."""
@@ -1302,6 +1478,88 @@ class EvidenceStore:
             self.connection.rollback()
             raise
         return observation
+
+    def record_pause_cycle_observation(self, intent: PauseIntent,
+                                       snapshots: Mapping[str, Mapping[str, Any]]) -> Mapping[str, Any]:
+        """Append exact pre-pause snapshots as immutable local evidence, not an ack."""
+        self._require_schema()
+        board, anchor = _scope_values(intent.scope)
+        if (not intent.active or intent.resuming or not intent.managed_task_ids
+                or set(snapshots) != set(intent.managed_task_ids)
+                or set(intent.baseline_digests) != set(intent.managed_task_ids)):
+            raise ValueError("pause-cycle observation must bind one complete active pause")
+        observations: dict[str, dict[str, Any]] = {}
+        for task_id in sorted(intent.managed_task_ids):
+            raw = snapshots.get(task_id)
+            if not isinstance(raw, Mapping):
+                raise ValueError("pause-cycle observation snapshot is malformed")
+            snapshot = BoardSnapshot.from_dict(raw)
+            canonical = snapshot.to_dict()
+            if canonical != dict(raw) or snapshot.native_task.get("id") != task_id or snapshot.digest != intent.baseline_digests[task_id]:
+                raise ValueError("pause-cycle observation does not match the persisted baseline")
+            observations[task_id] = canonical
+        observation = {
+            "kind": "local_pause_observation_v1",
+            "scope": {"board_id": board, "anchor_task_id": anchor},
+            "generation": intent.generation,
+            "baseline_digests": dict(intent.baseline_digests),
+            "observations": observations,
+        }
+        payload, identity = _json(observation), _canonical_identity(observation)
+        key = f"local-pause-observation:v1:{intent.generation}"
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.connection.execute(
+                "SELECT observation_json FROM effect_observations WHERE board_id=? AND anchor_task_id=? AND operation_key=?",
+                (board, anchor, key),
+            ).fetchall()
+            if len(rows) > 1 or (rows and rows[0][0] != payload):
+                raise ConflictError("pause-cycle observation conflicts with immutable evidence")
+            if not rows:
+                self.connection.execute("INSERT INTO effect_observations VALUES (?, ?, ?, ?, ?)",
+                                        (board, anchor, key, identity, payload))
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
+        return observation
+
+    def read_pause_cycle_observation(self, intent: PauseIntent, *, generation: int) -> Mapping[str, BoardSnapshot] | None:
+        """Return one completely baseline-bound cycle-start snapshot set, or none."""
+        self._require_schema()
+        board, anchor = _scope_values(intent.scope)
+        if type(generation) is not int or generation < 0:
+            raise ValueError("pause-cycle generation must be a non-negative integer")
+        key = f"local-pause-observation:v1:{generation}"
+        rows = self.connection.execute(
+            "SELECT observation_json FROM effect_observations WHERE board_id=? AND anchor_task_id=? AND operation_key=?",
+            (board, anchor, key),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        try:
+            raw = rows[0][0]
+            value = _decode(raw)
+            expected = {"kind", "scope", "generation", "baseline_digests", "observations"}
+            if (not isinstance(value, dict) or set(value) != expected or _json(value) != raw
+                    or value["kind"] != "local_pause_observation_v1"
+                    or value["scope"] != {"board_id": board, "anchor_task_id": anchor}
+                    or value["generation"] != generation
+                    or value["baseline_digests"] != dict(intent.baseline_digests)
+                    or not isinstance(value["observations"], dict)
+                    or set(value["observations"]) != set(intent.managed_task_ids)):
+                return None
+            snapshots: dict[str, BoardSnapshot] = {}
+            for task_id in intent.managed_task_ids:
+                item = value["observations"][task_id]
+                snapshot = BoardSnapshot.from_dict(item)
+                if (snapshot.to_dict() != item or snapshot.native_task.get("id") != task_id
+                        or snapshot.digest != intent.baseline_digests.get(task_id)):
+                    return None
+                snapshots[task_id] = snapshot
+            return snapshots
+        except (KeyError, TypeError, ValueError, SchemaError):
+            return None
 
     def observe_effect(self, scope: Mapping[str, Any], key: str, *, outcome: str | None, readback: Mapping[str, Any] | None, phase: str) -> OperationIntent:
         self._require_schema()

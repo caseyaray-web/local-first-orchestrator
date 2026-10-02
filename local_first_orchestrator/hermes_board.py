@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .contracts import Action, ActionResult, BoardSnapshot, validate_scope
+from .contracts import Action, ActionResult, BoardSnapshot, NATIVE_COMMENT_AUTHOR, validate_scope
 from .planning_coordinator import (request_from_payload, _canonical_digest, _evidence_snapshot,
     reconstruct_evidence, first_active_tranche_materialization, accepted_active_tranche_create_payload,
     ActiveTrancheRoute, HeldCardTarget)
@@ -131,8 +131,13 @@ def validate_accepted_first_link_transition(before_source, before_child, after_s
     return AcceptedFirstLinkTransition(source_id, child_id, *frozen)
 from .ticket import parse_contract, contract_payload
 
-_AUTHOR = "local-first-orchestrator"
+_AUTHOR = NATIVE_COMMENT_AUTHOR
 _MAX_FIELD = 16_384
+# A claim operation is a whole reconstructed evidence bundle, not a scalar ID,
+# title, body, or argv field.  Keep its transport under the same 1 MiB aggregate
+# JSON ceiling enforced by _plain_json_snapshot; individual scalar limits remain
+# _MAX_FIELD at every identifier and native-command boundary.
+_MAX_LINK_CLAIM_OPERATION_BYTES = 1_000_000
 _MAX_MARKER_SEARCH_ROWS = 30
 _MAX_MARKER_SEARCH_CLI_CALLS = 64
 _MAX_NATIVE_MARKER_DEPTH = 64
@@ -243,7 +248,7 @@ class HermesBoardAdapter:
         self.capabilities = BoardCapabilities.native_m0()
 
     def _accepted_piece_payload(self, action: Action):
-        if action.effect != "create_held" or action.target.get("kind") != "accepted_active_tranche_piece_v1":
+        if action.effect != "create_held" or action.target.get("kind") not in {"accepted_active_tranche_piece_v1", "accepted_active_tranche_piece_v2"}:
             return None
         if self.accepted_piece_create_lookup is None:
             raise ValueError("trusted accepted-piece resolver is required")
@@ -253,8 +258,8 @@ class HermesBoardAdapter:
         if not isinstance(resolved.target, Mapping):
             raise ValueError("trusted accepted-piece target must be a mapping")
         canonical = dict(resolved.target)
-        expected_kind = "accepted_active_tranche_piece_v1"
-        if type(canonical.get("kind")) is not str or canonical.get("kind") != expected_kind:
+        expected_kind = action.target.get("kind")
+        if type(expected_kind) is not str or type(canonical.get("kind")) is not str or canonical.get("kind") != expected_kind:
             raise ValueError("trusted accepted-piece target kind mismatch")
         if type(resolved.title) is not str or type(resolved.body) is not str or type(resolved.idempotency_key) is not str:
             raise ValueError("trusted accepted-piece payload fields must be strings")
@@ -298,7 +303,7 @@ class HermesBoardAdapter:
         selected = [item for item in material.targets if item.ticket_id == canonical.get("ticket_id")]
         if len(selected) != 1:
             raise ValueError("accepted-piece target is not a unique reconstructed ticket")
-        rebuilt = accepted_active_tranche_create_payload(token, evidence, selected[0])
+        rebuilt = accepted_active_tranche_create_payload(token, evidence, selected[0], body_kind=expected_kind)
         if (resolved.title != rebuilt.title or resolved.body != rebuilt.body
                 or dict(canonical) != dict(rebuilt.target)
                 or resolved.idempotency_key != rebuilt.idempotency_key):
@@ -326,6 +331,8 @@ class HermesBoardAdapter:
         body_fields = {"schema_version", "kind", "accepted_token_key", "accepted_token", "ticket",
                        "ticket_contract_hash", "criterion_statements", "tranche_semantics", "repository",
                        "association", "route"}
+        if expected_kind == "accepted_active_tranche_piece_v2":
+            body_fields.add("root_semantics")
         raw_digest_fields = {"proposal_hash", "plan_contract_hash"}
         hashes_valid = (isinstance(source, Mapping) and set(source) == source_fields
                         and all(type(source.get(name)) is str and len(source[name]) == 64
@@ -457,6 +464,35 @@ class HermesBoardAdapter:
         if not isinstance(rows, list) or not all(isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"] for x in rows): raise _BoardUnavailable("task list malformed")
         return tuple(self._snapshot(x["id"]) for x in rows)
     def read_task(self, task_id: str) -> BoardSnapshot: return self._snapshot(task_id)
+
+    def read_accepted_active_tranche_raw_cards(self, scope: Mapping[str, str], task_ids: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+        """Read exact active-tranche raw cards and runs without a native mutation.
+
+        The caller supplies the closed managed set reconstructed from accepted
+        evidence; this helper deliberately does not list or discover cards.
+        """
+        valid = validate_scope(scope)
+        if valid != {"board_id": self.board, "anchor_task_id": self.anchor_task_id}:
+            raise ValueError("raw active-tranche read scope does not match configured board and anchor")
+        if type(task_ids) is not tuple or not task_ids or any(type(task_id) is not str or not task_id for task_id in task_ids):
+            raise ValueError("raw active-tranche read requires a non-empty tuple of exact task IDs")
+        if len(task_ids) != len(set(task_ids)):
+            raise ValueError("raw active-tranche read task IDs must be unique")
+        if any(task_id != self.anchor_task_id and not self._trusted_member(valid, task_id) for task_id in task_ids):
+            raise ValueError("raw active-tranche read includes an unmanaged task")
+        result = {}
+        for task_id in task_ids:
+            raw, runs = self._raw_show_and_runs(task_id)
+            # Keep exact raw task fields and opaque top-level show fields; only
+            # runs is supplied by its separate supported endpoint.
+            if "show_has_runs" in raw or "show_runs" in raw:
+                raise _BoardUnavailable("raw show collides with reserved inspection transport metadata")
+            raw_plain = _plain_json_snapshot(raw)
+            result[task_id] = {**raw_plain, "runs": _plain_json_snapshot(runs),
+                               "show_has_runs": "runs" in raw,
+                               "show_runs": _plain_json_snapshot(raw["runs"]) if "runs" in raw else None}
+        return result
+
     def read_run(self, task_id: str, run_id: str) -> Mapping[str, Any]:
         for run in self._snapshot(task_id).runs:
             if str(run.get("id")) == str(run_id): return run
@@ -762,11 +798,69 @@ class HermesBoardAdapter:
             return self._result(action, "conflict", "marked create is not associated with anchor", snapshot)
         if not native_parent and snapshot.parents:
             return self._result(action, "conflict", "store-associated create unexpectedly has native dependencies", snapshot)
-        return self._result(action, "no-op", "exact marked held creation already present", snapshot)
+        return self._capture_accepted_piece_raw_readback(
+            action, self._result(action, "no-op", "exact marked held creation already present", snapshot))
+
+    def _capture_accepted_piece_raw_readback(self, action: Action, result: ActionResult) -> ActionResult:
+        """Retain the exact public show envelope in new accepted-piece receipts."""
+        if (action.target.get("kind") not in {"accepted_active_tranche_piece_v1", "accepted_active_tranche_piece_v2"}
+                or result.outcome not in {"verified", "no-op"} or result.readback is None):
+            return result
+        visited = 0
+        def detach(value, depth=0):
+            nonlocal visited
+            visited += 1
+            if visited > 20_000 or depth > 64:
+                raise ValueError("accepted-piece readback exceeds raw-capture traversal bounds")
+            if type(value) is MappingProxyType:
+                return {key: detach(child, depth + 1) for key, child in value.items()}
+            if type(value) is dict:
+                return {key: detach(child, depth + 1) for key, child in dict.items(value)}
+            if type(value) in (tuple, list):
+                return [detach(child, depth + 1) for child in value]
+            return value
+
+        snapshot = None
+        try:
+            snapshot = BoardSnapshot.from_dict(_plain_json_snapshot(detach(result.readback)))
+            task_id = snapshot.native_task.get("id")
+            if type(task_id) is not str or not task_id:
+                raise ValueError("accepted-piece readback lacks exact native identity")
+            show, runs = self._raw_show_and_runs(task_id)
+            parents = show.get("parents")
+            expected_task = _plain_json_snapshot(detach(snapshot.native_task))
+            if (type(show.get("task")) is dict and "workspace_path" in show["task"]
+                    and "workspace_path" not in expected_task
+                    and isinstance(expected_task.get("workspace"), str)
+                    and expected_task["workspace"].startswith("dir:")
+                    and show["task"]["workspace_path"] == expected_task["workspace"][4:]):
+                expected_task["workspace_path"] = expected_task["workspace"][4:]
+            expected_runs = _plain_json_snapshot(detach(snapshot.runs))
+            expected_comments = _plain_json_snapshot(detach(snapshot.comments))
+            expected_events = _plain_json_snapshot(detach(snapshot.events))
+            expected_attachments = _plain_json_snapshot(detach(snapshot.attachments))
+            if (show.get("task") != expected_task
+                    or type(parents) is not list
+                    or parents != [item.get("id") for item in snapshot.parents]
+                    or show.get("children") != []
+                    or runs != expected_runs
+                    or show.get("comments", []) != expected_comments
+                    or show.get("events", []) != expected_events
+                    or ("attachments" in show and show["attachments"] != expected_attachments)
+                    or ("attachments" not in show and snapshot.attachments)):
+                raise ValueError("exact raw accepted-piece show differs from verified held snapshot")
+            capture = {"kind": "hermes_kanban_raw_capture_v1",
+                       "show": _plain_json_snapshot(show), "runs": _plain_json_snapshot(runs)}
+            readback = _plain_json_snapshot(detach(result.readback))
+            readback["raw_capture_v1"] = capture
+            return ActionResult(result.action_key, result.outcome, result.details, readback)
+        except (ValueError, TypeError, KeyError, _BoardUnavailable) as exc:
+            details = f"accepted-piece exact raw creation capture unavailable: {str(exc)[:384]}"
+            return ActionResult(result.action_key, "conflict", details, result.readback)
 
     def create_held(self, action: Action, *, title: str, body: str, assignee: str, workspace: str, idempotency_key: str) -> ActionResult:
         accepted_piece: Any = None
-        if action.target.get("kind") == "accepted_active_tranche_piece_v1":
+        if action.target.get("kind") in {"accepted_active_tranche_piece_v1", "accepted_active_tranche_piece_v2"}:
             try:
                 accepted_piece = self._accepted_piece_payload(action)
             except Exception as exc:
@@ -793,44 +887,72 @@ class HermesBoardAdapter:
             if title != action.target.get("create_title") or body != action.target.get("create_body"):
                 return self._result(action, "conflict", "planner create title/body differ from persisted action identity", None)
         elif not native_parent:
-            source_task = action.target.get("source_task_id")
-            candidate = action.target.get("candidate")
-            association = action.target.get("association")
-            replacement_for = action.target.get("replacement_for")
-            content = candidate.get("content_identity") if isinstance(candidate, Mapping) else None
-            if action.target.get("correction_of") == source_task:
-                generation = action.target.get("generation")
-                finding_ids = action.target.get("finding_ids")
-                findings = action.target.get("findings")
-                valid_findings = (
-                    isinstance(finding_ids, (tuple, list)) and bool(finding_ids)
-                    and all(isinstance(finding_id, str) and finding_id for finding_id in finding_ids)
-                    and len(set(finding_ids)) == len(finding_ids)
-                    and isinstance(findings, (tuple, list)) and len(findings) == len(finding_ids)
-                    and all(isinstance(finding, Mapping)
-                            and set(finding) == {"finding_id", "criterion_id", "severity", "summary"}
-                            and all(isinstance(finding.get(field), str) and finding[field]
-                                    for field in ("finding_id", "criterion_id", "severity", "summary"))
-                            and finding["severity"] in {"blocker", "major", "minor"}
-                            for finding in findings)
-                    and tuple(sorted(finding["finding_id"] for finding in findings)) == tuple(finding_ids)
-                )
-                expected_association = f"separate-review-correction:{source_task}:{content}:{generation}"
-                correction_contract_valid = (
-                    isinstance(action.target.get("review_id"), str) and bool(action.target["review_id"])
-                    and isinstance(generation, int) and not isinstance(generation, bool) and generation > 0
-                    and action.target.get("task_id") == source_task and valid_findings
-                )
+            # Paid integrated review and its finding-driven correction are
+            # review workflow members, not native children of the tranche
+            # anchor.  Their durable operation targets carry association; a
+            # parent edge would make the anchor a prerequisite and contradict
+            # the canonical separate-review topology.
+            kind = action.target.get("kind")
+            if kind == "paid_integrated_review_v1":
+                required = {"kind", "anchor_task_id", "plan_id", "tranche_id", "head_sha",
+                            "check_operation_key", "candidate", "profile", "native_parent"}
+                candidate = action.target.get("candidate")
+                if (set(action.target) != required or action.target.get("anchor_task_id") != self.anchor_task_id
+                        or not all(isinstance(action.target.get(field), str) and action.target[field]
+                                   for field in ("plan_id", "tranche_id", "head_sha", "check_operation_key", "profile"))
+                        or not isinstance(candidate, Mapping)):
+                    return self._result(action, "conflict", "parentless paid review create requires exact revision target", None)
+            elif kind == "paid_correction_v1":
+                required = {"kind", "anchor_task_id", "plan_id", "ticket_id", "tranche_id", "source_review_id",
+                            "source_task_id", "task_id", "head_sha", "candidate", "finding_ids", "findings", "native_parent"}
+                finding_ids, findings = action.target.get("finding_ids"), action.target.get("findings")
+                if (set(action.target) != required or action.target.get("anchor_task_id") != self.anchor_task_id
+                        or action.target.get("task_id") != action.target.get("source_task_id")
+                        or not all(isinstance(action.target.get(field), str) and action.target[field]
+                                   for field in ("plan_id", "ticket_id", "tranche_id", "source_review_id", "source_task_id", "head_sha"))
+                        or not isinstance(action.target.get("candidate"), Mapping)
+                        or not isinstance(finding_ids, (tuple, list)) or not finding_ids
+                        or not isinstance(findings, (tuple, list)) or len(findings) != len(finding_ids)):
+                    return self._result(action, "conflict", "parentless paid correction create requires exact finding target", None)
             else:
-                expected_association = (f"premature-done:{source_task}:{content}" if replacement_for is None
-                                        else f"premature-done-replacement:{replacement_for}:{content}")
-                correction_contract_valid = True
-            if (not isinstance(source_task, str) or not source_task or not isinstance(content, str) or not content
-                    or (action.target.get("correction_of") is not None and action.target.get("correction_of") != source_task)
-                    or (replacement_for is not None and (not isinstance(replacement_for, str)
-                        or not replacement_for or replacement_for == source_task))
-                    or not correction_contract_valid or association != expected_association):
-                return self._result(action, "conflict", "parentless create requires exact scoped source candidate association", None)
+                source_task = action.target.get("source_task_id")
+                candidate = action.target.get("candidate")
+                association = action.target.get("association")
+                replacement_for = action.target.get("replacement_for")
+                content = candidate.get("content_identity") if isinstance(candidate, Mapping) else None
+                if action.target.get("correction_of") == source_task:
+                    generation = action.target.get("generation")
+                    finding_ids = action.target.get("finding_ids")
+                    findings = action.target.get("findings")
+                    valid_findings = (
+                        isinstance(finding_ids, (tuple, list)) and bool(finding_ids)
+                        and all(isinstance(finding_id, str) and finding_id for finding_id in finding_ids)
+                        and len(set(finding_ids)) == len(finding_ids)
+                        and isinstance(findings, (tuple, list)) and len(findings) == len(finding_ids)
+                        and all(isinstance(finding, Mapping)
+                                and set(finding) == {"finding_id", "criterion_id", "severity", "summary"}
+                                and all(isinstance(finding.get(field), str) and finding[field]
+                                        for field in ("finding_id", "criterion_id", "severity", "summary"))
+                                and finding["severity"] in {"blocker", "major", "minor"}
+                                for finding in findings)
+                        and tuple(sorted(finding["finding_id"] for finding in findings)) == tuple(finding_ids)
+                    )
+                    expected_association = f"separate-review-correction:{source_task}:{content}:{generation}"
+                    correction_contract_valid = (
+                        isinstance(action.target.get("review_id"), str) and bool(action.target["review_id"])
+                        and isinstance(generation, int) and not isinstance(generation, bool) and generation > 0
+                        and action.target.get("task_id") == source_task and valid_findings
+                    )
+                else:
+                    expected_association = (f"premature-done:{source_task}:{content}" if replacement_for is None
+                                            else f"premature-done-replacement:{replacement_for}:{content}")
+                    correction_contract_valid = True
+                if (not isinstance(source_task, str) or not source_task or not isinstance(content, str) or not content
+                        or (action.target.get("correction_of") is not None and action.target.get("correction_of") != source_task)
+                        or (replacement_for is not None and (not isinstance(replacement_for, str)
+                            or not replacement_for or replacement_for == source_task))
+                        or not correction_contract_valid or association != expected_association):
+                    return self._result(action, "conflict", "parentless create requires exact scoped source candidate association", None)
         created_body = body if marker in body else f"{body}\n\n{marker}"
         if len(created_body) > _MAX_FIELD: raise ValueError("creation body plus stable marker exceeds bound")
         if not self._assert_create_lock(action):
@@ -892,7 +1014,8 @@ class HermesBoardAdapter:
             return self._result(action, "conflict", "created task idempotency key differs from action", after)
         if native_parent and not any(x.get("id") == self.anchor_task_id for x in after.parents): return self._result(action, "conflict", "created task is not associated with anchor", after)
         if not native_parent and after.parents: return self._result(action, "conflict", "store-associated create unexpectedly has native dependencies", after)
-        return self._result(action, "verified", "held creation verified by exact readback", after)
+        return self._capture_accepted_piece_raw_readback(
+            action, self._result(action, "verified", "held creation verified by exact readback", after))
 
     def comment(self, action: Action, task_id: str, text: str) -> ActionResult:
         if not isinstance(text, str) or not text or len(text) > _MAX_FIELD: raise ValueError("bounded non-empty comment required")
@@ -1027,8 +1150,28 @@ class HermesBoardAdapter:
                     and len(receipt["digest"]) == 71 and all(c in "0123456789abcdef" for c in receipt["digest"][7:])):
                 raise ValueError("accepted-link receipt digest malformed")
             raw_receipt = _plain_json_snapshot(receipt["readback"])
-            if raw_receipt != value["source_snapshot"] and raw_receipt != value["child_snapshot"]:
-                if receipt["task_id"] in {value["source_id"], value["child_id"]}:
+            if type(raw_receipt) is not dict:
+                raise ValueError("accepted-link receipt snapshot malformed")
+            raw_capture = raw_receipt.pop("raw_capture_v1", None)
+            if type(raw_capture) is not dict:
+                raise ValueError("accepted-link receipt lacks exact raw creation capture")
+            try:
+                raw_snapshot = BoardSnapshot.from_dict(raw_receipt)
+            except (TypeError, ValueError) as error:
+                raise ValueError("accepted-link receipt normalized snapshot malformed") from error
+            if not self._raw_capture_matches_snapshot(raw_snapshot, raw_capture):
+                raise ValueError("accepted-link raw creation capture differs from normalized receipt")
+            for field, endpoint_id in (("source_snapshot", value["source_id"]),
+                                       ("child_snapshot", value["child_id"])):
+                if receipt["task_id"] != endpoint_id:
+                    continue
+                resolver_snapshot = _plain_json_snapshot(value[field])
+                if type(resolver_snapshot) is not dict:
+                    raise ValueError("accepted-link resolver snapshot is malformed")
+                resolver_capture = resolver_snapshot.pop("raw_capture_v1", None)
+                if resolver_capture is not None and resolver_capture != raw_capture:
+                    raise ValueError("accepted-link resolver raw capture differs from frozen receipt")
+                if resolver_snapshot != raw_receipt:
                     raise ValueError("accepted-link transport snapshot differs from immutable receipt")
         if (authority["source_ticket_id"] not in selected or authority["target_ticket_id"] not in selected
                 or selected[authority["source_ticket_id"]]["task_id"] != value["source_id"]
@@ -1038,7 +1181,14 @@ class HermesBoardAdapter:
         for field, receipt_key in (("source_snapshot", "source_ticket_id"), ("child_snapshot", "target_ticket_id")):
             raw_snapshot = _plain_json_snapshot(value[field])
             receipt = selected[authority[receipt_key]]
-            if raw_snapshot != receipt["readback"] or receipt["task_id"] != value["source_id" if field == "source_snapshot" else "child_id"]:
+            receipt_snapshot = _plain_json_snapshot(receipt["readback"])
+            if type(raw_snapshot) is not dict or type(receipt_snapshot) is not dict:
+                raise ValueError("accepted-link normalized snapshot is malformed")
+            resolver_capture = raw_snapshot.pop("raw_capture_v1", None)
+            receipt_capture = receipt_snapshot.pop("raw_capture_v1", None)
+            if resolver_capture is not None and resolver_capture != receipt_capture:
+                raise ValueError("accepted-link resolver capture differs from frozen create receipt")
+            if raw_snapshot != receipt_snapshot or receipt["task_id"] != value["source_id" if field == "source_snapshot" else "child_id"]:
                 raise ValueError("accepted-link snapshot does not equal its frozen create receipt")
             snapshot = BoardSnapshot.from_dict(raw_snapshot)
             if snapshot.parents or snapshot.runs or snapshot.native_task.get("status") != "blocked":
@@ -1057,6 +1207,31 @@ class HermesBoardAdapter:
                 or not all(isinstance(run, dict) for run in runs)):
             raise _BoardUnavailable("accepted-link exact raw show or runs malformed")
         return raw, runs
+
+    def read_accepted_first_link_prebarrier(self, action: Action, source_id: str, child_id: str):
+        """Read only the exact empty native first-edge barrier; never claim or link.
+
+        A successful capture is evidence for a coordinator-owned pending journal
+        reservation, not authorization to perform the later native link effect.
+        """
+        if not self._assert_create_lock(action):
+            raise ValueError("trusted singleton lock assertion required for accepted-link prebarrier")
+        target = action.target
+        exact_target = {"kind": "accepted_active_tranche_native_link_v1",
+                        "source_task_id": source_id, "child_task_id": child_id,
+                        "operation_key": action.key}
+        if (action.effect != "link" or action.scope != {"board_id": self.board, "anchor_task_id": self.anchor_task_id}
+                or target != exact_target or type(source_id) is not str or type(child_id) is not str
+                or not source_id or not child_id or source_id == child_id):
+            raise ValueError("accepted-link prebarrier requires exact scoped first-edge action and IDs")
+        source_raw, source_runs = self._raw_show_and_runs(source_id)
+        child_raw, child_runs = self._raw_show_and_runs(child_id)
+        if (source_runs or child_runs or source_raw["task"].get("status") != "blocked"
+                or child_raw["task"].get("status") != "blocked"
+                or source_raw.get("children") != [] or child_raw.get("parents") != []):
+            raise ValueError("accepted-link prebarrier is not an empty blocked first edge")
+        return {"source_raw": _plain_json_snapshot(source_raw),
+                "child_raw": _plain_json_snapshot(child_raw)}
 
     def _link_accepted_first_edge(self, action: Action, parent_task_id: str, child_task_id: str) -> ActionResult:
         if action.effect != "link" or action.scope != {"board_id": self.board, "anchor_task_id": self.anchor_task_id}:
@@ -1114,9 +1289,13 @@ class HermesBoardAdapter:
             operation = receipt.get("operation")
             if type(operation) is not dict or set(operation) != {"key", "scope", "target", "effect", "expected_observed_identity", "before_evidence", "outcome", "readback", "retry", "phase"}:
                 raise ValueError("claim receipt operation transport malformed")
-            # Strict bounded JSON round-trip rejects custom mappings/hooks and non-JSON values.
+            # Strict bounded JSON round-trip rejects custom mappings/hooks and
+            # enforces the dedicated whole-evidence aggregate cap.  This is not
+            # the scalar field/argv cap: first-link evidence intentionally
+            # repeats independently frozen raw cards and receipts.
             encoded = json.dumps(operation, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
-            if len(encoded) > _MAX_FIELD or json.loads(encoded) != operation:
+            if (len(encoded.encode("utf-8")) > _MAX_LINK_CLAIM_OPERATION_BYTES
+                    or json.loads(encoded) != operation):
                 raise ValueError("claim receipt operation transport is not bounded plain JSON")
             if (operation["key"] != action.key or operation["scope"] != dict(action.scope)
                     or operation["effect"] != "link" or operation["target"] != action.to_dict()["target"]
@@ -1176,6 +1355,39 @@ class HermesBoardAdapter:
             return self._result(action, "conflict", f"accepted-link transition contradicts frozen proof: {exc}", None)
 
     def link(self, action: Action, parent_task_id: str, child_task_id: str) -> ActionResult:
+        if action.target.get("kind") == "accepted_active_tranche_native_link_v2":
+            # The coordinator supplies the complete immutable DAG prebarrier and
+            # validates the all-card post-state.  The adapter owns only the one
+            # supported native command plus endpoint readback; it never invents
+            # ordering authority or retries an ambiguous v2 effect.
+            exact = {"kind": "accepted_active_tranche_native_link_v2", "operation_key": action.key,
+                     "source_ticket_id": action.target.get("source_ticket_id"), "target_ticket_id": action.target.get("target_ticket_id"),
+                     "source_task_id": parent_task_id, "target_task_id": child_task_id}
+            if action.effect != "link" or dict(action.target) != exact or parent_task_id == child_task_id:
+                return self._result(action, "conflict", "generalized accepted-link target differs from exact endpoints", None)
+            if not self._assert_create_lock(action):
+                return self._result(action, "unsupported", "trusted singleton lock is required before generalized link", None)
+            try:
+                source_raw, source_runs = self._raw_show_and_runs(parent_task_id)
+                child_raw, child_runs = self._raw_show_and_runs(child_task_id)
+                if source_runs or child_runs or source_raw["task"].get("status") != "blocked" or child_raw["task"].get("status") != "blocked":
+                    return self._result(action, "conflict", "generalized link endpoints are not held with no runs", None)
+                if self.create_lock_assertion is None:
+                    return self._result(action, "unsupported", "trusted singleton lock assertion callback is unavailable", None)
+                self.create_lock_assertion(action.scope, self.anchor_task_id)
+                self._invoke("link", parent_task_id, child_task_id)
+                _after_source, _ = self._raw_show_and_runs(parent_task_id)
+                after_child, _ = self._raw_show_and_runs(child_task_id)
+                snapshot_data = {"native_task": after_child["task"], "parents": [{"id": item} for item in after_child.get("parents", [])],
+                    "runs": [], "comments": after_child.get("comments", []), "events": after_child.get("events", []),
+                    "attachments": after_child.get("attachments", [])}
+                snapshot = BoardSnapshot(native_task=snapshot_data["native_task"], parents=tuple(snapshot_data["parents"]),
+                    runs=(), comments=tuple(snapshot_data["comments"]), events=tuple(snapshot_data["events"]),
+                    attachments=tuple(snapshot_data["attachments"]), observed_at=datetime.now(timezone.utc).isoformat(),
+                    digest=self._digest(snapshot_data))
+                return self._result(action, "verified", "generalized link command completed; coordinator must validate all-card receipt", snapshot)
+            except (_BoardUnavailable, ValueError) as exc:
+                return self._result(action, "unknown", f"generalized native link outcome unknown: {exc}", None)
         if action.target.get("kind") == "accepted_active_tranche_native_link_v1":
             return self._link_accepted_first_edge(action, parent_task_id, child_task_id)
         if parent_task_id != self.anchor_task_id or parent_task_id == child_task_id or action.target.get("parent_task_id") != parent_task_id or action.target.get("child_task_id") != child_task_id: return self._result(action, "conflict", "links must originate at exact anchor with distinct endpoints", None)
@@ -1208,6 +1420,49 @@ class HermesBoardAdapter:
         if not accepted: return self._result(action, "conflict", "trusted verifier rejected acceptance evidence", before)
         return self._mutate(action, task_id=task_id, argv=("complete", task_id, "--result", approval_evidence), verifier=lambda _b,a: None if a.native_task.get("status") == "done" else "conflict", description="anchor completion")
 
+    @staticmethod
+    def _raw_capture_matches_snapshot(snapshot: BoardSnapshot, capture: Any) -> bool:
+        """Check the retained raw public envelope against its normalized snapshot."""
+        if (type(capture) is not dict or set(capture) != {"kind", "show", "runs"}
+                or capture.get("kind") != "hermes_kanban_raw_capture_v1"
+                or type(capture.get("show")) is not dict or type(capture.get("runs")) is not list):
+            return False
+        def thaw(value: Any) -> Any:
+            if type(value) is MappingProxyType:
+                return {key: thaw(child) for key, child in value.items()}
+            if type(value) is dict:
+                return {key: thaw(child) for key, child in dict.items(value)}
+            if type(value) in (tuple, list):
+                return [thaw(child) for child in value]
+            return value
+
+        show, runs = capture["show"], capture["runs"]
+        if "show_has_runs" in show or "show_runs" in show:
+            return False
+        expected_task = thaw(snapshot.native_task)
+        shown_task = show.get("task")
+        if (type(shown_task) is dict and "workspace_path" in shown_task
+                and "workspace_path" not in expected_task
+                and type(expected_task.get("workspace")) is str
+                and expected_task["workspace"].startswith("dir:")
+                and shown_task["workspace_path"] == expected_task["workspace"][4:]):
+            expected_task["workspace_path"] = expected_task["workspace"][4:]
+        expected = {
+            "parents": [item.get("id") for item in snapshot.parents],
+            "runs": thaw(snapshot.runs),
+            "comments": thaw(snapshot.comments),
+            "events": thaw(snapshot.events),
+            "attachments": thaw(snapshot.attachments),
+        }
+        return (shown_task == expected_task
+                and show.get("parents") == expected["parents"]
+                and show.get("children") == []
+                and runs == expected["runs"]
+                and show.get("comments", []) == expected["comments"]
+                and show.get("events", []) == expected["events"]
+                and (("attachments" not in show and not expected["attachments"])
+                     or show.get("attachments") == expected["attachments"]))
+
     def validate_accepted_piece_frozen_receipt(self, action: Action, readback: Any, native_task_id: str):
         """Check a historical accepted-piece creation receipt without native I/O.
 
@@ -1220,6 +1475,10 @@ class HermesBoardAdapter:
         # resolver or constructing snapshot objects.  Only ordinary dict/list
         # JSON transport is accepted; callers must thaw frozen store objects.
         data = _plain_json_snapshot(readback)
+        if type(data) is not dict:
+            raise ValueError("frozen accepted-piece receipt is malformed")
+        has_raw_capture = "raw_capture_v1" in data
+        raw_capture = data.pop("raw_capture_v1", None)
         if (type(native_task_id) is not str or not native_task_id or len(native_task_id) > _MAX_FIELD
                 or not _utf8_clean(native_task_id) or native_task_id != native_task_id.strip()
                 or any(ord(c) < 32 or ord(c) == 127 for c in native_task_id)):
@@ -1231,12 +1490,14 @@ class HermesBoardAdapter:
             snapshot = BoardSnapshot.from_dict(data)
         except (TypeError, ValueError) as exc:
             raise ValueError("frozen receipt snapshot is malformed") from exc
+        if has_raw_capture and not self._raw_capture_matches_snapshot(snapshot, raw_capture):
+            raise ValueError("frozen receipt raw creation capture differs from normalized snapshot")
         canonical_data = {name: data[name] for name in ("native_task", "parents", "runs", "comments", "events", "attachments")}
         if (type(data["digest"]) is not str or len(data["digest"]) != 71 or not data["digest"].startswith("sha256:")
                 or any(c not in "0123456789abcdef" for c in data["digest"][7:])
                 or data["digest"] != self._digest(canonical_data)):
             raise ValueError("frozen receipt digest does not bind exact snapshot")
-        if action.effect != "create_held" or action.target.get("kind") != "accepted_active_tranche_piece_v1":
+        if action.effect != "create_held" or action.target.get("kind") not in {"accepted_active_tranche_piece_v1", "accepted_active_tranche_piece_v2"}:
             raise ValueError("frozen receipt requires an accepted-piece create action")
         # This reconstitutes the closed accepted description from trusted plan
         # evidence and proves the supplied Action is exactly its adapter target.
@@ -1277,7 +1538,7 @@ class HermesBoardAdapter:
                 return self._result(action, "conflict", f"trusted accepted-link reconciliation failed: {exc}", None)
         if action.effect == "create_held":
             accepted_piece: Any = None
-            if action.target.get("kind") == "accepted_active_tranche_piece_v1":
+            if action.target.get("kind") in {"accepted_active_tranche_piece_v1", "accepted_active_tranche_piece_v2"}:
                 if not self._assert_create_lock(action):
                     return self._result(action, "unsupported", "trusted singleton lock is required for accepted-piece reconciliation", None)
                 try:
@@ -1319,12 +1580,24 @@ class HermesBoardAdapter:
             )
         task_id = action.target.get("task_id")
         if not isinstance(task_id, str) or not task_id: raise ValueError("verify_effect requires exact task target")
-        if action.effect not in {"hold", "release", "request_review"}:
+        if action.effect not in {"hold", "release", "request_review", "comment"}:
             return self._result(action, "unsupported", "standalone readback is only supported for exact native effect markers", None)
         error = self._scope_and_target(action, action.effect, task_id)
         if error: return self._result(action, "conflict", error, None)
         try: before = self._snapshot(task_id)
         except (_BoardUnavailable, ValueError) as exc: return self._result(action, "unknown", f"read-only effect verification unavailable: {exc}", None)
+        if action.effect == "comment":
+            text, author = action.target.get("marker"), action.target.get("author")
+            if (not isinstance(text, str) or not text or not isinstance(author, str) or author != _AUTHOR
+                    or f"<!-- local-first-action:{action.key} -->" not in text):
+                return self._result(action, "conflict", "comment recovery requires exact native author and stable action marker", before)
+            exact = [item for item in before.comments if item.get("author") == author and item.get("body") == text]
+            marked = [item for item in before.comments if self._contains_marker(item, f"<!-- local-first-action:{action.key} -->")]
+            if len(exact) == 1 and len(marked) == 1:
+                return self._result(action, "verified", "exact native comment author, marker, and task verified read-only", before)
+            if marked:
+                return self._result(action, "conflict", "native comment marker contradicts exact author or body", before)
+            return self._result(action, "unsupported", "exact native comment marker is absent", before)
         outcome = self._verify_review_marker(action, before) if action.effect == "request_review" else self._verify_native_hold_release(action, before)
         if outcome is None:
             evidence = ("exact scoped native marker, event, and target status" if action.effect == "hold"

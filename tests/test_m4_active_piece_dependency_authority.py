@@ -110,7 +110,8 @@ def _batch_fixture(tmp_path, monkeypatch):
 
     def snapshot(task_id, *, title="", body=""):
         native = {"id": task_id, "status": "blocked", "assignee": "implementer",
-                  "title": title, "body": body, "workspace": f"dir:{tmp_path}"}
+                  "title": title, "body": body, "workspace": f"dir:{tmp_path}",
+                  "workspace_path": str(tmp_path)}
         digest = hashlib.sha256(json.dumps(native, sort_keys=True).encode()).hexdigest()
         return BoardSnapshot(native_task=native, parents=(), runs=(), comments=(), events=(),
                              attachments=(), observed_at="unit", digest=digest)
@@ -132,7 +133,14 @@ def _batch_fixture(tmp_path, monkeypatch):
     def create_held(action, *, title, body, **kwargs):
         task_id = "native-" + action.target["ticket_id"]
         cards[task_id] = snapshot(task_id, title=title, body=body)
-        return ActionResult(action.key, "verified", "created", cards[task_id].to_dict())
+        card = cards[task_id]
+        show_task = dict(card.native_task)
+        show_task["workspace_path"] = str(tmp_path)
+        show = {"task": show_task, "parents": [], "children": [], "runs": [],
+                "events": [], "comments": [], "latest_summary": None}
+        readback = card.to_dict()
+        readback["raw_capture_v1"] = {"kind": "hermes_kanban_raw_capture_v1", "show": show, "runs": []}
+        return ActionResult(action.key, "verified", "created", readback)
 
     def verify_effect(action):
         task_id = "native-" + action.target["ticket_id"]
@@ -157,14 +165,27 @@ def _third_card_proposal(req):
     return PlanProposal(req.identity, plan, original.tranche_semantics)
 
 
-def _three_card_fixture(tmp_path, monkeypatch):
+def _serial_three_card_proposal(req):
+    """Keep the batch's A -> B edge and add B -> C for v2 sequencing tests."""
+    from local_first_orchestrator.decomposition_planner import PlanProposal
+
+    original = _third_card_proposal(req)
+    tranche = original.plan.tranches[0]
+    ticket_a, ticket_b, ticket_c = tranche.tickets
+    ticket_c = dataclasses.replace(ticket_c, dependencies=(ticket_b.ticket_id,))
+    plan = dataclasses.replace(original.plan,
+        tranches=(dataclasses.replace(tranche, tickets=(ticket_a, ticket_b, ticket_c)),))
+    return PlanProposal(req.identity, plan, original.tranche_semantics)
+
+
+def _three_card_fixture(tmp_path, monkeypatch, *, proposal_factory=_third_card_proposal):
     import tests.test_m4_plan_acceptance as acceptance
     original = acceptance.evidence
 
     def third_evidence():
         base = original()
         req = acceptance.base_request()
-        return evidence_payload(req, _third_card_proposal(req),
+        return evidence_payload(req, proposal_factory(req),
             planner_task_id=base["planner"]["task_id"], planner_run_id=base["planner"]["run_id"],
             planner_session_id=base["planner"]["session_id"], planner_profile=base["planner"]["profile"])
 
@@ -175,7 +196,8 @@ def _three_card_fixture(tmp_path, monkeypatch):
 
     def snapshot(task_id, *, title="", body=""):
         native = {"id": task_id, "status": "blocked", "assignee": "implementer",
-                  "title": title, "body": body, "workspace": f"dir:{tmp_path}"}
+                  "title": title, "body": body, "workspace": f"dir:{tmp_path}",
+                  "workspace_path": str(tmp_path)}
         digest = hashlib.sha256(json.dumps(native, sort_keys=True).encode()).hexdigest()
         return BoardSnapshot(native_task=native, parents=(), runs=(), comments=(), events=(),
                              attachments=(), observed_at="unit", digest=digest)
@@ -196,7 +218,14 @@ def _three_card_fixture(tmp_path, monkeypatch):
     def create_held(action, *, title, body, **kwargs):
         task_id = "native-" + action.target["ticket_id"]
         cards[task_id] = snapshot(task_id, title=title, body=body)
-        return ActionResult(action.key, "verified", "created", cards[task_id].to_dict())
+        card = cards[task_id]
+        show_task = dict(card.native_task)
+        show_task["workspace_path"] = str(tmp_path)
+        show = {"task": show_task, "parents": [], "children": [], "runs": [],
+                "events": [], "comments": [], "latest_summary": None}
+        readback = card.to_dict()
+        readback["raw_capture_v1"] = {"kind": "hermes_kanban_raw_capture_v1", "show": show, "runs": []}
+        return ActionResult(action.key, "verified", "created", readback)
 
     def verify_effect(action):
         task_id = "native-" + action.target["ticket_id"]
@@ -263,6 +292,12 @@ def test_valid_firstedge_authority_is_stable_frozen_and_read_only(tmp_path, monk
         assert first["operation_key"] == second["operation_key"]
         assert first["frozen_create_receipts"] == second["frozen_create_receipts"]
         assert len(first["frozen_create_receipts"]) == 2
+        for receipt in first["frozen_create_receipts"]:
+            capture = receipt["readback"]["raw_capture_v1"]
+            assert capture["kind"] == "hermes_kanban_raw_capture_v1"
+            assert capture["show"]["task"]["id"] == receipt["task_id"]
+            assert capture["show"]["children"] == ()
+            assert capture["runs"] == ()
         with pytest.raises(TypeError):
             first["plan_id"] = "changed"
         with pytest.raises(TypeError):

@@ -52,7 +52,8 @@ def detect_issues(snapshot: BoardSnapshot, evidence: Mapping[str, Any], git: Map
     """Classify safe-to-recognize mismatches from already-read fixture evidence."""
     if type(snapshot) is not BoardSnapshot or not isinstance(evidence, Mapping) or not isinstance(git, Mapping):
         raise ValueError("snapshot, evidence, and git observations are required")
-    scope = validate_scope(evidence.get("scope", _scope_from_task(snapshot.native_task)))
+    supplied_scope = evidence.get("scope")
+    scope = validate_scope(supplied_scope if supplied_scope is not None else _scope_from_task(snapshot.native_task))
     members = tuple(evidence.get("members", ()))
     candidates = tuple(evidence.get("candidates", ()))
     reviews = tuple(evidence.get("reviews", ()))
@@ -95,9 +96,23 @@ def detect_issues(snapshot: BoardSnapshot, evidence: Mapping[str, Any], git: Map
             }
             issues.append(_issue(kind, scope, operation_task, None, _generation(member), None, details, snapshot.digest))
 
-    issues.extend(_duplicate_issues(scope, members, candidates, snapshot.digest))
+    issues.extend(_duplicate_issues(scope, members, candidates, snapshot.digest, evidence.get("native_tasks", {})))
     if _status(task) == "running" and any(parent.get("accepted") is False for parent in snapshot.parents):
-        issues.append(_issue("dependent_early_running", scope, task_id, _run_id(snapshot.runs), _generation(member), candidate, {"parent_task_ids": tuple(_id(parent) for parent in snapshot.parents if parent.get("accepted") is False and _id(parent))}, snapshot.digest))
+        parent_ids = tuple(_id(parent) for parent in snapshot.parents if parent.get("accepted") is False and _id(parent))
+        live_run = _run_id(snapshot.runs)
+        known_terminal = {"cancelled", "completed", "done", "stopped", "failed", "rejected"}
+        statuses = {run.get("status") for run in snapshot.runs}
+        if live_run is not None:
+            kind = "dependent_early_running"
+        elif snapshot.runs and statuses <= known_terminal:
+            # The worker is conclusively over, so one normal held-card repair is
+            # safer than claiming a stop that cannot have happened.
+            kind = "dependent_early_ended_worker"
+        else:
+            # Missing or unrecognized run state is not evidence of an ended
+            # worker. Leave its exact IDs visible for a human decision.
+            kind = "dependent_early_ambiguous_worker"
+        issues.append(_issue(kind, scope, task_id, live_run, _generation(member), candidate, {"parent_task_ids": parent_ids}, snapshot.digest))
     if any(_is_human_edit(event, task_id) for event in snapshot.events):
         preserved_ids: set[str] = {task_id}
         for item in members:
@@ -106,7 +121,8 @@ def detect_issues(snapshot: BoardSnapshot, evidence: Mapping[str, Any], git: Map
                 preserved_ids.add(item_id)
         preserved = tuple(sorted(preserved_ids))
         issues.append(_issue("human_board_edit", scope, task_id, _run_id(snapshot.runs), _generation(member), candidate, {"preserve_task_ids": preserved}, snapshot.digest))
-    priority = {"dependent_early_running": 0}
+    priority = {"dependent_early_running": 0, "dependent_early_ended_worker": 0,
+                "dependent_early_ambiguous_worker": 0}
     return tuple(sorted({deduplicate_issue(issue): issue for issue in issues}.values(), key=lambda item: (priority.get(item.kind, 1), item.kind, item.task_id, item.finding_id)))
 
 
@@ -138,6 +154,7 @@ def propose_repair(issue: RecoveryIssue, budget: Mapping[str, Any]) -> Action | 
         "unknown_operation": "reconcile_operation",
         "duplicate_unstarted": "hold",
         "dependent_early_running": "stop_or_park",
+        "dependent_early_ended_worker": "hold",
         "human_board_edit": "adopt_human_edit",
     }
     effect = effect_by_kind.get(issue.kind)
@@ -261,7 +278,8 @@ def _run_id(runs: tuple[Mapping[str, Any], ...]) -> str | None:
     return None
 
 
-def _duplicate_issues(scope: Mapping[str, str], members: tuple[Any, ...], candidates: tuple[Any, ...], observed: str) -> tuple[RecoveryIssue, ...]:
+def _duplicate_issues(scope: Mapping[str, str], members: tuple[Any, ...], candidates: tuple[Any, ...], observed: str,
+                      native_tasks: Any = None) -> tuple[RecoveryIssue, ...]:
     groups: dict[tuple[str, int, str], list[Any]] = {}
     for item in members:
         if not hasattr(item, "task_id") or getattr(item, "role", "") != "implementation":
@@ -273,6 +291,9 @@ def _duplicate_issues(scope: Mapping[str, str], members: tuple[Any, ...], candid
         if len(items) < 2:
             continue
         for redundant in sorted(items, key=lambda item: item.task_id)[1:]:
+            current = native_tasks.get(redundant.task_id) if isinstance(native_tasks, Mapping) else None
+            if isinstance(current, Mapping) and _status(current) in {"blocked", "done", "archived", "cancelled"}:
+                continue
             kind = "duplicate_useful_work" if redundant.task_id in worked_ids else "duplicate_unstarted"
             found.append(_issue(kind, scope, redundant.task_id, None, _generation(redundant), None, {"canonical_task_id": sorted(item.task_id for item in items)[0]}, observed))
     return tuple(found)

@@ -108,6 +108,27 @@ def test_containment_uses_hermes_blocked_status_but_never_equates_it_with_stoppe
     assert result.report.active_workers == active
 
 
+def test_final_resume_proof_accepts_an_inert_historical_blocked_run_without_counting_it_as_a_stop():
+    current = snapshot("task-1", "ready", {"id": "run-history", "status": "blocked"})
+    pause = PauseIntent(
+        SCOPE, "operator", 4, False, False, active=True,
+        managed_task_ids=("task-1",), baseline_digests={"task-1": "baseline"},
+        resuming=True, resuming_task_ids=("task-1",),
+        resuming_action_keys={"task-1": "release:task-1:held"},
+    )
+    proof = ActionResult("release:task-1:held", "verified", "released", current.to_dict())
+
+    decision = plan_resume(
+        SCOPE, pause_intent=pause,
+        reconciliation=reconcile_operator_edits(SCOPE, (), (), (), ()),
+        operator_authorized_resume=True, members=(member("task-1"),),
+        snapshots=(current,), effect_results=(proof,),
+    )
+
+    assert decision.allowed
+    assert decision.intent is not None and not decision.intent.active
+
+
 @pytest.mark.parametrize("terminal_status", ("done", "archived"))
 def test_terminal_hermes_statuses_release_pause_dependencies_without_new_holds(terminal_status):
     planned = plan_pause(
@@ -515,8 +536,8 @@ def test_authorized_resume_enters_persisted_resuming_phase_then_cannot_clear_mul
         managed_task_ids=("task-1", "task-2"),
         baseline_digests=paused.baseline_digests, resuming_task_ids=("task-1", "task-2"),
         resuming_action_keys={
-            "task-1": "release:task-1:digest-task-1-blocked",
-            "task-2": "release:task-2:digest-task-2-blocked",
+            "task-1": "release:task-1:digest-task-1-blocked:resume:7",
+            "task-2": "release:task-2:digest-task-2-blocked:resume:7",
         },
     )
     assert tuple(action.effect for action in begin.actions) == ("release", "release")

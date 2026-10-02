@@ -225,6 +225,8 @@ def test_registration_requires_paid_capacity_and_denial_writes_nothing(tmp_path,
     ({"implementation_profile": "implementer", "local_review_profile": "reviewer", "planning_profile": "reviewer"}, "reviewer", "planning, implementation, and local-review roles"),
     ({"implementation_profile": "implementer", "local_review_profile": "reviewer", "planning_profile": "profile"}, "other-profile", "explicit planning profile does not match configured role"),
     ({"implementation_profile": "implementer", "local_review_profile": "reviewer", "planning_profile": "profile", "extra": "surplus"}, "profile", "configured planning role"),
+    ({"implementation_profile": "implementer", "local_review_profile": "reviewer", "planning_profile": "profile", "paid_review_profile": "profile"}, "profile", "distinct non-empty"),
+    ({"implementation_profile": "implementer", "local_review_profile": "reviewer", "planning_profile": "profile", "paid_review_profile": ""}, "profile", "distinct non-empty"),
 ])
 @pytest.mark.parametrize("action", ["register", "submit"])
 def test_invalid_planning_roles_reject_before_any_evidence_write(
@@ -273,6 +275,27 @@ def test_invalid_planning_roles_reject_before_any_evidence_write(
             else:
                 ctl.submit_plan(serialize_proposal(proposal(req)))
         assert evidence_state() == before
+    finally:
+        store.close()
+
+
+def test_planning_and_paid_roles_accept_one_distinct_optional_paid_profile(tmp_path):
+    class Board:
+        is_fake = True
+        def read_task(self, task_id): return {"id": task_id}
+        def hold(self, *args, **kwargs): pass
+        def release(self, *args, **kwargs): pass
+        def stop_run(self, *args, **kwargs): pass
+
+    store = EvidenceStore.open(tmp_path / "optional-paid.sqlite", create_new=True); store.migrate()
+    try:
+        ctl = Coordinator(SCOPE, board=Board(), store=store, lock=instance_lock(tmp_path / "lock"),
+            budget_policy=BudgetPolicy(2, 2, 2, 2, 1),
+            configured_roles={"implementation_profile": "implementer", "local_review_profile": "reviewer",
+                              "planning_profile": "planner", "paid_review_profile": "paid"},
+            planning_profile="planner")
+        assert ctl._planning_roles() == "planner"
+        assert ctl._paid_review_role() == "paid"
     finally:
         store.close()
 

@@ -1,7 +1,7 @@
 {
   "name": "local-first-orchestrator",
   "label": "Local First",
-  "description": "Minimal operator controls for the separate local-first ledger.",
+  "description": "Scoped board-native Local First evidence and recovery controls.",
   "icon": "Shield",
   "version": "0.1.0",
   "tab": { "path": "/local-first", "position": "after:kanban" },

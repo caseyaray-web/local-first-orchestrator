@@ -359,6 +359,16 @@ def accepted_fixture():
     return evidence, token, materialized.targets[0]
 
 
+def test_accepted_create_payload_v1_remains_exact_legacy_wire_without_root_semantics():
+    from local_first_orchestrator.planning_coordinator import accepted_active_tranche_create_payload
+    evidence, token, target = accepted_fixture()
+    legacy = accepted_active_tranche_create_payload(token, evidence, target, body_kind="accepted_active_tranche_piece_v1")
+    body = json.loads(legacy.body)
+    assert body["kind"] == "accepted_active_tranche_piece_v1"
+    assert "root_semantics" not in body
+    assert legacy.target["kind"] == "accepted_active_tranche_piece_v1"
+
+
 def test_accepted_create_payload_is_pure_complete_immutable_and_deterministic():
     from local_first_orchestrator.planning_coordinator import accepted_active_tranche_create_payload
     evidence, token, target = accepted_fixture()
@@ -367,11 +377,14 @@ def test_accepted_create_payload_is_pure_complete_immutable_and_deterministic():
     two = accepted_active_tranche_create_payload(token, evidence, target)
     assert one == two and evidence == before
     body = json.loads(one.body)
-    assert body["kind"] == "accepted_active_tranche_piece_v1"
+    assert body["kind"] == "accepted_active_tranche_piece_v2"
     ticket = body["ticket"]
     assert ticket["ticket_id"] == target.ticket_id
     assert ticket["verification"]["working_directory"] == "."
     assert body["tranche_semantics"] == {"objective": "First", "non_goals": ["No unrelated changes"]}
+    from local_first_orchestrator.planning_coordinator import reconstruct_evidence
+    request, _proposal = reconstruct_evidence(evidence)
+    assert body["root_semantics"] == {"objective": request.objective, "non_goals": list(request.non_goals)}
     assert body["criterion_statements"] == [{"criterion": "AC-1", "statement": "First criterion"}]
     assert body["repository"]["repository_identity"] == "repo-A"
     assert body["association"]["declared_dependencies"] == []

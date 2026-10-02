@@ -8,10 +8,19 @@ version = "0.1.0"
 description = "Hermes-native, local-first orchestration with durable validation, recovery, integration, and operator controls."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["cryptography>=41"]
+dependencies = []
 
 [project.scripts]
 local-first-orchestrator = "local_first_orchestrator.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.data-files]
+"local-first-orchestrator" = ["plugin.yaml", "__init__.py"]
+"local-first-orchestrator/dashboard" = ["dashboard/manifest.json", "dashboard/plugin_api.py"]
+"local-first-orchestrator/dashboard/dist" = ["dashboard/dist/index.js"]
+"local-first-orchestrator/python/local_first_orchestrator" = ["local_first_orchestrator/*.py"]
 
 [tool.setuptools.packages.find]
 include = ["local_first_orchestrator*"]

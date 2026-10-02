@@ -46,7 +46,7 @@ Kanban is authoritative for actual work state; a lane value is not proof that co
 4. A local implementation profile works in a persistent worktree and submits a candidate with checks and Git identity.
 5. A fresh local-review session reviews that exact candidate. Prefer the native same-card review loop when the card's state and run ownership permit it. Fresh session is required; a different underlying model is not required.
 6. Local review requests corrections until satisfied or a configured bound is reached. Every correction receives local review before acceptance.
-7. Integrate accepted piece revisions into a dedicated tranche branch, then collect its actual base-to-head diff, commits, check results, ticket references, and unresolved findings. Do not rely solely on commit names reported by a model.
+7. Integrate accepted piece revisions into a dedicated tranche branch using the expected tranche-head CAS/revision precondition, then collect its actual base-to-head diff, commits, check results, ticket references, and unresolved findings. Do not rely solely on commit names reported by a model. If a cherry-pick, rebase, or conflict resolution alters content, the result is a new candidate identity: rerun required checks and fresh local review, then obtain a later paid review before acceptance or release. The old approval is historical evidence only and cannot authorize the changed candidate.
 8. A configured paid Hermes review profile reviews the combined tranche against the original requirements.
 9. Paid reviewers comment on affected tickets and request bounded corrections. The plugin coordinates ticket creation/return-to-work, preventing competing repair actions. Corrections pass local review, are integrated, and receive another paid tranche review.
 10. Accept only the exact approved revision with required checks and findings resolved. Release subsequent tranche work only after that evidence is verified. Finishing a review task is not the same as approving the tranche.
@@ -124,6 +124,10 @@ Detect -> reconcile current board/Git/run evidence
 | Both duplicate tickets contain work | Preserve both; pause the ambiguous portion instead of discarding either. |
 | Dependent started before prerequisite acceptance | Attempt supported stop/park of affected downstream work; preserve changes; repair prerequisite review and revalidate downstream work before release. |
 | Human rearranged the board | Adopt coherent supported changes after reconciliation; invalidate stale approvals; never restore old topology merely to match cached expectations. |
+
+### Bounded M5 human-edit implementation policy
+
+The current isolated implementation supports verified title-only edits and a supported human repair that adds exactly one missing declared accepted-DAG edge. Adoption requires an active operator pause, fully blocked managed work with no live or unknown runs/effects, current accepted-plan authority, and complete immutable prior/current observations. The edge repair additionally requires complete raw envelopes and the exact native linked event. A versioned receipt is revalidated after restart before explicit resume; affected stale approvals remain historical but ineligible. Reconciliation does not send a replacement link or automatically clear operator intent. Other coherent-edit classes are not automatically adopted by this implementation; they remain held for an explicit supported decision. This bounded policy describes verified implementation coverage, not a replacement for the canonical requirement above.
 
 Recovery cannot undo execution that already occurred. Claims of containment must be backed by observed run/process state. If the prerequisite candidate cannot be reconstructed, do not invent it from a ticket summary.
 

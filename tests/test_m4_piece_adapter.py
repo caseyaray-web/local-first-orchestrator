@@ -322,7 +322,7 @@ def test_accepted_piece_resolver_closed_contract_fails_before_create(tmp_path, d
     result = board.create_held(action, title=p.title, body=p.body, assignee="implementer",
         workspace="dir:/repo", idempotency_key=p.idempotency_key)
     assert result.outcome == "conflict"
-    assert action.target["kind"] == "accepted_active_tranche_piece_v1"
+    assert action.target["kind"] == "accepted_active_tranche_piece_v2"
     assert not any(call[4] == "create" for call in fake.calls)
 
 
@@ -447,7 +447,7 @@ def test_native_accepted_piece_create_is_store_authorized_parentless_and_durable
     creates = []
     lose = {"next":lost_response}
     def runner(argv, **kwargs):
-        if "create" in argv: 
+        if "create" in argv:
             op = store.read_scope(scope)["operations"]
             assert any(x.effect == "create_held" and x.phase == "unknown" for x in op)
             creates.append(tuple(argv))

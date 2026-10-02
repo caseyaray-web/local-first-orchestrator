@@ -209,6 +209,13 @@ def planner_schema(request: PlanningRequest | None = None) -> dict:
         "patch_budget": {"type":"object", "required":["max_files","max_changed_lines","max_attempts"], "additionalProperties":False, "properties":{"max_files":bound("max_patch_files","max_patch_files"),"max_changed_lines":bound("max_patch_lines","max_patch_lines"),"max_attempts":bound("max_attempts","max_attempts")}},
         "verification": {"type":"object", "required":["commands","working_directory","timeout_seconds","output_limit"], "additionalProperties":False, "properties":{"commands":{"const":[list(c) for c in request.verification_commands]} if request else arr(arr(string,minimum=1,maximum=32),minimum=1,maximum=32),"working_directory":{"const":"."},"timeout_seconds":{"type":"integer","minimum":1,"maximum":request.verification_timeout_seconds if request else HARD_CAPS["verification_timeout_seconds"]},"output_limit":{"type":"integer","minimum":1,"maximum":request.verification_output_limit if request else HARD_CAPS["verification_output_limit"]}}}}}
     tranche = {"type":"object", "required":["tranche_id","ordinal","objective","non_goals","criterion_ids","tickets"],"additionalProperties":False,"properties":{"tranche_id":{**string,"pattern":SAFE_ID.pattern},"ordinal":{"type":"integer","minimum":0,"maximum":127},"objective":string,"non_goals":arr(string,maximum=1024),"criterion_ids":arr({**string, **({"enum":sorted(request.expected_criteria)} if request else {})},minimum=1,maximum=16384,unique=True),"tickets":arr(ticket,minimum=1,maximum=2048)}}
+    if request is not None and request.non_goals:
+        # Every generated tranche and ticket must carry every root exclusion.
+        # Do not emit an empty allOf: Draft 2020-12 requires at least one item.
+        ticket["allOf"] = [{"properties": {"non_goals": {"contains": {"const": non_goal}}}}
+                           for non_goal in request.non_goals]
+        tranche["allOf"] = [{"properties": {"non_goals": {"contains": {"const": non_goal}}}}
+                            for non_goal in request.non_goals]
     schema={"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["schema_version","request_identity","execution_order","plan"],"additionalProperties":False,"properties":{"schema_version":{"type":"integer","const":1},"request_identity":{"type":"string","pattern":"^[0-9a-f]{64}$"},"execution_order":arr({**string,"pattern":SAFE_ID.pattern},maximum=2048,unique=True),"plan":{"type":"object","required":["plan_id","schema_version","tranches","criterion_coverage"],"additionalProperties":False,"properties":{"plan_id":{**string,"pattern":SAFE_ID.pattern},"schema_version":{"type":"integer","const":1},"tranches":arr(tranche,minimum=1,maximum=128),"criterion_coverage":{"type":"object","maxProperties":16384,"propertyNames":{"type":"string","minLength":1,"maxLength":4096},"additionalProperties":arr({**string,"pattern":SAFE_ID.pattern},minimum=1,maximum=2048,unique=True)}}}}}
     if request is not None:
         schema["properties"]["request_identity"]={"const":request.identity}
@@ -274,6 +281,8 @@ def parse_proposal(raw: str, request: PlanningRequest) -> PlanProposal:
         t = _object(raw_tranche, {"tranche_id", "ordinal", "objective", "non_goals", "criterion_ids", "tickets"}, f"tranche[{i}]")
         if type(t["objective"]) is not str or not t["objective"].strip() or len(t["objective"])>4096 or type(t["non_goals"]) is not list or len(t["non_goals"])>1024 or any(type(x) is not str or not x.strip() or len(x)>4096 for x in t["non_goals"]):
             raise PlannerError("tranche objective and non-goals must be explicit")
+        if not set(request.non_goals) <= set(t["non_goals"]):
+            raise PlannerError("tranche drops authoritative root non-goals")
         if type(t["criterion_ids"]) is not list or not t["criterion_ids"] or len(t["criterion_ids"])>16384 or any(type(x) is not str or not x.strip() or len(x)>4096 for x in t["criterion_ids"]) or len(set(t["criterion_ids"]))!=len(t["criterion_ids"]):
             raise PlannerError("invalid tranche criteria")
         if type(t["tickets"]) is not list or not t["tickets"]:
@@ -289,6 +298,8 @@ def parse_proposal(raw: str, request: PlanningRequest) -> PlanProposal:
                     or not ticket["criterion_ids"] or not ticket["allowed_paths"]
                     or len(set(ticket["criterion_ids"]))!=len(ticket["criterion_ids"]) or len(set(ticket["allowed_paths"]))!=len(ticket["allowed_paths"]) or len(set(ticket["dependencies"]))!=len(ticket["dependencies"])):
                 raise PlannerError("ticket text and reference bounds are invalid")
+            if not set(request.non_goals) <= set(ticket["non_goals"]):
+                raise PlannerError("ticket drops authoritative root non-goals")
             try:
                 parsed = parse_contract(ticket)
             except (TypeError, ValueError) as exc:

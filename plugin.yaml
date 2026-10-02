@@ -2,6 +2,14 @@ name: local-first-orchestrator
 version: 0.1.0
 manifest_version: 2
 api_version: 1
-description: "Hermes-native local-first orchestration with durable validation, recovery, integration, metrics, and operator controls."
+description: "Scoped board-native Local First coordinator controls with durable evidence and recovery."
 license: MIT
 tags: [kanban, orchestration, local-first]
+provides_tools:
+  - local_first_submit_plan
+  - local_first_submit_review
+  - local_first_request_corrections
+  - local_first_report_issue
+  - local_first_status
+provides_hooks:
+  - pre_tool_call

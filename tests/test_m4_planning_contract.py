@@ -155,6 +155,31 @@ def test_terra_v1_decomposition_digest_is_legacy_payload_exact():
     assert p.contract_hash == expected
 
 
+def test_planner_schema_is_draft_valid_for_generic_empty_and_bound_non_goals():
+    from local_first_orchestrator.decomposition_planner import planner_schema
+    Draft202012Validator.check_schema(planner_schema())
+    empty = request(non_goals=())
+    Draft202012Validator.check_schema(planner_schema(empty))
+    bound = request()
+    Draft202012Validator.check_schema(planner_schema(bound))
+    assert "allOf" not in planner_schema()["properties"]["plan"]["properties"]["tranches"]["items"]
+    assert "allOf" not in planner_schema(empty)["properties"]["plan"]["properties"]["tranches"]["items"]
+    assert planner_schema(bound)["properties"]["plan"]["properties"]["tranches"]["items"]["allOf"]
+
+
+def test_proposal_rejects_ticket_or_tranche_that_drops_authoritative_root_non_goal():
+    req = request()
+    for target in ("tranche", "ticket"):
+        raw = json.loads(serialize_proposal(proposal(req)))
+        if target == "tranche":
+            raw["plan"]["tranches"][0]["non_goals"] = []
+        else:
+            raw["plan"]["tranches"][0]["tickets"][0]["non_goals"] = []
+        with pytest.raises(PlannerError, match="root non-goals"):
+            parse_proposal(json.dumps(raw, sort_keys=True, separators=(",", ":")), req)
+    assert parse_proposal(serialize_proposal(proposal(req)), req) == proposal(req)
+
+
 @pytest.mark.parametrize("field", ["max_context_tokens", "max_patch_files", "max_patch_lines", "max_attempts", "verification_timeout_seconds", "verification_output_limit", "max_tranches", "max_tickets", "max_payload_bytes", "max_json_depth"])
 def test_every_hard_cap_rejects_huge_integer(field):
     with pytest.raises(ValueError):
@@ -317,7 +342,7 @@ def test_terra_schema_capped_ticket_arrays_rejected_by_schema_and_parser(field,v
 def test_terra_ticket_text_and_non_goal_count_boundaries_are_accepted():
     from local_first_orchestrator.decomposition_planner import planner_schema
     req=request(max_payload_bytes=4_000_000); doc=json.loads(serialize_proposal(proposal(req))); t=doc["plan"]["tranches"][0]["tickets"][0]
-    t["objective"]="x"*4096; t["non_goals"]=[f"excluded-{i}" for i in range(1024)]
+    t["objective"]="x"*4096; t["non_goals"]=[req.non_goals[0], *[f"excluded-{i}" for i in range(1023)]]
     Draft202012Validator(planner_schema(req)).validate(doc)
     assert parse_proposal(json.dumps(doc),req)
 

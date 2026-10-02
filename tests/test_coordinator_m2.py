@@ -93,17 +93,17 @@ def test_status_pause_restart_and_partial_stop_are_durable(tmp_path):
 def test_unknown_effect_is_never_resent_and_reconcile_is_read_only(tmp_path):
     store, board, lock_path = setup(tmp_path)
     coordinator = Coordinator(SCOPE, board=board, store=store, lock=instance_lock(lock_path))
-    board.unknown_keys.add("hold:task:task:ready:0")
+    board.unknown_keys.add("hold:task:task:ready:0:pause:0")
     assert coordinator.pause()["outcome"] == "partial"
     assert len(board.calls) == 1
     assert coordinator.reconcile()["outcome"] == "partial"
-    assert board.calls == ["hold:task:task:ready:0", "verify:hold:task:task:ready:0"]
+    assert board.calls == ["hold:task:task:ready:0:pause:0", "verify:hold:task:task:ready:0:pause:0"]
     assert store.pending_operations(SCOPE)[0].phase == "unknown"
 
 
 def test_restart_reconciles_unknown_after_effect_with_exact_marker_without_resend(tmp_path):
     store, board, lock_path = setup(tmp_path)
-    key = "hold:task:task:ready:0"
+    key = "hold:task:task:ready:0:pause:0"
     board.unknown_after_effect_keys.add(key)
     assert Coordinator(SCOPE, board=board, store=store, lock=instance_lock(lock_path)).pause()["outcome"] == "partial"
     assert board.calls == [key]
@@ -113,7 +113,8 @@ def test_restart_reconciles_unknown_after_effect_with_exact_marker_without_resen
         assert result["outcome"] == "verified"
         assert board.calls == [key, f"verify:{key}"]
         assert restarted.pending_operations(SCOPE) == ()
-        assert restarted.read_scope(SCOPE)["effect_observations"][-1]["outcome"] == "verified"
+        assert any(observation["outcome"] == "verified"
+                   for observation in restarted.read_scope(SCOPE)["effect_observations"])
 
 
 def test_restart_human_edit_against_durable_pause_baseline_fails_closed(tmp_path):

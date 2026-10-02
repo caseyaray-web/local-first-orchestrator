@@ -33,7 +33,7 @@ class FakeKanban:
     def add(self, task_id: str, *, status: str = "blocked", runs: list[dict[str, Any]] | None = None,
             title: str | None = None, body: str = "body", assignee: str = "worker", workspace: str = "dir:/repo", archived: bool = False) -> None:
         self.tasks[task_id] = {"task": {"id": task_id, "title": title or task_id, "body": body, "status": "archived" if archived else status,
-                                         "assignee": assignee, "workspace": workspace}, "parents": [],
+                                         "assignee": assignee, "workspace": workspace}, "parents": [], "children": [],
                                "comments": [], "events": [], "runs": [] if runs is None else runs, "attachments": []}
         if archived:
             self.archived_task_ids.add(task_id)
@@ -85,6 +85,7 @@ class FakeKanban:
             self.tasks[args[1]]["events"].append({"kind": "unblocked", "payload": None})
         elif args[0] == "link":
             self.tasks[args[2]]["parents"].append(args[1])
+            self.tasks[args[1]]["children"].append(args[2])
             if self.after_link: self.after_link(self.tasks[args[2]])
         elif args[0] == "complete": self.tasks[args[1]]["task"]["status"] = "done"
         else: return subprocess.CompletedProcess(argv, 2, "", "unsupported")

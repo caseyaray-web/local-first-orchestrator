@@ -1,285 +1,215 @@
-"""Authenticated operator API for one registered local-first ledger.
+"""Scoped dashboard API backed only by the plugin composition root.
 
-The dashboard mounts this router at ``/api/plugins/local-first-orchestrator``.
-No HTTP parameter can choose a database, repository, provider, or model.
+The host mounts ``router`` below ``/api/plugins/local-first-orchestrator``.
+Browser payloads can select a named operator action, but never a repository,
+executable, database, profile, budget, board, or anchor.  Those values come
+from the trusted local PluginConfig and trusted bootstrap scope.
 """
 from __future__ import annotations
 
+from dataclasses import is_dataclass
+import hashlib
 import json
-
+import os
 import sys
 from pathlib import Path
-from typing import Any
-
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from typing import Any, Callable, Mapping
 
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
-from local_first_orchestrator.ledger import Ledger
-from local_first_orchestrator.controller import LocalFirstController
-from local_first_orchestrator.local_qwen import LocalQwenAdapter
-from local_first_orchestrator.hermes_profiles import discover_profiles, resolve_registration
-from local_first_orchestrator.operator_config import OperatorConfig, default_config_path, load_operator_config, save_operator_config
-from local_first_orchestrator.runtime_metrics import RuntimeMetricsStore
+from local_first_orchestrator.composition import Runtime, build_runtime, close_runtime
+from local_first_orchestrator.config import PluginConfig
 
-router = APIRouter()
+_PREFIX = "/api/plugins/local-first-orchestrator"
+RuntimeFactory = Callable[[], Runtime]
+_runtime_factory: RuntimeFactory | None = None
 
 
-class OperatorAction(BaseModel):
-    reason: str = Field(default="operator action", max_length=240)
+def _plain(value: Any, *, depth: int = 0) -> Any:
+    if depth > 16:
+        return "<depth-limited>"
+    if value is None or type(value) in {str, int, float, bool}:
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _plain(child, depth=depth + 1) for key, child in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_plain(child, depth=depth + 1) for child in value]
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        return _plain(value.to_dict(), depth=depth + 1)
+    if is_dataclass(value):
+        return _plain({name: getattr(value, name) for name in value.__dataclass_fields__}, depth=depth + 1)
+    raise ValueError("dashboard result contains unsupported record")
 
 
-class ConfigurationUpdate(BaseModel):
-    canonical_repository: str | None = Field(default=None, min_length=1, max_length=4096)
-    repository_allowlist: list[str] | None = None
-    implementation_profile: str = Field(min_length=1, max_length=240)
-    review_profile: str = Field(min_length=1, max_length=240)
-    local_review_profile: str | None = Field(default=None, max_length=240)
-    decomposition_local_profile: str | None = Field(default=None, max_length=240)
-    decomposition_standard_profile: str | None = Field(default=None, max_length=240)
-    paid_checkpoint_profile: str | None = Field(default=None, max_length=240)
-    paid_escalation_profile: str | None = Field(default=None, max_length=240)
-    implementation_timeout_seconds: int = Field(ge=1, le=86400)
-    review_timeout_seconds: int = Field(ge=1, le=86400)
+def _trusted_runtime() -> Runtime:
+    """Compose from server-local bootstrap only; request data is never consulted."""
+    raw_config = os.environ.get("LOCAL_FIRST_ORCHESTRATOR_CONFIG")
+    if not raw_config:
+        raise ValueError("dashboard requires trusted LOCAL_FIRST_ORCHESTRATOR_CONFIG")
+    config = PluginConfig.from_file(Path(raw_config))
+    return build_runtime(config, scope=config.scope)
 
 
-class ImplementationAction(BaseModel):
-    ticket_id: str = Field(min_length=1, max_length=240)
-    reason: str = Field(default="operator implementation-only action", max_length=240)
+def configure_runtime_factory(factory: RuntimeFactory | None) -> None:
+    """Test-only injection point; production leaves this unset."""
+    global _runtime_factory
+    _runtime_factory = factory
 
 
-class RevalidateImplementationAction(BaseModel):
-    ticket_id: str = Field(min_length=1, max_length=240)
-    attempt_number: int = Field(ge=1)
-    reason: str = Field(default="operator revalidate existing implementation", max_length=240)
+def _open_runtime() -> Runtime:
+    return _trusted_runtime() if _runtime_factory is None else _runtime_factory()
 
 
-class AuthorizeHistoricalRevalidationAction(BaseModel):
-    ticket_id: str = Field(min_length=1, max_length=240)
-    attempt_number: int = Field(ge=1)
-    reason: str = Field(default="operator authorization for historical revalidation", max_length=240)
+def _digest(payload: Mapping[str, Any]) -> str:
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return "sha256:" + hashlib.sha256(body).hexdigest()
 
 
-class AttestHistoricalRevalidationAction(BaseModel):
-    ticket_id: str = Field(min_length=1, max_length=240)
-    attempt_number: int = Field(ge=1)
-
-
-class _OperatorBoard:
-    is_fake = False
-
-
-def _config() -> OperatorConfig:
-    try:
-        return load_operator_config()
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail=f"operator dashboard unavailable: {exc}") from exc
-
-
-def _ledger() -> tuple[Ledger, OperatorConfig]:
-    config = _config()
-    try:
-        ledger = Ledger(config.ledger_path)
-        ledger.migrate()
-        return ledger, config
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail=f"registered ledger unavailable: {exc}") from exc
-
-
-def _configuration_json(config: OperatorConfig) -> dict[str, Any]:
-    decomposition = dict(config.decomposition)
-    return {
-        "canonical_repository": str(config.canonical_repository),
-        "repository_allowlist": [str(path) for path in config.repository_allowlist],
-        "implementation": config.implementation.__dict__,
-        "review": config.review.__dict__,
-        "local_review": config.local_review_registration.__dict__,
-        "decomposition": {name: route.__dict__ for name, route in decomposition.items()},
-        "paid_checkpoint": config.paid_checkpoint.__dict__ if config.paid_checkpoint is not None else None,
-        "paid_escalation": config.paid_escalation.__dict__ if config.paid_escalation is not None else None,
-        "worktree_root": str(config.worktree_root) if config.worktree_root is not None else None,
-        "artifact_root": str(config.artifact_root) if config.artifact_root is not None else None,
-        "implementation_timeout_seconds": config.implementation_timeout_seconds,
-        "review_timeout_seconds": config.review_timeout_seconds,
+def _status(runtime: Runtime) -> dict[str, Any]:
+    observed = _plain(runtime.coordinator.status())
+    members = observed.get("members", [])
+    native_tasks = observed.get("native_tasks", {})
+    native_runs = observed.get("native_runs", [])
+    operations = observed.get("operations", [])
+    reviews = observed.get("reviews", [])
+    budget_events = observed.get("budget_events", [])
+    intent = observed.get("operator_intent")
+    active_workers = [run for run in native_runs if run.get("status") in {"active", "claimed", "running", "stopping"}]
+    preserved_paths = sorted({str(value) for item in operations for value in (
+        item.get("target", {}).get("worktree"), item.get("target", {}).get("workspace"),
+        item.get("readback", {}).get("worktree") if isinstance(item.get("readback"), dict) else None,
+    ) if isinstance(value, str) and value})
+    projection = {
+        "scope": observed.get("scope", dict(runtime.scope)),
+        "anchor": native_tasks.get(runtime.scope["anchor_task_id"]),
+        "managed_anchors": members,
+        "current_head": observed.get("git_observation"),
+        "reviews": reviews,
+        "review_queues": {
+            "local": [item for item in reviews if item.get("role") == "local_review"],
+            "paid": [item for item in reviews if item.get("role") == "paid_review"],
+        },
+        "repair_history": operations[-50:],
+        "budgets": budget_events,
+        "operator_intent": intent,
+        "active_workers": active_workers,
+        "uncontained_workers": active_workers if intent and intent.get("active") else [],
+        "preserved_paths": preserved_paths,
+        "pending_operations": [item for item in operations if item.get("phase") in {"pending", "unknown"}],
     }
+    projection["observation_digest"] = _digest(projection)
+    return projection
 
 
-def _optional_registration(profile: str | None):
-    if profile is None or not profile.strip():
-        return None
-    return resolve_registration(profile.strip())
+def _error(status: int, detail: str, *, fresh: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
+    body: dict[str, Any] = {"detail": detail}
+    if fresh is not None:
+        body["status"] = fresh
+    return status, body
 
 
-def _status() -> dict[str, Any]:
-    ledger, config = _ledger()
+def _expected_digest(payload: Mapping[str, Any]) -> str:
+    allowed = {"expected_observation_digest", "authorized_clear"}
+    if set(payload) - allowed:
+        raise ValueError("dashboard action payload contains unsupported fields")
+    digest = payload.get("expected_observation_digest")
+    if type(digest) is not str or not digest.startswith("sha256:") or len(digest) != 71:
+        raise ValueError("expected_observation_digest is required")
+    return digest
+
+
+def dispatch(method: str, path: str, payload: Mapping[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
+    """One mounted-request dispatch; every action has a fresh runtime and readback."""
+    if method == "GET" and path == _PREFIX + "/status":
+        try:
+            runtime = _open_runtime()
+            try:
+                return 200, _status(runtime)
+            finally:
+                close_runtime(runtime)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return _error(503, str(exc))
+    if method != "POST" or not path.startswith(_PREFIX + "/actions/"):
+        return _error(404, "dashboard route not found")
+    action = path.removeprefix(_PREFIX + "/actions/")
+    if action not in {"pause", "stop", "reconcile", "resume", "cancel", "recover"}:
+        return _error(404, "unsupported dashboard action")
+    if not isinstance(payload, Mapping):
+        return _error(400, "dashboard action body must be an object")
     try:
-        status = ledger.operator_status(active_limit=25)
-        status["configuration"] = _configuration_json(config)
-        metrics = RuntimeMetricsStore(ledger)
-        status["runtime_metrics"] = metrics.summary()
-        status["adaptive_sizing"] = metrics.recommendation().as_json()
-        return status
-    finally:
-        ledger.close()
-
-@router.get("/status")
-def status() -> dict[str, Any]:
-    """Read bounded operator status from the single registered ledger."""
-    return _status()
-
-
-@router.get("/profiles")
-def profiles() -> dict[str, Any]:
-    """Discover Hermes profiles and their resolved provider/model provenance."""
-    try:
-        return {"profiles": [profile.as_json() for profile in discover_profiles()]}
-    except (OSError, ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=503, detail=f"Hermes profiles unavailable: {exc}") from exc
-
-
-@router.put("/configuration")
-def update_configuration(update: ConfigurationUpdate) -> dict[str, Any]:
-    """Update model-role routing from Hermes profile selections while paused."""
-    ledger, config = _ledger()
-    try:
-        if not ledger.status()["paused"]:
-            raise HTTPException(status_code=409, detail="pause Local First before changing model-role configuration")
-        routes = {
-            name: registration
-            for name, registration in (
-                ("local", _optional_registration(update.decomposition_local_profile)),
-                ("standard", _optional_registration(update.decomposition_standard_profile)),
-            )
-            if registration is not None
-        }
-        requested_repository = Path(update.canonical_repository).expanduser() if update.canonical_repository is not None else config.canonical_repository
-        requested_allowlist = tuple(Path(item).expanduser() for item in update.repository_allowlist) if update.repository_allowlist is not None else config.repository_allowlist
-        if update.repository_allowlist is not None and (not update.repository_allowlist or any(not item.strip() for item in update.repository_allowlist)):
-            raise ValueError("repository_allowlist must be a non-empty list of paths")
-        local_review = (
-            _optional_registration(update.local_review_profile)
-            if "local_review_profile" in update.model_fields_set
-            else config.local_review
-        )
-        checked = OperatorConfig(
-            ledger_path=config.ledger_path,
-            canonical_repository=requested_repository,
-            repository_allowlist=requested_allowlist,
-            implementation=resolve_registration(update.implementation_profile),
-            review=resolve_registration(update.review_profile),
-            local_review=local_review,
-            worktree_root=config.worktree_root,
-            artifact_root=config.artifact_root,
-            implementation_timeout_seconds=update.implementation_timeout_seconds,
-            review_timeout_seconds=update.review_timeout_seconds,
-            decomposition=tuple(sorted(routes.items())),
-            paid_checkpoint=_optional_registration(update.paid_checkpoint_profile),
-            paid_escalation=_optional_registration(update.paid_escalation_profile),
-        ).validated(require_ledger=True)
-        save_operator_config(checked, default_config_path())
-        ledger.connection.execute(
-            "INSERT INTO events(entity_type,entity_id,event_type,from_state,to_state,actor_type,actor_id,payload_json,created_at) "
-            "VALUES ('controller','global','operator_configuration_updated',NULL,NULL,'controller','dashboard-operator',?,strftime('%s','now'))",
-            (json.dumps({
-                "implementation_profile": checked.implementation.profile,
-                "canonical_repository": str(checked.canonical_repository),
-                "repository_allowlist": [str(path) for path in checked.repository_allowlist],
-                "review_profile": checked.review.profile,
-                "local_review_profile": checked.local_review_registration.profile,
-                "decomposition_profiles": {name: route.profile for name, route in checked.decomposition},
-                "paid_checkpoint_profile": checked.paid_checkpoint.profile if checked.paid_checkpoint else None,
-                "paid_escalation_profile": checked.paid_escalation.profile if checked.paid_escalation else None,
-            }, sort_keys=True),),
-        )
-        return _configuration_json(checked)
-    except HTTPException:
-        raise
-    except (OSError, ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    finally:
-        ledger.close()
+        expected = _expected_digest(payload)
+        runtime = _open_runtime()
+        try:
+            before = _status(runtime)
+            if expected != before["observation_digest"]:
+                return _error(409, "stale dashboard observation; refresh before mutating", fresh=before)
+            coordinator = runtime.coordinator
+            if action == "pause":
+                result = coordinator.pause(stop=False)
+            elif action == "stop":
+                result = coordinator.pause(stop=True)
+            elif action == "reconcile":
+                result = coordinator.reconcile()
+            elif action == "resume":
+                if type(payload.get("authorized_clear", False)) is not bool:
+                    return _error(400, "authorized_clear must be a boolean")
+                result = coordinator.resume(authorized_clear=payload.get("authorized_clear", False))
+            elif action == "cancel":
+                result = coordinator.cancel()
+            else:
+                result = coordinator.recover()
+            fresh = _status(runtime)
+            return 200, {"result": _plain(result), "status": fresh}
+        finally:
+            close_runtime(runtime)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return _error(409, str(exc))
 
 
-@router.post("/pause")
-def pause(action: OperatorAction) -> dict[str, Any]:
-    ledger, _ = _ledger()
-    try:
-        ledger.pause("dashboard-operator", reason=action.reason)
-    finally:
-        ledger.close()
-    return _status()
+class _Router:
+    """Minimal ASGI router so the plugin has no undeclared FastAPI dependency."""
+
+    async def __call__(self, scope: Mapping[str, Any], receive: Callable[[], Any], send: Callable[[Mapping[str, Any]], Any]) -> None:
+        if scope.get("type") != "http":
+            return
+        body = b""
+        while True:
+            message = await receive()
+            body += message.get("body", b"")
+            if not message.get("more_body"):
+                break
+        try:
+            payload = None if not body else json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            status, response = _error(400, "dashboard action body must be valid JSON")
+        else:
+            status, response = dispatch(str(scope.get("method", "")), str(scope.get("path", "")), payload)
+        encoded = json.dumps(response, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": encoded})
 
 
-@router.post("/resume")
-def resume(action: OperatorAction) -> dict[str, Any]:
-    ledger, _ = _ledger()
-    try:
-        ledger.resume("dashboard-operator", reason=action.reason)
-    finally:
-        ledger.close()
-    return _status()
+try:  # Hermes hosts normally provide FastAPI; fixture-only environments need no extra wheel.
+    from fastapi import APIRouter
+    from fastapi.responses import JSONResponse
+except ImportError:
+    router = _Router()
+else:
+    router = APIRouter()
+
+    @router.get("/status")
+    def mounted_status():
+        code, body = dispatch("GET", _PREFIX + "/status")
+        return JSONResponse(status_code=code, content=body)
+
+    @router.post("/actions/{action}")
+    def mounted_action(action: str, payload: dict[str, Any]):
+        code, body = dispatch("POST", _PREFIX + "/actions/" + action, payload)
+        return JSONResponse(status_code=code, content=body)
 
 
-@router.post("/implementation")
-def implementation(action: ImplementationAction) -> dict[str, Any]:
-    """Run one registered ticket through implementation and validation only."""
-    ledger, config = _ledger()
-    try:
-        runtime = config.runtime_config()
-        model = LocalQwenAdapter(provider=config.implementation.provider, model=config.implementation.model,
-                                 hermes_home=Path.home()/".hermes"/"profiles"/config.implementation.profile,
-                                 implementation_timeout_seconds=runtime.implementation_timeout_seconds,
-                                 review_timeout_seconds=runtime.review_timeout_seconds)
-        result = LocalFirstController(ledger, _OperatorBoard(), runtime, local_model=model).execute_implementation(
-            action.ticket_id, repository=config.canonical_repository, owner="dashboard-operator")
-        return result or {"ticket_id": action.ticket_id, "status": "not_run"}
-    except (OSError, ValueError, RuntimeError, PermissionError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    finally:
-        ledger.close()
-
-
-@router.post("/implementation-revalidate")
-def implementation_revalidate(action: RevalidateImplementationAction) -> dict[str, Any]:
-    """Revalidate one preserved implementation; never invokes a model."""
-    ledger, config = _ledger()
-    try:
-        runtime = config.runtime_config()
-        return LocalFirstController(ledger, _OperatorBoard(), runtime).revalidate_historical_implementation(
-            action.ticket_id, action.attempt_number, repository=config.canonical_repository, operator_id="dashboard-operator")
-    except (OSError, ValueError, RuntimeError, PermissionError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    finally:
-        ledger.close()
-
-
-@router.post("/implementation-revalidation-authorize")
-def implementation_revalidation_authorize(action: AuthorizeHistoricalRevalidationAction) -> dict[str, Any]:
-    """Authorize one exact historical implementation for a future integrity gate."""
-    ledger, config = _ledger()
-    try:
-        runtime = config.runtime_config()
-        return LocalFirstController(ledger, _OperatorBoard(), runtime).authorize_historical_revalidation(
-            action.ticket_id, action.attempt_number, repository=config.canonical_repository,
-            operator_id="dashboard-operator", reason=action.reason)
-    except (OSError, ValueError, RuntimeError, PermissionError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    finally:
-        ledger.close()
-
-
-@router.post("/implementation-revalidation-attest")
-def implementation_revalidation_attest(action: AttestHistoricalRevalidationAction) -> dict[str, Any]:
-    """Attest preserved implementation identity; never validates semantics."""
-    ledger, config = _ledger()
-    try:
-        runtime = config.runtime_config()
-        return LocalFirstController(ledger, _OperatorBoard(), runtime).attest_historical_revalidation_implementation(
-            action.ticket_id, action.attempt_number, repository=config.canonical_repository, operator_id="dashboard-operator")
-    except (OSError, ValueError, RuntimeError, PermissionError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    finally:
-        ledger.close()
+__all__ = ["router", "dispatch", "configure_runtime_factory"]

@@ -6,7 +6,7 @@ not model native task lanes or expose a generic task-state mutation operation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -17,6 +17,9 @@ _EFFECT_PHASES = frozenset({"pending", "applied", "unknown"})
 _ACTION_OUTCOMES = frozenset(
     {"verified", "no-op", "retryable", "ambiguous", "conflict", "unknown", "unsupported", "partial"}
 )
+# Native comment receipts bind this exact producer identity.  Coordinators and
+# adapters must use the same value; accepting aliases would weaken recovery.
+NATIVE_COMMENT_AUTHOR = "local-first-orchestrator"
 
 
 class ContractError(ValueError):
@@ -274,10 +277,10 @@ class PauseIntent:
     cancellation_requested: bool
     active: bool = True
     managed_task_ids: tuple[str, ...] = ()
-    baseline_digests: Mapping[str, str] = MappingProxyType({})
+    baseline_digests: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     resuming: bool = False
     resuming_task_ids: tuple[str, ...] = ()
-    resuming_action_keys: Mapping[str, str] = MappingProxyType({})
+    resuming_action_keys: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "scope", MappingProxyType(validate_scope(self.scope)))
