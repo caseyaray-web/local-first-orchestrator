@@ -42,41 +42,51 @@ def _config_json(config, path: Path) -> None:
     }), encoding="utf-8")
 
 
-def test_m6_rejected_registered_tool_runtime_is_closed_before_a_later_valid_call(tmp_path: Path, monkeypatch) -> None:
-    """Characterizes the pre-handler worker-environment rejection lifecycle."""
+@pytest.mark.parametrize(("tool_name", "arguments"), [
+    ("local_first_submit_plan", {"proposal_json": "{}"}),
+    ("local_first_submit_review", {"task_id": "anchor", "candidate": {}, "review": {}}),
+    ("local_first_request_corrections", {"task_id": "anchor", "candidate": {}, "review": {}, "operation_key": "fixture"}),
+    ("local_first_report_issue", {"issue": {}}),
+])
+def test_m6_rejected_registered_worker_tools_close_runtime_before_a_later_valid_call(
+    tmp_path: Path, monkeypatch, tool_name: str, arguments: dict[str, object]
+) -> None:
+    """Production-composed fixture runtimes close on pre-handler authority rejection."""
     import local_first_orchestrator.plugin_tools as plugin_tools
 
     config = _config(tmp_path)
     initialize_store(config)
     tools, runtimes, closed = _Tools(), [], []
 
-    def factory(scope):
+    def factory(_requested_scope):
         board = FixtureBoard()
         board.list_tasks = lambda: tuple(board.cards.values())
-        runtime = build_runtime(config, board=board, scope=scope)
+        runtime = build_runtime(config, board=board, scope=SCOPE)
         runtimes.append(runtime)
         return runtime
 
     original_close = plugin_tools.close_runtime
     monkeypatch.setattr(plugin_tools, "close_runtime", lambda runtime: (closed.append(runtime), original_close(runtime))[1])
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
-    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
-    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setenv("HERMES_M0_CLI", "")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "fixture-task")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "fixture-run")
+    monkeypatch.setenv("HERMES_SESSION_ID", "fixture-session")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", SCOPE["board_id"])
     register_tools(tools, runtime_factory=factory)
 
-    rejected = json.loads(tools.handlers["local_first_submit_plan"]({**SCOPE, "proposal_json": "{}"}))
-    assert rejected["ok"] is False
-    assert "trusted native worker" in rejected["error"]
+    mismatched_scope = json.loads(tools.handlers[tool_name]({**SCOPE, **arguments, "board_id": "other-board"}))
+    assert mismatched_scope["ok"] is False
+    assert "scope must match" in mismatched_scope["error"]
+
+    monkeypatch.delenv("HERMES_SESSION_ID")
+    unavailable_worker = json.loads(tools.handlers[tool_name]({**SCOPE, **arguments}))
+    assert unavailable_worker["ok"] is False
+    assert "trusted native worker" in unavailable_worker["error"]
 
     valid = json.loads(tools.handlers["local_first_status"](dict(SCOPE)))
     assert valid["ok"] is True
-    # The status control proves the registration remains usable after rejection.
-    assert len(runtimes) == 2
-    # This is intentionally a faithful red regression: _runtime_for_args creates
-    # the first runtime before worker validation, outside every handler finally.
-    assert len(closed) == len(runtimes)
+    assert len(runtimes) == 3
+    assert closed == runtimes
     with instance_lock(config.lock_path) as lock:
         lock.assert_held()
 

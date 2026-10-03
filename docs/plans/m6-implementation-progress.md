@@ -1,6 +1,6 @@
 # M6 implementation progress
 
-**Status:** isolated M6 implementation was accepted by both independent specification and quality/reliability reviews (`deleg_3af549de`). The subsequent test-portability and evidence-count follow-up changes no production runtime behavior. This checkout has not been installed, enabled, enrolled against a live board, dispatched against a provider, or pointed at production Hermes state. M7 host activation/cutover remains pending.
+**Status:** earlier M6 review evidence is historical and superseded by the current dashboard completion. The current isolated implementation awaits renewed independent review. This checkout has not been installed, enabled, enrolled against a live board, dispatched against a provider, or pointed at production Hermes state. M7 host activation/cutover remains paused.
 
 ## Implemented isolated surfaces
 
@@ -10,7 +10,7 @@
 - [x] **CLI:** `local_first_orchestrator.cli` provides `status`, `initialize-store`, `enroll`, `pause [--stop]`, `reconcile`, `resume [--authorized-clear]`, `cancel`, `recover`, and `run [--once]`. It renders JSON outcomes with exit codes 0/2/3/4/5/6/7 for verified-or-recorded/invalid/held/partial/conflict/unsupported/unknown.
 - [x] **Plugin registration:** the root entrypoint registers the native `local-first-orchestrator` CLI command, five structured tools, and the advisory `pre_tool_call` hook without configuration loading, SQLite access, board writes, provider calls, or coordinator start.
 - [x] **Tools and hook:** registered tools are `local_first_submit_plan`, `local_first_submit_review`, `local_first_request_corrections`, `local_first_report_issue`, and `local_first_status`. They enforce composed scope; mutation tools require native worker task/run/session/board environment. The hook performs lazy configured membership lookup only when a managed implementation completion attempt is intercepted.
-- [x] **Dashboard:** the mounted API exposes scoped status and `pause`, `stop`, `reconcile`, `resume`, `cancel`, and `recover` actions. Mutations require a current observation digest; stale requests return HTTP 409 and fresh status. The React bundle preserves an action error after its refresh instead of clearing it.
+- [x] **Dashboard:** the mounted API exposes scoped status, trusted configured role profiles, configured-anchor enrollment, bounded configuration tightening, and `pause`, `stop`, `reconcile`, `resume`, `cancel`, and `recover` actions. Mutations require a current observation digest; configuration saves require their own digest and cannot alter trust boundaries, profiles, scopes, or increase budgets. The React bundle preserves an action error after its refresh instead of clearing it.
 - [x] **Packaging/docs:** package assets declare the root plugin registration, manifest, dashboard API/bundle, and standalone CLI. The operator guide documents explicit bootstrap rather than implicit migration.
 
 ## Executed isolated evidence
@@ -23,6 +23,6 @@
 
 ## Remaining gates
 
-- [x] **Independent M6 review:** both independent reviews accepted the cumulative isolated implementation and evidence (`deleg_3af549de`). Their suite result and the later test-only follow-up run are recorded separately above.
-- [ ] **Host activation/cutover (M7):** prove the packaged plugin in an authenticated host with the authorized installation/profile/board configuration. This includes neither live-provider execution nor production board enrollment today.
+- [ ] **Renewed independent M6 review:** required after the dashboard profiles/configuration/enrollment completion; the former GO is historical, not acceptance of this current diff.
+- [ ] **Host activation/cutover (M7, paused):** prove the packaged plugin in an authenticated host with the authorized installation/profile/board configuration. This includes neither live-provider execution nor production board enrollment today.
 - [ ] **No implied migration:** existing boards, stores, worktrees, profiles, and provider state remain untouched; any installation, enrollment, dispatch, or activation requires separate authorization.

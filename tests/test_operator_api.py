@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import subprocess
+from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
@@ -78,8 +79,19 @@ def _config(tmp_path: Path) -> PluginConfig:
     })
 
 
+def _write_config(config: PluginConfig, path: Path) -> None:
+    path.write_text(json.dumps({
+        "version": config.version, "state_root": str(config.state_root),
+        "hermes_executable": str(config.hermes_executable), "hermes_home": str(config.hermes_home),
+        "kanban_home": str(config.kanban_home), "trusted_roots": {key: str(value) for key, value in config.trusted_roots.items()},
+        "roles": dict(config.roles), "budgets": asdict(config.budget_policy),
+        "poll_interval_seconds": config.poll_interval_seconds, "scope": dict(config.scope),
+        "check_commands": [{"check_id": check_id, "argv": list(argv)} for check_id, argv in config.check_commands],
+    }), encoding="utf-8")
+
+
 @pytest.fixture
-def mounted_api(tmp_path: Path, monkeypatch):
+def mounted_api(tmp_path: Path, monkeypatch, request):
     module_path = Path(__file__).parents[1] / "dashboard" / "plugin_api.py"
     spec = importlib.util.spec_from_file_location("m6_dashboard_api", module_path)
     module = importlib.util.module_from_spec(spec)
@@ -89,9 +101,12 @@ def mounted_api(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "fixture-run")
     initialize_store(config)
     store = EvidenceStore.open(config.evidence_store_path, create_new=False)
-    store.register_member(ManagedMember("fixture-board", "anchor", "work", "implementation", 0, (), "fixture-work"))
+    if getattr(request, "param", True):
+        store.register_member(ManagedMember("fixture-board", "anchor", "work", "implementation", 0, (), "fixture-work"))
     store.close()
-    module.configure_runtime_factory(lambda: build_runtime(config, board=board, scope=SCOPE))
+    configuration_path = tmp_path / "trusted-dashboard-config.json"
+    _write_config(config, configuration_path)
+    module.configure_runtime_factory(lambda: build_runtime(PluginConfig.from_file(configuration_path), board=board, scope=SCOPE), configuration_path=configuration_path)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self): self._serve()
@@ -112,7 +127,7 @@ def mounted_api(tmp_path: Path, monkeypatch):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = Thread(target=server.serve_forever, daemon=True); thread.start()
     try:
-        yield f"http://127.0.0.1:{server.server_port}", board
+        yield f"http://127.0.0.1:{server.server_port}", board, configuration_path
     finally:
         server.shutdown(); thread.join(); server.server_close(); module.configure_runtime_factory(None)
 
@@ -127,7 +142,7 @@ def _request(url: str, method="GET", payload=None):
 
 
 def test_mounted_fixture_dashboard_status_stale_and_partial_stop(mounted_api):
-    base, board = mounted_api
+    base, board, _ = mounted_api
     code, status = _request(base + PREFIX + "/status")
     assert code == 200
     assert status["scope"] == SCOPE
@@ -153,3 +168,38 @@ def test_mounted_fixture_dashboard_status_stale_and_partial_stop(mounted_api):
     assert code == 200 and stopped["result"]["outcome"] == "partial"
     assert stopped["status"]["uncontained_workers"][0]["id"] == "run-1"
     assert all(not item.startswith("stop:") for item in board.writes)
+
+
+@pytest.mark.parametrize("mounted_api", [False], indirect=True)
+def test_mounted_dashboard_profiles_bounded_configuration_and_enrollment(mounted_api):
+    base, board, configuration_path = mounted_api
+    code, status = _request(base + PREFIX + "/status")
+    assert code == 200
+    code, profiles = _request(base + PREFIX + "/profiles")
+    assert code == 200 and profiles == {"scope": SCOPE, "profiles": {
+        "implementation_profile": "implementer", "local_review_profile": "reviewer",
+        "planning_profile": "planner", "paid_review_profile": "paid"}}
+    code, enrolled = _request(base + PREFIX + "/enroll", "POST", {"expected_observation_digest": status["observation_digest"]})
+    assert code == 200 and enrolled["result"]["outcome"] == "verified", enrolled
+    assert board.writes == ["hold:anchor"]
+    code, configuration = _request(base + PREFIX + "/configuration")
+    assert code == 200
+    tightened = dict(configuration["budgets"]); tightened["paid_capacity"] = 0
+    code, saved = _request(base + PREFIX + "/configuration", "POST", {
+        "expected_configuration_digest": configuration["configuration_digest"],
+        "poll_interval_seconds": 2, "budgets": tightened,
+    })
+    assert code == 200 and saved["configuration"]["poll_interval_seconds"] == 2
+    assert json.loads(configuration_path.read_text(encoding="utf-8"))["budgets"]["paid_capacity"] == 0
+    assert board.writes == ["hold:anchor"]
+    code, stale = _request(base + PREFIX + "/configuration", "POST", {
+        "expected_configuration_digest": configuration["configuration_digest"],
+        "poll_interval_seconds": 3, "budgets": tightened,
+    })
+    assert code == 409 and "stale" in stale["detail"]
+    code, rejected = _request(base + PREFIX + "/configuration", "POST", {
+        "expected_configuration_digest": saved["configuration"]["configuration_digest"],
+        "poll_interval_seconds": 3, "budgets": {**tightened, "paid_capacity": 9},
+        "hermes_executable": "/tmp/attacker", "scope": {"board_id": "other", "anchor_task_id": "other"},
+    })
+    assert code == 400 and board.writes == ["hold:anchor"]

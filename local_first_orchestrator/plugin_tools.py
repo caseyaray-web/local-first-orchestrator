@@ -51,19 +51,23 @@ def _runtime_for_args(runtime_factory: Callable[..., Any], args: Mapping[str, An
         raise ValueError("object arguments are required")
     requested_scope = {"board_id": args.get("board_id"), "anchor_task_id": args.get("anchor_task_id")}
     runtime = runtime_factory(requested_scope)
-    scope = getattr(runtime, "scope", None)
-    if not isinstance(scope, Mapping):
-        raise ValueError("trusted runtime is required")
-    if args.get("board_id") != scope.get("board_id") or args.get("anchor_task_id") != scope.get("anchor_task_id"):
-        raise ValueError("tool scope must match the composed trusted runtime")
-    if require_worker:
-        task, run = os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_RUN_ID")
-        session, board = os.environ.get("HERMES_SESSION_ID"), os.environ.get("HERMES_KANBAN_BOARD")
-        if not all(type(value) is str and value for value in (task, run, session, board)):
-            raise ValueError("tool requires trusted native worker task, run, session, and board environment")
-        if board != scope.get("board_id"):
-            raise ValueError("worker native board environment differs from composed scope")
-    return runtime
+    try:
+        scope = getattr(runtime, "scope", None)
+        if not isinstance(scope, Mapping):
+            raise ValueError("trusted runtime is required")
+        if args.get("board_id") != scope.get("board_id") or args.get("anchor_task_id") != scope.get("anchor_task_id"):
+            raise ValueError("tool scope must match the composed trusted runtime")
+        if require_worker:
+            task, run = os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_RUN_ID")
+            session, board = os.environ.get("HERMES_SESSION_ID"), os.environ.get("HERMES_KANBAN_BOARD")
+            if not all(type(value) is str and value for value in (task, run, session, board)):
+                raise ValueError("tool requires trusted native worker task, run, session, and board environment")
+            if board != scope.get("board_id"):
+                raise ValueError("worker native board environment differs from composed scope")
+        return runtime
+    except Exception:
+        close_runtime(runtime)
+        raise
 
 
 def register_tools(ctx: ToolContext, *, runtime_factory: Callable[[Mapping[str, object]], Any]) -> None:

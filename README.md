@@ -4,7 +4,7 @@ A Hermes plugin for scoped, board-native Local First coordination. Hermes remain
 
 ## Current status
 
-M6 is an **isolated source and fixture milestone**. It has not enabled this plugin, enrolled a board, started a coordinator, called a provider, or changed any live Hermes/profile/data state. Independent review, browser verification, and any activation are later M7/cutover work.
+M6 is an **isolated source and fixture milestone**. It has not enabled this plugin, enrolled a live board, started a coordinator, called a provider, or changed any live Hermes/profile/data state. The dashboard’s mounted/browser fixture coverage is implemented; fresh independent review and any activation remain paused M7/cutover work.
 
 ## Supported M6 surfaces
 
@@ -12,7 +12,7 @@ M6 is an **isolated source and fixture milestone**. It has not enabled this plug
 - strict versioned plugin configuration and explicit evidence-store initialization;
 - scoped status, enrollment, pause/stop, reconcile, resume, cancel, recover, and bounded loop commands;
 - five scoped planner/reviewer proposal/status tools plus non-blocking advisory hooks;
-- plugin dashboard status and scoped operator actions with stale-observation protection;
+- plugin dashboard status, configured role-profile display, configured-anchor enrollment, and bounded configuration tightening with stale-observation protection;
 - wheel/sdist payloads containing the plugin root registration, manifest, dashboard manifest/API, and dashboard JavaScript.
 
 ## Isolated operator use

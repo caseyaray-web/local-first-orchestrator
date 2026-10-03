@@ -70,7 +70,9 @@ The root plugin registration exposes the same parser through `hermes local-first
 
 The wheel is a Python distribution, while Hermes discovers native plugins from a directory containing `plugin.yaml` and root `__init__.py`. Hermes does not automatically turn `pip install local-first-orchestrator` into a discovered directory plugin. For a supported offline artifact installation, install the wheel in the target Python environment, then place the wheel's `*.data/data/local-first-orchestrator/` payload intact at `$HERMES_HOME/plugins/local-first-orchestrator/` and explicitly enable `local-first-orchestrator` in that target home's `config.yaml`. The payload includes its artifact-local `python/local_first_orchestrator/` package; do not copy source checkout files or reuse a different host package. Validate the installed directory with `hermes plugins doctor "$HERMES_HOME/plugins/local-first-orchestrator" --ci`, then restart Hermes only when a separate activation authorization exists.
 
-The mounted dashboard API is `/api/plugins/local-first-orchestrator/status` plus scoped `pause`, `stop`, `reconcile`, `resume`, `cancel`, and `recover` actions. Mutations require the current observation digest; stale observations return a conflict with fresh status. Partial stops remain visible as uncontained workers. Dashboard payloads cannot edit configuration or trust boundaries in this M6 surface.
+The mounted dashboard API provides `status`, `profiles`, `configuration`, `enroll`, and scoped `pause`, `stop`, `reconcile`, `resume`, `cancel`, and `recover` actions. Mutations require the current observation digest; stale observations return a conflict with fresh status. `profiles` returns only the four distinct profiles already assigned by trusted bootstrap and `enroll` can target only the configured anchor. Partial stops remain visible as uncontained workers.
+
+`POST /configuration` (also exposed as `update_configuration`) requires the current configuration digest and accepts exactly `poll_interval_seconds` plus all configured budget categories. It can set a 1–3600 second poll interval and **tighten** non-negative limits only. It cannot increase a budget or reset consumed evidence. It writes only the server-selected trusted bootstrap file under the coordinator lock, validates it with `PluginConfig`, and never accepts a browser-selected configuration path, state root, repository/workspace, executable, Hermes home, board/anchor, profile, check command, or task ID.
 
 ## Operational boundaries
 
@@ -81,4 +83,4 @@ The mounted dashboard API is `/api/plugins/local-first-orchestrator/status` plus
 
 ## Status
 
-M6 source and fixture verification are complete only to the extent recorded in `docs/plans/m6-implementation-progress.md`. Independent review and a separately authorized browser/live activation remain M7/cutover gates.
+M6 source and fixture verification are complete only to the extent recorded in `docs/plans/m6-implementation-progress.md`. Fresh independent review and separately authorized live activation remain paused M7/cutover gates.

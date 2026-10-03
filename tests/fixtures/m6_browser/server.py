@@ -99,8 +99,8 @@ def main() -> None:
     os.environ["HERMES_M0_CLI"] = ""
     monkeypatch = MonkeyPatch()
     with tempfile.TemporaryDirectory(prefix="m6-browser-") as temporary:
-        generator = mounted_api.__wrapped__(Path(temporary), monkeypatch)
-        fixture_base, board = next(generator)
+        generator = mounted_api.__wrapped__(Path(temporary), monkeypatch, object())
+        fixture_base, board, _configuration_path = next(generator)
         server = HarnessServer(("127.0.0.1", 0), Handler)
         server.fixture_base, server.bundle, server.plugin, server.board = fixture_base, args.bundle, plugin, board
         print(json.dumps({"url": f"http://127.0.0.1:{server.server_port}/", "fixture_backend": fixture_base}), flush=True)

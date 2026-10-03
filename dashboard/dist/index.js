@@ -15,11 +15,14 @@
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState("");
     const [result, setResult] = useState(null);
+    const [profiles, setProfiles] = useState({});
+    const [configDraft, setConfigDraft] = useState(null);
 
     const refresh = function () {
       setBusy(true); setError("");
       return SDK.fetchJSON(apiBase + "/status")
-        .then(function (next) { setStatus(next); })
+        .then(function (next) { setStatus(next); setConfigDraft(next.configuration || null); return SDK.fetchJSON(apiBase + "/profiles"); })
+        .then(function (next) { setProfiles(next.profiles || {}); })
         .catch(function (err) { setStatus(null); setError(String(err.message || err)); })
         .finally(function () { setBusy(false); });
     };
@@ -31,7 +34,7 @@
       setBusy(true); setError(""); setResult(null);
       const payload = { expected_observation_digest: status.observation_digest };
       if (authorizedClear) payload.authorized_clear = true;
-      SDK.fetchJSON(apiBase + "/actions/" + action, {
+      SDK.fetchJSON(apiBase + (action === "enroll" ? "/enroll" : "/actions/" + action), {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
       }).then(function (next) {
         setResult(next.result || next);
@@ -41,6 +44,17 @@
         const detail = err && (err.message || err);
         return refresh().then(function () { setError(String(detail)); });
       }).finally(function () { setBusy(false); });
+    };
+
+    const saveConfiguration = function () {
+      if (!configDraft || !status) return;
+      setBusy(true); setError("");
+      const payload = { expected_configuration_digest: status.configuration.configuration_digest,
+        poll_interval_seconds: Number(configDraft.poll_interval_seconds), budgets: configDraft.budgets };
+      SDK.fetchJSON(apiBase + "/configuration", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
+        .then(function (next) { setStatus(next.status); setConfigDraft(next.configuration); setResult(next.configuration); })
+        .catch(function (err) { return refresh().then(function () { setError(String(err.message || err)); }); })
+        .finally(function () { setBusy(false); });
     };
 
     const disabled = busy || !status || !status.observation_digest;
@@ -71,11 +85,21 @@
             React.createElement("div", { className: "grid gap-3 sm:grid-cols-3" }, metric("Managed anchors", status.managed_anchors.length), metric("Active workers", status.active_workers.length), metric("Uncontained workers", status.uncontained_workers.length)),
             React.createElement("div", { className: "grid gap-2 sm:grid-cols-3" },
               React.createElement(Button, { className: "w-full justify-center", disabled: busy, onClick: refresh }, "Refresh observation"),
+              button("Enroll configured anchor", "enroll"),
               button("Pause", "pause"), button("Pause and stop", "stop"), button("Reconcile", "reconcile"),
               button("Resume (explicit)", "resume", true), button("Cancel managed scope", "cancel"), button("Run bounded recovery", "recover")),
             React.createElement("p", { className: "text-xs text-muted-foreground" }, "Controls are disabled until a fresh observation exists. A stale response is rejected by the backend and this page refreshes after every action."),
             result ? React.createElement("pre", { className: "max-h-56 overflow-auto rounded border p-2 text-xs" }, json(result)) : null
           ) : null)),
+      status && configDraft ? React.createElement(Card, null,
+        React.createElement(CardHeader, null, React.createElement(CardTitle, null, "Configured scope and bounded settings")),
+        React.createElement(CardContent, { className: "space-y-3" },
+          React.createElement("p", { className: "text-xs text-muted-foreground" }, "Scope and profiles are trusted bootstrap selections. Roots, executables, board identity, and profile assignments cannot be changed in this browser."),
+          React.createElement("label", { className: "text-sm" }, "Configured scope", React.createElement("select", { disabled: true, value: status.scope.board_id + ":" + status.scope.anchor_task_id, className: "block w-full rounded border p-2" }, React.createElement("option", { value: status.scope.board_id + ":" + status.scope.anchor_task_id }, status.scope.board_id + " / " + status.scope.anchor_task_id))),
+          React.createElement("pre", { className: "rounded border p-2 text-xs overflow-auto" }, json(profiles)),
+          React.createElement("label", { className: "text-sm" }, "Poll interval (seconds)", React.createElement("input", { type: "number", min: 1, max: 3600, value: configDraft.poll_interval_seconds, onChange: function (event) { setConfigDraft(Object.assign({}, configDraft, { poll_interval_seconds: event.target.value })); }, className: "block w-full rounded border p-2" })),
+          React.createElement("pre", { className: "rounded border p-2 text-xs overflow-auto" }, "Budget limits (may only be tightened through the bounded API):\n" + json(configDraft.budgets)),
+          React.createElement(Button, { disabled: busy, onClick: saveConfiguration }, "Save bounded configuration"))) : null,
       status ? React.createElement(React.Fragment, null,
         React.createElement(Card, null, React.createElement(CardHeader, null, React.createElement(CardTitle, null, "Managed anchors, head, and workers")),
           React.createElement(CardContent, { className: "space-y-3" },

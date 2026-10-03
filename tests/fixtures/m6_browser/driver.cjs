@@ -52,6 +52,9 @@ async function main() {
     const fixtureUrl = JSON.parse(first.toString()).url;
     await page.goto(fixtureUrl, { waitUntil: "networkidle", timeout: 15000 });
     await page.getByRole("heading", { name: "Local First" }).waitFor();
+    await page.getByRole("heading", { name: "Configured scope and bounded settings" }).waitFor();
+    if (await page.getByLabel("Configured scope").inputValue() !== "fixture-board:anchor") throw new Error("configured scope selector was not rendered");
+    await page.getByText("implementer").waitFor();
     const reactVersion = await page.evaluate(() => window.__M6_HARNESS__.reactVersion);
     if (reactVersion !== "19.2.7") throw new Error(`expected React 19.2.7, got ${reactVersion}`);
 

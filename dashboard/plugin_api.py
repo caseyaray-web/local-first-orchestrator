@@ -7,11 +7,12 @@ from the trusted local PluginConfig and trusted bootstrap scope.
 """
 from __future__ import annotations
 
-from dataclasses import is_dataclass
+from dataclasses import asdict, is_dataclass
 import hashlib
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -25,6 +26,7 @@ from local_first_orchestrator.config import PluginConfig
 _PREFIX = "/api/plugins/local-first-orchestrator"
 RuntimeFactory = Callable[[], Runtime]
 _runtime_factory: RuntimeFactory | None = None
+_configuration_path_for_tests: Path | None = None
 
 
 def _plain(value: Any, *, depth: int = 0) -> Any:
@@ -45,19 +47,33 @@ def _plain(value: Any, *, depth: int = 0) -> Any:
     raise ValueError("dashboard result contains unsupported record")
 
 
-def _trusted_runtime() -> Runtime:
-    """Compose from server-local bootstrap only; request data is never consulted."""
+def _trusted_config_path() -> Path:
     raw_config = os.environ.get("LOCAL_FIRST_ORCHESTRATOR_CONFIG")
     if not raw_config:
         raise ValueError("dashboard requires trusted LOCAL_FIRST_ORCHESTRATOR_CONFIG")
-    config = PluginConfig.from_file(Path(raw_config))
+    path = Path(raw_config)
+    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        raise ValueError("dashboard configuration bootstrap must be an absolute regular file")
+    return path
+
+
+def _trusted_runtime() -> Runtime:
+    """Compose from server-local bootstrap only; request data is never consulted."""
+    config = PluginConfig.from_file(_trusted_config_path())
     return build_runtime(config, scope=config.scope)
 
 
-def configure_runtime_factory(factory: RuntimeFactory | None) -> None:
-    """Test-only injection point; production leaves this unset."""
-    global _runtime_factory
+def configure_runtime_factory(factory: RuntimeFactory | None, *, configuration_path: Path | None = None) -> None:
+    """Test-only injection point; production leaves this unset.
+
+    A test may supply an already-created absolute bootstrap file to exercise
+    persistence. It remains server setup, never request data.
+    """
+    global _runtime_factory, _configuration_path_for_tests
+    if configuration_path is not None and (not configuration_path.is_absolute() or not configuration_path.is_file()):
+        raise ValueError("test configuration path must be an absolute regular file")
     _runtime_factory = factory
+    _configuration_path_for_tests = configuration_path
 
 
 def _open_runtime() -> Runtime:
@@ -67,6 +83,22 @@ def _open_runtime() -> Runtime:
 def _digest(payload: Mapping[str, Any]) -> str:
     body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return "sha256:" + hashlib.sha256(body).hexdigest()
+
+
+def _configuration(config: PluginConfig) -> dict[str, Any]:
+    """The only configuration projection a browser may read or propose edits to."""
+    return {
+        "poll_interval_seconds": config.poll_interval_seconds,
+        "budgets": asdict(config.budget_policy),
+        "roles": dict(config.roles),
+        "scope": dict(config.scope),
+    }
+
+
+def _configuration_with_digest(config: PluginConfig) -> dict[str, Any]:
+    projection = _configuration(config)
+    projection["configuration_digest"] = _digest(projection)
+    return projection
 
 
 def _status(runtime: Runtime) -> dict[str, Any]:
@@ -100,6 +132,7 @@ def _status(runtime: Runtime) -> dict[str, Any]:
         "uncontained_workers": active_workers if intent and intent.get("active") else [],
         "preserved_paths": preserved_paths,
         "pending_operations": [item for item in operations if item.get("phase") in {"pending", "unknown"}],
+        "configuration": _configuration_with_digest(runtime.config),
     }
     projection["observation_digest"] = _digest(projection)
     return projection
@@ -122,6 +155,58 @@ def _expected_digest(payload: Mapping[str, Any]) -> str:
     return digest
 
 
+def _update_configuration(runtime: Runtime, payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Persist only tightening edits to the server-selected bootstrap file.
+
+    The browser never supplies a path, executable, root, board, anchor, or
+    profile.  Increasing a finite budget is new authority and is deliberately
+    not an M6 dashboard operation.
+    """
+    if _runtime_factory is not None and _configuration_path_for_tests is None:
+        raise ValueError("configuration persistence is unavailable in injected runtime")
+    if set(payload) != {"expected_configuration_digest", "poll_interval_seconds", "budgets"}:
+        raise ValueError("configuration update contains unsupported fields")
+    expected = payload["expected_configuration_digest"]
+    if type(expected) is not str:
+        raise ValueError("expected_configuration_digest is required")
+    current = _configuration_with_digest(runtime.config)
+    if expected != current["configuration_digest"]:
+        raise RuntimeError("stale dashboard configuration; refresh before saving")
+    interval = payload["poll_interval_seconds"]
+    if type(interval) is not int or not 1 <= interval <= 3600:
+        raise ValueError("poll_interval_seconds must be a bounded positive integer")
+    budgets = payload["budgets"]
+    if not isinstance(budgets, Mapping) or set(budgets) != set(current["budgets"]):
+        raise ValueError("budgets must contain exactly the configured policy categories")
+    for name, value in budgets.items():
+        if type(value) is not int or value < 0:
+            raise ValueError("budgets must be finite non-negative integers")
+        if value > current["budgets"][name]:
+            raise ValueError("dashboard configuration cannot increase a consumed-policy budget")
+    path = _configuration_path_for_tests or _trusted_config_path()
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, Mapping):
+        raise ValueError("configuration must be valid JSON")
+    # Re-open and compare while holding the coordinator singleton lock.  This
+    # prevents a stale browser save from racing another dashboard mutation.
+    raw = dict(raw)
+    raw["poll_interval_seconds"] = interval
+    raw["budgets"] = dict(budgets)
+    replacement = PluginConfig.from_mapping(raw)
+    encoded = json.dumps(raw, sort_keys=True, separators=(",", ":")) + "\n"
+    descriptor, temporary = tempfile.mkstemp(prefix=".local-first-config-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return _configuration_with_digest(replacement)
+
+
 def dispatch(method: str, path: str, payload: Mapping[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
     """One mounted-request dispatch; every action has a fresh runtime and readback."""
     if method == "GET" and path == _PREFIX + "/status":
@@ -133,6 +218,51 @@ def dispatch(method: str, path: str, payload: Mapping[str, Any] | None = None) -
                 close_runtime(runtime)
         except (OSError, RuntimeError, ValueError) as exc:
             return _error(503, str(exc))
+    if method == "GET" and path in {_PREFIX + "/profiles", _PREFIX + "/configuration"}:
+        try:
+            runtime = _open_runtime()
+            try:
+                if path.endswith("/profiles"):
+                    return 200, {"scope": dict(runtime.scope), "profiles": dict(runtime.config.roles)}
+                return 200, _configuration_with_digest(runtime.config)
+            finally:
+                close_runtime(runtime)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return _error(503, str(exc))
+    if method == "POST" and path in {_PREFIX + "/configuration", _PREFIX + "/update_configuration"}:
+        if not isinstance(payload, Mapping):
+            return _error(400, "dashboard configuration body must be an object")
+        try:
+            runtime = _open_runtime()
+            try:
+                with runtime.coordinator.lock:
+                    configuration = _update_configuration(runtime, payload)
+                    fresh = _status(runtime)
+                    fresh["configuration"] = configuration
+                    fresh["observation_digest"] = _digest({key: value for key, value in fresh.items() if key != "observation_digest"})
+                    return 200, {"configuration": configuration, "status": fresh}
+            finally:
+                close_runtime(runtime)
+        except RuntimeError as exc:
+            return _error(409, str(exc))
+        except (OSError, ValueError) as exc:
+            return _error(400, str(exc))
+    if method == "POST" and path == _PREFIX + "/enroll":
+        if not isinstance(payload, Mapping) or set(payload) != {"expected_observation_digest"}:
+            return _error(400, "enrollment requires only expected_observation_digest")
+        try:
+            expected = _expected_digest(payload)
+            runtime = _open_runtime()
+            try:
+                before = _status(runtime)
+                if expected != before["observation_digest"]:
+                    return _error(409, "stale dashboard observation; refresh before mutating", fresh=before)
+                result = runtime.coordinator.enroll()
+                return 200, {"result": _plain(result), "status": _status(runtime)}
+            finally:
+                close_runtime(runtime)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return _error(409, str(exc))
     if method != "POST" or not path.startswith(_PREFIX + "/actions/"):
         return _error(404, "dashboard route not found")
     action = path.removeprefix(_PREFIX + "/actions/")
@@ -204,6 +334,27 @@ else:
     @router.get("/status")
     def mounted_status():
         code, body = dispatch("GET", _PREFIX + "/status")
+        return JSONResponse(status_code=code, content=body)
+
+    @router.get("/profiles")
+    def mounted_profiles():
+        code, body = dispatch("GET", _PREFIX + "/profiles")
+        return JSONResponse(status_code=code, content=body)
+
+    @router.get("/configuration")
+    def mounted_configuration():
+        code, body = dispatch("GET", _PREFIX + "/configuration")
+        return JSONResponse(status_code=code, content=body)
+
+    @router.post("/configuration")
+    @router.post("/update_configuration")
+    def mounted_configuration_update(payload: dict[str, Any]):
+        code, body = dispatch("POST", _PREFIX + "/configuration", payload)
+        return JSONResponse(status_code=code, content=body)
+
+    @router.post("/enroll")
+    def mounted_enroll(payload: dict[str, Any]):
+        code, body = dispatch("POST", _PREFIX + "/enroll", payload)
         return JSONResponse(status_code=code, content=body)
 
     @router.post("/actions/{action}")
