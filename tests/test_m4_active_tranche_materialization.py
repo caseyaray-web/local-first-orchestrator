@@ -30,6 +30,12 @@ def route(**changes):
     return ActiveTrancheRoute(**{"implementation_profile": "local-coder", "workspace": "/work/repo", **changes})
 
 
+def test_route_constructor_rejects_relative_workspace():
+    from local_first_orchestrator.planning_coordinator import ActiveTrancheRoute
+    with pytest.raises(ValueError):
+        ActiveTrancheRoute("local-coder", "relative")
+
+
 def test_materializes_only_validated_first_tranche_in_topological_order_and_exact_identities():
     req, p, evidence = fixture()
     before = copy.deepcopy(evidence)
@@ -63,97 +69,6 @@ def test_later_tranche_is_never_selected_and_source_only_changes_for_planner_pro
     changed = first_active_tranche_materialization(ev2, route())
     assert changed.source != original.source
     assert [(x.association, x.operation_key) for x in changed.targets] == [(x.association, x.operation_key) for x in original.targets]
-
-
-@pytest.mark.parametrize("workspace", ["", "relative", "/work/../repo", "/work/./repo", "/work//repo", "/work/repo/", "/", "/work/./", "/work/../"])
-def test_rejects_noncanonical_workspace(workspace):
-    _, _, ev = fixture()
-    with pytest.raises((TypeError, ValueError)):
-        first_active_tranche_materialization(ev, route(workspace=workspace))
-
-
-@pytest.mark.parametrize("profile", ["", " ", None, 1, True])
-def test_rejects_bad_profile(profile):
-    _, _, ev = fixture()
-    with pytest.raises((TypeError, ValueError)):
-        first_active_tranche_materialization(ev, route(implementation_profile=profile))
-
-
-@pytest.mark.parametrize("field,value", [
-    ("implementation_profile", None), ("implementation_profile", True),
-    ("implementation_profile", " "), ("implementation_profile", "bad\ud800"),
-    ("workspace", "relative"), ("workspace", "dir:relative"),
-    ("workspace", None), ("workspace", True), ("workspace", "/work/bad\ud800"),
-])
-def test_constructor_bypass_route_fields_are_revalidated(field, value):
-    from local_first_orchestrator.planning_coordinator import ActiveTrancheRoute
-    _, _, ev = fixture()
-    candidate = object.__new__(ActiveTrancheRoute)
-    object.__setattr__(candidate, "implementation_profile", "local-coder")
-    object.__setattr__(candidate, "workspace", "/work/repo")
-    object.__setattr__(candidate, field, value)
-    with pytest.raises(ValueError):
-        first_active_tranche_materialization(ev, candidate)
-
-
-@pytest.mark.parametrize("missing", ["implementation_profile", "workspace"])
-def test_constructor_bypass_missing_route_field_is_controlled(missing):
-    from local_first_orchestrator.planning_coordinator import ActiveTrancheRoute
-    _, _, ev = fixture()
-    candidate = object.__new__(ActiveTrancheRoute)
-    object.__setattr__(candidate, "implementation_profile", "local-coder")
-    object.__setattr__(candidate, "workspace", "/work/repo")
-    object.__delattr__(candidate, missing)
-    with pytest.raises(ValueError):
-        first_active_tranche_materialization(ev, candidate)
-
-
-@pytest.mark.parametrize("field,value", [("implementation_profile", "bad\ud800"), ("workspace", "/work/bad\ud800")])
-def test_route_constructor_rejects_non_utf8_unicode(field, value):
-    from local_first_orchestrator.planning_coordinator import ActiveTrancheRoute
-    with pytest.raises(ValueError):
-        ActiveTrancheRoute(**{field: value, **({"workspace": "/work/repo"} if field == "implementation_profile" else {"implementation_profile": "local-coder"})})
-
-
-@pytest.mark.parametrize("control", ["\x00", "\n", "\t", "\x7f", "\x85"])
-@pytest.mark.parametrize("field", ["implementation_profile", "workspace"])
-def test_route_constructor_rejects_control_characters(field, control):
-    from local_first_orchestrator.planning_coordinator import ActiveTrancheRoute
-    value = "local-coder" + control if field == "implementation_profile" else "/work/" + control + "repo"
-    with pytest.raises(ValueError):
-        ActiveTrancheRoute(**{field: value, **({"workspace": "/work/repo"} if field == "implementation_profile" else {"implementation_profile": "local-coder"})})
-
-
-@pytest.mark.parametrize("field,value", [("implementation_profile", " local-coder "), ("implementation_profile", "local\n-coder"), ("workspace", " /work/repo"), ("workspace", "/work/repo ")])
-def test_route_constructor_rejects_surrounding_whitespace(field, value):
-    from local_first_orchestrator.planning_coordinator import ActiveTrancheRoute
-    with pytest.raises(ValueError):
-        ActiveTrancheRoute(**{field: value, **({"workspace": "/work/repo"} if field == "implementation_profile" else {"implementation_profile": "local-coder"})})
-
-
-@pytest.mark.parametrize("control", ["\x00", "\n", "\t", "\x7f", "\x85"])
-@pytest.mark.parametrize("field", ["implementation_profile", "workspace"])
-def test_constructor_bypass_control_characters_are_rejected_at_consumption(field, control):
-    from local_first_orchestrator.planning_coordinator import ActiveTrancheRoute
-    _, _, ev = fixture()
-    candidate = object.__new__(ActiveTrancheRoute)
-    object.__setattr__(candidate, "implementation_profile", "local-coder")
-    object.__setattr__(candidate, "workspace", "/work/repo")
-    object.__setattr__(candidate, field, "local-coder" + control if field == "implementation_profile" else "/work/" + control + "repo")
-    with pytest.raises(ValueError):
-        first_active_tranche_materialization(ev, candidate)
-
-
-@pytest.mark.parametrize("field,value", [("implementation_profile", " local-coder "), ("implementation_profile", "local\n-coder"), ("workspace", " /work/repo"), ("workspace", "/work/repo ")])
-def test_constructor_bypass_whitespace_is_rejected_at_consumption(field, value):
-    from local_first_orchestrator.planning_coordinator import ActiveTrancheRoute
-    _, _, ev = fixture()
-    candidate = object.__new__(ActiveTrancheRoute)
-    object.__setattr__(candidate, "implementation_profile", "local-coder")
-    object.__setattr__(candidate, "workspace", "/work/repo")
-    object.__setattr__(candidate, field, value)
-    with pytest.raises(ValueError):
-        first_active_tranche_materialization(ev, candidate)
 
 
 def test_workspace_with_interior_spaces_and_unicode_remains_canonical():

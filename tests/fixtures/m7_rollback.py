@@ -67,6 +67,12 @@ def _relative_file(root: Path, path: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
+def _reject_symlink_path(path: Path, *, label: str) -> None:
+    """Reject a caller-supplied symlink before resolution can erase that fact."""
+    if path.is_symlink():
+        raise RollbackArchiveError(f"{label} must not be a symlink")
+
+
 def _validate_checkpoint(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(checkpoint, Mapping) or set(checkpoint) != _CHECKPOINT_KEYS:
         raise RollbackArchiveError("checkpoint keys are not the closed M7 fixture schema")
@@ -117,6 +123,9 @@ def build_fixture_rollback_archive(
     if not root.is_dir():
         raise RollbackArchiveError("fixture root must be a directory")
     checkpoint_data = _validate_checkpoint(checkpoint)
+    _reject_symlink_path(plugin_root, label="plugin root")
+    _reject_symlink_path(config_path, label="config input")
+    _reject_symlink_path(evidence_path, label="evidence input")
     plugin = _within(root, plugin_root, require_exists=True)
     config = _within(root, config_path, require_exists=True)
     evidence = _within(root, evidence_path, require_exists=True)
@@ -138,6 +147,10 @@ def build_fixture_rollback_archive(
         if candidate.is_absolute() or ".." in candidate.parts or candidate.as_posix() in seen:
             raise RollbackArchiveError("plugin allowlist contains an unsafe or duplicate path")
         seen.add(candidate.as_posix())
+        component = plugin
+        for part in candidate.parts:
+            component = component / part
+            _reject_symlink_path(component, label="plugin allowlist input")
         source = _within(root, plugin / candidate, require_exists=True)
         if source.parent != (plugin / candidate).parent.resolve(strict=True):
             raise RollbackArchiveError("plugin allowlist resolution changed")
@@ -189,6 +202,8 @@ def restore_fixture_rollback_archive(
         if any(not member.isfile() or Path(member.name).is_absolute() or ".." in Path(member.name).parts for member in members):
             raise RollbackArchiveError("archive contains an unsafe member")
         names = {member.name for member in members}
+        if len(names) != len(members):
+            raise RollbackArchiveError("archive contains duplicate members")
         if _METADATA_NAME not in names:
             raise RollbackArchiveError("archive metadata is missing")
         metadata_handle = bundle.extractfile(_METADATA_NAME)

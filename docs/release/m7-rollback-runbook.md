@@ -13,7 +13,7 @@ Inputs:
 3. one existing, plugin-owned `evidence.sqlite3` validated by the public `EvidenceStore` schema checker;
 4. a closed checkpoint object with exact scope, cutoff, native-effect status, installed-snapshot status, operator-intent status, and `fixture-only` restore policy.
 
-The helper validates the source database with `EvidenceStore`, uses that store connection's SQLite backup API to produce a consistent copy, validates the copied database again, then hashes every archived file. It intentionally archives the SQLite backup file rather than a live `-wal` sidecar. It rejects symlinks, traversal, duplicate/unknown plugin allowlist paths, source/destination escape from the fixture root, unknown/missing checkpoint fields, existing restore destinations, archive member drift, hash mismatch, and checkpoint mismatch at restore.
+The helper validates the source database with `EvidenceStore`, uses that store connection's SQLite backup API to produce a consistent copy, validates the copied database again, then hashes every archived file. It intentionally archives the SQLite backup file rather than a live `-wal` sidecar. It rejects caller-supplied source symlinks before path resolution, symlinked allowlisted plugin inputs, traversal and duplicate plugin allowlist paths, source/destination escape from the fixture root, unknown/missing checkpoint fields, existing restore destinations, unsafe or duplicate archive members, inventory drift, restored-file hash mismatch, and checkpoint mismatch at restore.
 
 The archive metadata includes file hashes and this capture declaration:
 
@@ -33,13 +33,14 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. HERMES_M0_CLI='' \
   python -m pytest tests/test_m7_release_rollback.py -q -pno:cacheprovider -oaddopts=''
 ```
 
-The test builds an archive under pytest's scratch-root fixture, restores it to a new fixture-only directory, and proves:
+The focused file currently has seven fixture-only cases. They build an archive under pytest's scratch-root fixture, restore it to a new fixture-only directory, and prove:
 
-- trusted config bytes and allowlisted plugin artifact bytes match after restore;
-- a public `EvidenceStore` reopen/migration accepts the restored SQLite database;
-- the fixture scope retains a persisted active paused/stopped operator intent;
+- trusted config bytes and **every** allowlisted plugin artifact byte match after restore;
+- a public `EvidenceStore` reopen/migration accepts the restored SQLite database and retains the active paused/stopped operator intent, member history, and immutable budget event;
 - archive SHA-256 is stable across build/restore reporting;
-- unknown checkpoint keys, missing checkpoint keys, and a different cutoff are refused.
+- unknown and missing checkpoint keys plus a different cutoff are refused;
+- duplicate/traversing allowlists and caller-supplied config/plugin-file symlinks are rejected at the intended build boundary, including a symlinked `dashboard/` ancestor for the allowlisted `dashboard/manifest.json` node before resolution can erase that fact;
+- an archive with a duplicate member is rejected before restoration.
 
 This is proof of the archive protocol only. It is not proof that a target package has been installed, an installed legacy plugin was backed up, a native board can be rolled back, or a live service can be stopped.
 
