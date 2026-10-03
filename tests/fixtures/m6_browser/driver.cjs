@@ -55,8 +55,33 @@ async function main() {
     await page.getByRole("heading", { name: "Configured scope and bounded settings" }).waitFor();
     if (await page.getByLabel("Configured scope").inputValue() !== "fixture-board:anchor") throw new Error("configured scope selector was not rendered");
     await page.getByText("implementer").waitFor();
+    await page.getByRole("heading", { name: "Runtime metrics" }).waitFor();
+    await page.getByText("Local / paid reviews").waitFor();
+    await page.getByText("anchor / finding-1 / review_corrections: net 1 of configured limit 1; remaining 0").waitFor();
     const reactVersion = await page.evaluate(() => window.__M6_HARNESS__.reactVersion);
     if (reactVersion !== "19.2.7") throw new Error(`expected React 19.2.7, got ${reactVersion}`);
+
+    const configurationPostsBeforeBlank = await page.evaluate(() => window.__M6_HARNESS__.apiCalls.filter(call => call.method === "POST" && /\/configuration$/.test(call.url)).length);
+    await page.getByLabel("paid capacity budget").fill("");
+    await page.getByRole("button", { name: "Save bounded configuration" }).click();
+    await page.getByText("paid capacity budget is required.").waitFor();
+    const configurationPostsAfterBlank = await page.evaluate(() => window.__M6_HARNESS__.apiCalls.filter(call => call.method === "POST" && /\/configuration$/.test(call.url)).length);
+    if (configurationPostsAfterBlank !== configurationPostsBeforeBlank) throw new Error("blank budget attempted a configuration POST");
+    const unchangedConfiguration = await (await page.request.get(fixtureUrl + "/api/plugins/local-first-orchestrator/configuration")).json();
+    if (unchangedConfiguration.budgets.paid_capacity !== 1) throw new Error("blank budget changed fixture configuration");
+    await page.getByLabel("paid capacity budget").fill("0");
+    await page.getByLabel("Poll interval (seconds)").fill("");
+    await page.getByRole("button", { name: "Save bounded configuration" }).click();
+    await page.getByText("Poll interval is required (1–3600 seconds).").waitFor();
+    const configurationPostsAfterBlankInterval = await page.evaluate(() => window.__M6_HARNESS__.apiCalls.filter(call => call.method === "POST" && /\/configuration$/.test(call.url)).length);
+    if (configurationPostsAfterBlankInterval !== configurationPostsBeforeBlank) throw new Error("blank poll interval attempted a configuration POST");
+    await page.getByLabel("Poll interval (seconds)").fill("2");
+    await page.getByRole("button", { name: "Save bounded configuration" }).click();
+    await page.getByText('"poll_interval_seconds": 2').waitFor();
+    const callsAfterConfiguration = await page.evaluate(() => window.__M6_HARNESS__.apiCalls.slice());
+    if (!callsAfterConfiguration.some(call => call.method === "POST" && /\/configuration$/.test(call.url) && call.status === 200)) {
+      throw new Error("bounded configuration save did not reach the fixture API with HTTP 200");
+    }
 
     await page.getByRole("button", { name: "Pause and stop" }).click();
     await page.getByText('"outcome": "partial"').waitFor();
@@ -92,6 +117,7 @@ async function main() {
     if (JSON.stringify(writesAfterStale) !== JSON.stringify(writesBeforeStale)) {
       throw new Error("stale action mutated fixture board writes");
     }
+    if (process.env.M6_BROWSER_SCREENSHOT) await page.screenshot({ path: process.env.M6_BROWSER_SCREENSHOT, fullPage: true });
     console.log(JSON.stringify({
       reactVersion,
       calls: calls.map(({ method, url, status }) => ({ method, url, status })),

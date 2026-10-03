@@ -7,7 +7,9 @@ license: MIT
 tags: [kanban, orchestration, local-first]
 provides_tools:
   - local_first_submit_plan
+  - local_first_register_planning_request
   - local_first_submit_review
+  - local_first_submit_paid_review
   - local_first_request_corrections
   - local_first_report_issue
   - local_first_status

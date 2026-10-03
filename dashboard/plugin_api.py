@@ -101,7 +101,64 @@ def _configuration_with_digest(config: PluginConfig) -> dict[str, Any]:
     return projection
 
 
-def _status(runtime: Runtime) -> dict[str, Any]:
+def _runtime_metrics(observed: Mapping[str, Any], native_runs: list[Mapping[str, Any]],
+                     operations: list[Mapping[str, Any]], reviews: list[Mapping[str, Any]],
+                     budget_events: list[Mapping[str, Any]], budget_net: list[Mapping[str, Any]],
+                     configuration: Mapping[str, Any]) -> dict[str, Any]:
+    """Project only evidence already read by ``Coordinator.status``.
+
+    The mounted dashboard opens a short-lived observer for each request, so it
+    cannot truthfully report a coordinator-loop heartbeat or process liveness.
+    Native run lanes are observations, not proof that a worker PID is alive.
+    """
+    active_states = {"active", "claimed", "running", "stopping"}
+    limits = configuration["budgets"]
+    by_finding: list[dict[str, Any]] = []
+    for item in budget_net:
+        root, finding, category, net = (item.get("root_task_id"), item.get("finding_id"),
+                                        item.get("category"), item.get("net"))
+        if (isinstance(root, str) and isinstance(finding, str) and category in limits
+                and type(net) is int):
+            limit = limits[category]
+            by_finding.append({"root_task_id": root, "finding_id": finding, "category": category,
+                               "consumed_net": net, "configured_limit": limit,
+                               "remaining": limit - net})
+    return {
+        "loop": {
+            "state": "unknown",
+            "reason": "no persistent coordinator-loop heartbeat is stored in the evidence scope",
+            "last_heartbeat": None,
+        },
+        "native_runs": {
+            "observed_total": len(native_runs),
+            "observed_active": sum(1 for run in native_runs if run.get("status") in active_states),
+            "liveness": "unknown",
+            "source": "current native board observation",
+        },
+        "operations": {
+            "total": len(operations),
+            "applied": sum(1 for item in operations if item.get("phase") == "applied"),
+            "pending": sum(1 for item in operations if item.get("phase") == "pending"),
+            "unknown": sum(1 for item in operations if item.get("phase") == "unknown"),
+        },
+        "reviews": {
+            "total": len(reviews),
+            "local": sum(1 for item in reviews if item.get("reviewer_role") == "local"),
+            "paid": sum(1 for item in reviews if item.get("reviewer_role") == "paid"),
+        },
+        "budget_usage": {
+            "by_finding": by_finding,
+            "aggregate": {
+                "consumed_net": sum(item["consumed_net"] for item in by_finding),
+                "semantics": "sum across recorded finding/category ledger rows; not an enforcement ceiling",
+            },
+        },
+        "budget_events_recorded": len(budget_events),
+        "observation_source": "current scoped evidence store and native board readback",
+    }
+
+
+def _status(runtime: Runtime, *, configuration: Mapping[str, Any] | None = None) -> dict[str, Any]:
     observed = _plain(runtime.coordinator.status())
     members = observed.get("members", [])
     native_tasks = observed.get("native_tasks", {})
@@ -109,12 +166,14 @@ def _status(runtime: Runtime) -> dict[str, Any]:
     operations = observed.get("operations", [])
     reviews = observed.get("reviews", [])
     budget_events = observed.get("budget_events", [])
+    budget_net = observed.get("budget_net", [])
     intent = observed.get("operator_intent")
     active_workers = [run for run in native_runs if run.get("status") in {"active", "claimed", "running", "stopping"}]
     preserved_paths = sorted({str(value) for item in operations for value in (
         item.get("target", {}).get("worktree"), item.get("target", {}).get("workspace"),
         item.get("readback", {}).get("worktree") if isinstance(item.get("readback"), dict) else None,
     ) if isinstance(value, str) and value})
+    configuration = _configuration_with_digest(runtime.config) if configuration is None else dict(configuration)
     projection = {
         "scope": observed.get("scope", dict(runtime.scope)),
         "anchor": native_tasks.get(runtime.scope["anchor_task_id"]),
@@ -122,8 +181,8 @@ def _status(runtime: Runtime) -> dict[str, Any]:
         "current_head": observed.get("git_observation"),
         "reviews": reviews,
         "review_queues": {
-            "local": [item for item in reviews if item.get("role") == "local_review"],
-            "paid": [item for item in reviews if item.get("role") == "paid_review"],
+            "local": [item for item in reviews if item.get("reviewer_role") == "local"],
+            "paid": [item for item in reviews if item.get("reviewer_role") == "paid"],
         },
         "repair_history": operations[-50:],
         "budgets": budget_events,
@@ -132,7 +191,8 @@ def _status(runtime: Runtime) -> dict[str, Any]:
         "uncontained_workers": active_workers if intent and intent.get("active") else [],
         "preserved_paths": preserved_paths,
         "pending_operations": [item for item in operations if item.get("phase") in {"pending", "unknown"}],
-        "configuration": _configuration_with_digest(runtime.config),
+        "configuration": configuration,
+        "runtime_metrics": _runtime_metrics(observed, native_runs, operations, reviews, budget_events, budget_net, configuration),
     }
     projection["observation_digest"] = _digest(projection)
     return projection
@@ -237,8 +297,7 @@ def dispatch(method: str, path: str, payload: Mapping[str, Any] | None = None) -
             try:
                 with runtime.coordinator.lock:
                     configuration = _update_configuration(runtime, payload)
-                    fresh = _status(runtime)
-                    fresh["configuration"] = configuration
+                    fresh = _status(runtime, configuration=configuration)
                     fresh["observation_digest"] = _digest({key: value for key, value in fresh.items() if key != "observation_digest"})
                     return 200, {"configuration": configuration, "status": fresh}
             finally:

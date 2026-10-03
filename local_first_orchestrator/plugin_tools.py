@@ -9,7 +9,9 @@ from .composition import close_runtime
 
 TOOL_NAMES = (
     "local_first_submit_plan",
+    "local_first_register_planning_request",
     "local_first_submit_review",
+    "local_first_submit_paid_review",
     "local_first_request_corrections",
     "local_first_report_issue",
     "local_first_status",
@@ -29,7 +31,9 @@ def _schema(name: str, description: str, properties: Mapping[str, Any], required
 
 SCHEMAS = {
     "local_first_submit_plan": _schema("local_first_submit_plan", "Submit a structured paid planning proposal from the currently running native planner task.", {"proposal_json": {"type": "string"}, "request_id": {"type": "string"}}, ["proposal_json"]),
+    "local_first_register_planning_request": _schema("local_first_register_planning_request", "Bind the current native planner run to its persisted planning request.", {"request_id": {"type": "string"}}, []),
     "local_first_submit_review": _schema("local_first_submit_review", "Submit structured local review evidence from the current native reviewer run.", {"task_id": {"type": "string"}, "candidate": {"type": "object"}, "review": {"type": "object"}}, ["task_id", "candidate", "review"]),
+    "local_first_submit_paid_review": _schema("local_first_submit_paid_review", "Submit a paid review only from the current configured paid-review worker.", {"plan_id": {"type": "string"}, "review": {"type": "object"}}, ["plan_id", "review"]),
     "local_first_request_corrections": _schema("local_first_request_corrections", "Reserve bounded native correction handoff from the current reviewer run; it does not create work in this tool call.", {"task_id": {"type": "string"}, "candidate": {"type": "object"}, "review": {"type": "object"}, "operation_key": {"type": "string"}, "reason": {"type": "string"}}, ["task_id", "candidate", "review", "operation_key"]),
     "local_first_report_issue": _schema("local_first_report_issue", "Record a scoped recovery issue for later bounded reconciliation; this tool does not perform repair.", {"issue": {"type": "object"}}, ["issue"]),
     "local_first_status": _schema("local_first_status", "Read scoped Local First coordinator status without changing board state.", {}, []),
@@ -70,6 +74,20 @@ def _runtime_for_args(runtime_factory: Callable[..., Any], args: Mapping[str, An
         raise
 
 
+def _require_exact_args(name: str, args: Mapping[str, Any]) -> None:
+    """Enforce registered closed schemas when handlers are called directly."""
+    if not isinstance(args, Mapping):
+        raise ValueError("object arguments are required")
+    parameters = SCHEMAS[name]["parameters"]
+    allowed = set(parameters["properties"])
+    required = set(parameters["required"])
+    supplied = set(args)
+    if supplied - allowed:
+        raise ValueError("tool arguments contain unsupported selectors")
+    if required - supplied:
+        raise ValueError("tool arguments omit required selectors")
+
+
 def register_tools(ctx: ToolContext, *, runtime_factory: Callable[[Mapping[str, object]], Any]) -> None:
     """Register schemas only; runtime creation happens inside a tool invocation."""
     if not callable(runtime_factory):
@@ -77,6 +95,7 @@ def register_tools(ctx: ToolContext, *, runtime_factory: Callable[[Mapping[str, 
 
     def submit_plan(args: Mapping[str, Any], **_: Any) -> str:
         def call() -> Mapping[str, Any]:
+            _require_exact_args("local_first_submit_plan", args)
             runtime = _runtime_for_args(runtime_factory, args, require_worker=True)
             try:
                 return runtime.coordinator.submit_plan(args["proposal_json"], request_id=args.get("request_id"))
@@ -84,9 +103,43 @@ def register_tools(ctx: ToolContext, *, runtime_factory: Callable[[Mapping[str, 
                 close_runtime(runtime)
         return _json_result(call)
 
+    def register_planning_request(args: Mapping[str, Any], **_: Any) -> str:
+        def call() -> Mapping[str, Any]:
+            _require_exact_args("local_first_register_planning_request", args)
+            runtime = _runtime_for_args(runtime_factory, args, require_worker=True)
+            try:
+                return runtime.coordinator.register_planning_request(
+                    os.environ["HERMES_KANBAN_TASK"], request_id=args.get("request_id"))
+            finally:
+                close_runtime(runtime)
+        return _json_result(call)
+
+    def submit_paid_review(args: Mapping[str, Any], **_: Any) -> str:
+        def call() -> Mapping[str, Any]:
+            _require_exact_args("local_first_submit_paid_review", args)
+            runtime = _runtime_for_args(runtime_factory, args, require_worker=True)
+            try:
+                review = args["review"]
+                native = review.get("native_review") if isinstance(review, Mapping) else None
+                if not isinstance(native, Mapping):
+                    raise ValueError("paid review requires native review provenance")
+                if (native.get("task_id") != os.environ["HERMES_KANBAN_TASK"]
+                        or native.get("run_id") != os.environ["HERMES_KANBAN_RUN_ID"]
+                        or native.get("session_id") != os.environ["HERMES_SESSION_ID"]):
+                    raise ValueError("paid review provenance must be the active trusted worker identity")
+                if native.get("profile") != runtime.config.roles["paid_review_profile"]:
+                    raise ValueError("paid review profile must match configured paid-review role")
+                from .composition import build_git_adapter
+                return runtime.coordinator.submit_paid_integrated_review(
+                    args["plan_id"], review, git_adapter=build_git_adapter(runtime.config))
+            finally:
+                close_runtime(runtime)
+        return _json_result(call)
+
     def submit_review(args: Mapping[str, Any], **_: Any) -> str:
         from .contracts import CandidateIdentity
         def call() -> Mapping[str, Any]:
+            _require_exact_args("local_first_submit_review", args)
             runtime = _runtime_for_args(runtime_factory, args, require_worker=True)
             try:
                 return runtime.coordinator.submit_review(args["task_id"], CandidateIdentity.from_dict(args["candidate"]), args["review"], expected_profile=runtime.config.roles["local_review_profile"])
@@ -97,6 +150,7 @@ def register_tools(ctx: ToolContext, *, runtime_factory: Callable[[Mapping[str, 
     def request_corrections(args: Mapping[str, Any], **_: Any) -> str:
         from .contracts import CandidateIdentity
         def call() -> Mapping[str, Any]:
+            _require_exact_args("local_first_request_corrections", args)
             runtime = _runtime_for_args(runtime_factory, args, require_worker=True)
             try:
                 return runtime.coordinator.request_corrections(args["task_id"], CandidateIdentity.from_dict(args["candidate"]), args["review"], implementation_profile=runtime.config.roles["implementation_profile"], operation_key=args["operation_key"], reason=args.get("reason", "review findings require correction"))
@@ -107,6 +161,7 @@ def register_tools(ctx: ToolContext, *, runtime_factory: Callable[[Mapping[str, 
     def report_issue(args: Mapping[str, Any], **_: Any) -> str:
         from .recovery import RecoveryIssue
         def call() -> Mapping[str, Any]:
+            _require_exact_args("local_first_report_issue", args)
             runtime = _runtime_for_args(runtime_factory, args, require_worker=True)
             try:
                 issue = args["issue"]
@@ -119,6 +174,7 @@ def register_tools(ctx: ToolContext, *, runtime_factory: Callable[[Mapping[str, 
 
     def status(args: Mapping[str, Any], **_: Any) -> str:
         def call() -> Mapping[str, Any]:
+            _require_exact_args("local_first_status", args)
             runtime = _runtime_for_args(runtime_factory, args, require_worker=False)
             try:
                 return runtime.coordinator.status()
@@ -126,7 +182,10 @@ def register_tools(ctx: ToolContext, *, runtime_factory: Callable[[Mapping[str, 
                 close_runtime(runtime)
         return _json_result(call)
 
-    for name, handler in (("local_first_submit_plan", submit_plan), ("local_first_submit_review", submit_review),
+    for name, handler in (("local_first_submit_plan", submit_plan),
+                          ("local_first_register_planning_request", register_planning_request),
+                          ("local_first_submit_review", submit_review),
+                          ("local_first_submit_paid_review", submit_paid_review),
                           ("local_first_request_corrections", request_corrections), ("local_first_report_issue", report_issue),
                           ("local_first_status", status)):
         ctx.register_tool(name=name, toolset=_TOOLSET, schema=SCHEMAS[name], handler=handler)

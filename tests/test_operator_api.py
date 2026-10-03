@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import subprocess
 from dataclasses import asdict
@@ -14,11 +15,19 @@ import pytest
 
 from local_first_orchestrator.composition import build_runtime, close_runtime, initialize_store
 from local_first_orchestrator.config import PluginConfig
-from local_first_orchestrator.contracts import Action, ActionResult, BoardSnapshot, ManagedMember
+from local_first_orchestrator.contracts import Action, ActionResult, BoardSnapshot, CandidateIdentity, ManagedMember
 from local_first_orchestrator.evidence_store import EvidenceStore
 
 SCOPE = {"board_id": "fixture-board", "anchor_task_id": "anchor"}
 PREFIX = "/api/plugins/local-first-orchestrator"
+
+
+def _review(review_id: str, candidate: CandidateIdentity, role: str) -> dict[str, object]:
+    checks = [{"check_id": "fixture", "outcome": "passed", "evidence": "persisted fixture"}]
+    return {"review_id": review_id, "candidate_identity": candidate.to_dict(), "reviewer_role": role,
+            "native_review": {"task_id": role + "-task", "run_id": role + "-run", "session_id": role + "-session", "profile": role},
+            "checks": checks, "checks_identity": hashlib.sha256(json.dumps(checks, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "verdict": "approved", "criterion_evidence": [{"criterion_id": "fixture", "outcome": "pass", "evidence": "persisted fixture"}], "findings": []}
 
 
 def _snapshot(task_id: str, status: str, revision: int, runs=()) -> BoardSnapshot:
@@ -33,6 +42,8 @@ class FixtureBoard:
         self.cards = {
             "anchor": _snapshot("anchor", "blocked", 0),
             "work": _snapshot("work", "running", 0, ({"id": "run-1", "status": "running", "stop_supported": False},)),
+            "finding-one": _snapshot("finding-one", "blocked", 0),
+            "finding-two": _snapshot("finding-two", "blocked", 0),
         }
         self.writes: list[str] = []
         self.create_lock_assertion = None
@@ -103,6 +114,16 @@ def mounted_api(tmp_path: Path, monkeypatch, request):
     store = EvidenceStore.open(config.evidence_store_path, create_new=False)
     if getattr(request, "param", True):
         store.register_member(ManagedMember("fixture-board", "anchor", "work", "implementation", 0, (), "fixture-work"))
+        store.register_member(ManagedMember("fixture-board", "anchor", "finding-one", "implementation", 0, ("finding-1",), "fixture-finding-one"))
+        store.register_member(ManagedMember("fixture-board", "anchor", "finding-two", "implementation", 0, ("finding-2",), "fixture-finding-two"))
+        candidate = CandidateIdentity("fixture-repository", str(config.trusted_roots["workspace"]), "fixture-base", "fixture-head", "fixture-content", "fixture-diff", "fixture-producer-run", "fixture-contract")
+        store.record_review(SCOPE, candidate, _review("fixture-local", candidate, "local"))
+        store.record_review(SCOPE, candidate, _review("fixture-paid", candidate, "paid"))
+        for finding, task, source in (("finding-1", "finding-one", "fixture-charge-one"), ("finding-2", "finding-two", "fixture-charge-two")):
+            store.record_budget_event(SCOPE, {"event_id": "review_corrections:" + source,
+                "lineage_id": "anchor:" + finding, "root_task_id": "anchor", "finding_id": finding,
+                "generation": 0, "source_task_id": task, "source_kind": "native_run",
+                "native_source_id": source, "count": 1}, policy_limit=1)
     store.close()
     configuration_path = tmp_path / "trusted-dashboard-config.json"
     _write_config(config, configuration_path)
@@ -147,6 +168,18 @@ def test_mounted_fixture_dashboard_status_stale_and_partial_stop(mounted_api):
     assert code == 200
     assert status["scope"] == SCOPE
     assert status["active_workers"][0]["id"] == "run-1"
+    assert status["runtime_metrics"]["reviews"] == {"total": 2, "local": 1, "paid": 1}
+    assert [item["reviewer_role"] for item in status["review_queues"]["local"]] == ["local"]
+    assert [item["reviewer_role"] for item in status["review_queues"]["paid"]] == ["paid"]
+    assert status["runtime_metrics"]["budget_usage"] == {
+        "by_finding": [
+            {"root_task_id": "anchor", "finding_id": "finding-1", "category": "review_corrections", "consumed_net": 1, "configured_limit": 1, "remaining": 0},
+            {"root_task_id": "anchor", "finding_id": "finding-2", "category": "review_corrections", "consumed_net": 1, "configured_limit": 1, "remaining": 0},
+        ],
+        "aggregate": {"consumed_net": 2, "semantics": "sum across recorded finding/category ledger rows; not an enforcement ceiling"},
+    }
+    assert status["runtime_metrics"]["native_runs"]["liveness"] == "unknown"
+    assert status["runtime_metrics"]["loop"]["state"] == "unknown"
     assert "observation_digest" in status
 
     stale, stale_body = _request(base + PREFIX + "/actions/pause", "POST", {"expected_observation_digest": "sha256:" + "0" * 64})
@@ -190,6 +223,10 @@ def test_mounted_dashboard_profiles_bounded_configuration_and_enrollment(mounted
         "poll_interval_seconds": 2, "budgets": tightened,
     })
     assert code == 200 and saved["configuration"]["poll_interval_seconds"] == 2
+    assert saved["status"]["runtime_metrics"]["budget_usage"] == {
+        "by_finding": [],
+        "aggregate": {"consumed_net": 0, "semantics": "sum across recorded finding/category ledger rows; not an enforcement ceiling"},
+    }
     assert json.loads(configuration_path.read_text(encoding="utf-8"))["budgets"]["paid_capacity"] == 0
     assert board.writes == ["hold:anchor"]
     code, stale = _request(base + PREFIX + "/configuration", "POST", {

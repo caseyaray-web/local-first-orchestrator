@@ -113,8 +113,14 @@ def _install_board(ctl, store, board, cards):
             return ActionResult(action.key, "verified", "fixture held replay", readback)
         return ActionResult(action.key, "unknown", "fixture verifier unused", None)
 
+    def native_marker(action):
+        marker_payload = json.dumps({"action_key": action.key, "anchor_task_id": action.scope["anchor_task_id"],
+                                     "board_id": action.scope["board_id"], "effect": action.effect},
+                                    sort_keys=True, separators=(",", ":"))
+        return "<!-- local-first-native:v1:sha256:" + hashlib.sha256(marker_payload.encode()).hexdigest() + " -->"
+
     board.create_held = create; board.read_task = read; board.release = release; board.link = link
-    board._native_marker = lambda action: "marker:" + action.key
+    board._native_marker = native_marker
     board.verify_effect = verify
     board.read_accepted_active_tranche_raw_cards = raw_reader
     board.read_scoped_run = lambda _scope, task_id, run_id: next(dict(run) for run in runs[task_id] if str(run["id"]) == str(run_id))
@@ -167,18 +173,30 @@ def _no_effect_state(store, cards, git, tranche_id, base):
             git.existing_execution_base(tranche_id, base))
 
 
-def _exercise_public_m4_core_flow(tmp_path, monkeypatch):
-    ctl, store, board, cards = _batch_fixture(tmp_path, monkeypatch)
-    try:
-        ctl.configured_roles = {"implementation_profile": "implementer", "local_review_profile": "local", "paid_review_profile": "paid", "planning_profile": "default"}
-        ctl.budget_policy = BudgetPolicy(5, 5, 5, 5, 5)
+def _exercise_public_m4_core_flow(tmp_path, monkeypatch, *, public_driver_factory=None, public_setup_factory=None,
+                                   before_accept=None):
+    """Run the seeded regression or a fresh public plan lifecycle setup."""
+    repo = tmp_path / "repo"; repo.mkdir(); _git(repo, "init", "-q"); _git(repo, "config", "user.name", "M4"); _git(repo, "config", "user.email", "m4@example.invalid")
+    (repo / "base.txt").write_text("base\n"); _git(repo, "add", "."); _git(repo, "commit", "-qm", "base")
+    base = _git(repo, "rev-parse", "HEAD"); git = GitWorktreeAdapter(repo, tmp_path / "attempts"); git.resolve_execution_base("TR-A", base)
+    if public_setup_factory is None:
+        ctl, store, board, cards = _batch_fixture(tmp_path, monkeypatch)
         runs = _install_board(ctl, store, board, cards)
-        repo = tmp_path / "repo"; repo.mkdir(); _git(repo, "init", "-q"); _git(repo, "config", "user.name", "M4"); _git(repo, "config", "user.email", "m4@example.invalid")
-        (repo / "base.txt").write_text("base\n"); _git(repo, "add", "."); _git(repo, "commit", "-qm", "base")
-        base = _git(repo, "rev-parse", "HEAD"); git = GitWorktreeAdapter(repo, tmp_path / "attempts"); git.resolve_execution_base("TR-A", base)
-        held = ctl.prepare_active_tranche("plan-1")
+        public = None if public_driver_factory is None else public_driver_factory(ctl, store, board, cards, repo, git)
+    else:
+        ctl, store, board, cards, runs, public = public_setup_factory(repo, git, base)
+    try:
+        if public_setup_factory is None:
+            ctl.configured_roles = {"implementation_profile": "implementer", "local_review_profile": "local", "paid_review_profile": "paid", "planning_profile": "default"}
+        ctl.budget_policy = BudgetPolicy(5, 5, 5, 5, 5)
+        if public is None:
+            held = ctl.prepare_active_tranche("plan-1")
+            linked = ctl.execute_accepted_dependency_link("plan-1", "TK-B", "TK-A")
+        else:
+            pieces = [public.prepare_piece("plan-1", ticket_id) for ticket_id in ("TK-A", "TK-B")]
+            held = {"outcome": "held", "completed": len(pieces), "pieces": pieces}
+            linked = public.link_piece("plan-1", "TK-B", "TK-A")
         assert held["outcome"] == "held" and held["completed"] == 2
-        linked = ctl.execute_accepted_dependency_link("plan-1", "TK-B", "TK-A")
         assert linked["outcome"] == "linked"
 
         # An arbitrary unaccepted ticket cannot reserve a release or alter native state.
@@ -188,10 +206,11 @@ def _exercise_public_m4_core_flow(tmp_path, monkeypatch):
         assert _no_effect_state(store, cards, git, "TR-A", base) == before
 
         # The declared child remains a valid held card after link materialization.
-        assert ctl.release_active_piece("plan-1", "TK-A")["outcome"] == "released"
-        assert ctl.release_active_piece("plan-1", "TK-B")["outcome"] == "released"
-        accepted_reader = store.read_accepted_plan
-        store.read_accepted_plan = lambda scope, plan_id: {**accepted_reader(scope, plan_id), "base_sha": base}
+        assert (ctl.release_active_piece("plan-1", "TK-A") if public is None else public.release_piece("plan-1", "TK-A"))["outcome"] == "released"
+        assert (ctl.release_active_piece("plan-1", "TK-B") if public is None else public.release_piece("plan-1", "TK-B"))["outcome"] == "released"
+        if public is None:
+            accepted_reader = store.read_accepted_plan
+            store.read_accepted_plan = lambda scope, plan_id: {**accepted_reader(scope, plan_id), "base_sha": base}
         ctl.combined_check_runner = lambda context: {"head_sha": context["head_sha"], "checks": [{"check_id": "smoke", "command": "python -c pass", "exit_code": 0, "output_sha256": "sha256:" + context["head_sha"]}]}
 
         first = _candidate(git, repo, "TK-A", base, "a.txt")
@@ -208,9 +227,9 @@ def _exercise_public_m4_core_flow(tmp_path, monkeypatch):
         assert ctl.submit_local_review("plan-1", "TK-A", first, local_a)["outcome"] == "held"
         assert tuple(store.connection.iterdump()) == before
         _complete_same_card_local_review(ctl, store, cards, runs, monkeypatch, "TK-A", task_a, first, local_a)
-        submitted_a = ctl.submit_local_review("plan-1", "TK-A", first, local_a)
-        assert submitted_a["outcome"] == "approved", submitted_a
-        assert ctl.integrate_active_piece("plan-1", "TK-A", first, review_id="local-A-review", git_adapter=git)["outcome"] == "integrated"
+        submitted_a = ctl.submit_local_review("plan-1", "TK-A", first, local_a) if public is None else public.submit_local_review(task_a, first, local_a)
+        assert submitted_a["outcome"] in ({"approved"} if public is None else {"accepted"}), submitted_a
+        assert (ctl.integrate_active_piece("plan-1", "TK-A", first, review_id="local-A-review", git_adapter=git) if public is None else public.integrate_piece("plan-1", "TK-A", "local-A-review"))["outcome"] == "integrated"
 
         # A partial serial chain cannot run checks or create a paid-review card.
         before = _no_effect_state(store, cards, git, "TR-A", base)
@@ -222,14 +241,14 @@ def _exercise_public_m4_core_flow(tmp_path, monkeypatch):
         task_b = next(item["task_id"] for item in held["pieces"] if item["ticket_id"] == "TK-B")
         local_b = _review("local-B-review", second, role="local", task_id=task_b, run_id="local-B", session="local-B-session")
         _complete_same_card_local_review(ctl, store, cards, runs, monkeypatch, "TK-B", task_b, second, local_b)
-        assert ctl.submit_local_review("plan-1", "TK-B", second, local_b)["outcome"] == "approved"
-        assert ctl.integrate_active_piece("plan-1", "TK-B", second, review_id="local-B-review", git_adapter=git)["outcome"] == "integrated"
+        assert (ctl.submit_local_review("plan-1", "TK-B", second, local_b) if public is None else public.submit_local_review(task_b, second, local_b))["outcome"] in ({"approved"} if public is None else {"accepted"})
+        assert (ctl.integrate_active_piece("plan-1", "TK-B", second, review_id="local-B-review", git_adapter=git) if public is None else public.integrate_piece("plan-1", "TK-B", "local-B-review"))["outcome"] == "integrated"
 
-        request = ctl.prepare_paid_integrated_review("plan-1", git_adapter=git)
+        request = ctl.prepare_paid_integrated_review("plan-1", git_adapter=git) if public is None else public.prepare_paid_review("plan-1")
         assert request["outcome"] == "held"
         paid_create = next(op for op in store.read_scope(ctl.scope)["operations"] if op.key == request["review_request_key"])
         assert paid_create.target["native_parent"] is False
-        paid_release = ctl.release_paid_integrated_review("plan-1", git_adapter=git)
+        paid_release = ctl.release_paid_integrated_review("plan-1", git_adapter=git) if public is None else public.release_paid_review("plan-1")
         assert paid_release["outcome"] == "released"
         paid_task = request["review_task_id"]
         cards[paid_task] = _snapshot(cards[paid_task], status="done", assignee="paid")
@@ -238,8 +257,8 @@ def _exercise_public_m4_core_flow(tmp_path, monkeypatch):
         paid = _review("paid-changes", CandidateIdentity.from_dict(candidate), role="paid", task_id=paid_task, run_id="paid-1", session="paid-session", verdict="changes_requested", findings=[{"finding_id":"finding-1","criterion_id":"AC-1","severity":"major","summary":"fixture"}])
         # changes requested is owned by a running reviewer, not terminal approval.
         runs[paid_task] = ({**runs[paid_task][0], "status": "running"},)
-        assert ctl.submit_paid_integrated_review("plan-1", paid, git_adapter=git)["outcome"] == "changes_requested"
-        correction = ctl.prepare_paid_correction("plan-1", "paid-changes", git_adapter=git)
+        assert (ctl.submit_paid_integrated_review("plan-1", paid, git_adapter=git) if public is None else public.submit_paid_review("plan-1", paid))["outcome"] == "changes_requested"
+        correction = ctl.prepare_paid_correction("plan-1", "paid-changes", git_adapter=git) if public is None else public.prepare_paid_correction("plan-1", "paid-changes")
         assert correction["outcome"] == "held"
         correction_create = next(op for op in store.read_scope(ctl.scope)["operations"] if op.key == correction["operation_key"])
         assert correction_create.target["native_parent"] is False
@@ -253,25 +272,27 @@ def _exercise_public_m4_core_flow(tmp_path, monkeypatch):
         assert stale_release["outcome"] == "held"
         assert _no_effect_state(store, cards, git, "TR-A", base) == before
         _git(repo, "update-ref", git.integration_head_ref("TR-A"), second.head_sha, stale.head_sha)
-        correction_release = ctl.release_paid_correction("plan-1", "paid-changes", git_adapter=git)
+        correction_release = ctl.release_paid_correction("plan-1", "paid-changes", git_adapter=git) if public is None else public.release_paid_correction("plan-1", "paid-changes")
         assert correction_release["outcome"] == "released"
 
         correction_candidate = _candidate(git, repo, "TK-CORRECTION", second.head_sha, "correction.txt")
         correction_task = correction["correction_task_id"]
         correction_review = _review("local-correction-review", correction_candidate, role="local", task_id=correction_task, run_id="local-correction", session="local-correction-session")
         _complete_same_card_local_review(ctl, store, cards, runs, monkeypatch, "TK-CORRECTION", correction_task, correction_candidate, correction_review)
-        assert ctl.submit_local_review("plan-1", correction["operation_key"], correction_candidate, correction_review)["outcome"] == "approved"
-        assert ctl.integrate_active_piece("plan-1", correction["operation_key"], correction_candidate, review_id="local-correction-review", git_adapter=git)["outcome"] == "integrated"
-        request2 = ctl.prepare_paid_integrated_review("plan-1", git_adapter=git)
+        assert (ctl.submit_local_review("plan-1", correction["operation_key"], correction_candidate, correction_review) if public is None else public.submit_local_review(correction_task, correction_candidate, correction_review))["outcome"] in ({"approved"} if public is None else {"accepted"})
+        assert (ctl.integrate_active_piece("plan-1", correction["operation_key"], correction_candidate, review_id="local-correction-review", git_adapter=git) if public is None else public.integrate_piece("plan-1", correction["operation_key"], "local-correction-review"))["outcome"] == "integrated"
+        request2 = ctl.prepare_paid_integrated_review("plan-1", git_adapter=git) if public is None else public.prepare_paid_review("plan-1")
         assert request2["outcome"] == "held"
-        assert ctl.release_paid_integrated_review("plan-1", git_adapter=git)["outcome"] == "released"
+        assert (ctl.release_paid_integrated_review("plan-1", git_adapter=git) if public is None else public.release_paid_review("plan-1"))["outcome"] == "released"
         paid_task2 = request2["review_task_id"]
         cards[paid_task2] = _snapshot(cards[paid_task2], status="done", assignee="paid")
         runs[paid_task2] = ({"id":"paid-2", "task_id":paid_task2, "profile":"paid", "status":"completed", "metadata":{"worker_session_id":"paid-2-session"}},)
         paid_candidate2 = next(op for op in store.read_scope(ctl.scope)["operations"] if op.key == request2["review_request_key"]).readback["candidate"]
         approved = _review("paid-approved", CandidateIdentity.from_dict(paid_candidate2), role="paid", task_id=paid_task2, run_id="paid-2", session="paid-2-session")
-        assert ctl.submit_paid_integrated_review("plan-1", approved, git_adapter=git)["outcome"] == "approved"
-        accepted = ctl.accept_tranche("plan-1", "paid-approved", git_adapter=git, authorize_successor=True)
+        assert (ctl.submit_paid_integrated_review("plan-1", approved, git_adapter=git) if public is None else public.submit_paid_review("plan-1", approved))["outcome"] == "approved"
+        if before_accept is not None and before_accept(ctl, store, board, cards, runs, git, public, "plan-1", "paid-approved") is False:
+            return
+        accepted = ctl.accept_tranche("plan-1", "paid-approved", git_adapter=git, authorize_successor=True) if public is None else public.accept_tranche("plan-1", "paid-approved")
         assert accepted["outcome"] == "accepted"
         assert git.existing_execution_base("TR-A", base) == correction_candidate.head_sha
 

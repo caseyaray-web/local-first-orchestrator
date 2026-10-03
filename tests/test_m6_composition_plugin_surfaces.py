@@ -144,6 +144,11 @@ def test_packaging_declares_plugin_root_registration_and_dashboard_assets():
     data_files = metadata["tool"]["setuptools"]["data-files"]
     assets = {asset for paths in data_files.values() for asset in paths}
     assert {"plugin.yaml", "__init__.py", "dashboard/manifest.json", "dashboard/plugin_api.py", "dashboard/dist/index.js"} <= assets
+    manifest = (Path(__file__).parents[1] / "plugin.yaml").read_text(encoding="utf-8")
+    tool_section = manifest.split("provides_tools:\n", 1)[1].split("provides_hooks:", 1)[0]
+    declared_tools = [line.strip()[2:] for line in tool_section.splitlines() if line.strip().startswith("- ")]
+    assert len(declared_tools) == len(set(declared_tools))
+    assert set(declared_tools) == set(TOOL_NAMES)
 
 
 def test_production_git_and_check_callbacks_use_temporary_trusted_git_only(tmp_path: Path, monkeypatch):
@@ -244,6 +249,6 @@ def test_built_distribution_imports_every_module_and_registers_from_temporary_he
     doctor = subprocess.run((str(hermes), "plugins", "doctor", str(plugin_root), "--ci"), cwd=tmp_path,
                             env=env, text=True, capture_output=True)
     assert doctor.returncode == 0, doctor.stdout + doctor.stderr
-    assert "registrations: 5 tool(s), 1 hook(s)" in doctor.stdout
+    assert "registrations: 7 tool(s), 1 hook(s)" in doctor.stdout
     # Doctor runs Hermes' actual discovery/parser/import/register sequence in
     # its own temporary home and reports the native registry readback above.

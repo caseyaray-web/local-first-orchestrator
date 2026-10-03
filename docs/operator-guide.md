@@ -54,6 +54,7 @@ This is the sole first-run initialization path. It does not enroll the anchor or
 | --- | --- |
 | `status` | Read scoped coordinator/evidence status. |
 | `initialize-store` | Explicitly create/migrate an empty plugin evidence store. |
+| `bootstrap-planning --request-file PATH [--request-id ID]` | Persist one operator-owned initial planning request before a planner card or worker run exists. |
 | `enroll` | Uses the implemented bounded native enrollment path; unsupported host capability is reported, never emulated. |
 | `pause [--stop]` | Persist scoped pause; `--stop` requests supported native run stops and exposes partial containment. |
 | `reconcile` | Read/reconcile known scoped evidence and native observations. |
@@ -61,8 +62,19 @@ This is the sole first-run initialization path. It does not enroll the anchor or
 | `cancel` | Persist cancellation and reject late results. |
 | `recover` | Propose/apply only bounded deterministic recovery. |
 | `run [--once]` | Explicit coordinator loop; `--once` is the fixture/operator smoke tick. |
+| `prepare-planner [--request-id ID]` / `release-planner [--request-id ID]` | Create then explicitly release the exact held planner request. |
+| `accept-plan --plan-id ID [--request-id ID]` | Persist plan acceptance only; it does not materialize or release a piece. |
+| `prepare-piece --plan-id ID --ticket-id ID [--request-id ID]` / `link-piece --plan-id ID --child-ticket-id ID --parent-ticket-id ID` / `release-piece --plan-id ID --ticket-id ID` | Explicit held piece lifecycle transitions. |
+| `integrate-piece --plan-id ID --ticket-id ID --review-id ID` | Integrate only the candidate recovered from the exact persisted local-review receipt. |
+| `prepare-paid-review --plan-id ID` / `release-paid-review --plan-id ID` | Create then explicitly release the current integrated-head paid review. |
+| `prepare-paid-correction --plan-id ID --review-id ID` / `release-paid-correction --plan-id ID --review-id ID` | Create then explicitly release a correction bound to paid findings. |
+| `accept-tranche --plan-id ID --review-id ID --authorize-successor` | Persist exact paid approval and the explicit successor decision; successor materialization remains a separate admission. |
 
 Results are JSON. Exit code `0` means verified/recorded/deduplicated/no-op, `3` held, `4` partial, `5` conflict, `6` unsupported, `2` invalid input, and `7` unknown.
+
+Planning bootstrap is an explicit operator step after `initialize-store` and before `prepare-planner`: `bootstrap-planning --request-file /absolute/request.json --request-id initial`. The version-1 request file has exactly `version`, `objective`, `non_goals`, `criteria`, and `authorized_paths`; each criterion is `{ "id": "...", "statement": "..." }`. The operator supplies the bounded objective/criteria/non-goals/path contract. Under the scoped coordinator lock, composition supplies configured scope, repository/workspace roots, roles, fixed code-defined planner limits, and check policy, then observes a clean configured Git HEAD. The tree is read by that full SHA and a final HEAD read rejects drift before persistence. Replaying identical bootstrap input is safe; changed input or a second request conflicts atomically even across independent evidence-store connections. An active pause/cancellation returns `held` before request/Git observation or persistence. Bootstrap creates no board card, worker registration, run binding, capacity charge, release, or plan acceptance.
+
+Planner registration and paid-review verdicts are worker-owned tools, not CLI commands: `local_first_register_planning_request` derives its task/run/session from the native worker environment, while `local_first_submit_paid_review` accepts only an active configured paid-review worker's review record. Bootstrap does not replace planner registration: after explicit release, the native planner worker must still call `local_first_register_planning_request` before submitting the matching plan. Neither worker tool accepts a caller-selected task, run, profile, repository, workspace, candidate, or Git command. The normal `local_first_submit_plan`, local-review, and correction tools retain their existing ownership rules.
 
 ## Native plugin and dashboard
 
@@ -73,6 +85,10 @@ The wheel is a Python distribution, while Hermes discovers native plugins from a
 The mounted dashboard API provides `status`, `profiles`, `configuration`, `enroll`, and scoped `pause`, `stop`, `reconcile`, `resume`, `cancel`, and `recover` actions. Mutations require the current observation digest; stale observations return a conflict with fresh status. `profiles` returns only the four distinct profiles already assigned by trusted bootstrap and `enroll` can target only the configured anchor. Partial stops remain visible as uncontained workers.
 
 `POST /configuration` (also exposed as `update_configuration`) requires the current configuration digest and accepts exactly `poll_interval_seconds` plus all configured budget categories. It can set a 1–3600 second poll interval and **tighten** non-negative limits only. It cannot increase a budget or reset consumed evidence. It writes only the server-selected trusted bootstrap file under the coordinator lock, validates it with `PluginConfig`, and never accepts a browser-selected configuration path, state root, repository/workspace, executable, Hermes home, board/anchor, profile, check command, or task ID.
+
+The dashboard's **Runtime metrics** card restores the historical operational summary using only current scoped evidence and the current native-board readback: observed run lanes, operation phases, and recorded reviews. Review counters and queues derive from persisted `reviewer_role` (`local` or `paid`). **Budget usage by finding** renders each recorded `(root_task_id, finding_id, category)` ledger row as its net consumption, configured per-finding/category limit, and remaining capacity; the displayed total is explicitly a cross-row consumption sum, never an aggregate enforcement ceiling. Categories without ledger rows are reported as such rather than implying a charge or an empty finding. It explicitly reports coordinator heartbeat and worker-process liveness as `Unknown` because the mounted observer does not persist either signal; an active native run lane is not treated as proof of a live process. It does not estimate provider costs or invent runtime samples.
+
+Blank, non-finite, non-integer, or out-of-range numeric fields are rejected inline before the browser sends a configuration request. Budget `0` is an intentional valid tightening; poll interval remains 1–3600 seconds.
 
 ## Operational boundaries
 

@@ -48,9 +48,25 @@
 
     const saveConfiguration = function () {
       if (!configDraft || !status) return;
+      const budgets = {};
+      const intervalText = String(configDraft.poll_interval_seconds).trim();
+      if (!intervalText) { setError("Poll interval is required (1–3600 seconds)."); return; }
+      const interval = Number(intervalText);
+      if (!Number.isFinite(interval) || !Number.isInteger(interval) || interval < 1 || interval > 3600) {
+        setError("Poll interval must be a whole number from 1 to 3600 seconds."); return;
+      }
+      for (const name of Object.keys(configDraft.budgets || {})) {
+        const raw = String(configDraft.budgets[name]).trim();
+        if (!raw) { setError(name.replace(/_/g, " ") + " budget is required."); return; }
+        const value = Number(raw);
+        if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+          setError(name.replace(/_/g, " ") + " budget must be a non-negative whole number."); return;
+        }
+        budgets[name] = value;
+      }
       setBusy(true); setError("");
       const payload = { expected_configuration_digest: status.configuration.configuration_digest,
-        poll_interval_seconds: Number(configDraft.poll_interval_seconds), budgets: configDraft.budgets };
+        poll_interval_seconds: interval, budgets: budgets };
       SDK.fetchJSON(apiBase + "/configuration", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
         .then(function (next) { setStatus(next.status); setConfigDraft(next.configuration); setResult(next.configuration); })
         .catch(function (err) { return refresh().then(function () { setError(String(err.message || err)); }); })
@@ -70,6 +86,24 @@
       return React.createElement("div", { className: "space-y-2" },
         React.createElement("h3", { className: "text-sm font-medium" }, title),
         !values || !values.length ? React.createElement("p", { className: "text-xs text-muted-foreground" }, "None.") : values.map(render));
+    };
+    const updateBudget = function (name, value) {
+      setConfigDraft(function (current) {
+        return Object.assign({}, current, { budgets: Object.assign({}, current.budgets, { [name]: value }) });
+      });
+    };
+    const budgetUsage = function (usage) {
+      const rows = usage && usage.by_finding || [];
+      const aggregate = usage && usage.aggregate;
+      return React.createElement("div", { className: "space-y-2" },
+        React.createElement("h3", { className: "text-sm font-medium" }, "Budget usage by finding"),
+        !rows.length ? React.createElement("p", { className: "text-xs text-muted-foreground" }, "No budget ledger rows are recorded for this scope.") : rows.map(function (row) {
+          return React.createElement("div", { key: row.root_task_id + ":" + row.finding_id + ":" + row.category, className: "rounded border p-2 text-xs" },
+            row.root_task_id + " / " + row.finding_id + " / " + row.category + ": net " + row.consumed_net +
+            " of configured limit " + row.configured_limit + "; remaining " + row.remaining);
+        }),
+        aggregate ? React.createElement("p", { className: "text-xs text-muted-foreground" },
+          "Total net consumption: " + aggregate.consumed_net + ". " + aggregate.semantics) : null);
     };
 
     return React.createElement("div", { className: "space-y-4 max-w-6xl" },
@@ -98,8 +132,27 @@
           React.createElement("label", { className: "text-sm" }, "Configured scope", React.createElement("select", { disabled: true, value: status.scope.board_id + ":" + status.scope.anchor_task_id, className: "block w-full rounded border p-2" }, React.createElement("option", { value: status.scope.board_id + ":" + status.scope.anchor_task_id }, status.scope.board_id + " / " + status.scope.anchor_task_id))),
           React.createElement("pre", { className: "rounded border p-2 text-xs overflow-auto" }, json(profiles)),
           React.createElement("label", { className: "text-sm" }, "Poll interval (seconds)", React.createElement("input", { type: "number", min: 1, max: 3600, value: configDraft.poll_interval_seconds, onChange: function (event) { setConfigDraft(Object.assign({}, configDraft, { poll_interval_seconds: event.target.value })); }, className: "block w-full rounded border p-2" })),
-          React.createElement("pre", { className: "rounded border p-2 text-xs overflow-auto" }, "Budget limits (may only be tightened through the bounded API):\n" + json(configDraft.budgets)),
+          React.createElement("div", { className: "grid gap-3 sm:grid-cols-2" }, Object.keys(configDraft.budgets || {}).sort().map(function (name) {
+            return React.createElement("label", { key: name, className: "text-sm" }, name.replace(/_/g, " ") + " budget",
+              React.createElement("input", { type: "number", min: 0, step: 1, value: configDraft.budgets[name], disabled: busy,
+                onChange: function (event) { updateBudget(name, event.target.value); }, className: "block w-full rounded border p-2" }));
+          })),
+          React.createElement("p", { className: "text-xs text-muted-foreground" }, "Budget limits may only be tightened; the server rejects increases and stale saves."),
           React.createElement(Button, { disabled: busy, onClick: saveConfiguration }, "Save bounded configuration"))) : null,
+      status && status.runtime_metrics ? React.createElement(Card, null,
+        React.createElement(CardHeader, null, React.createElement(CardTitle, null, "Runtime metrics")),
+        React.createElement(CardContent, { className: "space-y-3" },
+          React.createElement("p", { className: "text-xs text-muted-foreground" }, "Metrics are read from the current scoped evidence/native-board observation. Worker liveness and loop heartbeat are unknown unless durable evidence exists."),
+          React.createElement("div", { className: "grid gap-3 sm:grid-cols-4" },
+            metric("Observed native runs", status.runtime_metrics.native_runs.observed_total),
+            metric("Observed active run lanes", status.runtime_metrics.native_runs.observed_active),
+            metric("Applied operations", status.runtime_metrics.operations.applied),
+            metric("Pending / unknown operations", status.runtime_metrics.operations.pending + " / " + status.runtime_metrics.operations.unknown)),
+          React.createElement("div", { className: "grid gap-3 sm:grid-cols-3" },
+            metric("Recorded reviews", status.runtime_metrics.reviews.total),
+            metric("Local / paid reviews", status.runtime_metrics.reviews.local + " / " + status.runtime_metrics.reviews.paid),
+            metric("Coordinator heartbeat", status.runtime_metrics.loop.last_heartbeat || "Unknown")),
+          budgetUsage(status.runtime_metrics.budget_usage))) : null,
       status ? React.createElement(React.Fragment, null,
         React.createElement(Card, null, React.createElement(CardHeader, null, React.createElement(CardTitle, null, "Managed anchors, head, and workers")),
           React.createElement(CardContent, { className: "space-y-3" },

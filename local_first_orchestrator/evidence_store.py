@@ -906,6 +906,96 @@ class EvidenceStore:
         stored = self.reserve_operation(intent)
         return stored.to_dict()["target"]
 
+    def bootstrap_planning_request(self, scope: Mapping[str, Any], request: Any, *, request_id: str | None = None) -> Mapping[str, Any]:
+        """Persist the operator-owned initial request before any planner exists.
+
+        This is deliberately distinct from ``register_planning_request``: it
+        records no native task, profile, run, capacity charge, or release proof.
+        A worker must still register its exact released planner run separately.
+        """
+        from .decomposition_planner import PlanningRequest, request_payload
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        if type(request) is not PlanningRequest:
+            raise ValueError("PlanningRequest required")
+        if request.board_id != board or request.anchor_id != anchor:
+            raise ConflictError("planning request scope does not match bootstrap scope")
+        if request_id is not None and not _nonempty_string(request_id):
+            raise ValueError("request_id must be non-empty when supplied")
+        key = "bootstrap-planning-request:" + _canonical_identity({"board_id": board, "anchor_task_id": anchor})
+        if request_id is not None:
+            key += ":" + _canonical_identity({"request_id": request_id})
+        payload = request_payload(request)
+        intent = OperationIntent(
+            key, {"board_id": board, "anchor_task_id": anchor},
+            {"request": payload}, "bootstrap_planning_request", request.identity,
+            {"request_identity": request.identity}, "verified",
+            {"operator_owned": True, "request_identity": request.identity},
+            {"operator_owned": True}, "applied",
+        )
+        # The scope-wide immutable-bootstrap decision and insertion must share a
+        # single write transaction.  Calling reserve_operation after a separate
+        # scan lets two independent store connections both see an empty scope and
+        # insert different request-id keys.
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = [OperationIntent.from_dict(_decode(row[0])) for row in self.connection.execute(
+                "SELECT intent_json FROM operation_intents WHERE board_id=? AND anchor_task_id=?", (board, anchor)
+            )]
+            bootstraps = [item for item in existing if item.effect == "bootstrap_planning_request"]
+            if bootstraps:
+                if len(bootstraps) != 1 or bootstraps[0].target != {"request": payload} or bootstraps[0].key != key:
+                    raise ConflictError("initial planning bootstrap is already immutable for this scope")
+                self.connection.commit()
+                return bootstraps[0].to_dict()["target"]
+            self.connection.execute(
+                "INSERT INTO operation_intents VALUES (?, ?, ?, ?)",
+                (board, anchor, intent.key, _json(intent.to_dict())),
+            )
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
+        return intent.to_dict()["target"]
+
+    def read_bootstrap_planning_request(self, scope: Mapping[str, Any], *, request_id: str | None = None) -> Mapping[str, Any]:
+        self._require_schema()
+        board, anchor = _scope_values(scope)
+        if request_id is not None and not _nonempty_string(request_id):
+            raise ValueError("request_id must be non-empty when supplied")
+        key = "bootstrap-planning-request:" + _canonical_identity({"board_id": board, "anchor_task_id": anchor})
+        if request_id is not None:
+            key += ":" + _canonical_identity({"request_id": request_id})
+        if request_id is None:
+            rows = self.connection.execute(
+                "SELECT intent_json FROM operation_intents WHERE board_id=? AND anchor_task_id=?",
+                (board, anchor),
+            )
+            matches = [OperationIntent.from_dict(_decode(row[0])) for row in rows]
+            matches = [item for item in matches if item.effect == "bootstrap_planning_request"]
+            if len(matches) != 1:
+                raise SchemaError("exactly one planning request bootstrap is required")
+            intent = matches[0]
+        else:
+            intent = self._operation({"board_id": board, "anchor_task_id": anchor}, key)
+        if (intent.effect != "bootstrap_planning_request" or intent.phase != "applied"
+                or intent.outcome != "verified"):
+            raise SchemaError("planning request bootstrap evidence is malformed")
+        from .planning_coordinator import request_from_payload
+        target = intent.to_dict()["target"]
+        try:
+            if (set(target) != {"request"}
+                    or intent.before_evidence != {"request_identity": intent.expected_observed_identity}
+                    or intent.readback != {"operator_owned": True, "request_identity": intent.expected_observed_identity}
+                    or intent.retry != {"operator_owned": True}):
+                raise ValueError("bootstrap target/readback mismatch")
+            request = request_from_payload(target["request"])
+            if request.identity != intent.expected_observed_identity or request.board_id != board or request.anchor_id != anchor:
+                raise ValueError("bootstrap request identity or scope is inconsistent")
+        except (TypeError, KeyError, ValueError) as error:
+            raise SchemaError("planning request bootstrap evidence is malformed") from error
+        return target
+
     def read_planning_request(self, scope: Mapping[str, Any], *, request_id: str | None = None) -> Mapping[str, Any]:
         self._require_schema()
         board, anchor = _scope_values(scope)

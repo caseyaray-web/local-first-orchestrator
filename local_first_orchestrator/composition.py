@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -95,6 +96,59 @@ def _git_observer(config: PluginConfig, scope: Mapping[str, str]) -> Mapping[str
             "criterion_ids": [item["check_id"] for item in checks], "plan_id": None}
 
 
+def operator_planning_request(config: PluginConfig, request_file: Path) -> Any:
+    """Build one immutable initial request from operator text and trusted facts."""
+    if not isinstance(config, PluginConfig) or not isinstance(request_file, Path):
+        raise ValueError("validated configuration and request file are required")
+    if not request_file.is_absolute() or request_file.is_symlink() or not request_file.is_file():
+        raise ValueError("request file must be an absolute regular JSON file")
+    try:
+        raw = json.loads(request_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("request file must contain valid JSON") from error
+    if not isinstance(raw, Mapping) or set(raw) != {"version", "objective", "non_goals", "criteria", "authorized_paths"} or raw["version"] != 1:
+        raise ValueError("request file must contain exactly version, objective, non_goals, criteria, and authorized_paths")
+    objective, non_goals, criteria, authorized_paths = raw["objective"], raw["non_goals"], raw["criteria"], raw["authorized_paths"]
+    if type(objective) is not str or type(non_goals) is not list or any(type(item) is not str for item in non_goals):
+        raise ValueError("operator objective and non_goals must be strings")
+    if not isinstance(criteria, list) or not criteria or any(not isinstance(item, Mapping) or set(item) != {"id", "statement"} or type(item["id"]) is not str or type(item["statement"]) is not str for item in criteria):
+        raise ValueError("criteria must be a non-empty list of id/statement objects")
+    if len({item["id"] for item in criteria}) != len(criteria):
+        raise ValueError("criteria IDs must be unique")
+    if (not isinstance(authorized_paths, list) or not authorized_paths
+            or any(type(path) is not str or not path or path.startswith("/") or "\\" in path or any(part in {"", ".", ".."} for part in path.split("/")) for path in authorized_paths)
+            or len(set(authorized_paths)) != len(authorized_paths)):
+        raise ValueError("authorized_paths must be unique safe repository-relative paths")
+    head = _git(config, "rev-parse", "HEAD")
+    if _git(config, "status", "--porcelain=v1", "--untracked-files=all"):
+        raise ValueError("trusted repository is dirty; planning bootstrap is unavailable")
+    paths = tuple(line for line in _git(config, "ls-files", "-z").split("\0") if line)
+    if not paths:
+        raise ValueError("trusted repository has no tracked planning paths")
+    # Pin every tree observation to the full SHA captured before status.  A
+    # final HEAD read rejects a repository that moved while the request was
+    # assembled instead of persisting a mixed-revision identity.
+    snapshot = hashlib.sha256(_git(config, "ls-tree", "-r", head).encode("utf-8")).hexdigest()
+    if _git(config, "rev-parse", "HEAD") != head:
+        raise ValueError("trusted repository HEAD changed during planning bootstrap observation")
+    contract = {"objective": objective, "non_goals": non_goals, "criteria": criteria,
+                "repository": str(config.trusted_roots["repository"]), "head": head,
+                "authorized_paths": sorted(authorized_paths), "checks": [(key, list(argv)) for key, argv in config.check_commands]}
+    from .decomposition_planner import PlanningRequest
+    return PlanningRequest(
+        board_id=config.scope["board_id"], anchor_id=config.scope["anchor_task_id"],
+        repository_identity=str(config.trusted_roots["repository"]), base_sha=head,
+        snapshot_hash=snapshot, root_contract_hash=hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest(),
+        expected_criteria=frozenset(item["id"] for item in criteria), authorized_paths=frozenset(authorized_paths),
+        max_tranches=8, max_tickets=64, max_context_tokens=65536, max_patch_files=128,
+        max_patch_lines=20000, max_attempts=16,
+        verification_commands=tuple(argv for _key, argv in config.check_commands),
+        verification_timeout_seconds=300, verification_output_limit=1_000_000,
+        max_payload_bytes=1_000_000, max_json_depth=32, objective=objective,
+        non_goals=tuple(non_goals), criterion_statements=tuple((item["id"], item["statement"]) for item in criteria),
+    )
+
+
 def build_runtime(config: PluginConfig, *, scope: Mapping[str, object], board: Any | None = None) -> Runtime:
     """Open a configured evidence store and assemble one scoped coordinator.
 
@@ -131,8 +185,8 @@ def build_runtime(config: PluginConfig, *, scope: Mapping[str, object], board: A
         def planning_observer(candidate_scope: Mapping[str, str]) -> Mapping[str, Any]:
             if dict(candidate_scope) != valid_scope:
                 raise ValueError("planning observer scope differs from configured scope")
-            registration = store.read_planning_request(valid_scope)
-            request = registration.get("request")
+            bootstrap = store.read_bootstrap_planning_request(valid_scope)
+            request = bootstrap.get("request")
             if not isinstance(request, Mapping):
                 raise ValueError("accepted planning request is unavailable")
             return {"request": dict(request)}
@@ -162,6 +216,18 @@ def close_runtime(runtime: Runtime) -> None:
     runtime.store.close()
 
 
+def build_git_adapter(config: PluginConfig) -> Any:
+    """Construct the only Git adapter available to public lifecycle handlers.
+
+    Roots come exclusively from the already validated bootstrap configuration;
+    command and tool arguments never select a repository or worktree root.
+    """
+    if not isinstance(config, PluginConfig):
+        raise ValueError("build_git_adapter requires validated PluginConfig")
+    from .git_adapter import GitWorktreeAdapter
+    return GitWorktreeAdapter(config.trusted_roots["repository"], config.trusted_roots["workspace"])
+
+
 def initialize_store(config: PluginConfig) -> Path:
     """Explicit first-time store bootstrap; never called by ordinary runtime use."""
     if not isinstance(config, PluginConfig):
@@ -174,4 +240,4 @@ def initialize_store(config: PluginConfig) -> Path:
     return config.evidence_store_path
 
 
-__all__ = ["Runtime", "build_runtime", "close_runtime", "initialize_store"]
+__all__ = ["Runtime", "build_runtime", "build_git_adapter", "close_runtime", "initialize_store", "operator_planning_request"]

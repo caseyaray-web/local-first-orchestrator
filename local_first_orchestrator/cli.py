@@ -5,14 +5,18 @@ import argparse
 import json
 import signal
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, Sequence
 
-from .composition import build_runtime, close_runtime, initialize_store
+from .composition import build_git_adapter, build_runtime, close_runtime, initialize_store, operator_planning_request
 from .config import PluginConfig
 from .daemon import CoordinatorLoop
 
-_EXIT = {"verified": 0, "recorded": 0, "deduplicated": 0, "no-op": 0, "held": 3,
-         "partial": 4, "conflict": 5, "unsupported": 6, "invalid": 2, "unknown": 7}
+_EXIT = {"verified": 0, "recorded": 0, "deduplicated": 0, "no-op": 0,
+         "held": 3, "released": 0, "linked": 0, "integrated": 0,
+         "accepted": 0, "approved": 0, "proposed": 0,
+         "changes_requested": 0, "partial": 4, "conflict": 5,
+         "unsupported": 6, "invalid": 2, "unknown": 7}
 
 
 def register_cli(parser: argparse.ArgumentParser) -> None:
@@ -22,7 +26,22 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status")
     commands.add_parser("initialize-store", help="explicitly create the configured empty evidence store")
+    bootstrap = commands.add_parser("bootstrap-planning", help="persist an operator-owned initial planning request")
+    bootstrap.add_argument("--request-file", required=True, type=Path)
+    bootstrap.add_argument("--request-id")
     commands.add_parser("enroll")
+    planner_prepare = commands.add_parser("prepare-planner"); planner_prepare.add_argument("--request-id")
+    planner_release = commands.add_parser("release-planner"); planner_release.add_argument("--request-id")
+    accept_plan = commands.add_parser("accept-plan"); accept_plan.add_argument("--plan-id", required=True); accept_plan.add_argument("--request-id")
+    prepare_piece = commands.add_parser("prepare-piece"); prepare_piece.add_argument("--plan-id", required=True); prepare_piece.add_argument("--ticket-id", required=True); prepare_piece.add_argument("--request-id")
+    link_piece = commands.add_parser("link-piece"); link_piece.add_argument("--plan-id", required=True); link_piece.add_argument("--child-ticket-id", required=True); link_piece.add_argument("--parent-ticket-id", required=True); link_piece.add_argument("--request-id")
+    release_piece = commands.add_parser("release-piece"); release_piece.add_argument("--plan-id", required=True); release_piece.add_argument("--ticket-id", required=True)
+    integrate_piece = commands.add_parser("integrate-piece"); integrate_piece.add_argument("--plan-id", required=True); integrate_piece.add_argument("--ticket-id", required=True); integrate_piece.add_argument("--review-id", required=True)
+    prepare_paid = commands.add_parser("prepare-paid-review"); prepare_paid.add_argument("--plan-id", required=True)
+    release_paid = commands.add_parser("release-paid-review"); release_paid.add_argument("--plan-id", required=True)
+    prepare_correction = commands.add_parser("prepare-paid-correction"); prepare_correction.add_argument("--plan-id", required=True); prepare_correction.add_argument("--review-id", required=True)
+    release_correction = commands.add_parser("release-paid-correction"); release_correction.add_argument("--plan-id", required=True); release_correction.add_argument("--review-id", required=True)
+    accept_tranche = commands.add_parser("accept-tranche"); accept_tranche.add_argument("--plan-id", required=True); accept_tranche.add_argument("--review-id", required=True); accept_tranche.add_argument("--authorize-successor", action="store_true", required=True)
     pause = commands.add_parser("pause"); pause.add_argument("--stop", action="store_true")
     commands.add_parser("reconcile")
     resume = commands.add_parser("resume"); resume.add_argument("--authorized-clear", action="store_true")
@@ -40,7 +59,7 @@ def _json_value(value: Any, *, depth: int = 0) -> Any:
         return value
     if isinstance(value, Path):
         return str(value)
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(key): _json_value(child, depth=depth + 1) for key, child in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
         return [_json_value(child, depth=depth + 1) for child in value]
@@ -53,7 +72,7 @@ def _json_value(value: Any, *, depth: int = 0) -> Any:
 
 
 def render_result(result: Any) -> int:
-    payload = result if isinstance(result, dict) else {"outcome": "unknown", "result": result}
+    payload = dict(result) if isinstance(result, Mapping) else {"outcome": "unknown", "result": result}
     print(json.dumps(_json_value(payload), sort_keys=True, separators=(",", ":")))
     return _EXIT.get(str(payload.get("outcome", "unknown")), 7)
 
@@ -61,6 +80,8 @@ def render_result(result: Any) -> int:
 def run_command(args: argparse.Namespace) -> int:
     config = PluginConfig.from_file(args.config)
     if args.command == "initialize-store":
+        if {"board_id": args.board, "anchor_task_id": args.anchor_task_id} != dict(config.scope):
+            raise ValueError("initialize-store scope must match the configured board and anchor")
         return render_result({"outcome": "verified", "evidence_store": str(initialize_store(config))})
     runtime = build_runtime(config, scope={"board_id": args.board, "anchor_task_id": args.anchor_task_id})
     try:
@@ -77,8 +98,41 @@ def run_command(args: argparse.Namespace) -> int:
             result = coordinator.cancel()
         elif args.command == "recover":
             result = coordinator.recover()
+        elif args.command == "bootstrap-planning":
+            result = coordinator.bootstrap_planning_request(
+                lambda: operator_planning_request(config, args.request_file), request_id=args.request_id)
         elif args.command == "enroll":
             result = coordinator.enroll()
+        elif args.command == "prepare-planner":
+            result = coordinator.prepare_planner(request_id=args.request_id)
+        elif args.command == "release-planner":
+            result = coordinator.release_planner(request_id=args.request_id)
+        elif args.command == "accept-plan":
+            result = dict(coordinator.accept_validated_plan(args.plan_id, request_id=args.request_id))
+            # Older successful acceptance records predate an explicit outcome;
+            # never overwrite a coordinator-held or invalid fail-closed result.
+            result.setdefault("outcome", "accepted")
+        elif args.command == "prepare-piece":
+            result = coordinator.prepare_active_piece(args.plan_id, args.ticket_id, request_id=args.request_id)
+        elif args.command == "link-piece":
+            result = coordinator.execute_accepted_dependency_link(args.plan_id, args.child_ticket_id, args.parent_ticket_id,
+                                                                   request_id=args.request_id)
+        elif args.command == "release-piece":
+            result = coordinator.release_active_piece(args.plan_id, args.ticket_id)
+        elif args.command == "integrate-piece":
+            result = coordinator.integrate_persisted_active_piece(args.plan_id, args.ticket_id, args.review_id,
+                                                                    git_adapter=build_git_adapter(config))
+        elif args.command == "prepare-paid-review":
+            result = coordinator.prepare_paid_integrated_review(args.plan_id, git_adapter=build_git_adapter(config))
+        elif args.command == "release-paid-review":
+            result = coordinator.release_paid_integrated_review(args.plan_id, git_adapter=build_git_adapter(config))
+        elif args.command == "prepare-paid-correction":
+            result = coordinator.prepare_paid_correction(args.plan_id, args.review_id, git_adapter=build_git_adapter(config))
+        elif args.command == "release-paid-correction":
+            result = coordinator.release_paid_correction(args.plan_id, args.review_id, git_adapter=build_git_adapter(config))
+        elif args.command == "accept-tranche":
+            result = coordinator.accept_tranche(args.plan_id, args.review_id, git_adapter=build_git_adapter(config),
+                                                 authorize_successor=args.authorize_successor)
         elif args.command == "run":
             loop = CoordinatorLoop(lambda _assert_held: coordinator.tick(), lock_path=config.lock_path,
                                    interval_seconds=config.poll_interval_seconds)

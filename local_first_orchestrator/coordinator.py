@@ -1684,6 +1684,28 @@ class Coordinator:
             raise ValueError("accepted source, request, or route changed during read-only proof")
 
 
+    def bootstrap_planning_request(self, request_factory: Callable[[], Any], *,
+                                   request_id: str | None = None) -> Mapping[str, Any]:
+        """Record the operator's first request inside the scoped mutation fence.
+
+        The factory performs composition-owned Git observation only after the
+        active pause/cancellation check.  Store-level atomicity remains required
+        because independent processes can have distinct coordinator locks.
+        """
+        if not callable(request_factory):
+            raise ValueError("bootstrap request factory must be callable")
+        if request_id is not None and (type(request_id) is not str or not request_id.strip() or len(request_id) > 256):
+            raise ValueError("request_id must be a non-empty string of at most 256 characters")
+        with self.lock:
+            self._assert_lock()
+            state = self.store.read_scope(self.scope)
+            pause = state["operator_intent"]
+            if pause is not None and pause.active:
+                return {"outcome": "held", "reason": "operator_pause_or_cancellation_active", "actions_attempted": 0}
+            request = request_factory()
+            target = self.store.bootstrap_planning_request(self.scope, request, request_id=request_id)
+            return {"outcome": "recorded", **target}
+
     def prepare_planner(self, *, request_id: str | None = None,
                         planning_profile: str | None = None) -> Mapping[str, Any]:
         """Create one durable, blocked planner card. This never dispatches work.
@@ -1943,13 +1965,14 @@ class Coordinator:
         if len([m for m in state["members"] if m.role == "implementation" and m.task_id == task_id]) != 1:
             raise ValueError("released candidate lacks exact managed implementation member")
 
-    def integrate_active_piece(self, plan_id: str, ticket_id: str, candidate: Any, *, review_id: str, git_adapter: Any) -> Mapping[str, Any]:
+    def integrate_active_piece(self, plan_id: str, ticket_id: str, candidate: Any, *, review_id: str, git_adapter: Any,
+                               _already_locked: bool = False) -> Mapping[str, Any]:
         """CAS-integrate one locally approved frozen candidate into an existing tranche ref."""
         from .contracts import CandidateIdentity
         from .git_adapter import GitAdapterError, IntegrationHeadConflictError
         if not isinstance(candidate, CandidateIdentity) or not isinstance(review_id, str) or not review_id:
             raise ValueError("candidate and local review identity are required")
-        with self.lock:
+        with (nullcontext() if _already_locked else self.lock):
             self._assert_lock()
             state = self.store.read_scope(self.scope)
             if state["operator_intent"] is not None and state["operator_intent"].active:
@@ -2016,6 +2039,30 @@ class Coordinator:
                 result = {"integration_head_before": expected, "integration_head_after": after, "candidate_identity": candidate.to_dict(), "review_id": review_id}
             self.store.ack_effect(self.scope, key, readback=result, outcome="verified")
             return {"outcome": "integrated", "operation_key": key, **result}
+
+    def integrate_persisted_active_piece(self, plan_id: str, ticket_id: str, review_id: str, *, git_adapter: Any) -> Mapping[str, Any]:
+        """Public identity-only integration façade.
+
+        The selected local-review receipt is the authority for the candidate.  A
+        CLI caller therefore cannot smuggle a worktree/head through JSON.
+        """
+        from .contracts import CandidateIdentity
+        if not all(type(value) is str and value for value in (plan_id, ticket_id, review_id)):
+            raise ValueError("explicit plan, ticket, and local review identities are required")
+        with self.lock:
+            self._assert_lock()
+            state = self.store.read_scope(self.scope)
+            reviews = [item for item in state["reviews"] if item.get("review_id") == review_id]
+            if len(reviews) != 1 or reviews[0].get("reviewer_role") != "local":
+                return {"outcome": "held", "reason": "exact_persisted_local_review_required"}
+            try:
+                candidate = CandidateIdentity.from_dict(reviews[0]["candidate_identity"])
+            except (KeyError, TypeError, ValueError):
+                return {"outcome": "held", "reason": "persisted_local_review_candidate_is_malformed"}
+            # The delegated method owns the same non-reentrant lock, so use its
+            # implementation directly rather than re-entering a public lock.
+            return self.integrate_active_piece(plan_id, ticket_id, candidate, review_id=review_id,
+                                               git_adapter=git_adapter, _already_locked=True)
 
     def prepare_paid_integrated_review(self, plan_id: str, *, git_adapter: Any) -> Mapping[str, Any]:
         """Freeze the complete integrated head, run trusted checks, and hold one paid review card.
