@@ -39,7 +39,7 @@ local-first-orchestrator \
 
 Normal commands open an existing store only. They never create a missing store, alter `kanban.db`, select arbitrary filesystem roots from request data, or implicitly enable/activate the plugin.
 
-See [the operator guide](docs/operator-guide.md) for configuration fields, command outcomes, dashboard behavior, and limitations. The removal inventory and retained replacement test mapping are in [docs/plans/m6-legacy-removal-inventory.md](docs/plans/m6-legacy-removal-inventory.md).
+See [the operator guide](docs/operator-guide.md) for configuration fields, command outcomes, dashboard behavior, and limitations. M7's release-readiness-only [cutover checklist](docs/release/m7-cutover-checklist.md) and [rollback package runbook](docs/release/m7-rollback-runbook.md) make live authorization and post-effect reconciliation STOP boundaries explicit. The removal inventory and retained replacement test mapping are in [docs/plans/m6-legacy-removal-inventory.md](docs/plans/m6-legacy-removal-inventory.md).
 
 ## Development verification
 

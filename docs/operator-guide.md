@@ -81,6 +81,10 @@ The mounted dashboard API provides `status`, `profiles`, `configuration`, `enrol
 - A hold, failed stop, unknown effect, missing evidence, or unsupported capability is surfaced; it is not converted to success.
 - Existing legacy stores, boards, worktrees, profiles, and user data are not migrated, resumed, or deleted.
 
+## M7 release readiness and cutover boundary
+
+The [M7 cutover checklist](release/m7-cutover-checklist.md) and [rollback package runbook](release/m7-rollback-runbook.md) are release-readiness artifacts only. They require explicit STOP authorization for target capture, installation/enablement, disposable native proving, scope expansion, and any post-effect reconciliation. The fixture rollback archive covers only an allowlisted plugin artifact, named trusted bootstrap, and SQLite-backup-API copy of plugin-owned evidence; it cannot restore `kanban.db`, native cards/runs, providers, profiles, services, or an installed legacy plugin.
+
 ## Status
 
 M6 source and fixture verification are complete only to the extent recorded in `docs/plans/m6-implementation-progress.md`. Fresh independent review and separately authorized live activation remain paused M7/cutover gates.
