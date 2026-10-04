@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import copy
 import gc
+import json
 from types import SimpleNamespace
 import weakref
 
 import pytest
 
 from local_first_orchestrator.coordinator import Coordinator
-from local_first_orchestrator.plugin_tools import _runtime_for_args
+from local_first_orchestrator.plugin_tools import _runtime_for_args, register_tools
 from local_first_orchestrator import worker_context
 from local_first_orchestrator.worker_context import NativeWorkerContext, capture_native_worker_context
 
@@ -141,6 +142,48 @@ def test_capture_fails_field_only_when_contextual_session_is_blank(monkeypatch, 
     monkeypatch.setenv("HERMES_SESSION_ID", "foreign-process-session")
 
     with scoped_current_session_id(""):
-        with pytest.raises(ValueError, match="^trusted native worker context unbound$") as error:
+        with pytest.raises(ValueError, match="^native_worker_context_unbound$") as error:
             capture_native_worker_context()
     assert "foreign-process-session" not in str(error.value)
+
+
+@pytest.mark.parametrize("missing_field", ("task_id", "run_id", "session_id", "board_id"))
+def test_registered_request_local_review_reports_each_missing_field_before_runtime_or_effects(
+        monkeypatch, scoped_current_session_id, missing_field):
+    """The installed public handler diagnoses an unbound worker without composing.
+
+    The sentinels cover every mutable stage a successful request could reach:
+    composition, store access, candidate/check construction, intent reservation,
+    and native calls.  A missing capture field must leave all of them untouched.
+    """
+    names = {"task_id": "HERMES_KANBAN_TASK", "run_id": "HERMES_KANBAN_RUN_ID",
+             "board_id": "HERMES_KANBAN_BOARD"}
+    for name in names.values():
+        monkeypatch.setenv(name, "trusted-" + name.lower())
+    monkeypatch.setenv("HERMES_SESSION_ID", "foreign-process-session")
+    if missing_field == "session_id":
+        session = ""
+    else:
+        monkeypatch.delenv(names[missing_field], raising=False)
+        session = "trusted-context-session"
+
+    registered, effects = {}, []
+
+    class Context:
+        def register_tool(self, **kwargs):
+            registered[kwargs["name"]] = kwargs
+
+    def forbidden_runtime_factory(_scope):
+        effects.append("runtime_composed")
+        raise AssertionError("missing worker context must fail before composition")
+
+    register_tools(Context(), runtime_factory=forbidden_runtime_factory)
+    with scoped_current_session_id(session):
+        response = json.loads(registered["local_first_request_local_review"]["handler"](
+            {"board_id": "fixture-board", "anchor_task_id": "anchor",
+             "operation_key": "diagnostic-only", "summary": "context diagnosis"}))
+
+    assert response == {"ok": False, "outcome": "invalid_or_held",
+                        "error": "native_worker_context_unbound",
+                        "missing_native_context_fields": [missing_field]}
+    assert effects == []

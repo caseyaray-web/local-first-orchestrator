@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any, Callable, Mapping, Protocol
 from .composition import close_runtime
-from .worker_context import NativeWorkerContext, capture_native_worker_context
+from .worker_context import (MissingNativeWorkerContextError, NativeWorkerContext,
+                             capture_native_worker_context)
 
 
 TOOL_NAMES = (
@@ -47,6 +47,11 @@ def _json_result(call: Callable[[], Mapping[str, Any]]) -> str:
     try:
         value = dict(call())
         return json.dumps({"ok": True, "result": value}, sort_keys=True, allow_nan=False)
+    except MissingNativeWorkerContextError as error:
+        return json.dumps({"ok": False, "outcome": "invalid_or_held",
+                           "error": "native_worker_context_unbound",
+                           "missing_native_context_fields": list(error.missing_fields)},
+                          sort_keys=True)
     except (ValueError, KeyError, TypeError, RuntimeError) as error:
         return json.dumps({"ok": False, "outcome": "invalid_or_held", "error": str(error)}, sort_keys=True)
     except Exception:
@@ -57,18 +62,12 @@ def _runtime_for_args(runtime_factory: Callable[..., Any], args: Mapping[str, An
     if not isinstance(args, Mapping):
         raise ValueError("object arguments are required")
     requested_scope = {"board_id": args.get("board_id"), "anchor_task_id": args.get("anchor_task_id")}
-    # Capture before composition so a contextvar-correct public entry cannot be
-    # changed by later process-global mutations. A failed worker capture still
-    # opens/closes the configured runtime once to preserve existing handler
-    # lifecycle cleanup semantics.
+    # Capture before composition so an unbound worker returns a value-free
+    # diagnostic before opening a runtime or reaching any mutable authority.
+    # A successful snapshot remains stable across later global mutations.
     worker_context: NativeWorkerContext | None = None
     if require_worker:
-        try:
-            worker_context = capture_native_worker_context()
-        except Exception:
-            runtime = runtime_factory(requested_scope)
-            close_runtime(runtime)
-            raise
+        worker_context = capture_native_worker_context()
     runtime = runtime_factory(requested_scope)
     try:
         scope = getattr(runtime, "scope", None)

@@ -15,6 +15,14 @@ import weakref
 _CAPTURED_CONTEXTS: dict[int, weakref.ReferenceType["NativeWorkerContext"]] = {}
 
 
+class MissingNativeWorkerContextError(ValueError):
+    """Value-free diagnostic for an unbound public worker-tool entry."""
+
+    def __init__(self, missing_fields: tuple[str, ...]) -> None:
+        self.missing_fields = missing_fields
+        super().__init__("native_worker_context_unbound")
+
+
 @dataclass(frozen=True, slots=True, weakref_slot=True)
 class NativeWorkerContext:
     """One worker-owned task/run/session/board tuple.
@@ -61,10 +69,14 @@ def capture_native_worker_context() -> NativeWorkerContext:
     run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
     session_id = get_session_env("HERMES_SESSION_ID", "")
     board_id = os.environ.get("HERMES_KANBAN_BOARD")
-    if not all(type(value) is str and value for value in (task_id, run_id, session_id, board_id)):
+    fields = (("task_id", task_id), ("run_id", run_id),
+              ("session_id", session_id), ("board_id", board_id))
+    missing_fields = tuple(name for name, value in fields
+                           if type(value) is not str or not value)
+    if missing_fields:
         # Deliberately field-only: callers and tool JSON must not disclose IDs,
         # session values, or any inherited environment contents.
-        raise ValueError("trusted native worker context unbound")
+        raise MissingNativeWorkerContextError(missing_fields)
     assert isinstance(task_id, str) and isinstance(run_id, str) and isinstance(session_id, str)
     assert isinstance(board_id, str)
     context = NativeWorkerContext(task_id, run_id, session_id, board_id)

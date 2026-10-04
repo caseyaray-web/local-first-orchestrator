@@ -51,7 +51,7 @@ def _config_json(config, path: Path) -> None:
 def test_m6_rejected_registered_worker_tools_close_runtime_before_a_later_valid_call(
     tmp_path: Path, monkeypatch, tool_name: str, arguments: dict[str, object]
 ) -> None:
-    """Production-composed fixture runtimes close on pre-handler authority rejection."""
+    """Scope rejection closes its runtime; unbound capture rejects before composition."""
     import local_first_orchestrator.plugin_tools as plugin_tools
 
     config = _config(tmp_path)
@@ -80,12 +80,13 @@ def test_m6_rejected_registered_worker_tools_close_runtime_before_a_later_valid_
 
     monkeypatch.delenv("HERMES_SESSION_ID")
     unavailable_worker = json.loads(tools.handlers[tool_name]({**SCOPE, **arguments}))
-    assert unavailable_worker["ok"] is False
-    assert "trusted native worker" in unavailable_worker["error"]
+    assert unavailable_worker == {"ok": False, "outcome": "invalid_or_held",
+                                  "error": "native_worker_context_unbound",
+                                  "missing_native_context_fields": ["session_id"]}
 
     valid = json.loads(tools.handlers["local_first_status"](dict(SCOPE)))
     assert valid["ok"] is True
-    assert len(runtimes) == 3
+    assert len(runtimes) == 2
     assert closed == runtimes
     with instance_lock(config.lock_path) as lock:
         lock.assert_held()
