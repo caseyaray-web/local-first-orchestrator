@@ -102,6 +102,39 @@ def _active_runs(snapshots: tuple[BoardSnapshot, ...], runs: tuple[Mapping[str, 
     return tuple(sorted(run_id for run_id, run in observed.items() if _run_is_live(run)))
 
 
+def _uncontained_observed_runs(prior_snapshots: tuple[BoardSnapshot, ...],
+                                current_snapshots: tuple[BoardSnapshot, ...],
+                                effect_results: tuple[ActionResult, ...]) -> tuple[str, ...]:
+    """Describe live runs that have not received an exact verified stop receipt.
+
+    A later empty/terminal runs list is only a current observation.  It cannot
+    prove that a cancellation request stopped an earlier worker, particularly
+    when an authorized parent harness performed its own owned-PID cleanup.
+    Preserve the original task/run/PID observation in a partial report instead
+    of letting an empty current list look like containment proof.
+    """
+    current = _snapshots_by_task(current_snapshots)
+    uncontained: list[str] = []
+    for before in prior_snapshots:
+        task_id = before.native_task.get("id")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        after = current.get(task_id)
+        for run in before.runs:
+            run_id = _run_id(run)
+            if run_id is None or not _run_is_live(run):
+                continue
+            stopped = after is not None and _stopped_in_snapshot(after, run_id)
+            verified = any(_stop_result_matches(result, task_id, run_id)
+                           for result in effect_results)
+            if stopped and verified:
+                continue
+            pid = run.get("worker_pid")
+            pid_text = str(pid) if type(pid) is int and pid > 0 else "unknown"
+            uncontained.append(f"{task_id}/{run_id}/pid:{pid_text}")
+    return tuple(sorted(set(uncontained)))
+
+
 def _runs_have_known_statuses(snapshots: tuple[BoardSnapshot, ...]) -> bool:
     """Do not clear a pause while any observed native run has an unknown state.
 
@@ -299,7 +332,14 @@ def verify_containment(scope: Mapping[str, Any], members: tuple[ManagedMember, .
             if not any(_stop_result_matches(result, member.task_id, run_id) for result in effect_results):
                 incomplete = True
     if active or incomplete:
-        return ContainmentVerification("partial", _report(resolved_scope, "containment_unverified", active=active, required="inspect_exact_task_and_run_ids"))
+        # ``active_workers`` is containment telemetry, not a claim that the
+        # listed PID is still live at the final read.  Keep both currently-live
+        # IDs and earlier live task/run/PID observations lacking a matching
+        # verified stop receipt; a blank final runs list is not containment.
+        uncontained = tuple(sorted(set(active) | set(
+            _uncontained_observed_runs(prior_snapshots, snapshots, effect_results)
+        )))
+        return ContainmentVerification("partial", _report(resolved_scope, "containment_unverified", active=uncontained, required="inspect_exact_task_and_run_ids"))
     return ContainmentVerification("verified", _report(resolved_scope, "containment_verified"))
 
 
