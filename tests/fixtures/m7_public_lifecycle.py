@@ -41,6 +41,7 @@ class PublicLifecycleDriver:
             })
         self.config = config
         self.config_path = config_path
+        self.monkeypatch = monkeypatch
         self.board = board
         self._base_claim_create_attempt = getattr(board, "claim_create_attempt", None)
         self.scope = dict(scope)
@@ -148,10 +149,12 @@ class PublicLifecycleDriver:
         return self.command("release-piece", "--plan-id", plan_id, "--ticket-id", ticket_id)
 
     def submit_local_review(self, task_id: str, candidate: Any, review: Mapping[str, Any]) -> dict[str, Any]:
-        import os
         native = review["native_review"]
-        os.environ.update({"HERMES_KANBAN_TASK": native["task_id"], "HERMES_KANBAN_RUN_ID": native["run_id"],
-                           "HERMES_SESSION_ID": native["session_id"], "HERMES_KANBAN_BOARD": self.scope["board_id"]})
+        for name, value in (("HERMES_KANBAN_TASK", native["task_id"]),
+                            ("HERMES_KANBAN_RUN_ID", native["run_id"]),
+                            ("HERMES_SESSION_ID", native["session_id"]),
+                            ("HERMES_KANBAN_BOARD", self.scope["board_id"])):
+            self.monkeypatch.setenv(name, value)
         self.git_observer = lambda _scope: {
             "candidate": candidate.to_dict(), "checks": review["checks"],
             "checks_identity": review["checks_identity"], "criterion_ids": ["AC-1"],
@@ -172,9 +175,11 @@ class PublicLifecycleDriver:
         # The test transport supplies synthetic worker identities, while the tool
         # still derives and validates them exclusively from the worker environment.
         native = review["native_review"]
-        import os
-        os.environ.update({"HERMES_KANBAN_TASK": native["task_id"], "HERMES_KANBAN_RUN_ID": native["run_id"],
-                           "HERMES_SESSION_ID": native["session_id"], "HERMES_KANBAN_BOARD": self.scope["board_id"]})
+        for name, value in (("HERMES_KANBAN_TASK", native["task_id"]),
+                            ("HERMES_KANBAN_RUN_ID", native["run_id"]),
+                            ("HERMES_SESSION_ID", native["session_id"]),
+                            ("HERMES_KANBAN_BOARD", self.scope["board_id"])):
+            self.monkeypatch.setenv(name, value)
         return self.tool("local_first_submit_paid_review", {"plan_id": plan_id, "review": review})
 
     def prepare_paid_correction(self, plan_id: str, review_id: str) -> dict[str, Any]:

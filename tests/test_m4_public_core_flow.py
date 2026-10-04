@@ -149,6 +149,9 @@ def _complete_same_card_local_review(ctl, store, cards, runs, monkeypatch, ticke
     monkeypatch.setenv("HERMES_KANBAN_BOARD", ctl.scope["board_id"])
     ctl.git_observer = lambda _scope: {"candidate": candidate.to_dict(), "checks": review["checks"],
                                        "checks_identity": review["checks_identity"], "criterion_ids": ["AC-1"]}
+    ctl.finalization_observer = lambda _scope, _candidate: {
+        "candidate": candidate.to_dict(), "checks": review["checks"],
+        "checks_identity": review["checks_identity"], "criterion_ids": ["AC-1"]}
     key = "local-handoff:" + ticket_id
     assert ctl.request_local_review_from_worker(operation_key=key, summary="fixture candidate")["outcome"] == "proposed"
     marker = next(op.target["review_marker"] for op in store.read_scope(ctl.scope)["operations"] if op.key == key)
@@ -166,6 +169,7 @@ def _complete_same_card_local_review(ctl, store, cards, runs, monkeypatch, ticke
          "payload": {"run_id": review["native_review"]["run_id"], "source_status": "review"}},
         {"kind": "completed", "run_id": review["native_review"]["run_id"], "payload": {"summary": "approved"}},
     ))
+    assert ctl.finalize_local_review(key)["outcome"] == "finalized"
 
 
 def _no_effect_state(store, cards, git, tranche_id, base):
@@ -660,7 +664,7 @@ def test_frozen_implementation_handoff_survives_reviewer_context_and_rejects_dis
         task_id = next(piece["task_id"] for piece in held["pieces"] if piece["ticket_id"] == "TK-A")
         review = _review("frozen-review", candidate, role="local", task_id=task_id, run_id="frozen-run", session="frozen-session")
         _complete_same_card_local_review(ctl, store, cards, runs, monkeypatch, "TK-A", task_id, candidate, review)
-        handoff = next(op for op in store.read_scope(ctl.scope)["operations"] if op.key == "local-handoff:TK-A")
+        handoff = next(op for op in store.read_scope(ctl.scope)["operations"] if op.key == "finalize-local-review:local-handoff:TK-A")
         assert handoff.target["frozen_handoff"]["candidate"] == candidate.to_dict()
         assert tuple(handoff.target["frozen_handoff"]["checks"]) == tuple(review["checks"])
         assert tuple(handoff.target["frozen_handoff"]["criterion_ids"]) == ("AC-1",)

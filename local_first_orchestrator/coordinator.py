@@ -19,6 +19,8 @@ from .operator_controls import (
     reconcile_operator_edits, reject_late_result, verify_containment,
 )
 from .recovery import RecoveryIssue, deduplicate_issue, detect_issues, propose_repair, summarize_escalation
+from .worker_context import (NativeWorkerContext, _is_captured_native_worker_context,
+                             capture_native_worker_context)
 
 
 class Coordinator:
@@ -26,6 +28,7 @@ class Coordinator:
 
     def __init__(self, scope: Mapping[str, Any], *, board: Any, store: Any,
                  lock: InstanceLock, git_observer: Callable[[Mapping[str, str]], Mapping[str, Any]] | None = None,
+                 finalization_observer: Callable[[Mapping[str, str], Any], Mapping[str, Any]] | None = None,
                  repository_telemetry: Callable[[Mapping[str, str]], Mapping[str, Any]] | None = None,
                  budget_policy: BudgetPolicy | None = None,
                  configured_roles: Mapping[str, str] | None = None,
@@ -55,7 +58,10 @@ class Coordinator:
         self.configured_roles = MappingProxyType(dict(configured_roles or {}))
         if repository_telemetry is not None and not callable(repository_telemetry):
             raise ValueError("repository telemetry must be a trusted callable")
-        self.git_observer, self.repository_telemetry, self.budget_policy = git_observer, repository_telemetry, budget_policy
+        if finalization_observer is not None and not callable(finalization_observer):
+            raise ValueError("finalization observer must be a trusted callable")
+        self.git_observer, self.finalization_observer = git_observer, finalization_observer
+        self.repository_telemetry, self.budget_policy = repository_telemetry, budget_policy
         # Trusted composition-root dependency. The callback observes current
         # repository, base, contract and approved objective/configuration itself.
         self.planning_observer = planning_observer
@@ -70,6 +76,44 @@ class Coordinator:
         # Recovery can continue a revision only through this composition-root
         # adapter; polling never accepts a model/report supplied Git authority.
         self.recovery_git_adapter = recovery_git_adapter
+        # Set only by the registered public worker-tool wrapper.  It is scoped
+        # to this freshly composed runtime and never populated from tool args.
+        self._native_worker_context: NativeWorkerContext | None = None
+        # Lifecycle bookkeeping only: public binding is determined by the
+        # capture capability above, never by a caller-selected boolean.
+        self._native_worker_context_public_entry = False
+
+    def _bind_native_worker_context(self, context: NativeWorkerContext) -> None:
+        """Install the one immutable public-entry worker snapshot exactly once."""
+        if not _is_captured_native_worker_context(context):
+            raise ValueError("native_worker_context_unbound")
+        if context.board_id != self.scope["board_id"]:
+            raise ValueError("native_worker_context_board_mismatch")
+        if self._native_worker_context is not None:
+            raise ValueError("native_worker_context_already_bound")
+        self._native_worker_context = context
+        self._native_worker_context_public_entry = True
+
+    def _ensure_native_worker_context(self) -> NativeWorkerContext:
+        """Capture once per direct legacy entry, never refreshing public-tool state."""
+        if self._native_worker_context is None or not self._native_worker_context_public_entry:
+            context = capture_native_worker_context()
+            if context.board_id != self.scope["board_id"]:
+                raise ValueError("native_worker_context_board_mismatch")
+            self._native_worker_context = context
+            self._native_worker_context_public_entry = False
+        assert self._native_worker_context is not None
+        return self._native_worker_context
+
+    def _current_native_worker_context(self, *, task_id: str | None = None,
+                                       run_id: str | None = None) -> NativeWorkerContext:
+        context = self._native_worker_context
+        if context is None:
+            raise ValueError("native_worker_context_unbound")
+        if ((task_id is not None and context.task_id != task_id)
+                or (run_id is not None and context.run_id != run_id)):
+            raise ValueError("native_worker_context_task_run_mismatch")
+        return context
 
     def _accepted_piece_description(self, scope: Mapping[str, str], operation_key: str) -> Any:
         """Resolve a native create solely from strict accepted-store authority."""
@@ -3067,7 +3111,15 @@ class Coordinator:
         handoffs = []
         for operation in operations:
             target = operation["target"]
-            frozen = target.get("frozen_handoff") if operation["effect"] == "request_review" else None
+            if operation["effect"] == "request_review":
+                # Provisional evidence is deliberately not reviewer authority.
+                handoffs.append({"state": "pending", "operation_key": operation["key"],
+                                 "phase": operation["phase"], "task_id": target.get("task_id"),
+                                 "reviewer_profile": target.get("reviewer_profile"),
+                                 "review_marker": target.get("review_marker"),
+                                 "reason": "awaiting_native_request_review_finalization"})
+                continue
+            frozen = target.get("frozen_handoff") if operation["effect"] == "finalize_request_review" else None
             if not isinstance(frozen, Mapping):
                 continue
             candidate_data = frozen.get("candidate")
@@ -3086,7 +3138,7 @@ class Coordinator:
                 except (TypeError, ValueError, KeyError):
                     available = False
             if available:
-                handoffs.append({"state": "available", "operation_key": operation["key"],
+                handoffs.append({"state": "finalized", "operation_key": target.get("operation_key"),
                                  "phase": operation["phase"], "task_id": target.get("task_id"),
                                  "reviewer_profile": target.get("reviewer_profile"),
                                  "review_marker": target.get("review_marker"),
@@ -4382,33 +4434,28 @@ class Coordinator:
         session_id = metadata.get("worker_session_id") if isinstance(metadata, Mapping) else None
         return session_id if isinstance(session_id, str) and session_id else None
 
-    @staticmethod
-    def _active_worker_session(task_id: str, run_id: str) -> str:
-        """Read the native tool's own worker context, never caller payload.
-
-        Hermes exposes the session only to the active worker until
-        ``kanban_request_review`` closes the run and stamps its metadata.  The
-        same task/run environment is the native lifecycle ownership fence, so a
-        controller process or a sibling worker cannot nominate a session here.
-        """
-        task = os.environ.get("HERMES_KANBAN_TASK")
-        active_run = os.environ.get("HERMES_KANBAN_RUN_ID")
-        session = os.environ.get("HERMES_SESSION_ID")
-        if task != task_id or active_run != run_id or not isinstance(session, str) or not session:
-            raise ValueError("local-review handoff reservation requires the active worker-owned tool session")
-        return session
+    def _active_worker_session(self, task_id: str, run_id: str) -> str:
+        """Return the immutable public-entry session, never a later env read."""
+        return self._current_native_worker_context(task_id=task_id, run_id=run_id).session_id
 
     def _scoped_run(self, task_id: str, run_id: str) -> Mapping[str, Any]:
         reader = getattr(self.board, "read_scoped_run", None)
         if not callable(reader):
             raise ValueError("board cannot verify exact native run attribution")
-        result = reader(self.scope, task_id, run_id)
+        try:
+            result = reader(self.scope, task_id, run_id)
+        except KeyError as error:
+            raise ValueError("native_run_missing") from error
+        except ValueError:
+            raise
+        except Exception as error:
+            raise ValueError("native_run_read_unavailable") from error
         if not isinstance(result, Mapping):
-            raise ValueError("board returned malformed native run attribution")
+            raise ValueError("native_run_attribution_malformed")
         return result
 
     def _native_implementation_candidate(self, task_id: str, candidate: Any, *,
-                                         run_id: str, session_id: str) -> None:
+                                         run_id: str, session_id: str) -> Mapping[str, Any]:
         """Require the candidate producer to be the active native implementation worker."""
         implementation, _reviewer = self._local_review_roles()
         if candidate.originating_run_id != run_id:
@@ -4419,27 +4466,76 @@ class Coordinator:
                 or card.native_task.get("assignee") != implementation
                 or card.native_task.get("status") not in {"running", "active"}
                 or run.get("profile") != implementation or run.get("status") not in {"running", "active", "claimed"}
-                or self._worker_session(run) != session_id
                 or not any(str(item.get("id")) == run_id for item in card.runs)):
-            raise ValueError("candidate requires matching active native implementation task, run, and session")
+            raise ValueError("native_task_run_profile_mismatch")
+        reader = getattr(self.board, "read_active_worker_identity", None)
+        if callable(reader):
+            receipt = reader(self.scope, task_id, run_id, session_id, implementation)
+            if not isinstance(receipt, Mapping):
+                raise ValueError("native_session_receipt_malformed")
+            required = {"version", "task_id", "run_id", "session_id", "profile", "source"}
+            if (not required <= set(receipt) or receipt.get("version") != 1
+                    or receipt.get("task_id") != task_id or str(receipt.get("run_id")) != run_id
+                    or receipt.get("session_id") != session_id or receipt.get("profile") != implementation
+                    or receipt.get("source") != "native_run_metadata"):
+                raise ValueError("native_session_receipt_malformed")
+            return dict(receipt)
+        # Synthetic adapters must expose the same native terminal metadata that
+        # production eventually stamps.  They cannot stand in for a live native
+        # session-store readback.
+        if self._worker_session(run) != session_id:
+            raise ValueError("native_session_unbound")
+        return {"version": 1, "task_id": task_id, "run_id": run_id,
+                "session_id": session_id, "profile": implementation,
+                "source": "native_run_metadata"}
+
+    def _provisional_implementation_candidate(self, task_id: str, candidate: Any, *,
+                                               run_id: str, session_id: str) -> Mapping[str, Any]:
+        """Observe the active worker tuple without upgrading its session to authority."""
+        implementation, _reviewer = self._local_review_roles()
+        if candidate.originating_run_id != run_id:
+            raise ValueError("candidate must originate from the active implementation run")
+        reader = getattr(self.board, "read_provisional_worker_context", None)
+        if callable(reader):
+            receipt = reader(self.scope, task_id, run_id, session_id, implementation)
+            expected = {"version", "task_id", "run_id", "session_id", "profile", "source"}
+            if (not isinstance(receipt, Mapping) or not expected <= set(receipt)
+                    or receipt.get("version") != 1 or receipt.get("task_id") != task_id
+                    or str(receipt.get("run_id")) != run_id or receipt.get("session_id") != session_id
+                    or receipt.get("profile") != implementation
+                    or receipt.get("source") != "active_worker_context"):
+                raise ValueError("provisional_worker_context_malformed")
+            return dict(receipt)
+        # Test adapters without the native method still have to prove the exact
+        # active task/run/profile; they never establish a session binding.
+        run = self._scoped_run(task_id, run_id)
+        card = self.board.read_task(task_id)
+        if (not isinstance(card, BoardSnapshot) or card.native_task.get("id") != task_id
+                or card.native_task.get("assignee") != implementation
+                or card.native_task.get("status") not in {"running", "active"}
+                or run.get("profile") != implementation
+                or run.get("status") not in {"running", "active", "claimed"}
+                or not any(str(item.get("id")) == run_id for item in card.runs)):
+            raise ValueError("native_task_run_profile_mismatch")
+        return {"version": 1, "task_id": task_id, "run_id": run_id,
+                "session_id": session_id, "profile": implementation,
+                "source": "active_worker_context"}
 
     def observe_candidate_checks(self) -> dict[str, Any]:
-        """Return current implementation candidate/check evidence without effects."""
+        """Return current evidence using the one public-entry worker snapshot."""
         from .contracts import CandidateIdentity
-        task_id, run_id = os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_RUN_ID")
-        session_id, board_id = os.environ.get("HERMES_SESSION_ID"), os.environ.get("HERMES_KANBAN_BOARD")
-        if not all(isinstance(value, str) and value for value in (task_id, run_id, session_id, board_id)):
-            raise ValueError("candidate observation requires native task, run, session, and board")
+        context = self._ensure_native_worker_context()
+        task_id, run_id = context.task_id, context.run_id
+        session_id, board_id = context.session_id, context.board_id
         if board_id != self.scope["board_id"]:
             raise ValueError("candidate observation board differs from configured scope")
-        assert isinstance(task_id, str) and isinstance(run_id, str) and isinstance(session_id, str)
         if self.git_observer is None:
             raise ValueError("candidate observation requires configured trusted Git observer")
         observed = self.git_observer(dict(self.scope))
         if not isinstance(observed, Mapping):
             raise ValueError("trusted Git observer returned malformed observation")
         candidate = CandidateIdentity.from_dict(observed.get("candidate", {}))
-        self._native_implementation_candidate(task_id, candidate, run_id=run_id, session_id=session_id)
+        self._provisional_implementation_candidate(task_id, candidate, run_id=run_id, session_id=session_id)
         checks = observed.get("checks")
         if not isinstance(checks, list) or not checks:
             raise ValueError("candidate observation requires configured check records")
@@ -4460,11 +4556,14 @@ class Coordinator:
             observed["task_id"], candidate,
             implementation_profile=self.configured_roles.get("implementation_profile", ""),
             reviewer_profile=self.configured_roles.get("local_review_profile", ""),
-            summary=summary, operation_key=operation_key)
+            summary=summary, operation_key=operation_key, _context_captured=True)
 
     def request_local_review(self, task_id: str, candidate: Any, *, implementation_profile: str,
-                             reviewer_profile: str, summary: str, operation_key: str) -> dict[str, Any]:
+                             reviewer_profile: str, summary: str, operation_key: str,
+                             _context_captured: bool = False) -> dict[str, Any]:
         """Durably propose a handoff which only the implementation worker can send."""
+        if not _context_captured:
+            self._ensure_native_worker_context()
         from .contracts import CandidateIdentity
         configured_implementation, configured_reviewer = self._local_review_roles()
         if not isinstance(candidate, CandidateIdentity):
@@ -4479,6 +4578,9 @@ class Coordinator:
         if implementation.get("status") != "running":
             raise ValueError("worker-owned implementation run must be active")
         implementation_session = self._active_worker_session(task_id, candidate.originating_run_id)
+        self._provisional_implementation_candidate(task_id, candidate,
+                                                   run_id=candidate.originating_run_id,
+                                                   session_id=implementation_session)
         # Capture complete observer authority while the implementation worker
         # still owns this exact native run.  The immutable intent below is the
         # only source a later reviewer may consume.
@@ -4488,9 +4590,12 @@ class Coordinator:
             observed = self.git_observer(dict(self.scope))
         except Exception as error:
             raise ValueError("active implementation candidate/check observation is unavailable") from error
-        self._native_implementation_candidate(task_id, candidate, run_id=candidate.originating_run_id,
-                                              session_id=implementation_session)
-        frozen_handoff = self._validated_frozen_candidate_observation(
+        # The active native run has not yet been closed by
+        # ``kanban_request_review``.  Its session environment is therefore a
+        # *provisional* claim only; do not require (or invent) terminal run
+        # metadata here.  The public finalizer binds it after the native
+        # transition.
+        frozen_handoff = self._validated_provisional_candidate_observation(
             observed, candidate, task_id=task_id, run_id=candidate.originating_run_id,
             session_id=implementation_session, implementation_profile=implementation_profile)
         if frozen_handoff is None:
@@ -4502,11 +4607,11 @@ class Coordinator:
                   "implementation_run_id": candidate.originating_run_id,
                   "implementation_profile": implementation_profile,
                   "implementation_session_id": implementation_session,
-                  "reviewer_profile": reviewer_profile, "frozen_handoff": frozen_handoff}
+                  "reviewer_profile": reviewer_profile, "provisional_handoff": frozen_handoff}
         action = Action(operation_key, self.scope, {
             "task_id": task_id, "reviewer_profile": reviewer_profile, "summary": summary,
             "candidate_content_identity": candidate.content_identity,
-            "frozen_handoff": frozen_handoff, "review_marker": marker,
+            "provisional_handoff": frozen_handoff, "review_marker": marker,
         }, "request_review", before.digest)
         with self.lock:
             self._assert_lock()
@@ -4517,6 +4622,150 @@ class Coordinator:
             if stored.phase == "applied":
                 return {"outcome": "verified", "operation_key": operation_key}
             return {"outcome": "proposed", "operation_key": operation_key}
+
+    @staticmethod
+    def _validated_provisional_candidate_observation(observed: Any, candidate: Any, *, task_id: str,
+                                                     run_id: str, session_id: str,
+                                                     implementation_profile: str) -> dict[str, Any] | None:
+        """Freeze worker-observed evidence without treating its live session as authority."""
+        if not isinstance(observed, Mapping) or observed.get("candidate") != candidate.to_dict():
+            return None
+        checks, criterion_ids = observed.get("checks"), observed.get("criterion_ids")
+        if (not isinstance(checks, (list, tuple)) or not checks or not isinstance(criterion_ids, (list, tuple))
+                or not criterion_ids or list(criterion_ids) != sorted(set(criterion_ids))
+                or not all(isinstance(item, str) and item for item in criterion_ids)):
+            return None
+        if any(not isinstance(check, Mapping) or set(check) != {"check_id", "outcome", "evidence"}
+               or any(not isinstance(check.get(field), str) or not check[field]
+                      for field in ("check_id", "outcome", "evidence"))
+               or check.get("outcome") != "passed" for check in checks):
+            return None
+        try:
+            from .evidence_store import _canonical_identity
+            normalized = [dict(item) for item in checks]
+            identity = _canonical_identity(normalized)
+        except (TypeError, ValueError):
+            return None
+        if observed.get("checks_identity") != identity:
+            return None
+        return {"task_id": task_id, "implementation_run_id": run_id,
+                "provisional_session_id": session_id, "implementation_profile": implementation_profile,
+                "candidate": candidate.to_dict(), "checks": normalized,
+                "checks_identity": identity, "criterion_ids": list(criterion_ids)}
+
+    def finalize_local_review(self, operation_key: str) -> dict[str, Any]:
+        """Read-only reconcile the worker-owned native transition into final authority.
+
+        This never calls the native request-review command.  It is safe after a
+        reviewer has claimed/completed the card because it locates the ended
+        implementation run by exact operation marker and run id.
+        """
+        if type(operation_key) is not str or not operation_key:
+            raise ValueError("local review operation key must be a non-empty string")
+        with self.lock:
+            self._assert_lock()
+            state = self.store.read_scope(self.scope)
+            requests = [op for op in state["operations"] if op.key == operation_key and op.effect == "request_review"]
+            if len(requests) != 1:
+                return {"outcome": "held", "reason": "exact_provisional_review_request_required", "operation_key": operation_key}
+            request = requests[0]
+            marker, provisional = request.target.get("review_marker"), request.target.get("provisional_handoff")
+            if not isinstance(marker, Mapping) or not isinstance(provisional, Mapping):
+                return {"outcome": "conflict", "reason": "provisional_review_record_malformed", "operation_key": operation_key}
+            try:
+                from .contracts import CandidateIdentity
+                task_id = provisional.get("task_id")
+                run_id = provisional.get("implementation_run_id")
+                provisional_session = provisional.get("provisional_session_id")
+                implementation_profile = provisional.get("implementation_profile")
+                if not all(type(value) is str and value for value in (task_id, run_id, provisional_session, implementation_profile)):
+                    raise ValueError("provisional identity is malformed")
+                assert isinstance(task_id, str) and isinstance(run_id, str)
+                assert isinstance(provisional_session, str) and isinstance(implementation_profile, str)
+                candidate = CandidateIdentity.from_dict(provisional.get("candidate", {}))
+                checked_provisional = self._validated_provisional_candidate_observation(
+                        {"candidate": candidate.to_dict(), "checks": provisional.get("checks"),
+                         "checks_identity": provisional.get("checks_identity"), "criterion_ids": provisional.get("criterion_ids")},
+                        candidate, task_id=task_id, run_id=run_id,
+                        session_id=provisional_session, implementation_profile=implementation_profile)
+                if checked_provisional is None:
+                    raise ValueError("provisional snapshot changed")
+                observer = self.finalization_observer
+                if observer is None:
+                    # Compatibility for controlled direct coordinator fixtures.
+                    # Production composition always supplies the environment-free
+                    # trusted finalization observer below.
+                    observer = lambda candidate_scope, _candidate: self.git_observer(candidate_scope) if self.git_observer else None
+                fresh = observer(dict(self.scope), candidate)
+                if not isinstance(fresh, Mapping):
+                    raise ValueError("trusted finalization observation is malformed")
+                fresh_candidate = CandidateIdentity.from_dict(fresh.get("candidate", {}))
+                fresh_provisional = self._validated_provisional_candidate_observation(
+                    fresh, fresh_candidate, task_id=task_id, run_id=run_id,
+                    session_id=provisional_session, implementation_profile=implementation_profile)
+                if (fresh_candidate.to_dict() != candidate.to_dict()
+                        or fresh_provisional != checked_provisional):
+                    return {"outcome": "conflict", "reason": "trusted_finalization_candidate_or_checks_changed",
+                            "operation_key": operation_key}
+                card = self.board.read_task(task_id)
+                run = self._scoped_run(task_id, run_id)
+            except (ValueError, KeyError, TypeError):
+                return {"outcome": "held", "reason": "provisional_review_evidence_unavailable", "operation_key": operation_key}
+            session = self._worker_session(run)
+            events = [] if not isinstance(card, BoardSnapshot) else [event for event in card.events
+                if event.get("kind") == "review_requested" and str(event.get("run_id")) == str(run.get("id"))
+                and isinstance(event.get("payload"), Mapping)
+                and event["payload"].get("implementer") == provisional.get("implementation_profile")
+                and event["payload"].get("reviewer") == marker.get("reviewer_profile")]
+            if (not isinstance(card, BoardSnapshot) or run.get("profile") != provisional.get("implementation_profile")
+                    or run.get("status") not in {"completed", "done"} or run.get("outcome") != "review_requested"
+                    or not isinstance(run.get("metadata"), Mapping) or run["metadata"].get("local_first_review") != dict(marker)
+                    or session != provisional_session or len(events) != 1):
+                return {"outcome": "held", "reason": "exact_native_review_transition_not_finalized", "operation_key": operation_key}
+            if session is None:
+                return {"outcome": "held", "reason": "exact_native_review_transition_not_finalized", "operation_key": operation_key}
+            receipt = {"version": 1, "task_id": task_id, "run_id": run_id,
+                       "session_id": session, "profile": implementation_profile, "source": "native_run_metadata"}
+            frozen = self._validated_frozen_candidate_observation(
+                {"candidate": candidate.to_dict(), "checks": provisional["checks"],
+                 "checks_identity": provisional["checks_identity"], "criterion_ids": provisional["criterion_ids"]}, candidate,
+                task_id=task_id, run_id=run_id, session_id=session,
+                implementation_profile=implementation_profile, worker_receipt=receipt)
+            if frozen is None:
+                return {"outcome": "conflict", "reason": "finalized_review_snapshot_invalid", "operation_key": operation_key}
+            final_key = "finalize-local-review:" + operation_key
+            target = {"operation_key": operation_key, "task_id": task_id, "review_marker": dict(marker),
+                      "frozen_handoff": frozen}
+            existing = [op for op in state["operations"] if op.key == final_key]
+            if existing:
+                if len(existing) != 1 or dict(existing[0].target) != target:
+                    return {"outcome": "conflict", "reason": "finalization_record_conflicts", "operation_key": operation_key}
+                # A restart can encounter a legacy finalization receipt that was
+                # reserved after the same verified native readback but never
+                # acknowledged.  Reconcile only that exact pending receipt;
+                # unknown/applied outcomes are never rewritten.
+                if existing[0].phase == "pending":
+                    self.store.ack_effect(self.scope, final_key, readback=card.to_dict(), outcome="verified")
+                elif existing[0].phase != "applied":
+                    return {"outcome": "held", "reason": "finalization_record_effect_unknown", "operation_key": operation_key}
+                return {"outcome": "finalized", "operation_key": operation_key, "finalization_key": final_key}
+            # The exact native transition is now a verified read-only receipt for
+            # the worker-owned request; acknowledge it before exposing the final
+            # immutable handoff so pause/recovery does not retain a false pending
+            # native effect or try to resend it.
+            if request.phase == "pending":
+                self.store.ack_effect(self.scope, request.key, readback=card.to_dict(), outcome="verified")
+            elif request.phase != "applied":
+                return {"outcome": "held", "reason": "provisional_review_request_effect_unknown", "operation_key": operation_key}
+            action = Action(final_key, self.scope, target, "finalize_request_review", request.expected_observed_identity)
+            self.store.reserve_operation(self._intent_for(action))
+            # Finalization is a fully verified, read-only receipt: its only
+            # external observation is the exact native transition validated
+            # above.  Leaving this local receipt pending would make a later
+            # pause/resume mistake it for an unknown native effect and hold a
+            # coherent, unchanged scope indefinitely.
+            self.store.ack_effect(self.scope, final_key, readback=card.to_dict(), outcome="verified")
+            return {"outcome": "finalized", "operation_key": operation_key, "finalization_key": final_key}
 
     def recover_premature_done(self, task_id: str, candidate: Any, *, reviewer_profile: str,
                                already_locked: bool = False, replacement_for: str | None = None) -> dict[str, Any]:
@@ -4555,7 +4804,8 @@ class Coordinator:
             return {"outcome": "held", "reason": "trusted_git_freeze_unavailable"}
         frozen_handoff = self._validated_frozen_candidate_observation(
             source_observation, candidate, task_id=task_id, run_id=candidate.originating_run_id,
-            session_id=source_session, implementation_profile=configured_implementation)
+            session_id=source_session, implementation_profile=configured_implementation,
+            allow_unbound_observation=True)
         if frozen_handoff is None:
             return {"outcome": "held", "reason": "trusted_git_freeze_unavailable"}
         canonical = json.dumps({"scope": self.scope, "source_task_id": task_id,
@@ -4741,7 +4991,9 @@ class Coordinator:
     @staticmethod
     def _validated_frozen_candidate_observation(observed: Any, candidate: Any, *, task_id: str,
                                                 run_id: str, session_id: str,
-                                                implementation_profile: str) -> dict[str, Any] | None:
+                                                implementation_profile: str,
+                                                worker_receipt: Mapping[str, Any] | None = None,
+                                                allow_unbound_observation: bool = False) -> dict[str, Any] | None:
         """Detach the implementation-owned candidate/check handoff once.
 
         This record is stored inside the immutable request-review intent.  It is
@@ -4767,9 +5019,29 @@ class Coordinator:
             return None
         if observed.get("checks_identity") != checks_identity:
             return None
+        receipt = worker_receipt
+        # Separate premature-done recovery has already verified its terminal
+        # source run/session before calling this helper; it is not a native
+        # implementation-to-review handoff and must not invent a receipt.
+        if receipt is None and allow_unbound_observation:
+            return {"task_id": task_id, "implementation_run_id": run_id,
+                    "implementation_session_id": session_id,
+                    "implementation_profile": implementation_profile,
+                    "candidate": candidate.to_dict(), "checks": normalized_checks,
+                    "checks_identity": checks_identity, "criterion_ids": list(criterion_ids)}
+        if receipt is None:
+            return None
+        receipt_expected = {"version", "task_id", "run_id", "session_id", "profile", "source"}
+        if (not isinstance(receipt, Mapping) or not receipt_expected <= set(receipt)
+                or receipt.get("version") != 1 or receipt.get("task_id") != task_id
+                or str(receipt.get("run_id")) != run_id or receipt.get("session_id") != session_id
+                or receipt.get("profile") != implementation_profile
+                or receipt.get("source") != "native_run_metadata"):
+            return None
         return {"task_id": task_id, "implementation_run_id": run_id,
                 "implementation_session_id": session_id,
                 "implementation_profile": implementation_profile,
+                "worker_receipt": dict(receipt),
                 "candidate": candidate.to_dict(), "checks": normalized_checks,
                 "checks_identity": checks_identity, "criterion_ids": list(criterion_ids)}
 
@@ -4783,18 +5055,23 @@ class Coordinator:
             return False
         return self._validated_frozen_candidate_observation(
             observed, candidate, task_id="separate-recovery", run_id=candidate.originating_run_id,
-            session_id="separate-recovery", implementation_profile="separate-recovery") is not None
+            session_id="separate-recovery", implementation_profile="separate-recovery",
+            allow_unbound_observation=True) is not None
 
-    def _frozen_candidate(self, candidate: Any, review: Mapping[str, Any], handoff: Any) -> bool:
-        """Bind a verdict to the immutable implementation handoff, not reviewer state."""
+    def _frozen_candidate(self, candidate: Any, review: Mapping[str, Any], handoff: Any,
+                          *, allow_unbound: bool = False) -> bool:
+        """Bind a verdict to immutable evidence, with an explicit recovery-only mode."""
         expected = {"task_id", "implementation_run_id", "implementation_session_id",
                     "implementation_profile", "candidate", "checks", "checks_identity", "criterion_ids"}
+        if not allow_unbound:
+            expected = expected | {"worker_receipt"}
         if not isinstance(handoff, Mapping) or set(handoff) != expected:
             return False
         try:
             frozen = self._validated_frozen_candidate_observation(
                 handoff, candidate, task_id=handoff["task_id"], run_id=handoff["implementation_run_id"],
-                session_id=handoff["implementation_session_id"], implementation_profile=handoff["implementation_profile"])
+                session_id=handoff["implementation_session_id"], implementation_profile=handoff["implementation_profile"],
+                worker_receipt=handoff.get("worker_receipt"), allow_unbound_observation=allow_unbound)
         except (KeyError, TypeError):
             return False
         if frozen is None:
@@ -4806,6 +5083,10 @@ class Coordinator:
                              "checks": [dict(check) for check in handoff["checks"]] if isinstance(handoff["checks"], (list, tuple)) else handoff["checks"],
                              "checks_identity": handoff["checks_identity"],
                              "criterion_ids": list(handoff["criterion_ids"]) if isinstance(handoff["criterion_ids"], (list, tuple)) else handoff["criterion_ids"]}
+        if not allow_unbound:
+            canonical_handoff["worker_receipt"] = (dict(handoff["worker_receipt"])
+                                                   if isinstance(handoff["worker_receipt"], Mapping)
+                                                   else handoff["worker_receipt"])
         if frozen != canonical_handoff:
             return False
         review_checks = review.get("checks")
@@ -4832,18 +5113,16 @@ class Coordinator:
             return None
         state = self.store.read_scope(self.scope)
         matches = [operation for operation in state["operations"]
-                   if operation.effect == "request_review"
-                   and operation.target.get("task_id") == task_id
-                   and operation.target.get("reviewer_profile") == expected_profile
-                   and operation.target.get("candidate_content_identity") == candidate.content_identity]
+                   if operation.effect == "finalize_request_review"
+                   and operation.target.get("task_id") == task_id]
         if len(matches) != 1:
             return None
-        marker = matches[0].target.get("review_marker")
-        frozen_handoff = matches[0].target.get("frozen_handoff")
+        final = matches[0]
+        marker = final.target.get("review_marker")
+        frozen_handoff = final.target.get("frozen_handoff")
         if (not isinstance(marker, Mapping) or marker.get("candidate") != candidate.to_dict()
                 or marker.get("implementation_profile") != configured_implementation
                 or marker.get("reviewer_profile") != configured_reviewer
-                or marker.get("frozen_handoff") != frozen_handoff
                 or not self._frozen_candidate(candidate, {"checks": frozen_handoff.get("checks") if isinstance(frozen_handoff, Mapping) else None,
                                                           "checks_identity": frozen_handoff.get("checks_identity") if isinstance(frozen_handoff, Mapping) else None,
                                                           "criterion_evidence": [{"criterion_id": item, "outcome": "pass", "evidence": "frozen"} for item in frozen_handoff.get("criterion_ids", ())] if isinstance(frozen_handoff, Mapping) else None}, frozen_handoff)):
@@ -4881,15 +5160,6 @@ class Coordinator:
         # request is a later candidate revision, so this candidate's completed
         # reviewer verdict cannot be accepted through the old handoff.
         if any(event.get("kind") == "review_requested" for event in observed.events[handoff_index + 1:]):
-            return None
-        intent = matches[0]
-        if intent.phase == "pending":
-            try:
-                self.store.ack_effect(self.scope, intent.key, readback=observed.to_dict())
-                self.store.record_candidate(self.scope, candidate)
-            except Exception:
-                return None
-        elif intent.phase != "applied":
             return None
         return {"marker": marker, "implementation_session_id": implementation_session,
                 "frozen_handoff": frozen_handoff}
@@ -4930,7 +5200,8 @@ class Coordinator:
                              "checks_identity": frozen_handoff.get("checks_identity") if isinstance(frozen_handoff, Mapping) else None,
                              "criterion_evidence": [{"criterion_id": item, "outcome": "pass", "evidence": "frozen"}
                                                     for item in frozen_handoff.get("criterion_ids", ())] if isinstance(frozen_handoff, Mapping) else None}
-            if create is None or not self._frozen_candidate(candidate, frozen_review, frozen_handoff):
+            if create is None or not self._frozen_candidate(candidate, frozen_review, frozen_handoff,
+                                                            allow_unbound=True):
                 return {"outcome": "held", "reason": "separate_review_association_or_freeze_missing"}
             before = self.board.read_task(task_id)
             if not isinstance(before, BoardSnapshot) or self._state(before) != "blocked" or before.parents or before.runs:
@@ -5098,7 +5369,8 @@ class Coordinator:
             if separate is None and (not isinstance(handoff, Mapping)
                                     or not self._frozen_candidate(candidate, review, handoff.get("frozen_handoff"))):
                 return {"outcome": "held", "reason": "trusted_git_freeze_unavailable"}
-            if separate is not None and not self._frozen_candidate(candidate, review, separate.target.get("frozen_handoff")):
+            if separate is not None and not self._frozen_candidate(
+                    candidate, review, separate.target.get("frozen_handoff"), allow_unbound=True):
                 return {"outcome": "held", "reason": "trusted_git_freeze_unavailable"}
             observed = self._scoped_run(task_id, run_id)
             self._exact_run(observed, run_id=run_id, profile=expected_profile)

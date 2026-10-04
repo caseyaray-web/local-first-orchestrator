@@ -14,7 +14,7 @@ from .daemon import CoordinatorLoop
 
 _EXIT = {"verified": 0, "recorded": 0, "deduplicated": 0, "no-op": 0,
          "held": 3, "released": 0, "linked": 0, "integrated": 0,
-         "accepted": 0, "approved": 0, "proposed": 0,
+         "accepted": 0, "approved": 0, "proposed": 0, "finalized": 0,
          "changes_requested": 0, "partial": 4, "conflict": 5,
          "unsupported": 6, "invalid": 2, "unknown": 7}
 
@@ -44,6 +44,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     accept_tranche = commands.add_parser("accept-tranche"); accept_tranche.add_argument("--plan-id", required=True); accept_tranche.add_argument("--review-id", required=True); accept_tranche.add_argument("--authorize-successor", action="store_true", required=True)
     pause = commands.add_parser("pause"); pause.add_argument("--stop", action="store_true")
     commands.add_parser("reconcile")
+    finalize_review = commands.add_parser("finalize-local-review", help="read-only finalize one native implementation-to-review handoff")
+    finalize_review.add_argument("--operation-key", required=True)
     resume = commands.add_parser("resume"); resume.add_argument("--authorized-clear", action="store_true")
     commands.add_parser("cancel")
     commands.add_parser("recover")
@@ -92,6 +94,8 @@ def run_command(args: argparse.Namespace) -> int:
             result = coordinator.pause(stop=bool(args.stop))
         elif args.command == "reconcile":
             result = coordinator.reconcile()
+        elif args.command == "finalize-local-review":
+            result = coordinator.finalize_local_review(args.operation_key)
         elif args.command == "resume":
             result = coordinator.resume(authorized_clear=bool(args.authorized_clear))
         elif args.command == "cancel":

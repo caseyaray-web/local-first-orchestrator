@@ -17,6 +17,7 @@ from local_first_orchestrator.composition import (_combined_checks, _git_observe
 from local_first_orchestrator.contracts import BoardSnapshot, ManagedMember
 from local_first_orchestrator.evidence_store import EvidenceStore
 from local_first_orchestrator.plugin_tools import TOOL_NAMES, register_tools
+from local_first_orchestrator.cli import register_cli
 
 
 class _Context:
@@ -28,11 +29,21 @@ class _Context:
     def register_tool(self, **kwargs):
         self.tools[kwargs["name"]] = kwargs
 
+
     def register_cli_command(self, *args, **kwargs):
         self.cli.append((args, kwargs))
 
     def register_hook(self, name, callback):
         self.hooks[name] = callback
+
+
+def test_public_finalization_cli_requires_only_the_operation_key():
+    parser = argparse.ArgumentParser()
+    register_cli(parser)
+    args = parser.parse_args(["--config", "/trusted/config.json", "--board", "fixture", "--anchor-task-id", "anchor",
+                              "finalize-local-review", "--operation-key", "handoff-1"])
+    assert args.command == "finalize-local-review"
+    assert args.operation_key == "handoff-1"
 
 
 class _Board:
@@ -195,7 +206,7 @@ def test_registered_local_review_handoff_status_and_submission_use_frozen_eviden
         def __init__(self):
             super().__init__()
             self.implementation_run = {"id": "implementation-run", "profile": "implementer", "status": "running",
-                                       "metadata": {"worker_session_id": "implementation-session"}}
+                                       "metadata": None}
             self.card = BoardSnapshot({"id": "implementation-task", "status": "running", "assignee": "implementer"},
                                       (), (self.implementation_run,), (), (), (), "fixture", "implementation-task")
             self.anchor = BoardSnapshot({"id": "anchor", "status": "blocked"}, (), (), (), (), (), "fixture", "anchor")
@@ -248,15 +259,26 @@ def test_registered_local_review_handoff_status_and_submission_use_frozen_eviden
     status = json.loads(ctx.tools["local_first_status"]["handler"](dict(config.scope)))
     assert status["ok"] is True, status
     handoff = status["result"]["review_handoffs"]
-    assert handoff == [{"state": "available", "operation_key": "local-handoff-fixture", "phase": "pending",
+    assert handoff == [{"state": "pending", "operation_key": "local-handoff-fixture", "phase": "pending",
                         "task_id": "implementation-task", "reviewer_profile": "reviewer",
-                        "review_marker": handoff[0]["review_marker"], "frozen_handoff": handoff[0]["frozen_handoff"]}]
-    assert handoff[0]["frozen_handoff"]["candidate"]["originating_run_id"] == "implementation-run"
-    assert handoff[0]["frozen_handoff"]["checks"][0]["outcome"] == "passed"
+                        "review_marker": handoff[0]["review_marker"],
+                        "reason": "awaiting_native_request_review_finalization"}]
     # The isolated transport now exposes the exact native request-review marker
     # and a distinct completed reviewer run.  No native effect or provider runs.
     board.complete_review(handoff[0]["review_marker"])
-    frozen = handoff[0]["frozen_handoff"]
+    # Native transition happens outside this plugin. Public finalization is
+    # read-only and may run after review claim/completion with no worker env.
+    for name in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_SESSION_ID", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(name, raising=False)
+    runtime = build_runtime(config, board=board, scope=config.scope)
+    try:
+        finalized = runtime.coordinator.finalize_local_review("local-handoff-fixture")
+    finally:
+        close_runtime(runtime)
+    assert finalized["outcome"] == "finalized"
+    status = json.loads(ctx.tools["local_first_status"]["handler"](dict(config.scope)))
+    finalized_handoff = next(item for item in status["result"]["review_handoffs"] if item["state"] == "finalized")
+    frozen = finalized_handoff["frozen_handoff"]
     review = {
         "review_id": "reviewer-approved", "candidate_identity": frozen["candidate"], "reviewer_role": "local",
         "native_review": {"task_id": "implementation-task", "run_id": "reviewer-run",
@@ -269,6 +291,8 @@ def test_registered_local_review_handoff_status_and_submission_use_frozen_eviden
     # A sibling worker cannot submit a payload recorded by the actual reviewer:
     # registered-tool provenance must bind to the invoker's exact live context
     # before the coordinator is allowed to persist anything.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "implementation-task")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", config.scope["board_id"])
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "other-reviewer-run")
     monkeypatch.setenv("HERMES_SESSION_ID", "other-reviewer-session")
     mismatched = json.loads(ctx.tools["local_first_submit_review"]["handler"]({

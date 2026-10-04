@@ -18,7 +18,15 @@ from tests.test_operator_api import FixtureBoard, SCOPE, _config, _write_config
 
 
 class _Coordinator:
-    def __init__(self): self.calls = []
+    def __init__(self):
+        self.calls = []
+        self._native_worker_context = None
+    def _bind_native_worker_context(self, context):
+        self._native_worker_context = context
+    def _current_native_worker_context(self):
+        if self._native_worker_context is None:
+            raise ValueError("native_worker_context_unbound")
+        return self._native_worker_context
     def __getattr__(self, name):
         def call(*args, **kwargs):
             self.calls.append((name, args, kwargs)); return {"outcome": "verified", "method": name}

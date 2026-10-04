@@ -5,6 +5,7 @@ import json
 import os
 from typing import Any, Callable, Mapping, Protocol
 from .composition import close_runtime
+from .worker_context import NativeWorkerContext, capture_native_worker_context
 
 
 TOOL_NAMES = (
@@ -56,6 +57,18 @@ def _runtime_for_args(runtime_factory: Callable[..., Any], args: Mapping[str, An
     if not isinstance(args, Mapping):
         raise ValueError("object arguments are required")
     requested_scope = {"board_id": args.get("board_id"), "anchor_task_id": args.get("anchor_task_id")}
+    # Capture before composition so a contextvar-correct public entry cannot be
+    # changed by later process-global mutations. A failed worker capture still
+    # opens/closes the configured runtime once to preserve existing handler
+    # lifecycle cleanup semantics.
+    worker_context: NativeWorkerContext | None = None
+    if require_worker:
+        try:
+            worker_context = capture_native_worker_context()
+        except Exception:
+            runtime = runtime_factory(requested_scope)
+            close_runtime(runtime)
+            raise
     runtime = runtime_factory(requested_scope)
     try:
         scope = getattr(runtime, "scope", None)
@@ -63,17 +76,28 @@ def _runtime_for_args(runtime_factory: Callable[..., Any], args: Mapping[str, An
             raise ValueError("trusted runtime is required")
         if args.get("board_id") != scope.get("board_id") or args.get("anchor_task_id") != scope.get("anchor_task_id"):
             raise ValueError("tool scope must match the composed trusted runtime")
-        if require_worker:
-            task, run = os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_RUN_ID")
-            session, board = os.environ.get("HERMES_SESSION_ID"), os.environ.get("HERMES_KANBAN_BOARD")
-            if not all(type(value) is str and value for value in (task, run, session, board)):
-                raise ValueError("tool requires trusted native worker task, run, session, and board environment")
-            if board != scope.get("board_id"):
-                raise ValueError("worker native board environment differs from composed scope")
+        if worker_context is not None:
+            if worker_context.board_id != scope.get("board_id"):
+                raise ValueError("worker native board context differs from composed scope")
+            binder = getattr(getattr(runtime, "coordinator", None), "_bind_native_worker_context", None)
+            if not callable(binder):
+                raise ValueError("trusted runtime does not support worker-context binding")
+            binder(worker_context)
         return runtime
     except Exception:
         close_runtime(runtime)
         raise
+
+
+def _bound_worker_context(runtime: Any) -> NativeWorkerContext:
+    """Read the immutable capture installed by this public worker-tool entry."""
+    reader = getattr(getattr(runtime, "coordinator", None), "_current_native_worker_context", None)
+    if not callable(reader):
+        raise ValueError("trusted runtime does not expose bound worker context")
+    context = reader()
+    if not isinstance(context, NativeWorkerContext):
+        raise ValueError("trusted runtime returned malformed worker context")
+    return context
 
 
 def _require_exact_args(name: str, args: Mapping[str, Any]) -> None:
@@ -110,8 +134,8 @@ def register_tools(ctx: ToolContext, *, runtime_factory: Callable[[Mapping[str, 
             _require_exact_args("local_first_register_planning_request", args)
             runtime = _runtime_for_args(runtime_factory, args, require_worker=True)
             try:
-                return runtime.coordinator.register_planning_request(
-                    os.environ["HERMES_KANBAN_TASK"], request_id=args.get("request_id"))
+                return runtime.coordinator.register_planning_request(_bound_worker_context(runtime).task_id,
+                                                                      request_id=args.get("request_id"))
             finally:
                 close_runtime(runtime)
         return _json_result(call)
@@ -121,13 +145,13 @@ def register_tools(ctx: ToolContext, *, runtime_factory: Callable[[Mapping[str, 
             _require_exact_args("local_first_submit_paid_review", args)
             runtime = _runtime_for_args(runtime_factory, args, require_worker=True)
             try:
+                context = _bound_worker_context(runtime)
                 review = args["review"]
                 native = review.get("native_review") if isinstance(review, Mapping) else None
                 if not isinstance(native, Mapping):
                     raise ValueError("paid review requires native review provenance")
-                if (native.get("task_id") != os.environ["HERMES_KANBAN_TASK"]
-                        or native.get("run_id") != os.environ["HERMES_KANBAN_RUN_ID"]
-                        or native.get("session_id") != os.environ["HERMES_SESSION_ID"]):
+                if (native.get("task_id") != context.task_id or native.get("run_id") != context.run_id
+                        or native.get("session_id") != context.session_id):
                     raise ValueError("paid review provenance must be the active trusted worker identity")
                 if native.get("profile") != runtime.config.roles["paid_review_profile"]:
                     raise ValueError("paid review profile must match configured paid-review role")
@@ -144,13 +168,13 @@ def register_tools(ctx: ToolContext, *, runtime_factory: Callable[[Mapping[str, 
             _require_exact_args("local_first_submit_review", args)
             runtime = _runtime_for_args(runtime_factory, args, require_worker=True)
             try:
+                context = _bound_worker_context(runtime)
                 review = args["review"]
                 native = review.get("native_review") if isinstance(review, Mapping) else None
                 if not isinstance(native, Mapping):
                     raise ValueError("local review requires native review provenance")
-                if (native.get("task_id") != os.environ["HERMES_KANBAN_TASK"]
-                        or native.get("run_id") != os.environ["HERMES_KANBAN_RUN_ID"]
-                        or native.get("session_id") != os.environ["HERMES_SESSION_ID"]):
+                if (native.get("task_id") != context.task_id or native.get("run_id") != context.run_id
+                        or native.get("session_id") != context.session_id):
                     raise ValueError("local review provenance must be the active trusted worker identity")
                 if native.get("profile") != runtime.config.roles["local_review_profile"]:
                     raise ValueError("local review profile must match configured local-review role")

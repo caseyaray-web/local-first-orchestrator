@@ -519,6 +519,55 @@ class HermesBoardAdapter:
                 raise ValueError(f"native run {field} contradicts the exact read")
         return {**run, "task_id": task_id, "board_id": self.board, "anchor_task_id": self.anchor_task_id}
 
+    def read_active_worker_identity(self, scope: Mapping[str, str], task_id: str, run_id: str,
+                                    session_id: str, profile: str) -> Mapping[str, Any]:
+        """Return only an exact native task/run/session receipt.
+
+        A profile-level session row, timestamp ordering, or worker environment
+        cannot establish that an active native run owns that session.  Hermes
+        currently stamps ``worker_session_id`` on terminal lifecycle metadata;
+        if an active-run API has no exact binding, this remains fail-closed.
+        """
+        if (type(session_id) is not str or not session_id or type(profile) is not str
+                or not profile or not profile.replace("-", "").replace("_", "").isalnum()):
+            raise ValueError("native_session_unbound")
+        run = self.read_scoped_run(scope, task_id, run_id)
+        if run.get("profile") != profile or run.get("status") not in {"running", "active", "claimed"}:
+            raise ValueError("native_run_inactive_or_profile_mismatch")
+        metadata = run.get("metadata")
+        if isinstance(metadata, Mapping) and "worker_session_id" in metadata:
+            if metadata.get("worker_session_id") != session_id:
+                raise ValueError("native_run_session_mismatch")
+            return {"version": 1, "task_id": task_id, "run_id": run_id,
+                    "session_id": session_id, "profile": profile,
+                    "source": "native_run_metadata"}
+        raise ValueError("native_session_unbound")
+
+    def read_provisional_worker_context(self, scope: Mapping[str, str], task_id: str, run_id: str,
+                                        session_id: str, profile: str) -> Mapping[str, Any]:
+        """Observe an exact live worker context without claiming session authority.
+
+        Native active runs do not yet carry ``worker_session_id``. The coordinator
+        separately binds the supplied session to its current worker environment;
+        this adapter only proves the configured active task/run/profile tuple.
+        Terminal metadata remains mandatory for authoritative finalization.
+        """
+        if (type(session_id) is not str or not session_id or type(profile) is not str
+                or not profile or not profile.replace("-", " ").replace("_", " ").isalnum()):
+            raise ValueError("native_worker_context_unbound")
+        run = self.read_scoped_run(scope, task_id, run_id)
+        card = self.read_task(task_id)
+        if (not isinstance(card, BoardSnapshot) or card.native_task.get("id") != task_id
+                or card.native_task.get("assignee") != profile
+                or card.native_task.get("status") not in {"running", "active"}
+                or run.get("profile") != profile
+                or run.get("status") not in {"running", "active", "claimed"}
+                or not any(str(item.get("id")) == run_id for item in card.runs)):
+            raise ValueError("native_task_run_profile_mismatch")
+        return {"version": 1, "task_id": task_id, "run_id": run_id,
+                "session_id": session_id, "profile": profile,
+                "source": "active_worker_context"}
+
     @staticmethod
     def _evidence(snapshot: BoardSnapshot) -> dict[str, Any]: return snapshot.to_dict()
     def _result(self, action: Action, outcome: str, details: str, snapshot: BoardSnapshot | None) -> ActionResult:

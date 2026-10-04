@@ -119,6 +119,7 @@ def test_paid_review_checks_correction_and_exact_acceptance_smoke(tmp_path, monk
     ))
     monkeypatch.setenv("HERMES_KANBAN_TASK", "correction")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "impl-c")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", SCOPE["board_id"])
     monkeypatch.setenv("HERMES_SESSION_ID", implementation_session)
     ctl.git_observer = lambda _scope: {"candidate": correction_candidate.to_dict(), "checks": local_checks,
                                        "checks_identity": check_identity(local_checks), "criterion_ids": ["c"]}
@@ -133,6 +134,10 @@ def test_paid_review_checks_correction_and_exact_acceptance_smoke(tmp_path, monk
         {"kind":"claimed", "run_id":"local-run", "payload":{"run_id":"local-run", "source_status":"review"}},
         {"kind":"completed", "run_id":"local-run", "payload":{"summary":"approved"}},
     ))
+    ctl.finalization_observer = lambda _scope, _candidate: {
+        "candidate": correction_candidate.to_dict(), "checks": local_checks,
+        "checks_identity": check_identity(local_checks), "criterion_ids": ["c"]}
+    assert ctl.finalize_local_review("local-handoff-c")["outcome"] == "finalized"
     assert ctl.submit_local_review("plan", correction["operation_key"], correction_candidate,
                                    {**local_review, "native_review": {**local_review["native_review"], "session_id": "wrong-session"}})["outcome"] == "held"
     assert ctl.submit_local_review("plan", correction["operation_key"], correction_candidate, local_review)["outcome"] == "approved"

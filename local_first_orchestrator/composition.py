@@ -93,7 +93,38 @@ def _repository_telemetry(config: PluginConfig, scope: Mapping[str, str]) -> Map
     return {"state": "available", "head_sha": head, "clean": not dirty}
 
 
-def _git_observer(config: PluginConfig, scope: Mapping[str, str]) -> Mapping[str, Any]:
+def _finalization_observer(config: PluginConfig, scope: Mapping[str, str], candidate: Any) -> Mapping[str, Any]:
+    """Re-observe one frozen candidate from trusted configuration, never worker env.
+
+    The native run is already terminal at this point, so the operator path must
+    not rely on ``HERMES_*`` variables.  It rechecks the configured repository,
+    workspace, clean pinned head, and configured check commands before the
+    coordinator compares the complete evidence to the provisional snapshot.
+    """
+    if dict(scope) != dict(config.scope):
+        raise ValueError("finalization observer scope differs from configured scope")
+    from .contracts import CandidateIdentity
+    if not isinstance(candidate, CandidateIdentity):
+        raise ValueError("finalization requires a candidate identity")
+    repository, workspace = str(config.trusted_roots["repository"]), str(config.trusted_roots["workspace"])
+    if candidate.repository_identity != repository or candidate.worktree != workspace:
+        raise ValueError("candidate is outside configured trusted repository/workspace")
+    head = _git(config, "rev-parse", "HEAD")
+    if (len(head) != 40 or any(char not in "0123456789abcdef" for char in head)
+            or candidate.base_sha != head or candidate.head_sha != head):
+        raise ValueError("configured trusted repository no longer matches frozen candidate")
+    if _git(config, "status", "--porcelain=v1", "--untracked-files=all"):
+        raise ValueError("configured trusted repository is dirty during finalization")
+    checked = _combined_checks(config, {"head_sha": head})["checks"]
+    checks = [{"check_id": item["check_id"], "outcome": "passed" if item["exit_code"] == 0 else "failed",
+               "evidence": item["output_sha256"]} for item in checked]
+    from .evidence_store import _canonical_identity
+    return {"candidate": candidate.to_dict(), "checks": checks,
+            "checks_identity": _canonical_identity(checks),
+            "criterion_ids": [item["check_id"] for item in checks], "plan_id": None}
+
+
+def _git_observer(config: PluginConfig, scope: Mapping[str, str], *, worker_context: Any = None) -> Mapping[str, Any]:
     if dict(scope) != dict(config.scope):
         raise ValueError("Git observer scope differs from configured scope")
     head = _git(config, "rev-parse", "HEAD")
@@ -102,19 +133,22 @@ def _git_observer(config: PluginConfig, scope: Mapping[str, str]) -> Mapping[str
     status = _git(config, "status", "--porcelain=v1", "--untracked-files=all")
     if status:
         raise ValueError("trusted repository is dirty; candidate observation is unavailable")
-    task_id, run_id = os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_RUN_ID")
-    session_id, board_id = os.environ.get("HERMES_SESSION_ID"), os.environ.get("HERMES_KANBAN_BOARD")
-    if not all(type(value) is str and value for value in (task_id, run_id, session_id, board_id)):
-        raise ValueError("Git candidate observation requires native worker task, run, session, and board")
-    if board_id != config.scope["board_id"]:
+    if worker_context is None:
+        from .worker_context import capture_native_worker_context
+        worker_context = capture_native_worker_context()
+    context_task, context_run = getattr(worker_context, "task_id", None), getattr(worker_context, "run_id", None)
+    context_session, context_board = getattr(worker_context, "session_id", None), getattr(worker_context, "board_id", None)
+    if not all(type(value) is str and value for value in (context_task, context_run, context_session, context_board)):
+        raise ValueError("Git candidate observation requires captured native worker context")
+    if context_board != config.scope["board_id"]:
         raise ValueError("Git candidate observation worker board differs from configured scope")
-    assert isinstance(run_id, str)
+    assert isinstance(context_run, str)
     from .contracts import CandidateIdentity
     repository = str(config.trusted_roots["repository"])
     diff = hashlib.sha256(_git(config, "diff", "--no-ext-diff", f"{head}..{head}").encode()).hexdigest()
     candidate = CandidateIdentity(repository, str(config.trusted_roots["workspace"]), head, head,
                                   "git:" + hashlib.sha256((repository + head).encode()).hexdigest(),
-                                  "diff:" + diff, run_id, "git:" + hashlib.sha256(head.encode()).hexdigest())
+                                  "diff:" + diff, context_run, "git:" + hashlib.sha256(head.encode()).hexdigest())
     checked = _combined_checks(config, {"head_sha": head})["checks"]
     checks = [{"check_id": item["check_id"], "outcome": "passed" if item["exit_code"] == 0 else "failed",
                "evidence": item["output_sha256"]} for item in checked]
@@ -224,13 +258,16 @@ def build_runtime(config: PluginConfig, *, scope: Mapping[str, object], board: A
             lock=InstanceLock(config.lock_path),
             budget_policy=config.budget_policy,
             configured_roles=config.roles,
-            git_observer=lambda candidate_scope: _git_observer(config, candidate_scope),
+            git_observer=None,
+            finalization_observer=lambda candidate_scope, candidate: _finalization_observer(config, candidate_scope, candidate),
             repository_telemetry=lambda candidate_scope: _repository_telemetry(config, candidate_scope),
             planning_observer=planning_observer,
             planning_profile=config.roles["planning_profile"],
             planning_workspace=str(config.trusted_roots["workspace"]),
             combined_check_runner=lambda request: _combined_checks(config, request),
         )
+        coordinator.git_observer = lambda candidate_scope: _git_observer(
+            config, candidate_scope, worker_context=coordinator._current_native_worker_context())
         return Runtime(config, valid_scope, board, store, coordinator)
     except BaseException:
         store.close()

@@ -33,7 +33,7 @@ def register_hooks(ctx: HookContext, *, member_role: Callable[[str], str | None]
             return {"action": "block", "message": "Managed membership unavailable; completion needs reconciliation before retry."}
         if role != "implementation":
             return None
-        return {"action": "block", "message": "Submit the exact candidate through kanban_request_review from this implementation run; completion is not local approval."}
+        return {"action": "block", "message": "Call local_first_request_local_review, obtain its exact pending review_marker from local_first_status, then call kanban_request_review from this implementation run. The later operator finalizes that native transition; completion is not local approval."}
 
     ctx.register_hook("pre_tool_call", pre_tool_call)
 
