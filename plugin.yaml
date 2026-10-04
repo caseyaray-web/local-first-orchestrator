@@ -12,6 +12,7 @@ provides_tools:
   - local_first_submit_paid_review
   - local_first_request_corrections
   - local_first_report_issue
+  - local_first_request_local_review
   - local_first_status
 provides_hooks:
   - pre_tool_call

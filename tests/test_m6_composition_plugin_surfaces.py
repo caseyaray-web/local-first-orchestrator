@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -11,7 +12,10 @@ import zipfile
 import pytest
 
 from local_first_orchestrator.config import PluginConfig
-from local_first_orchestrator.composition import _combined_checks, _git_observer, build_runtime, close_runtime, initialize_store
+from local_first_orchestrator.composition import (_combined_checks, _git_observer, _repository_telemetry,
+                                                  build_runtime, close_runtime, initialize_store)
+from local_first_orchestrator.contracts import BoardSnapshot, ManagedMember
+from local_first_orchestrator.evidence_store import EvidenceStore
 from local_first_orchestrator.plugin_tools import TOOL_NAMES, register_tools
 
 
@@ -159,7 +163,10 @@ def test_production_git_and_check_callbacks_use_temporary_trusted_git_only(tmp_p
                  ("git", "config", "user.name", "Fixture"), ("git", "add", "proof.txt"),
                  ("git", "commit", "-m", "fixture")):
         subprocess.run(argv, cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-fixture")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "run-fixture")
+    monkeypatch.setenv("HERMES_SESSION_ID", "session-fixture")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", config.scope["board_id"])
     observed = _git_observer(config, config.scope)
     assert observed["candidate"]["originating_run_id"] == "run-fixture"
     assert observed["checks"][0]["outcome"] == "passed"
@@ -167,6 +174,207 @@ def test_production_git_and_check_callbacks_use_temporary_trusted_git_only(tmp_p
     assert _combined_checks(config, {"head_sha": head})["checks"][0]["exit_code"] == 0
     with pytest.raises(ValueError, match="scope"):
         _git_observer(config, {"board_id": "other", "anchor_task_id": "anchor"})
+
+
+def test_registered_local_review_handoff_status_and_submission_use_frozen_evidence(tmp_path: Path, monkeypatch):
+    config = _config(tmp_path)
+    repo = config.trusted_roots["repository"]
+    (repo / "proof.txt").write_text("fixture\n", encoding="utf-8")
+    for argv in (("git", "init"), ("git", "config", "user.email", "fixture@example.test"),
+                 ("git", "config", "user.name", "Fixture"), ("git", "add", "proof.txt"),
+                 ("git", "commit", "-m", "fixture")):
+        subprocess.run(argv, cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    initialize_store(config)
+    store = EvidenceStore.open(config.evidence_store_path, create_new=False)
+    try:
+        store.register_member(ManagedMember("fixture", "anchor", "implementation-task", "implementation", 0, (), "fixture-work"))
+    finally:
+        store.close()
+
+    class Board(_Board):
+        def __init__(self):
+            super().__init__()
+            self.implementation_run = {"id": "implementation-run", "profile": "implementer", "status": "running",
+                                       "metadata": {"worker_session_id": "implementation-session"}}
+            self.card = BoardSnapshot({"id": "implementation-task", "status": "running", "assignee": "implementer"},
+                                      (), (self.implementation_run,), (), (), (), "fixture", "implementation-task")
+            self.anchor = BoardSnapshot({"id": "anchor", "status": "blocked"}, (), (), (), (), (), "fixture", "anchor")
+
+        def list_tasks(self):
+            return (self.anchor, self.card)
+
+        def read_task(self, task_id):
+            assert task_id in {"anchor", "implementation-task"}
+            return self.anchor if task_id == "anchor" else self.card
+
+        def read_scoped_run(self, scope, task_id, run_id):
+            assert scope == config.scope and task_id == "implementation-task"
+            return next(run for run in self.card.runs if run["id"] == run_id)
+
+        def complete_review(self, marker):
+            self.implementation_run = {"id": "implementation-run", "profile": "implementer", "status": "completed",
+                                       "outcome": "review_requested", "metadata": {"worker_session_id": "implementation-session",
+                                                                                      "local_first_review": marker}}
+            reviewer_run = {"id": "reviewer-run", "profile": "reviewer", "status": "completed",
+                            "outcome": "completed", "metadata": {"worker_session_id": "reviewer-session"}}
+            self.card = BoardSnapshot({"id": "implementation-task", "status": "done", "assignee": "reviewer"}, (),
+                                      (self.implementation_run, reviewer_run), (), (
+                                          {"kind": "review_requested", "run_id": "implementation-run",
+                                           "payload": {"implementer": "implementer", "reviewer": "reviewer"}},
+                                          {"kind": "claimed", "run_id": "reviewer-run",
+                                           "payload": {"source_status": "review"}},
+                                          {"kind": "completed", "run_id": "reviewer-run", "payload": {"summary": "approved"}},
+                                      ), (), "fixture", "implementation-task")
+
+    board, ctx = Board(), _Context()
+    reviewer_context = {"active": False}
+    def runtime_factory(_scope):
+        runtime = build_runtime(config, board=board, scope=config.scope)
+        if reviewer_context["active"]:
+            runtime.coordinator.git_observer = lambda _scope: (_ for _ in ()).throw(
+                AssertionError("reviewer must consume the frozen handoff"))
+        return runtime
+    register_tools(ctx, runtime_factory=runtime_factory)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "implementation-task")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "implementation-run")
+    monkeypatch.setenv("HERMES_SESSION_ID", "implementation-session")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", config.scope["board_id"])
+    arguments = {**config.scope, "operation_key": "local-handoff-fixture", "summary": "fixture candidate"}
+    observed = json.loads(ctx.tools["local_first_request_local_review"]["handler"](arguments))
+    assert observed["ok"] is True
+    assert observed["result"]["outcome"] == "proposed"
+    # The reviewer consumes this exact detached JSON record through the
+    # registered read-only tool, not a coordinator helper or Python repr.
+    status = json.loads(ctx.tools["local_first_status"]["handler"](dict(config.scope)))
+    assert status["ok"] is True, status
+    handoff = status["result"]["review_handoffs"]
+    assert handoff == [{"state": "available", "operation_key": "local-handoff-fixture", "phase": "pending",
+                        "task_id": "implementation-task", "reviewer_profile": "reviewer",
+                        "review_marker": handoff[0]["review_marker"], "frozen_handoff": handoff[0]["frozen_handoff"]}]
+    assert handoff[0]["frozen_handoff"]["candidate"]["originating_run_id"] == "implementation-run"
+    assert handoff[0]["frozen_handoff"]["checks"][0]["outcome"] == "passed"
+    # The isolated transport now exposes the exact native request-review marker
+    # and a distinct completed reviewer run.  No native effect or provider runs.
+    board.complete_review(handoff[0]["review_marker"])
+    frozen = handoff[0]["frozen_handoff"]
+    review = {
+        "review_id": "reviewer-approved", "candidate_identity": frozen["candidate"], "reviewer_role": "local",
+        "native_review": {"task_id": "implementation-task", "run_id": "reviewer-run",
+                          "session_id": "reviewer-session", "profile": "reviewer"},
+        "checks": frozen["checks"], "checks_identity": frozen["checks_identity"], "verdict": "approved",
+        "criterion_evidence": [{"criterion_id": item, "outcome": "pass", "evidence": "reviewed frozen handoff"}
+                               for item in frozen["criterion_ids"]], "findings": [],
+    }
+    reviewer_context["active"] = True
+    # A sibling worker cannot submit a payload recorded by the actual reviewer:
+    # registered-tool provenance must bind to the invoker's exact live context
+    # before the coordinator is allowed to persist anything.
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "other-reviewer-run")
+    monkeypatch.setenv("HERMES_SESSION_ID", "other-reviewer-session")
+    mismatched = json.loads(ctx.tools["local_first_submit_review"]["handler"]({
+        **config.scope, "task_id": "implementation-task", "candidate": frozen["candidate"], "review": review,
+    }))
+    assert mismatched["ok"] is False
+    assert "active trusted worker identity" in mismatched["error"]
+    after_mismatch = json.loads(ctx.tools["local_first_status"]["handler"](dict(config.scope)))
+    assert after_mismatch["ok"] is True
+    assert after_mismatch["result"]["reviews"] == []
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "reviewer-run")
+    monkeypatch.setenv("HERMES_SESSION_ID", "reviewer-session")
+    submitted = json.loads(ctx.tools["local_first_submit_review"]["handler"]({
+        **config.scope, "task_id": "implementation-task", "candidate": frozen["candidate"], "review": review,
+    }))
+    assert submitted == {"ok": True, "result": {"outcome": "accepted", "candidate": frozen["candidate"]["content_identity"],
+                                                      "review_id": "reviewer-approved"}}
+    recorded = json.loads(ctx.tools["local_first_status"]["handler"](dict(config.scope)))
+    assert recorded["ok"] is True
+    assert len(recorded["result"]["reviews"]) == 1
+
+
+def test_operator_status_uses_read_only_repository_telemetry_not_worker_candidate_authority(tmp_path: Path, monkeypatch, capsys):
+    config = _config(tmp_path)
+    repo = config.trusted_roots["repository"]
+    (repo / "proof.txt").write_text("fixture\n", encoding="utf-8")
+    for argv in (("git", "init"), ("git", "config", "user.email", "fixture@example.test"),
+                 ("git", "config", "user.name", "Fixture"), ("git", "add", "proof.txt"),
+                 ("git", "commit", "-m", "fixture")):
+        subprocess.run(argv, cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    initialize_store(config)
+    check_marker = tmp_path / "configured-check-ran"
+    config.hermes_executable.write_text("#!/bin/sh\nprintf checked > " + str(check_marker) + "\n", encoding="utf-8")
+
+    class Board(_Board):
+        def __init__(self):
+            super().__init__()
+            self.anchor = BoardSnapshot({"id": "anchor", "status": "blocked"}, (), (), (), (), (), "fixture", "anchor")
+
+        def list_tasks(self):
+            return (self.anchor,)
+
+        def read_task(self, task_id):
+            assert task_id == "anchor"
+            return self.anchor
+
+    for name in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_SESSION_ID", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(name, raising=False)
+    runtime = build_runtime(config, board=Board(), scope=config.scope)
+    try:
+        before = runtime.store.read_scope(config.scope)
+        status = runtime.coordinator.status()
+        after = runtime.store.read_scope(config.scope)
+        assert status["repository_telemetry"]["state"] == "available"
+        assert status["repository_telemetry"]["clean"] is True
+        assert "candidate" not in status["repository_telemetry"]
+        assert "checks" not in status["repository_telemetry"]
+        assert not check_marker.exists()
+        assert before == after
+    finally:
+        close_runtime(runtime)
+
+    # The public CLI must remain readable before dispatch, while a native-shaped
+    # worker is active, and after its environment has gone away.  Every call
+    # constructs fresh composition, but status leaves the durable evidence and
+    # budgets exactly as it found them.
+    import local_first_orchestrator.cli as cli
+    config_path = tmp_path / "trusted-config.json"
+    config_path.write_text(json.dumps({
+        "version": 1, "state_root": str(config.state_root), "hermes_executable": str(config.hermes_executable),
+        "hermes_home": str(config.hermes_home), "kanban_home": str(config.kanban_home),
+        "trusted_roots": {key: str(value) for key, value in config.trusted_roots.items()}, "roles": dict(config.roles),
+        "budgets": {"implementation_attempts": 1, "review_corrections": 1, "infrastructure_retries": 1,
+                    "workflow_repairs": 1, "paid_capacity": 1}, "poll_interval_seconds": config.poll_interval_seconds,
+        "scope": dict(config.scope), "check_commands": [{"check_id": key, "argv": list(argv)} for key, argv in config.check_commands],
+    }), encoding="utf-8")
+    monkeypatch.setattr(cli, "build_runtime", lambda parsed, *, scope: build_runtime(parsed, board=Board(), scope=scope))
+    store = EvidenceStore.open(config.evidence_store_path, create_new=False)
+    try:
+        cli_before = store.read_scope(config.scope)
+    finally:
+        store.close()
+    command = ("--config", str(config_path), "--board", config.scope["board_id"],
+               "--anchor-task-id", config.scope["anchor_task_id"], "status")
+    for worker_env in (False, True, False):
+        if worker_env:
+            monkeypatch.setenv("HERMES_KANBAN_TASK", "task-fixture")
+            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "run-fixture")
+            monkeypatch.setenv("HERMES_SESSION_ID", "session-fixture")
+            monkeypatch.setenv("HERMES_KANBAN_BOARD", config.scope["board_id"])
+        else:
+            for name in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_SESSION_ID", "HERMES_KANBAN_BOARD"):
+                monkeypatch.delenv(name, raising=False)
+        assert cli.main(command) == 0
+        assert json.loads(capsys.readouterr().out)["status"]["repository_telemetry"]["state"] == "available"
+        assert not check_marker.exists()
+    store = EvidenceStore.open(config.evidence_store_path, create_new=False)
+    try:
+        assert store.read_scope(config.scope) == cli_before
+    finally:
+        store.close()
+
+    shutil.rmtree(repo)
+    assert _repository_telemetry(config, config.scope) == {
+        "state": "unavailable", "error": {"code": "repository_observation_unavailable"}}
 
 
 def _hermes_test_executable() -> Path:
@@ -249,6 +457,6 @@ def test_built_distribution_imports_every_module_and_registers_from_temporary_he
     doctor = subprocess.run((str(hermes), "plugins", "doctor", str(plugin_root), "--ci"), cwd=tmp_path,
                             env=env, text=True, capture_output=True)
     assert doctor.returncode == 0, doctor.stdout + doctor.stderr
-    assert "registrations: 7 tool(s), 1 hook(s)" in doctor.stdout
+    assert f"registrations: {len(TOOL_NAMES)} tool(s), 1 hook(s)" in doctor.stdout
     # Doctor runs Hermes' actual discovery/parser/import/register sequence in
     # its own temporary home and reports the native registry readback above.

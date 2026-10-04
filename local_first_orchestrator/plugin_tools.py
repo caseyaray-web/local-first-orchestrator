@@ -14,6 +14,7 @@ TOOL_NAMES = (
     "local_first_submit_paid_review",
     "local_first_request_corrections",
     "local_first_report_issue",
+    "local_first_request_local_review",
     "local_first_status",
 )
 _TOOLSET = "local_first_orchestrator"
@@ -36,6 +37,7 @@ SCHEMAS = {
     "local_first_submit_paid_review": _schema("local_first_submit_paid_review", "Submit a paid review only from the current configured paid-review worker.", {"plan_id": {"type": "string"}, "review": {"type": "object"}}, ["plan_id", "review"]),
     "local_first_request_corrections": _schema("local_first_request_corrections", "Reserve bounded native correction handoff from the current reviewer run; it does not create work in this tool call.", {"task_id": {"type": "string"}, "candidate": {"type": "object"}, "review": {"type": "object"}, "operation_key": {"type": "string"}, "reason": {"type": "string"}}, ["task_id", "candidate", "review", "operation_key"]),
     "local_first_report_issue": _schema("local_first_report_issue", "Record a scoped recovery issue for later bounded reconciliation; this tool does not perform repair.", {"issue": {"type": "object"}}, ["issue"]),
+    "local_first_request_local_review": _schema("local_first_request_local_review", "Reserve a local-review handoff from the current implementation worker. Candidate and check evidence are resolved from trusted native worker context, never tool arguments.", {"operation_key": {"type": "string"}, "summary": {"type": "string"}}, ["operation_key", "summary"]),
     "local_first_status": _schema("local_first_status", "Read scoped Local First coordinator status without changing board state.", {}, []),
 }
 
@@ -43,7 +45,7 @@ SCHEMAS = {
 def _json_result(call: Callable[[], Mapping[str, Any]]) -> str:
     try:
         value = dict(call())
-        return json.dumps({"ok": True, "result": value}, sort_keys=True, default=str)
+        return json.dumps({"ok": True, "result": value}, sort_keys=True, allow_nan=False)
     except (ValueError, KeyError, TypeError, RuntimeError) as error:
         return json.dumps({"ok": False, "outcome": "invalid_or_held", "error": str(error)}, sort_keys=True)
     except Exception:
@@ -142,7 +144,17 @@ def register_tools(ctx: ToolContext, *, runtime_factory: Callable[[Mapping[str, 
             _require_exact_args("local_first_submit_review", args)
             runtime = _runtime_for_args(runtime_factory, args, require_worker=True)
             try:
-                return runtime.coordinator.submit_review(args["task_id"], CandidateIdentity.from_dict(args["candidate"]), args["review"], expected_profile=runtime.config.roles["local_review_profile"])
+                review = args["review"]
+                native = review.get("native_review") if isinstance(review, Mapping) else None
+                if not isinstance(native, Mapping):
+                    raise ValueError("local review requires native review provenance")
+                if (native.get("task_id") != os.environ["HERMES_KANBAN_TASK"]
+                        or native.get("run_id") != os.environ["HERMES_KANBAN_RUN_ID"]
+                        or native.get("session_id") != os.environ["HERMES_SESSION_ID"]):
+                    raise ValueError("local review provenance must be the active trusted worker identity")
+                if native.get("profile") != runtime.config.roles["local_review_profile"]:
+                    raise ValueError("local review profile must match configured local-review role")
+                return runtime.coordinator.submit_review(args["task_id"], CandidateIdentity.from_dict(args["candidate"]), review, expected_profile=runtime.config.roles["local_review_profile"])
             finally:
                 close_runtime(runtime)
         return _json_result(call)
@@ -182,11 +194,23 @@ def register_tools(ctx: ToolContext, *, runtime_factory: Callable[[Mapping[str, 
                 close_runtime(runtime)
         return _json_result(call)
 
+    def request_local_review(args: Mapping[str, Any], **_: Any) -> str:
+        def call() -> Mapping[str, Any]:
+            _require_exact_args("local_first_request_local_review", args)
+            runtime = _runtime_for_args(runtime_factory, args, require_worker=True)
+            try:
+                return runtime.coordinator.request_local_review_from_worker(
+                    operation_key=args["operation_key"], summary=args["summary"])
+            finally:
+                close_runtime(runtime)
+        return _json_result(call)
+
     for name, handler in (("local_first_submit_plan", submit_plan),
                           ("local_first_register_planning_request", register_planning_request),
                           ("local_first_submit_review", submit_review),
                           ("local_first_submit_paid_review", submit_paid_review),
                           ("local_first_request_corrections", request_corrections), ("local_first_report_issue", report_issue),
+                          ("local_first_request_local_review", request_local_review),
                           ("local_first_status", status)):
         ctx.register_tool(name=name, toolset=_TOOLSET, schema=SCHEMAS[name], handler=handler)
 

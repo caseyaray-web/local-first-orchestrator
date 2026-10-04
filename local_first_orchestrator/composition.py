@@ -70,6 +70,29 @@ def _combined_checks(config: PluginConfig, request: Mapping[str, Any]) -> Mappin
     return {"head_sha": head, "checks": checks}
 
 
+def _repository_telemetry(config: PluginConfig, scope: Mapping[str, str]) -> Mapping[str, Any]:
+    """Read only the configured repository state for an operator-facing status.
+
+    This is deliberately not candidate or check authority.  In particular, it
+    does not require a worker environment, construct a CandidateIdentity, or
+    run configured checks.  Worker-owned candidate/check observation remains
+    in ``_git_observer`` below.
+    """
+    if dict(scope) != dict(config.scope):
+        return {"state": "unavailable", "error": {"code": "scope_mismatch"}}
+    try:
+        head = _git(config, "rev-parse", "HEAD")
+        if len(head) != 40 or any(char not in "0123456789abcdef" for char in head):
+            raise ValueError("trusted repository HEAD is not a full Git SHA")
+        dirty = bool(_git(config, "status", "--porcelain=v1", "--untracked-files=all"))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        # Do not expose command output or path details through a read-only
+        # status response.  The structured code is enough for an operator to
+        # distinguish unavailable telemetry from a dirty but observable tree.
+        return {"state": "unavailable", "error": {"code": "repository_observation_unavailable"}}
+    return {"state": "available", "head_sha": head, "clean": not dirty}
+
+
 def _git_observer(config: PluginConfig, scope: Mapping[str, str]) -> Mapping[str, Any]:
     if dict(scope) != dict(config.scope):
         raise ValueError("Git observer scope differs from configured scope")
@@ -79,9 +102,13 @@ def _git_observer(config: PluginConfig, scope: Mapping[str, str]) -> Mapping[str
     status = _git(config, "status", "--porcelain=v1", "--untracked-files=all")
     if status:
         raise ValueError("trusted repository is dirty; candidate observation is unavailable")
-    run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
-    if type(run_id) is not str or not run_id:
-        raise ValueError("Git candidate observation requires the native worker run")
+    task_id, run_id = os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_RUN_ID")
+    session_id, board_id = os.environ.get("HERMES_SESSION_ID"), os.environ.get("HERMES_KANBAN_BOARD")
+    if not all(type(value) is str and value for value in (task_id, run_id, session_id, board_id)):
+        raise ValueError("Git candidate observation requires native worker task, run, session, and board")
+    if board_id != config.scope["board_id"]:
+        raise ValueError("Git candidate observation worker board differs from configured scope")
+    assert isinstance(run_id, str)
     from .contracts import CandidateIdentity
     repository = str(config.trusted_roots["repository"])
     diff = hashlib.sha256(_git(config, "diff", "--no-ext-diff", f"{head}..{head}").encode()).hexdigest()
@@ -198,6 +225,7 @@ def build_runtime(config: PluginConfig, *, scope: Mapping[str, object], board: A
             budget_policy=config.budget_policy,
             configured_roles=config.roles,
             git_observer=lambda candidate_scope: _git_observer(config, candidate_scope),
+            repository_telemetry=lambda candidate_scope: _repository_telemetry(config, candidate_scope),
             planning_observer=planning_observer,
             planning_profile=config.roles["planning_profile"],
             planning_workspace=str(config.trusted_roots["workspace"]),

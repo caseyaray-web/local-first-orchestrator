@@ -146,11 +146,11 @@ def _complete_same_card_local_review(ctl, store, cards, runs, monkeypatch, ticke
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", candidate.originating_run_id)
     monkeypatch.setenv("HERMES_SESSION_ID", implementation_session)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", ctl.scope["board_id"])
     ctl.git_observer = lambda _scope: {"candidate": candidate.to_dict(), "checks": review["checks"],
                                        "checks_identity": review["checks_identity"], "criterion_ids": ["AC-1"]}
     key = "local-handoff:" + ticket_id
-    assert ctl.request_local_review(task_id, candidate, implementation_profile=implementation,
-                                    reviewer_profile=reviewer, summary="fixture candidate", operation_key=key)["outcome"] == "proposed"
+    assert ctl.request_local_review_from_worker(operation_key=key, summary="fixture candidate")["outcome"] == "proposed"
     marker = next(op.target["review_marker"] for op in store.read_scope(ctl.scope)["operations"] if op.key == key)
     runs[task_id] = (
         {"id": candidate.originating_run_id, "task_id": task_id, "profile": implementation,
@@ -641,6 +641,42 @@ def test_regression_serial_git_integration_requires_observed_local_approval(tmp_
         assert git.existing_execution_base("TR-A", base) == candidate.head_sha
     finally:
         store.close()
+
+
+
+def test_frozen_implementation_handoff_survives_reviewer_context_and_rejects_distinct_candidate(tmp_path, monkeypatch):
+    ctl, store, _board, cards, runs = _regression_core(tmp_path, monkeypatch)
+    try:
+        held = ctl.prepare_active_tranche("plan-1")
+        assert ctl.release_active_piece("plan-1", "TK-A")["outcome"] == "released"
+        repo = tmp_path / "repo"; repo.mkdir()
+        _git(repo, "init", "-q"); _git(repo, "config", "user.name", "M4"); _git(repo, "config", "user.email", "m4@example.invalid")
+        (repo / "base.txt").write_text("base\n"); _git(repo, "add", "."); _git(repo, "commit", "-qm", "base")
+        base = _git(repo, "rev-parse", "HEAD"); git = GitWorktreeAdapter(repo, tmp_path / "attempts")
+        git.resolve_execution_base("TR-A", base)
+        accepted_reader = store.read_accepted_plan
+        store.read_accepted_plan = lambda scope, plan_id: {**accepted_reader(scope, plan_id), "base_sha": base}
+        candidate = _candidate(git, repo, "TK-A", base, "a.txt")
+        task_id = next(piece["task_id"] for piece in held["pieces"] if piece["ticket_id"] == "TK-A")
+        review = _review("frozen-review", candidate, role="local", task_id=task_id, run_id="frozen-run", session="frozen-session")
+        _complete_same_card_local_review(ctl, store, cards, runs, monkeypatch, "TK-A", task_id, candidate, review)
+        handoff = next(op for op in store.read_scope(ctl.scope)["operations"] if op.key == "local-handoff:TK-A")
+        assert handoff.target["frozen_handoff"]["candidate"] == candidate.to_dict()
+        assert tuple(handoff.target["frozen_handoff"]["checks"]) == tuple(review["checks"])
+        assert tuple(handoff.target["frozen_handoff"]["criterion_ids"]) == ("AC-1",)
+        before = tuple(store.connection.iterdump())
+        forged = dataclasses.replace(candidate, head_sha="f" * 40)
+        assert ctl.submit_local_review("plan-1", "TK-A", forged, review)["outcome"] == "held"
+        assert tuple(store.connection.iterdump()) == before
+        wrong_checks = [{"check_id": "smoke", "outcome": "passed", "evidence": "forged"}]
+        forged_checks_review = {**review, "checks": wrong_checks, "checks_identity": _identity(wrong_checks)}
+        assert ctl.submit_local_review("plan-1", "TK-A", candidate, forged_checks_review)["outcome"] == "held"
+        assert store.read_scope(ctl.scope)["reviews"] == ()
+        ctl.git_observer = lambda _scope: (_ for _ in ()).throw(AssertionError("reviewer must not observe implementation evidence"))
+        assert ctl.submit_review(task_id, candidate, review, expected_profile="local")["outcome"] == "accepted"
+    finally:
+        store.close()
+
 
 
 def _complete_integrated_serial_core(tmp_path, monkeypatch):

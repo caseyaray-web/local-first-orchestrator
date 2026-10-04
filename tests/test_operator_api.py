@@ -167,6 +167,8 @@ def test_mounted_fixture_dashboard_status_stale_and_partial_stop(mounted_api):
     code, status = _request(base + PREFIX + "/status")
     assert code == 200
     assert status["scope"] == SCOPE
+    assert set(status["current_head"]) == {"state", "head_sha", "clean"}
+    assert status["current_head"]["state"] == "available"
     assert status["active_workers"][0]["id"] == "run-1"
     assert status["runtime_metrics"]["reviews"] == {"total": 2, "local": 1, "paid": 1}
     assert [item["reviewer_role"] for item in status["review_queues"]["local"]] == ["local"]

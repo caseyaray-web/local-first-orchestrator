@@ -26,6 +26,7 @@ class Coordinator:
 
     def __init__(self, scope: Mapping[str, Any], *, board: Any, store: Any,
                  lock: InstanceLock, git_observer: Callable[[Mapping[str, str]], Mapping[str, Any]] | None = None,
+                 repository_telemetry: Callable[[Mapping[str, str]], Mapping[str, Any]] | None = None,
                  budget_policy: BudgetPolicy | None = None,
                  configured_roles: Mapping[str, str] | None = None,
                  planning_observer: Callable[[Mapping[str, str]], Mapping[str, Any]] | None = None,
@@ -52,7 +53,9 @@ class Coordinator:
         if configured_roles is not None and not isinstance(configured_roles, Mapping):
             raise ValueError("configured roles must be a mapping")
         self.configured_roles = MappingProxyType(dict(configured_roles or {}))
-        self.git_observer, self.budget_policy = git_observer, budget_policy
+        if repository_telemetry is not None and not callable(repository_telemetry):
+            raise ValueError("repository telemetry must be a trusted callable")
+        self.git_observer, self.repository_telemetry, self.budget_policy = git_observer, repository_telemetry, budget_policy
         # Trusted composition-root dependency. The callback observes current
         # repository, base, contract and approved objective/configuration itself.
         self.planning_observer = planning_observer
@@ -2486,10 +2489,7 @@ class Coordinator:
             handoff = self._verified_handoff(task_id, candidate, local)
             if handoff is None:
                 return {"outcome": "held", "reason": "verified_local_review_handoff_missing"}
-            # Candidate/check assertions belong to the observer, not to the
-            # submitting caller.  This is the same acceptance boundary used by
-            # the M3 same-card review loop.
-            if not self._frozen_candidate(candidate, review):
+            if not self._frozen_candidate(candidate, review, handoff.get("frozen_handoff")):
                 return {"outcome": "held", "reason": "trusted_git_freeze_unavailable"}
             reader = getattr(self.board, "read_scoped_run", None)
             run = reader(self.scope, task_id, native.get("run_id")) if callable(reader) else None
@@ -3056,12 +3056,63 @@ class Coordinator:
             if not isinstance(anchor, BoardSnapshot):
                 raise ValueError("board adapter must return BoardSnapshot")
             native_tasks[self.scope["anchor_task_id"]] = anchor
-        git = None if self.git_observer is None else self.git_observer(dict(self.scope))
-        if git is not None and not isinstance(git, Mapping):
-            raise ValueError("trusted git observer must return a mapping")
-        return {**state, "native_tasks": native_tasks,
-                "native_runs": tuple(run for item in native_tasks.values() for run in item.runs),
-                "git_observation": git}
+        telemetry = None if self.repository_telemetry is None else self.repository_telemetry(dict(self.scope))
+        if telemetry is not None and not isinstance(telemetry, Mapping):
+            raise ValueError("trusted repository telemetry must return a mapping")
+        # ``read_scope`` deliberately returns immutable domain objects for
+        # coordinator use.  Public status is a separate JSON contract: never
+        # delegate its serialization to ``default=str`` because that turns a
+        # frozen request-review handoff into an opaque Python repr.
+        operations = [item.to_dict() for item in state["operations"]]
+        handoffs = []
+        for operation in operations:
+            target = operation["target"]
+            frozen = target.get("frozen_handoff") if operation["effect"] == "request_review" else None
+            if not isinstance(frozen, Mapping):
+                continue
+            candidate_data = frozen.get("candidate")
+            if not isinstance(candidate_data, Mapping):
+                available = False
+            else:
+                try:
+                    from .contracts import CandidateIdentity
+                    candidate = CandidateIdentity.from_dict(candidate_data)
+                    synthetic_review = {
+                        "checks": frozen.get("checks"), "checks_identity": frozen.get("checks_identity"),
+                        "criterion_evidence": [{"criterion_id": item, "outcome": "pass", "evidence": "frozen"}
+                                               for item in frozen.get("criterion_ids", ())],
+                    }
+                    available = self._frozen_candidate(candidate, synthetic_review, frozen)
+                except (TypeError, ValueError, KeyError):
+                    available = False
+            if available:
+                handoffs.append({"state": "available", "operation_key": operation["key"],
+                                 "phase": operation["phase"], "task_id": target.get("task_id"),
+                                 "reviewer_profile": target.get("reviewer_profile"),
+                                 "review_marker": target.get("review_marker"),
+                                 "frozen_handoff": frozen})
+            else:
+                handoffs.append({"state": "unavailable", "operation_key": operation["key"],
+                                 "error": {"code": "invalid_frozen_local_review_handoff"}})
+        public = {
+            "scope": dict(state["scope"]),
+            "members": [item.to_dict() for item in state["members"]],
+            "candidates": [item.to_dict() for item in state["candidates"]],
+            "reviews": list(state["reviews"]), "operations": operations,
+            "effect_observations": list(state["effect_observations"]),
+            "budget_events": list(state["budget_events"]),
+            "budget_reconciliations": list(state["budget_reconciliations"]),
+            "budget_net": list(state["budget_net"]),
+            "operator_intent": None if state["operator_intent"] is None else state["operator_intent"].to_dict(),
+            "native_tasks": {task_id: snapshot.to_dict() for task_id, snapshot in native_tasks.items()},
+            "native_runs": [run for snapshot in native_tasks.values() for run in snapshot.to_dict()["runs"]],
+            "repository_telemetry": None if telemetry is None else dict(telemetry),
+            "review_handoffs": handoffs,
+        }
+        try:
+            return json.loads(json.dumps(public, sort_keys=True, allow_nan=False))
+        except (TypeError, ValueError) as error:
+            raise ValueError("public status contains non-JSON evidence") from error
 
     @staticmethod
     def _native_workspace(worktree: str) -> str:
@@ -4356,6 +4407,61 @@ class Coordinator:
             raise ValueError("board returned malformed native run attribution")
         return result
 
+    def _native_implementation_candidate(self, task_id: str, candidate: Any, *,
+                                         run_id: str, session_id: str) -> None:
+        """Require the candidate producer to be the active native implementation worker."""
+        implementation, _reviewer = self._local_review_roles()
+        if candidate.originating_run_id != run_id:
+            raise ValueError("candidate must originate from the active implementation run")
+        run = self._scoped_run(task_id, run_id)
+        card = self.board.read_task(task_id)
+        if (not isinstance(card, BoardSnapshot) or card.native_task.get("id") != task_id
+                or card.native_task.get("assignee") != implementation
+                or card.native_task.get("status") not in {"running", "active"}
+                or run.get("profile") != implementation or run.get("status") not in {"running", "active", "claimed"}
+                or self._worker_session(run) != session_id
+                or not any(str(item.get("id")) == run_id for item in card.runs)):
+            raise ValueError("candidate requires matching active native implementation task, run, and session")
+
+    def observe_candidate_checks(self) -> dict[str, Any]:
+        """Return current implementation candidate/check evidence without effects."""
+        from .contracts import CandidateIdentity
+        task_id, run_id = os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_RUN_ID")
+        session_id, board_id = os.environ.get("HERMES_SESSION_ID"), os.environ.get("HERMES_KANBAN_BOARD")
+        if not all(isinstance(value, str) and value for value in (task_id, run_id, session_id, board_id)):
+            raise ValueError("candidate observation requires native task, run, session, and board")
+        if board_id != self.scope["board_id"]:
+            raise ValueError("candidate observation board differs from configured scope")
+        assert isinstance(task_id, str) and isinstance(run_id, str) and isinstance(session_id, str)
+        if self.git_observer is None:
+            raise ValueError("candidate observation requires configured trusted Git observer")
+        observed = self.git_observer(dict(self.scope))
+        if not isinstance(observed, Mapping):
+            raise ValueError("trusted Git observer returned malformed observation")
+        candidate = CandidateIdentity.from_dict(observed.get("candidate", {}))
+        self._native_implementation_candidate(task_id, candidate, run_id=run_id, session_id=session_id)
+        checks = observed.get("checks")
+        if not isinstance(checks, list) or not checks:
+            raise ValueError("candidate observation requires configured check records")
+        return {"task_id": task_id, "run_id": run_id, "session_id": session_id,
+                "board_id": board_id, "candidate": candidate.to_dict(), "checks": checks,
+                "checks_identity": observed.get("checks_identity"), "criterion_ids": observed.get("criterion_ids")}
+
+    def request_local_review_from_worker(self, *, operation_key: str, summary: str) -> dict[str, Any]:
+        """Public worker entrypoint; caller supplies no candidate or provenance."""
+        if not isinstance(operation_key, str) or not operation_key:
+            raise ValueError("local review operation key must be a non-empty string")
+        if not isinstance(summary, str) or not summary:
+            raise ValueError("local review summary must be a non-empty string")
+        observed = self.observe_candidate_checks()
+        from .contracts import CandidateIdentity
+        candidate = CandidateIdentity.from_dict(observed["candidate"])
+        return self.request_local_review(
+            observed["task_id"], candidate,
+            implementation_profile=self.configured_roles.get("implementation_profile", ""),
+            reviewer_profile=self.configured_roles.get("local_review_profile", ""),
+            summary=summary, operation_key=operation_key)
+
     def request_local_review(self, task_id: str, candidate: Any, *, implementation_profile: str,
                              reviewer_profile: str, summary: str, operation_key: str) -> dict[str, Any]:
         """Durably propose a handoff which only the implementation worker can send."""
@@ -4373,6 +4479,22 @@ class Coordinator:
         if implementation.get("status") != "running":
             raise ValueError("worker-owned implementation run must be active")
         implementation_session = self._active_worker_session(task_id, candidate.originating_run_id)
+        # Capture complete observer authority while the implementation worker
+        # still owns this exact native run.  The immutable intent below is the
+        # only source a later reviewer may consume.
+        if self.git_observer is None:
+            raise ValueError("active implementation candidate/check observation is unavailable")
+        try:
+            observed = self.git_observer(dict(self.scope))
+        except Exception as error:
+            raise ValueError("active implementation candidate/check observation is unavailable") from error
+        self._native_implementation_candidate(task_id, candidate, run_id=candidate.originating_run_id,
+                                              session_id=implementation_session)
+        frozen_handoff = self._validated_frozen_candidate_observation(
+            observed, candidate, task_id=task_id, run_id=candidate.originating_run_id,
+            session_id=implementation_session, implementation_profile=implementation_profile)
+        if frozen_handoff is None:
+            raise ValueError("active implementation candidate/check observation is unavailable")
         before = self.board.read_task(task_id)
         if not isinstance(before, BoardSnapshot):
             raise ValueError("board adapter must return BoardSnapshot")
@@ -4380,11 +4502,11 @@ class Coordinator:
                   "implementation_run_id": candidate.originating_run_id,
                   "implementation_profile": implementation_profile,
                   "implementation_session_id": implementation_session,
-                  "reviewer_profile": reviewer_profile}
+                  "reviewer_profile": reviewer_profile, "frozen_handoff": frozen_handoff}
         action = Action(operation_key, self.scope, {
             "task_id": task_id, "reviewer_profile": reviewer_profile, "summary": summary,
             "candidate_content_identity": candidate.content_identity,
-            "review_marker": marker,
+            "frozen_handoff": frozen_handoff, "review_marker": marker,
         }, "request_review", before.digest)
         with self.lock:
             self._assert_lock()
@@ -4425,7 +4547,16 @@ class Coordinator:
         if (source_profile != configured_implementation or source_session is None
                 or source_run.get("status") not in {"completed", "done"}):
             return {"outcome": "held", "reason": "premature_done_source_provenance_missing"}
-        if not self._trusted_candidate_observation(candidate):
+        if self.git_observer is None:
+            return {"outcome": "held", "reason": "trusted_git_freeze_unavailable"}
+        try:
+            source_observation = self.git_observer(dict(self.scope))
+        except Exception:
+            return {"outcome": "held", "reason": "trusted_git_freeze_unavailable"}
+        frozen_handoff = self._validated_frozen_candidate_observation(
+            source_observation, candidate, task_id=task_id, run_id=candidate.originating_run_id,
+            session_id=source_session, implementation_profile=configured_implementation)
+        if frozen_handoff is None:
             return {"outcome": "held", "reason": "trusted_git_freeze_unavailable"}
         canonical = json.dumps({"scope": self.scope, "source_task_id": task_id,
                                 "candidate": candidate.to_dict(), "action": "premature_done_review",
@@ -4440,6 +4571,7 @@ class Coordinator:
             "association": association, "replacement_for": replacement_for, "native_parent": False,
             "task_id": task_id, "source_run_id": candidate.originating_run_id,
             "source_profile": source_profile, "source_session_id": source_session,
+            "frozen_handoff": frozen_handoff,
             "create_title": f"Local review: {task_id}",
             "create_body": f"Preserved candidate {candidate.content_identity} for completed source {task_id}.",
             "create_workspace": self._native_workspace(candidate.worktree), "create_idempotency_key": key,
@@ -4533,10 +4665,12 @@ class Coordinator:
             association = f"separate-review-correction:{review_task_id}:{candidate.content_identity}:{member.generation + 1}"
             if any(member.work_association == association for member in state["members"]):
                 return {"outcome": "held", "reason": "correction_already_registered"}
-            if (self._separate_review_intent(review_task_id, candidate, reviewer) is None
+            separate_intent = self._separate_review_intent(review_task_id, candidate, reviewer)
+            frozen_handoff = None if separate_intent is None else separate_intent.target.get("frozen_handoff")
+            if (separate_intent is None
                     or not self._verified_separate_review(review_task_id, candidate, reviewer,
                                                           native.get("run_id"), native.get("session_id"))
-                    or not self._frozen_candidate(candidate, review)):
+                    or not self._frozen_candidate(candidate, review, frozen_handoff)):
                 return {"outcome": "held", "reason": "terminal_separate_review_or_freeze_missing"}
             if self.budget_policy is None:
                 return {"outcome": "held", "reason": "finite_correction_budget_required"}
@@ -4604,65 +4738,89 @@ class Coordinator:
             self.store.register_member(registered)
             return {"outcome": "held", "task_id": registered.task_id}
 
-    def _trusted_candidate_observation(self, candidate: Any) -> bool:
-        if self.git_observer is None:
-            return False
-        try:
-            observed = self.git_observer(dict(self.scope))
-        except Exception:
-            return False
-        if not isinstance(observed, Mapping) or observed.get("candidate") != candidate.to_dict():
-            return False
-        checks = observed.get("checks")
-        return isinstance(checks, list) and bool(checks) and all(
-            isinstance(check, Mapping) and check.get("outcome") == "passed" for check in checks
-        )
+    @staticmethod
+    def _validated_frozen_candidate_observation(observed: Any, candidate: Any, *, task_id: str,
+                                                run_id: str, session_id: str,
+                                                implementation_profile: str) -> dict[str, Any] | None:
+        """Detach the implementation-owned candidate/check handoff once.
 
-    def _frozen_candidate(self, candidate: Any, review: Mapping[str, Any]) -> bool:
-        """Bind a verdict to observer-owned candidate, checks, and contract scope.
-
-        ``git_observer`` is a composition-root trust boundary: it must read the
-        frozen candidate and deterministic validation output itself.  Reviewer
-        text can attest to neither.  There is intentionally no fallback when a
-        trusted observer is unavailable.
+        This record is stored inside the immutable request-review intent.  It is
+        intentionally complete so a later reviewer never has to (and must not)
+        re-run the implementation observer from a different run/worktree.
         """
-        if self.git_observer is None:
-            return False
-        try:
-            observed = self.git_observer(dict(self.scope))
-        except Exception:
-            return False
-        if not isinstance(observed, Mapping):
-            return False
-        frozen, checks, criterion_ids = (observed.get("candidate"), observed.get("checks"),
-                                         observed.get("criterion_ids"))
-        if not isinstance(frozen, Mapping) or dict(frozen) != candidate.to_dict():
-            return False
-        if (not isinstance(checks, list) or not checks or not isinstance(criterion_ids, list) or not criterion_ids
+        if not isinstance(observed, Mapping) or observed.get("candidate") != candidate.to_dict():
+            return None
+        checks, criterion_ids = observed.get("checks"), observed.get("criterion_ids")
+        if (not isinstance(checks, (list, tuple)) or not checks or not isinstance(criterion_ids, (list, tuple)) or not criterion_ids
                 or not all(isinstance(item, str) and item for item in criterion_ids)
-                or criterion_ids != sorted(set(criterion_ids))):
-            return False
-        try:
-            from .evidence_store import _canonical_identity
-            checks_identity = _canonical_identity(checks)
-        except (TypeError, ValueError):
-            return False
-        if (observed.get("checks_identity") != checks_identity
-                or review.get("checks") != checks
-                or review.get("checks_identity") != checks_identity):
-            return False
+                or list(criterion_ids) != sorted(set(criterion_ids))):
+            return None
         if any(not isinstance(check, Mapping) or set(check) != {"check_id", "outcome", "evidence"}
                or not all(isinstance(check.get(field), str) and check[field] for field in ("check_id", "outcome", "evidence"))
                or check.get("outcome") != "passed" for check in checks):
+            return None
+        try:
+            from .evidence_store import _canonical_identity
+            normalized_checks = [dict(check) for check in checks]
+            checks_identity = _canonical_identity(normalized_checks)
+        except (TypeError, ValueError):
+            return None
+        if observed.get("checks_identity") != checks_identity:
+            return None
+        return {"task_id": task_id, "implementation_run_id": run_id,
+                "implementation_session_id": session_id,
+                "implementation_profile": implementation_profile,
+                "candidate": candidate.to_dict(), "checks": normalized_checks,
+                "checks_identity": checks_identity, "criterion_ids": list(criterion_ids)}
+
+    def _trusted_candidate_observation(self, candidate: Any) -> bool:
+        """Legacy implementation-context check for separate recovery creation."""
+        if self.git_observer is None:
+            return False
+        try:
+            observed = self.git_observer(dict(self.scope))
+        except Exception:
+            return False
+        return self._validated_frozen_candidate_observation(
+            observed, candidate, task_id="separate-recovery", run_id=candidate.originating_run_id,
+            session_id="separate-recovery", implementation_profile="separate-recovery") is not None
+
+    def _frozen_candidate(self, candidate: Any, review: Mapping[str, Any], handoff: Any) -> bool:
+        """Bind a verdict to the immutable implementation handoff, not reviewer state."""
+        expected = {"task_id", "implementation_run_id", "implementation_session_id",
+                    "implementation_profile", "candidate", "checks", "checks_identity", "criterion_ids"}
+        if not isinstance(handoff, Mapping) or set(handoff) != expected:
+            return False
+        try:
+            frozen = self._validated_frozen_candidate_observation(
+                handoff, candidate, task_id=handoff["task_id"], run_id=handoff["implementation_run_id"],
+                session_id=handoff["implementation_session_id"], implementation_profile=handoff["implementation_profile"])
+        except (KeyError, TypeError):
+            return False
+        if frozen is None:
+            return False
+        canonical_handoff = {"task_id": handoff["task_id"], "implementation_run_id": handoff["implementation_run_id"],
+                             "implementation_session_id": handoff["implementation_session_id"],
+                             "implementation_profile": handoff["implementation_profile"],
+                             "candidate": dict(handoff["candidate"]) if isinstance(handoff["candidate"], Mapping) else handoff["candidate"],
+                             "checks": [dict(check) for check in handoff["checks"]] if isinstance(handoff["checks"], (list, tuple)) else handoff["checks"],
+                             "checks_identity": handoff["checks_identity"],
+                             "criterion_ids": list(handoff["criterion_ids"]) if isinstance(handoff["criterion_ids"], (list, tuple)) else handoff["criterion_ids"]}
+        if frozen != canonical_handoff:
+            return False
+        review_checks = review.get("checks")
+        if (not isinstance(review_checks, (list, tuple))
+                or [dict(check) for check in review_checks] != frozen["checks"]
+                or review.get("checks_identity") != frozen["checks_identity"]):
             return False
         criteria = review.get("criterion_evidence")
-        if not isinstance(criteria, list) or len(criteria) != len(criterion_ids):
+        if not isinstance(criteria, list) or len(criteria) != len(frozen["criterion_ids"]):
             return False
         if any(not isinstance(item, Mapping) or set(item) != {"criterion_id", "outcome", "evidence"}
                or not all(isinstance(item.get(field), str) and item[field] for field in ("criterion_id", "outcome", "evidence"))
                or item.get("outcome") not in {"pass", "fail"} for item in criteria):
             return False
-        return [item["criterion_id"] for item in criteria] == criterion_ids
+        return [item["criterion_id"] for item in criteria] == frozen["criterion_ids"]
 
     def _verified_handoff(self, task_id: str, candidate: Any, expected_profile: str) -> Mapping[str, Any] | None:
         """Read native worker-owned run/event evidence; never replay its handoff."""
@@ -4681,9 +4839,14 @@ class Coordinator:
         if len(matches) != 1:
             return None
         marker = matches[0].target.get("review_marker")
+        frozen_handoff = matches[0].target.get("frozen_handoff")
         if (not isinstance(marker, Mapping) or marker.get("candidate") != candidate.to_dict()
                 or marker.get("implementation_profile") != configured_implementation
-                or marker.get("reviewer_profile") != configured_reviewer):
+                or marker.get("reviewer_profile") != configured_reviewer
+                or marker.get("frozen_handoff") != frozen_handoff
+                or not self._frozen_candidate(candidate, {"checks": frozen_handoff.get("checks") if isinstance(frozen_handoff, Mapping) else None,
+                                                          "checks_identity": frozen_handoff.get("checks_identity") if isinstance(frozen_handoff, Mapping) else None,
+                                                          "criterion_evidence": [{"criterion_id": item, "outcome": "pass", "evidence": "frozen"} for item in frozen_handoff.get("criterion_ids", ())] if isinstance(frozen_handoff, Mapping) else None}, frozen_handoff)):
             return None
         try:
             observed = self.board.read_task(task_id)
@@ -4728,7 +4891,8 @@ class Coordinator:
                 return None
         elif intent.phase != "applied":
             return None
-        return {"marker": marker, "implementation_session_id": implementation_session}
+        return {"marker": marker, "implementation_session_id": implementation_session,
+                "frozen_handoff": frozen_handoff}
 
     def _separate_review_intent(self, task_id: str, candidate: Any, profile: str) -> OperationIntent | None:
         state = self.store.read_scope(self.scope)
@@ -4761,7 +4925,12 @@ class Coordinator:
             if pause is not None and pause.active:
                 return {"outcome": "held", "reason": "operator_pause_or_cancellation_active"}
             create = self._separate_review_intent(task_id, candidate, reviewer_profile)
-            if create is None or not self._trusted_candidate_observation(candidate):
+            frozen_handoff = None if create is None else create.target.get("frozen_handoff")
+            frozen_review = {"checks": frozen_handoff.get("checks") if isinstance(frozen_handoff, Mapping) else None,
+                             "checks_identity": frozen_handoff.get("checks_identity") if isinstance(frozen_handoff, Mapping) else None,
+                             "criterion_evidence": [{"criterion_id": item, "outcome": "pass", "evidence": "frozen"}
+                                                    for item in frozen_handoff.get("criterion_ids", ())] if isinstance(frozen_handoff, Mapping) else None}
+            if create is None or not self._frozen_candidate(candidate, frozen_review, frozen_handoff):
                 return {"outcome": "held", "reason": "separate_review_association_or_freeze_missing"}
             before = self.board.read_task(task_id)
             if not isinstance(before, BoardSnapshot) or self._state(before) != "blocked" or before.parents or before.runs:
@@ -4926,7 +5095,10 @@ class Coordinator:
             handoff = None if separate is not None else self._verified_handoff(task_id, candidate, expected_profile)
             if handoff is None and separate is None:
                 return {"outcome": "held", "reason": "verified_local_review_handoff_missing"}
-            if not self._frozen_candidate(candidate, review):
+            if separate is None and (not isinstance(handoff, Mapping)
+                                    or not self._frozen_candidate(candidate, review, handoff.get("frozen_handoff"))):
+                return {"outcome": "held", "reason": "trusted_git_freeze_unavailable"}
+            if separate is not None and not self._frozen_candidate(candidate, review, separate.target.get("frozen_handoff")):
                 return {"outcome": "held", "reason": "trusted_git_freeze_unavailable"}
             observed = self._scoped_run(task_id, run_id)
             self._exact_run(observed, run_id=run_id, profile=expected_profile)

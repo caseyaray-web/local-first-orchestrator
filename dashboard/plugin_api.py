@@ -178,7 +178,7 @@ def _status(runtime: Runtime, *, configuration: Mapping[str, Any] | None = None)
         "scope": observed.get("scope", dict(runtime.scope)),
         "anchor": native_tasks.get(runtime.scope["anchor_task_id"]),
         "managed_anchors": members,
-        "current_head": observed.get("git_observation"),
+        "current_head": observed.get("repository_telemetry"),
         "reviews": reviews,
         "review_queues": {
             "local": [item for item in reviews if item.get("reviewer_role") == "local"],
