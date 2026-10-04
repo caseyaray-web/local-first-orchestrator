@@ -99,6 +99,16 @@ Blank, non-finite, non-integer, or out-of-range numeric fields are rejected inli
 - A hold, failed stop, unknown effect, missing evidence, or unsupported capability is surfaced; it is not converted to success.
 - Existing legacy stores, boards, worktrees, profiles, and user data are not migrated, resumed, or deleted.
 
+### Worker execution safety is an external boundary
+
+Local First coordinates workflow authority, evidence, budgets, and supported native lifecycle operations. It is not a filesystem sandbox or a general-purpose command security engine. Configured trusted roots, workspace routing, accepted path limits, disposable Hermes homes, and command approval checks do not confine arbitrary worker shell or Python execution on the host.
+
+When risky worker commands require enforced containment, the operator must provide an established OS/container sandbox outside this plugin. Restrict writable mounts to the authorized workspace and disposable runtime state, isolate temporary/cache storage, and grant only the provider/network access required for the run. Verify that the chosen environment preserves supported native task/run/session ownership before dispatch; sandbox compatibility is not implied by fixture or provider success. Without that boundary, execution relies on the operator's trust in the worker and its host privileges and must not be described as sandboxed.
+
+Do not add a plugin-level recursive-delete detector, cross-tool command blacklist, or custom sandbox to compensate for host execution limitations. Hermes approval controls remain useful defense in depth, but a blocked shell spelling is not proof that the equivalent operation is impossible through Python or another tool. Workers should report denied destructive operations rather than reformulate them; this instruction is behavioral guidance, not an enforcement guarantee. Do not weaken approvals to complete a rehearsal.
+
+Prepare authorized test execution so routine checks do not demand destructive cleanup: disable Python bytecode and pytest cache generation where appropriate, locate needed temporary files under disposable state, and configure repository-local commit identity before dispatch. Cancellation must still expose partial containment and verify exact native run/process state; persisting cancellation intent alone does not prove worker termination. These are harness/lifecycle responsibilities, not replacements for an external sandbox.
+
 ## M7 release readiness and cutover boundary
 
 The [M7 cutover checklist](release/m7-cutover-checklist.md) and [rollback package runbook](release/m7-rollback-runbook.md) are release-readiness artifacts only. They require explicit STOP authorization for target capture, installation/enablement, disposable native proving, scope expansion, and any post-effect reconciliation. The fixture rollback archive covers only an allowlisted plugin artifact, named trusted bootstrap, and SQLite-backup-API copy of plugin-owned evidence; it cannot restore `kanban.db`, native cards/runs, providers, profiles, services, or an installed legacy plugin.
