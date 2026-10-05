@@ -163,6 +163,22 @@ def test_authorized_runner_complete_self_test_accepts_optional_submit_plan_reque
     repo = Path(__file__).parents[1]
     source = tmp_path / "candidate-source"
     subprocess.run(("git", "clone", "--no-local", str(repo), str(source)), check=True)
+    # Freeze the implementation under test, including newly added fixture assets,
+    # into a scratch-only commit; HEAD alone predates uncommitted corrections.
+    import shutil
+    tracked = subprocess.check_output(("git", "-C", str(repo), "ls-files", "-z"))
+    for relative in tracked.decode().split("\0"):
+        if not relative:
+            continue
+        origin = repo / relative
+        destination = source / relative
+        if origin.is_file():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(origin, destination)
+    subprocess.run(("git", "-C", str(source), "add", "-A"), check=True)
+    subprocess.run(("git", "-C", str(source), "-c", "user.name=Fixture",
+                    "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty",
+                    "-qm", "freeze implementation under test"), check=True)
     commit = subprocess.check_output(("git", "-C", str(source), "rev-parse", "HEAD"), text=True).strip()
     wheel_dir = tmp_path / "wheel"; wheel_dir.mkdir()
     subprocess.run(
@@ -193,6 +209,17 @@ def test_authorized_runner_complete_self_test_accepts_optional_submit_plan_reque
     }
     assert (run_root / "verification-wheel-install.log").is_file()
     assert (run_root / "verification-test-dependencies-install.log").is_file()
+
+    fixture_root = tmp_path / "complete-fixture-test"
+    fixture = subprocess.run(
+        ("bash", str(script), "--fixture-test"),
+        env={**os.environ, "HERMES_M0_CLI": "", "HERMES_TEST_CLI": "",
+             "M7_TYPED_CANDIDATE_SOURCE": str(source), "M7_TYPED_SOURCE_COMMIT": commit,
+             "M7_TYPED_WHEEL": str(wheel), "M7_TYPED_WHEEL_SHA256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+             "M7_TYPED_REHEARSAL_ROOT": str(fixture_root)}, text=True, capture_output=True,
+    )
+    assert fixture.returncode == 0, fixture.stdout + fixture.stderr
+    assert "fixture-test: production helper fixture assertions passed" in fixture.stdout
 
 
 def test_authorized_runner_creates_a_blocked_anchor_and_arms_native_fallback_before_config_or_enrollment():

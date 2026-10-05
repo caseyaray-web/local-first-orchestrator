@@ -168,7 +168,13 @@ fi
 # helper definitions against only a disposable fake CLI. It never opens a real
 # board, profile, plugin, or provider.
 if [[ ${1:-} == --fixture-test ]]; then
-  exec "$(dirname "$0")/m7-real-worker-provider-rehearsal-fixture.sh" "$0"
+  # Exercise only source archived from the clean pinned candidate.  The sealed
+  # verifier is needed by the fixture's generated configured-check runner, but
+  # this branch never opens a board, profile, plugin, provider, or dispatcher.
+  setup_verification_environment
+  export M7_FIXTURE_VERIFY_PYTHON="$VERIFY_PYTHON"
+  exec "$CANDIDATE_SOURCE/scripts/m7-real-worker-provider-rehearsal-fixture.sh" \
+    "$CANDIDATE_SOURCE/scripts/m7-typed-planner-authorized-runner.sh"
 fi
 
 if [[ ${1:-} == --capability-report ]]; then
@@ -891,7 +897,7 @@ done
 write_configured_check_runner() { # absolute, argument-closed, cache-free worker check
   local target=$1
   [[ $target == /* && $VERIFY_PYTHON == /* && $REPO == /* ]] || die 'configured check runner requires absolute trusted paths'
-  printf '#!/usr/bin/env bash\nset -Eeuo pipefail\n(( $# == 0 )) || { printf "%%s\\n" "configured check accepts no worker-supplied pytest arguments" >&2; exit 64; }\nexport PYTHONDONTWRITEBYTECODE=1\nunset PYTHONPATH\ncd -- %q\nexec %q -I -m pytest -p no:cacheprovider -q\n' "$REPO" "$VERIFY_PYTHON" >"$target"
+  printf '#!/usr/bin/env bash\nset -Eeuo pipefail\n(( $# == 0 )) || { printf "%%s\\n" "configured check accepts no worker-supplied pytest arguments" >&2; exit 64; }\nexport PYTHONDONTWRITEBYTECODE=1\nunset PYTHONPATH\ncd -- %q\nexec %q -I -B -m pytest -p no:cacheprovider -q\n' "$REPO" "$VERIFY_PYTHON" >"$target"
   chmod 700 "$target"
 }
 
