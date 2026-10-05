@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import dataclasses
+import json
 from collections.abc import Mapping
 from typing import Any
 from pathlib import Path
@@ -70,7 +71,7 @@ def _accepted_plan(tmp_path, native_fixture, monkeypatch, proposal_factory=propo
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_id)
     monkeypatch.setenv("HERMES_SESSION_ID", "controlled-active-piece-session")
     controller.register_planning_request(planner["task_id"], request_id=request_id)
-    controller.submit_plan(serialize_proposal(proposal_factory(req)), request_id=request_id)
+    controller.submit_plan(json.loads(serialize_proposal(proposal_factory(req)))["plan"], request_id=request_id)
     accepted = controller.accept_validated_plan(proposal_factory(req).plan.plan_id, request_id=request_id)
     assert len([event for event in store.read_scope(scope)["budget_events"]
                 if event["event_id"].startswith("paid_capacity:")]) == 1

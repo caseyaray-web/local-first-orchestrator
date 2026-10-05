@@ -6,6 +6,7 @@ from typing import Any, Callable, Mapping, Protocol
 from .composition import close_runtime
 from .worker_context import (MissingNativeWorkerContextError, NativeWorkerContext,
                              capture_native_worker_context)
+from .decomposition_planner import planner_decisions_schema
 
 
 TOOL_NAMES = (
@@ -32,7 +33,7 @@ def _schema(name: str, description: str, properties: Mapping[str, Any], required
 
 
 SCHEMAS = {
-    "local_first_submit_plan": _schema("local_first_submit_plan", "Submit a structured paid planning proposal from the currently running native planner task.", {"proposal_json": {"type": "string"}, "request_id": {"type": "string"}}, ["proposal_json"]),
+    "local_first_submit_plan": _schema("local_first_submit_plan", "Submit typed planning decisions from the currently running native planner task. The legacy proposal_json string is unsupported; the plugin owns the canonical envelope.", {"decisions": planner_decisions_schema(), "request_id": {"type": "string"}}, ["decisions"]),
     "local_first_register_planning_request": _schema("local_first_register_planning_request", "Bind the current native planner run to its persisted planning request.", {"request_id": {"type": "string"}}, []),
     "local_first_submit_review": _schema("local_first_submit_review", "Submit structured local review evidence from the current native reviewer run.", {"task_id": {"type": "string"}, "candidate": {"type": "object"}, "review": {"type": "object"}}, ["task_id", "candidate", "review"]),
     "local_first_submit_paid_review": _schema("local_first_submit_paid_review", "Submit a paid review only from the current configured paid-review worker.", {"plan_id": {"type": "string"}, "review": {"type": "object"}}, ["plan_id", "review"]),
@@ -123,7 +124,7 @@ def register_tools(ctx: ToolContext, *, runtime_factory: Callable[[Mapping[str, 
             _require_exact_args("local_first_submit_plan", args)
             runtime = _runtime_for_args(runtime_factory, args, require_worker=True)
             try:
-                return runtime.coordinator.submit_plan(args["proposal_json"], request_id=args.get("request_id"))
+                return runtime.coordinator.submit_plan(args["decisions"], request_id=args.get("request_id"))
             finally:
                 close_runtime(runtime)
         return _json_result(call)

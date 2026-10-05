@@ -56,8 +56,8 @@ def test_applied_paid_release_binds_native_run_without_a_second_charge(tmp_path,
 
         registration = controller.register_planning_request(task)
         assert registration["planner_task_id"] == task
-        raw = serialize_proposal(proposal(req))
-        evidence = controller.submit_plan(raw)
+        decisions = json.loads(serialize_proposal(proposal(req)))["plan"]
+        evidence = controller.submit_plan(decisions)
         binding = store.read_paid_release_run_binding(scope, released["operation_key"])
         assert (binding["task_id"], binding["run_id"], binding["session_id"], binding["profile"]) == (
             task, run_id, session, "planner")
@@ -70,7 +70,7 @@ def test_applied_paid_release_binds_native_run_without_a_second_charge(tmp_path,
         membership["store"] = store
         controller.store = store
         assert controller.register_planning_request(task) == registration
-        assert controller.submit_plan(raw) == evidence
+        assert controller.submit_plan(decisions) == evidence
         assert store.read_paid_release_run_binding(scope, released["operation_key"]) == binding
         assert len([event for event in store.read_scope(scope)["budget_events"]
                     if event["event_id"].startswith("paid_capacity:")]) == 1

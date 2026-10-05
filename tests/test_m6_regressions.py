@@ -43,7 +43,7 @@ def _config_json(config, path: Path) -> None:
 
 
 @pytest.mark.parametrize(("tool_name", "arguments"), [
-    ("local_first_submit_plan", {"proposal_json": "{}"}),
+    ("local_first_submit_plan", {"decisions": {}}),
     ("local_first_submit_review", {"task_id": "anchor", "candidate": {}, "review": {}}),
     ("local_first_request_corrections", {"task_id": "anchor", "candidate": {}, "review": {}, "operation_key": "fixture"}),
     ("local_first_report_issue", {"issue": {}}),

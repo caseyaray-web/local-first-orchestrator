@@ -195,7 +195,8 @@ def serialize_proposal(proposal: PlanProposal) -> str:
     return _canonical(proposal_payload(proposal))
 
 
-def planner_schema(request: PlanningRequest | None = None) -> dict:
+def _plan_schema(request: PlanningRequest | None = None) -> dict:
+    """The shared model-owned plan body for envelope and typed tool views."""
     def arr(item, *, minimum=0, maximum=16384, unique=False):
         return {"type": "array", "items": item, "minItems": minimum, "maxItems": maximum, "uniqueItems": unique}
     string = {"type": "string", "minLength": 1, "maxLength": 4096}
@@ -216,24 +217,37 @@ def planner_schema(request: PlanningRequest | None = None) -> dict:
                            for non_goal in request.non_goals]
         tranche["allOf"] = [{"properties": {"non_goals": {"contains": {"const": non_goal}}}}
                             for non_goal in request.non_goals]
-    schema={"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["schema_version","request_identity","execution_order","plan"],"additionalProperties":False,"properties":{"schema_version":{"type":"integer","const":1},"request_identity":{"type":"string","pattern":"^[0-9a-f]{64}$"},"execution_order":arr({**string,"pattern":SAFE_ID.pattern},maximum=2048,unique=True),"plan":{"type":"object","required":["plan_id","schema_version","tranches","criterion_coverage"],"additionalProperties":False,"properties":{"plan_id":{**string,"pattern":SAFE_ID.pattern},"schema_version":{"type":"integer","const":1},"tranches":arr(tranche,minimum=1,maximum=128),"criterion_coverage":{"type":"object","maxProperties":16384,"propertyNames":{"type":"string","minLength":1,"maxLength":4096},"additionalProperties":arr({**string,"pattern":SAFE_ID.pattern},minimum=1,maximum=2048,unique=True)}}}}}
+    plan={"type":"object","required":["plan_id","schema_version","tranches","criterion_coverage"],"additionalProperties":False,"properties":{"plan_id":{**string,"pattern":SAFE_ID.pattern},"schema_version":{"type":"integer","const":1},"tranches":arr(tranche,minimum=1,maximum=128),"criterion_coverage":{"type":"object","maxProperties":16384,"propertyNames":{"type":"string","minLength":1,"maxLength":4096},"additionalProperties":arr({**string,"pattern":SAFE_ID.pattern},minimum=1,maximum=2048,unique=True)}}}
     if request is not None:
-        schema["properties"]["request_identity"]={"const":request.identity}
-        coverage=schema["properties"]["plan"]["properties"]["criterion_coverage"]
+        coverage=plan["properties"]["criterion_coverage"]
         coverage["properties"]={key:arr({**string,"pattern":SAFE_ID.pattern},minimum=1,maximum=2048,unique=True) for key in sorted(request.expected_criteria)}
         coverage["required"]=sorted(request.expected_criteria)
         coverage["additionalProperties"]=False
-        schema["properties"]["plan"]["properties"]["tranches"]["maxItems"]=request.max_tranches
-        schema["properties"]["plan"]["properties"]["tranches"]["items"]["properties"]["tickets"]["maxItems"]=request.max_tickets
+        plan["properties"]["tranches"]["maxItems"]=request.max_tranches
+        plan["properties"]["tranches"]["items"]["properties"]["tickets"]["maxItems"]=request.max_tickets
+    return plan
+
+
+def planner_decisions_schema(request: PlanningRequest | None = None) -> dict:
+    """JSON Schema for the complete model-owned decisions body only."""
+    return {"$schema": "https://json-schema.org/draft/2020-12/schema", **_plan_schema(request)}
+
+
+def planner_schema(request: PlanningRequest | None = None) -> dict:
+    """Historical v1 canonical envelope schema; retained for evidence replay."""
+    schema={"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["schema_version","request_identity","execution_order","plan"],"additionalProperties":False,"properties":{"schema_version":{"type":"integer","const":1},"request_identity":{"type":"string","pattern":"^[0-9a-f]{64}$"},"execution_order":{"type":"array","items":{"type":"string","pattern":SAFE_ID.pattern},"minItems":0,"maxItems":2048,"uniqueItems":True},"plan":_plan_schema(request)}}
+    if request is not None:
+        schema["properties"]["request_identity"]={"const":request.identity}
     return schema
 
 
 def packet(request: PlanningRequest) -> str:
     return _canonical({"contract": "local-first-planning-v1", "request": request_payload(request),
-                       "request_identity": request.identity, "schema": planner_schema(request),
-                       "rules": ["Return proposal JSON matching schema exactly.",
+                       "request_identity": request.identity, "schema": planner_decisions_schema(request),
+                       "rules": ["Return typed decisions matching schema exactly; do not wrap them in an envelope.",
                                  "Preserve every expected criterion; do not add scope.",
                                  "All paths, commands and finite limits are fixed by the request.",
+                                 "The plugin owns envelope version, request identity, and execution order.",
                                  "Tranches are ordered; only the first validated tranche is eligible for later materialization."]})
 
 
@@ -250,6 +264,59 @@ def _object(value, required: set[str], path: str) -> dict:
     if type(value) is not dict or set(value) != required:
         raise PlannerError(f"invalid or unknown fields at {path}")
     return value
+
+
+def _plain_json_snapshot(value: object, request: PlanningRequest) -> object:
+    """Detach one bounded plain JSON value without invoking hostile containers."""
+    nodes = 0
+    def copy(item: object, depth: int = 0) -> object:
+        nonlocal nodes
+        nodes += 1
+        if nodes > HARD_CAPS["max_tickets"] * 32 or depth > request.max_json_depth:
+            raise PlannerError("proposal exceeds nesting or node limit")
+        if type(item) is str:
+            try:
+                if len(item.encode("utf-8")) > 4096:
+                    raise PlannerError("proposal string exceeds limit")
+            except UnicodeEncodeError as exc:
+                raise PlannerError("proposal contains invalid Unicode") from exc
+            return item
+        if type(item) in (int, bool) or item is None:
+            return item
+        if type(item) is list:
+            return [copy(child, depth + 1) for child in item]
+        if type(item) is dict:
+            output: dict[str, object] = {}
+            for key, child in item.items():
+                if type(key) is not str or key in output:
+                    raise PlannerError("proposal has non-string or duplicate JSON key")
+                output[key] = copy(child, depth + 1)
+            return output
+        raise PlannerError("proposal decisions must use exact plain JSON types")
+    snapshot = copy(value)
+    try:
+        if len(_canonical(snapshot).encode("utf-8")) > request.max_payload_bytes:
+            raise PlannerError("proposal exceeds byte limit")
+    except UnicodeEncodeError as exc:
+        raise PlannerError("proposal contains invalid Unicode") from exc
+    return snapshot
+
+
+def proposal_from_decisions(decisions: Mapping[str, object], request: PlanningRequest) -> PlanProposal:
+    """Bind closed model decisions to trusted request authority and canonical v1 wire form."""
+    if type(request) is not PlanningRequest or type(decisions) is not dict:
+        raise PlannerError("typed decisions and trusted request are required")
+    plan_body = _plain_json_snapshot(decisions, request)
+    if type(plan_body) is not dict:
+        raise PlannerError("typed decisions must be an object")
+    raw_plan = _object(plan_body, {"plan_id", "schema_version", "tranches", "criterion_coverage"}, "decisions")
+    plan, semantics = _parse_plan_body(raw_plan, request)
+    proposal = PlanProposal(request.identity, plan, semantics)
+    canonical = serialize_proposal(proposal)
+    if len(canonical.encode("utf-8")) > request.max_payload_bytes:
+        raise PlannerError("generated proposal exceeds byte limit")
+    # The historical parser remains the final v1 envelope validator.
+    return parse_proposal(canonical, request)
 
 
 def parse_proposal(raw: str, request: PlanningRequest) -> PlanProposal:
@@ -273,6 +340,15 @@ def parse_proposal(raw: str, request: PlanningRequest) -> PlanProposal:
     if type(root["schema_version"]) is not int or root["schema_version"] != 1 or type(root["request_identity"]) is not str or not SHA64.fullmatch(root["request_identity"]) or root["request_identity"] != request.identity:
         raise PlannerError("proposal request identity mismatch")
     raw_plan = _object(root["plan"], {"plan_id", "schema_version", "tranches", "criterion_coverage"}, "plan")
+    plan, semantics = _parse_plan_body(raw_plan, request)
+    proposal = PlanProposal(request.identity, plan, semantics)
+    if type(root["execution_order"]) is not list or tuple(root["execution_order"]) != topological_ticket_order(plan):
+        raise PlannerError("execution order mismatch")
+    return proposal
+
+
+def _parse_plan_body(raw_plan: dict, request: PlanningRequest) -> tuple[DecompositionPlan, tuple[TrancheSemantics, ...]]:
+    """Parse the shared model-owned body after the enclosing authority is known."""
     if type(raw_plan["tranches"]) is not list or len(raw_plan["tranches"]) > request.max_tranches:
         raise PlannerError("tranche bound exceeded")
     tranches = []
@@ -348,11 +424,8 @@ def parse_proposal(raw: str, request: PlanningRequest) -> PlanProposal:
         raise PlannerError("criterion coverage must exactly preserve expected criteria")
     if any(not tranche.criterion_ids for tranche in plan.tranches):
         raise PlannerError("empty tranche criterion scope")
-    semantics = tuple(TrancheSemantics(t["tranche_id"], t["objective"], tuple(t["non_goals"])) for t in value["plan"]["tranches"])
-    proposal = PlanProposal(request.identity, plan, semantics)
-    if type(root["execution_order"]) is not list or tuple(root["execution_order"]) != topological_ticket_order(plan):
-        raise PlannerError("execution order mismatch")
-    return proposal
+    semantics = tuple(TrancheSemantics(t["tranche_id"], t["objective"], tuple(t["non_goals"])) for t in raw_plan["tranches"])
+    return plan, semantics
 
 
 def _safe_id(value: object) -> None:

@@ -355,7 +355,8 @@ def test_m7_public_driver_executes_disposable_git_correction_and_acceptance(tmp_
         monkeypatch.setenv("HERMES_SESSION_ID", "planner-session")
         monkeypatch.setenv("HERMES_KANBAN_BOARD", SCOPE["board_id"])
         assert value.register_planning_request("public-plan-request")["planner_task_id"] == planner_task
-        assert value.submit_plan(serialize_proposal(bootstrap_batch_proposal(request)), "public-plan-request")["request_identity"] == request.identity
+        decisions = json.loads(serialize_proposal(bootstrap_batch_proposal(request)))["plan"]
+        assert value.submit_plan(decisions, "public-plan-request")["request_identity"] == request.identity
         accepted = value.accept_plan("plan-1", "public-plan-request")
         assert accepted["base_sha"] == base_sha
 

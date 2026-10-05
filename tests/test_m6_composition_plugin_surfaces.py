@@ -471,6 +471,26 @@ def test_built_distribution_imports_every_module_and_registers_from_temporary_he
         cwd=tmp_path, text=True, capture_output=True)
     assert imported.returncode == 0, imported.stdout + imported.stderr
 
+    # Read the registration from the staged directory-plugin wrapper, not from
+    # this checkout or an already-installed profile plugin.
+    registration = subprocess.run((str(python), "-I", "-c", """
+import importlib.util, json, sys
+from pathlib import Path
+root = Path(sys.argv[1]); spec = importlib.util.spec_from_file_location('staged_local_first', root / '__init__.py')
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+class Context:
+    def __init__(self): self.tools = {}
+    def register_tool(self, **kwargs): self.tools[kwargs['name']] = kwargs
+    def register_hook(self, *args, **kwargs): pass
+    def register_cli_command(self, **kwargs): pass
+context = Context(); module.register(context)
+print(json.dumps(context.tools['local_first_submit_plan']['schema']['parameters'], sort_keys=True))
+""", str(plugin_root)), cwd=tmp_path, text=True, capture_output=True)
+    assert registration.returncode == 0, registration.stdout + registration.stderr
+    typed_parameters = json.loads(registration.stdout)
+    assert "decisions" in typed_parameters["properties"]
+    assert "proposal_json" not in typed_parameters["properties"]
+
     home = tmp_path / "hermes-home"
     (home / "config.yaml").write_text("plugins:\n  enabled:\n    - local-first-orchestrator\n", encoding="utf-8")
     site_packages = next((venv / "lib").glob("python*/site-packages"))

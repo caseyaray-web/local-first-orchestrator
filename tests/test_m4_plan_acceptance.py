@@ -1,3 +1,4 @@
+import json
 import pytest
 
 from local_first_orchestrator.evidence_store import EvidenceStore, SchemaError
@@ -24,7 +25,7 @@ def test_controlled_paid_planner_proposal_is_accepted_and_replayed(tmp_path, nat
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_id)
         monkeypatch.setenv("HERMES_SESSION_ID", "controlled-acceptance-session")
         controller.register_planning_request(task, request_id="acceptance-request")
-        controller.submit_plan(serialize_proposal(proposal(req)), request_id="acceptance-request")
+        controller.submit_plan(json.loads(serialize_proposal(proposal(req)))["plan"], request_id="acceptance-request")
         plan_id = proposal(req).plan.plan_id
         with pytest.raises(KeyError):
             store.read_accepted_plan(scope, plan_id)

@@ -2786,9 +2786,9 @@ class Coordinator:
             raise ValueError("evidence store returned malformed paid release binding")
         return binding
 
-    def submit_plan(self, proposal_json: str, *, request_id: str | None = None) -> Mapping[str, Any]:
+    def submit_plan(self, decisions: Mapping[str, object], *, request_id: str | None = None) -> Mapping[str, Any]:
         """Accept evidence from the active native planner run; never creates work."""
-        from .decomposition_planner import parse_proposal, request_payload
+        from .decomposition_planner import proposal_from_decisions, request_payload
         from .planning_coordinator import request_from_payload, evidence_payload
         planner_profile = self._planning_roles()
         if self.planning_observer is None:
@@ -2826,8 +2826,11 @@ class Coordinator:
             native_session = self._worker_session(run)
             if native_session is not None and native_session != session:
                 raise ValueError("active worker session does not match native run receipt")
+            # Validate the typed body before binding the release receipt, whose
+            # durable run association is a mutation. The trusted request and live
+            # worker identity above remain the only envelope authority.
+            proposal = proposal_from_decisions(decisions, request)
             self._bind_planner_run(task_id, run_id, session, profile, request.identity, run)
-            proposal = parse_proposal(proposal_json, request)
             evidence = evidence_payload(request, proposal, planner_task_id=task_id, planner_run_id=run_id,
                                         planner_session_id=session, planner_profile=profile)
             return self.store.record_plan(self.scope, evidence)

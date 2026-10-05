@@ -123,8 +123,8 @@ class PublicLifecycleDriver:
     def register_planning_request(self, request_id: str) -> dict[str, Any]:
         return self.tool("local_first_register_planning_request", {"request_id": request_id})
 
-    def submit_plan(self, proposal_json: str, request_id: str) -> dict[str, Any]:
-        return self.tool("local_first_submit_plan", {"proposal_json": proposal_json, "request_id": request_id})
+    def submit_plan(self, decisions: Mapping[str, Any], request_id: str) -> dict[str, Any]:
+        return self.tool("local_first_submit_plan", {"decisions": decisions, "request_id": request_id})
 
     def accept_plan(self, plan_id: str, request_id: str) -> dict[str, Any]:
         result = self.command("accept-plan", "--plan-id", plan_id, "--request-id", request_id)
