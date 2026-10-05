@@ -159,6 +159,33 @@ def test_authorized_runner_schema_self_test_imports_dynamic_schema_from_the_isol
     assert not receipt["module_path"].startswith(str(run_root / "frozen-source"))
 
 
+def test_authorized_runner_complete_self_test_accepts_optional_submit_plan_request_id_from_a_built_wheel(tmp_path):
+    repo = Path(__file__).parents[1]
+    source = tmp_path / "candidate-source"
+    subprocess.run(("git", "clone", "--no-local", str(repo), str(source)), check=True)
+    commit = subprocess.check_output(("git", "-C", str(source), "rev-parse", "HEAD"), text=True).strip()
+    wheel_dir = tmp_path / "wheel"; wheel_dir.mkdir()
+    subprocess.run(
+        ("python3", "-m", "pip", "wheel", "--no-deps", "--wheel-dir", str(wheel_dir), str(source)),
+        check=True,
+    )
+    wheel, = wheel_dir.glob("local_first_orchestrator-*.whl")
+    subprocess.run(("git", "-C", str(source), "clean", "-fdx"), check=True)
+    run_root = tmp_path / "complete-self-test"
+    script = repo / "scripts" / "m7-typed-planner-authorized-runner.sh"
+    completed = subprocess.run(
+        ("bash", str(script), "--self-test"),
+        env={**os.environ, "HERMES_M0_CLI": "", "M7_TYPED_CANDIDATE_SOURCE": str(source),
+             "M7_TYPED_SOURCE_COMMIT": commit, "M7_TYPED_WHEEL": str(wheel),
+             "M7_TYPED_WHEEL_SHA256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+             "M7_TYPED_REHEARSAL_ROOT": str(run_root)}, text=True, capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "contract-proof: installed plugin schemas" in completed.stdout
+    assert (run_root / "self-test-venv" / "bin" / "python").is_file()
+    assert (run_root / "self-test-wheel-install.log").is_file()
+
+
 def test_execute_mode_requires_parent_authorization_before_any_cli_invocation(tmp_path):
     script = Path(__file__).parents[1] / "scripts" / "m7-typed-planner-rehearsal.sh"
     marker = tmp_path / "cli-called"

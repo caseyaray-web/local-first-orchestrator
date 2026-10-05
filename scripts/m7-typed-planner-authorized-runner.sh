@@ -311,15 +311,16 @@ PY
 import json, pathlib, sys
 payload = json.loads(sys.argv[1]); schemas = payload['schemas']
 expected = {
-    "local_first_status": {"board_id", "anchor_task_id"},
-    "local_first_submit_plan": {"board_id", "anchor_task_id", "decisions"},
-    "local_first_register_planning_request": {"board_id", "anchor_task_id", "request_id"},
+    "local_first_status": ({"board_id", "anchor_task_id"}, {"board_id", "anchor_task_id"}),
+    "local_first_submit_plan": ({"board_id", "anchor_task_id", "decisions", "request_id"}, {"board_id", "anchor_task_id", "decisions"}),
+    "local_first_register_planning_request": ({"board_id", "anchor_task_id", "request_id"}, {"board_id", "anchor_task_id"}),
 }
-for name, fields in expected.items():
+for name, (expected_properties, expected_required) in expected.items():
     parameters = schemas[name]['parameters']
-    actual = set(parameters['properties'])
-    if actual != fields or not fields.issuperset(parameters['required']):
-        raise SystemExit(f'installed tool schema mismatch for {name}: {actual!r}/{parameters["required"]!r}')
+    actual_properties = set(parameters['properties'])
+    actual_required = set(parameters['required'])
+    if actual_properties != expected_properties or actual_required != expected_required:
+        raise SystemExit(f'installed tool schema mismatch for {name}: {actual_properties!r}/{actual_required!r}')
 if schemas['local_first_submit_plan']['parameters']['properties']['decisions'].get('type') != 'object':
     raise SystemExit('installed typed decisions schema is not an object')
 source = (pathlib.Path(sys.argv[2]) / 'local_first_orchestrator/cli.py').read_text(encoding='utf8')
