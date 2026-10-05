@@ -125,6 +125,29 @@ print(json.dumps({'source': 'installed-wheel', 'module_path': str(module_path), 
 PY
 }
 
+# This is the sole production installer for candidate verification. Keep it
+# separate from the PM-selected application runtime, which intentionally lacks
+# pytest helpers. Every import runs under -I with PYTHONPATH removed.
+setup_verification_environment() {
+  local root="$RUN_ROOT/verification-venv" interpreter="$RUN_ROOT/verification-venv/bin/python"
+  "$PM_BOOTSTRAP_PYTHON" -m venv "$root"
+  env -u PYTHONPATH "$interpreter" -I -m pip install --no-deps "$WHEEL" >"$RUN_ROOT/verification-wheel-install.log"
+  env -u PYTHONPATH "$interpreter" -I -m pip install pytest jsonschema >"$RUN_ROOT/verification-test-dependencies-install.log"
+  env -u PYTHONPATH "$interpreter" -I - "$RUN_ROOT/verification-environment.json" "$WHEEL" "$CANDIDATE_SOURCE" <<'PY'
+import importlib, json, pathlib, sys
+out, wheel, frozen = map(pathlib.Path, sys.argv[1:])
+modules = {name: importlib.import_module(name) for name in ('pytest', 'jsonschema', 'local_first_orchestrator')}
+module_path = pathlib.Path(modules['local_first_orchestrator'].__file__).resolve()
+if module_path == frozen or frozen in module_path.parents:
+    raise SystemExit('candidate package imported from frozen source, not verification wheel')
+if pathlib.Path(sys.executable).resolve() != out.parent.joinpath('verification-venv/bin/python').resolve():
+    raise SystemExit('verification imports did not use the sealed interpreter')
+out.write_text(json.dumps({'installer': 'production', 'interpreter': sys.executable,
+                           'imports': sorted(modules), 'wheel': str(wheel)}, sort_keys=True), encoding='utf-8')
+PY
+  VERIFY_PYTHON="$interpreter"
+}
+
 if [[ ${1:-} == --schema-extraction-self-test ]]; then
   SELF_TEST_VENV="$RUN_ROOT/schema-extraction-venv"
   "$PM_BOOTSTRAP_PYTHON" -m venv "$SELF_TEST_VENV"
@@ -156,8 +179,9 @@ fi
 # Retained historical fixture receipt only; the production-helper fixture above
 # is the supported regression entrypoint.
 if [[ ${1:-} == --legacy-fixture-test ]]; then
+  setup_verification_environment
   FIXTURE_ROOT=$(mktemp -d "${TMPDIR:-/home/ocadmin/.hermes/cache/scratch}/m7-harness-fixture.XXXXXX")
-  FIXTURE_PYTHON="$CANDIDATE_SOURCE/../verification-venv/bin/python"
+  FIXTURE_PYTHON="$VERIFY_PYTHON"
   [[ -x $FIXTURE_PYTHON ]] || { echo 'fixture verification interpreter unavailable' >&2; exit 66; }
   # Exercise the cleanup capture contract against a fake CLI: a stderr warning
   # must not corrupt JSON, while empty/non-JSON/failed/timeout calls preserve
@@ -301,13 +325,11 @@ assert 'review_handoffs' in rendered and 'awaiting_native_request_review_finaliz
 assert 'state' in rendered and 'pending' in rendered and 'finalized' in rendered
 print('harness-contract-proof: committed-clean worker prompts, exact public pending status, unbound-native rejection, and shared 120-second post-provisional window match')
 PY
-  # Resolve the public schemas from an isolated installation of the pinned
-  # wheel. Dynamic decision schemas are executable API values, not AST literals.
-  SELF_TEST_VENV="$RUN_ROOT/self-test-venv"
-  "$PM_BOOTSTRAP_PYTHON" -m venv "$SELF_TEST_VENV"
-  "$SELF_TEST_VENV/bin/pip" install --no-deps "$WHEEL" >"$RUN_ROOT/self-test-wheel-install.log"
-  installed_schemas=$(planner_tool_schemas_from_installed_wheel "$SELF_TEST_VENV/bin/python")
-  "$SELF_TEST_VENV/bin/python" - "$installed_schemas" "$CANDIDATE_SOURCE" <<'PY'
+  # Exercise the exact production installer before resolving dynamic schemas.
+  # This fails before any CLI marker if verification dependencies are missing.
+  setup_verification_environment
+  installed_schemas=$(planner_tool_schemas_from_installed_wheel "$VERIFY_PYTHON")
+  env -u PYTHONPATH "$VERIFY_PYTHON" -I - "$installed_schemas" "$CANDIDATE_SOURCE" <<'PY'
 import json, pathlib, sys
 payload = json.loads(sys.argv[1]); schemas = payload['schemas']
 expected = {
@@ -360,8 +382,7 @@ APPROVED_PROVIDER_CONFIG=/home/ocadmin/.hermes/profiles/worker-code-local/config
 PROVIDER_CONFIG_SHA=$(sha256sum "$M7_TYPED_PROVIDER_CONFIG_SOURCE" | awk '{print $1}')
 [[ $MAX_WALL_SECONDS =~ ^[1-9][0-9]*$ && $MAX_TASK_SECONDS =~ ^[1-9][0-9]*$ && $MAX_WORKER_RUNS =~ ^[1-9][0-9]*$ ]] || { echo 'invalid bounded limits' >&2; exit 64; }
 [[ $CLEANUP_SECONDS =~ ^[1-9][0-9]*$ && $CLEANUP_SECONDS -le 120 ]] || { echo 'cleanup budget must be 1..120 seconds' >&2; exit 64; }
-VERIFY_PYTHON=${M7_TYPED_VERIFY_PYTHON:-$(command -v python3 || true)}
-[[ -n $PM_BOOTSTRAP_PYTHON && -x $PM_BOOTSTRAP_PYTHON && -x $HERMES_LAUNCHER && -d $HERMES_SOURCE/pm && -d $CANDIDATE_SOURCE && -f $WHEEL && -x $VERIFY_PYTHON ]] || { echo 'missing PM bootstrap/frozen source/wheel/verification prerequisite' >&2; exit 66; }
+[[ -n $PM_BOOTSTRAP_PYTHON && -x $PM_BOOTSTRAP_PYTHON && -x $HERMES_LAUNCHER && -d $HERMES_SOURCE/pm && -d $CANDIDATE_SOURCE && -f $WHEEL ]] || { echo 'missing PM bootstrap/frozen source/wheel prerequisite' >&2; exit 66; }
 [[ $(git -C "$SOURCE" rev-parse "$SOURCE_COMMIT^{commit}") == "$SOURCE_COMMIT" ]] || { echo 'verified source commit unavailable' >&2; exit 65; }
 [[ $(sha256sum "$WHEEL" | awk '{print $1}') == "$WHEEL_SHA" ]] || { echo 'candidate wheel SHA-256 mismatch' >&2; exit 65; }
 
@@ -451,16 +472,14 @@ if [[ ${1:-} == --native-fingerprint-contract-test ]]; then
 fi
 
 # RUN_ROOT and frozen-source were created only after pin/clean checks above.
-mkdir -p "$RUN_ROOT"/{logs,state,repo,plugin,evidence,outer-home,hermes-home,kanban-home,profiles,tmp,venv}
-chmod 700 "$RUN_ROOT" "$RUN_ROOT"/{state,repo,plugin,evidence,outer-home,hermes-home,kanban-home,profiles,tmp,venv}
+mkdir -p "$RUN_ROOT"/{logs,state,repo,plugin,evidence,outer-home,hermes-home,kanban-home,profiles,tmp}
+chmod 700 "$RUN_ROOT" "$RUN_ROOT"/{state,repo,plugin,evidence,outer-home,hermes-home,kanban-home,profiles,tmp}
 export HOME="$RUN_ROOT/outer-home" HERMES_HOME="$RUN_ROOT/hermes-home" HERMES_KANBAN_HOME="$RUN_ROOT/kanban-home" HERMES_M0_CLI=
 export TMPDIR="$RUN_ROOT/tmp" PYTHONDONTWRITEBYTECODE=1
 export GIT_TERMINAL_PROMPT=0 HERMES_DISABLE_LAZY_INSTALLS=1
-# The candidate artifact is installed only in this disposable venv. Its helper
-# source remains the frozen git archive recorded above, never the live checkout.
-python3 -m venv "$RUN_ROOT/venv"
-"$RUN_ROOT/venv/bin/pip" install --no-deps "$WHEEL" >"$RUN_ROOT/logs/pinned-wheel-install.log"
-VERIFY_PYTHON="$RUN_ROOT/venv/bin/python"
+# Install and prove the candidate verification environment before any profile
+# clone, plugin activation, board operation, or provider-facing CLI call.
+setup_verification_environment
 export PYTHON="$MANAGED_PYTHON"
 # The selected venv interpreter deliberately has no app/test helper contract:
 # bare imports have no YAML/pytest. Start the same store Python and import
@@ -491,7 +510,7 @@ PY
 
 note() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$RUN_ROOT/logs/runner.log" >&2; }
 die() { note "STOPPED: $*"; exit 1; }
-CLEANUP_ARMED=0; REHEARSAL_SUCCESS=0; ANCHOR=; SCOPED_TASK_IDS=(); WORKER_RUN_COUNT=0
+CLEANUP_ARMED=0; REHEARSAL_SUCCESS=0; ANCHOR=; CONFIG=; SCOPED_TASK_IDS=(); WORKER_RUN_COUNT=0
 # Cleanup receives its own finite window.  It never reuses an exhausted main
 # wall budget, and every cleanup CLI call records independent stdout/stderr.
 CLEANUP_DEADLINE=0
@@ -711,17 +730,24 @@ cleanup() {
   if (( CLEANUP_ARMED )) && (( ! REHEARSAL_SUCCESS )); then
     set +e
     CLEANUP_DEADLINE=$(( $(date +%s) + CLEANUP_SECONDS ))
-    note "attempting supported cancellation for unfinished disposable scope${CLEANUP_INTERRUPTED:+ after $CLEANUP_INTERRUPTED}"
-    # Exit code 4 is a documented partial-cancellation contract only when its
-    # stdout is complete JSON; the capture retains it without treating it as
-    # successful containment.
-    capture_cleanup_json cancel-on-failure -p worker-architect-sol local-first-orchestrator --config "$CONFIG" --board "$BOARD" --anchor-task-id "$ANCHOR" cancel
-    cancel_rc=$?
-    capture_scoped_readback || true
-    # A success exit is not proof of containment. Always read exact persisted
-    # tasks/runs; any active lane or failed/partial cancel enters the supported
-    # scoped-block fallback.
-    if (( cancel_rc != 0 )) || ! verify_parked_scope || ! verify_whole_board_parked; then fallback_park_scope || rc=1; fi
+    if [[ -n ${CONFIG:-} && -f $CONFIG ]]; then
+      note "attempting supported cancellation for unfinished disposable scope${CLEANUP_INTERRUPTED:+ after $CLEANUP_INTERRUPTED}"
+      # Exit code 4 is a documented partial-cancellation contract only when its
+      # stdout is complete JSON; the capture retains it without treating it as
+      # successful containment.
+      capture_cleanup_json cancel-on-failure -p worker-architect-sol local-first-orchestrator --config "$CONFIG" --board "$BOARD" --anchor-task-id "$ANCHOR" cancel
+      cancel_rc=$?
+      capture_scoped_readback || true
+      # A success exit is not proof of containment. Always read exact persisted
+      # tasks/runs; any active lane or failed/partial cancel enters the supported
+      # scoped-block fallback.
+      if (( cancel_rc != 0 )) || ! verify_parked_scope || ! verify_whole_board_parked; then fallback_park_scope || rc=1; fi
+    else
+      # The anchor can exist before config/evidence initialization. Native
+      # fallback remains bounded and is the only available containment route.
+      note "configuration absent; using bounded native fallback for created anchor"
+      fallback_park_scope || rc=1
+    fi
   fi
   exit "$rc"
 }
@@ -759,6 +785,29 @@ json_field() { "$PYTHON" -c 'import json,sys
 v=json.load(sys.stdin)
 for k in sys.argv[1:]: v=v[int(k)] if isinstance(v,list) else v[k]
 print(v)' "$@"; }
+assert_pre_enrollment_release_guard() {
+  # Before enrollment/preparation there is no evidence ledger to authorize a
+  # release. The entire new board must therefore remain non-dispatchable.
+  local snapshot="$RUN_ROOT/logs/pre-enrollment-board.json"
+  board_cli list --json >"$snapshot"
+  "$PYTHON" - "$snapshot" "$ANCHOR" <<'PY'
+import json, pathlib, sys
+value, anchor = json.loads(pathlib.Path(sys.argv[1]).read_text()), sys.argv[2]
+active = {'ready', 'running'}
+def walk(item):
+    if isinstance(item, dict):
+        yield item
+        for child in item.values(): yield from walk(child)
+    elif isinstance(item, list):
+        for child in item: yield from walk(child)
+rows = [row for row in walk(value) if isinstance(row.get('id'), str)]
+anchor_rows = [row for row in rows if row['id'] == anchor]
+if len(anchor_rows) != 1 or anchor_rows[0].get('status') != 'blocked':
+    raise SystemExit('created anchor was not read back as exactly blocked')
+if any(row.get('status') in active for row in rows):
+    raise SystemExit('ready/running task observed before explicit release authority')
+PY
+}
 
 # No archive-and-wipe: construct just the deliberately tiny target repository.
 REPO="$RUN_ROOT/repo"
@@ -842,22 +891,28 @@ done
 write_configured_check_runner() { # absolute, argument-closed, cache-free worker check
   local target=$1
   [[ $target == /* && $VERIFY_PYTHON == /* && $REPO == /* ]] || die 'configured check runner requires absolute trusted paths'
-  printf '#!/usr/bin/env bash\nset -Eeuo pipefail\n(( $# == 0 )) || { printf "%%s\\n" "configured check accepts no worker-supplied pytest arguments" >&2; exit 64; }\nexport PYTHONDONTWRITEBYTECODE=1\ncd -- %q\nexec %q -m pytest -p no:cacheprovider -q\n' "$REPO" "$VERIFY_PYTHON" >"$target"
+  printf '#!/usr/bin/env bash\nset -Eeuo pipefail\n(( $# == 0 )) || { printf "%%s\\n" "configured check accepts no worker-supplied pytest arguments" >&2; exit 64; }\nexport PYTHONDONTWRITEBYTECODE=1\nunset PYTHONPATH\ncd -- %q\nexec %q -I -m pytest -p no:cacheprovider -q\n' "$REPO" "$VERIFY_PYTHON" >"$target"
   chmod 700 "$target"
 }
 
 # Disposable native board and explicit operator bootstrap request.
 run_cli kanban boards create "$BOARD" >"$RUN_ROOT/logs/kanban-board-create.log" 2>&1
 run_cli kanban --board "$BOARD" init >"$RUN_ROOT/logs/kanban-init.log" 2>&1
-ANCHOR=$(board_cli create 'M7 rehearsal anchor' --body 'One tiny normalize function; no unrelated edits.' --assignee worker-architect-sol --workspace "dir:$REPO" --idempotency-key m7-anchor --max-runtime 20m --json | json_field id)
+# Verify the supported creation flag before the first task effect. A blocked
+# initial state closes the native ready-to-blocked dispatch window.
+run_cli kanban --board "$BOARD" create --help >"$RUN_ROOT/logs/kanban-create-help.log" 2>&1
+grep -q -- '--initial-status' "$RUN_ROOT/logs/kanban-create-help.log" || die 'native CLI lacks required initial-status support'
+ANCHOR=$(board_cli create 'M7 rehearsal anchor' --body 'One tiny normalize function; no unrelated edits.' --assignee worker-architect-sol --workspace "dir:$REPO" --idempotency-key m7-anchor --max-runtime 20m --initial-status blocked --json | json_field id)
 [[ -n $ANCHOR ]] || die 'anchor ID missing'
 scope_task "$ANCHOR"
+CLEANUP_ARMED=1
+assert_pre_enrollment_release_guard
 # Prove the intended split explicitly: the PM-selected venv is suitable for
 # ABI-bound app deps, while the sealed candidate verification venv owns pytest.
 # Neither probe installs or changes a host environment.
 "$MANAGED_PYTHON" -c 'import openai,pydantic_core' || die 'managed Python ABI dependency check failed'
 if "$MANAGED_PYTHON" -c 'import yaml,pytest' 2>/dev/null; then die 'managed Python unexpectedly carries helper dependencies'; fi
-"$VERIFY_PYTHON" -c 'import pytest,jsonschema; assert "verification-venv" in __import__("sys").executable' || die 'candidate verification interpreter is incomplete'
+env -u PYTHONPATH "$VERIFY_PYTHON" -I -c 'import pytest,jsonschema; assert "verification-venv" in __import__("sys").executable' || die 'candidate verification interpreter is incomplete'
 CHECK="$RUN_ROOT/state/run-pytest"
 write_configured_check_runner "$CHECK"
 CONFIG="$RUN_ROOT/state/local-first.json"
@@ -1166,7 +1221,6 @@ REQUEST_FILE=$M7_TYPED_OPERATOR_REQUEST
 [[ -f $REQUEST_FILE ]] || die 'operator request file unavailable'
 lf_cli initialize-store >"$RUN_ROOT/logs/initialize-store.json"
 lf_cli enroll >"$RUN_ROOT/logs/enroll.json" || die 'enrollment failed'
-CLEANUP_ARMED=1
 readback "$ANCHOR"
 lf_cli bootstrap-planning --request-file "$REQUEST_FILE" --request-id "$REQUEST_ID" >"$RUN_ROOT/logs/bootstrap-planning.json" || die 'operator bootstrap failed'
 lf_cli prepare-planner --request-id "$REQUEST_ID" >"$RUN_ROOT/logs/prepare-planner.json" || [[ $? == 3 ]] || die 'prepare planner failed'
@@ -1176,7 +1230,7 @@ lf_cli release-planner --request-id "$REQUEST_ID" >"$RUN_ROOT/logs/release-plann
 # Build and verify the packet with the pinned wheel, then validate it with the
 # frozen helper from the exact archived source commit.
 PLANNER_STATUS=$(lf_cli status); printf '%s' "$PLANNER_STATUS" >"$RUN_ROOT/logs/status-before-planner-dispatch.json"
-"$VERIFY_PYTHON" - "$PLANNER_STATUS" "$RUN_ROOT/state/planner-packet.json" <<'PY'
+env -u PYTHONPATH "$VERIFY_PYTHON" -I - "$PLANNER_STATUS" "$RUN_ROOT/state/planner-packet.json" <<'PY'
 import json, sys
 from local_first_orchestrator.decomposition_planner import packet
 from local_first_orchestrator.planning_coordinator import request_from_payload
@@ -1184,8 +1238,9 @@ status=json.loads(sys.argv[1])['status']
 request=request_from_payload(status['planning_request']['request'])
 open(sys.argv[2], 'w', encoding='utf-8').write(packet(request))
 PY
-PYTHONPATH="$CANDIDATE_SOURCE" "$VERIFY_PYTHON" - "$RUN_ROOT/state/planner-packet.json" "$PLANNER_STATUS" >"$RUN_ROOT/logs/schema-delivery-receipt.json" <<'PY'
+env -u PYTHONPATH "$VERIFY_PYTHON" -I - "$RUN_ROOT/state/planner-packet.json" "$PLANNER_STATUS" "$CANDIDATE_SOURCE" >"$RUN_ROOT/logs/schema-delivery-receipt.json" <<'PY'
 import json, sys
+sys.path.insert(0, sys.argv[3])
 from local_first_orchestrator.planning_coordinator import request_from_payload
 from scripts.m7_typed_planner_runtime import schema_delivery_receipt
 status=json.loads(sys.argv[2])['status']; request=request_from_payload(status['planning_request']['request'])
@@ -1215,10 +1270,11 @@ DEADLINE=$(( $(date +%s) + MAX_TASK_SECONDS ))
 while (( $(date +%s) < DEADLINE )); do
   TASK_JSON=$(board_cli show "$PLANNER" --json)
   STATUS_JSON=$(status)
-  outcome=$(PYTHONPATH="$CANDIDATE_SOURCE" "$VERIFY_PYTHON" - "$TASK_JSON" "$STATUS_JSON" "$RUN_ROOT/state/planner-packet.json" "$PLANNER" "$PLANNER_RUN" worker-architect-sol "$REQUEST_ID" <<'PY'
+  outcome=$(env -u PYTHONPATH "$VERIFY_PYTHON" -I - "$TASK_JSON" "$STATUS_JSON" "$RUN_ROOT/state/planner-packet.json" "$PLANNER" "$PLANNER_RUN" worker-architect-sol "$REQUEST_ID" "$CANDIDATE_SOURCE" <<'PY'
 import json, sys
+sys.path.insert(0, sys.argv[8])
 from scripts.m7_typed_planner_runtime import planning_wait_outcome
-show,status,packet_text,task_id,run_id,profile,request_id=sys.argv[1:]
+show,status,packet_text,task_id,run_id,profile,request_id=sys.argv[1:8]
 show=json.loads(show); public=json.loads(status)['status']; identity=json.loads(open(packet_text, encoding='utf-8').read())['request_identity']
 plans=public.get('plans'); exact=[]
 if isinstance(plans,list):

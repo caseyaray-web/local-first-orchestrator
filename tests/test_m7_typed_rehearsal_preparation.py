@@ -182,8 +182,31 @@ def test_authorized_runner_complete_self_test_accepts_optional_submit_plan_reque
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "contract-proof: installed plugin schemas" in completed.stdout
-    assert (run_root / "self-test-venv" / "bin" / "python").is_file()
-    assert (run_root / "self-test-wheel-install.log").is_file()
+    verification_python = run_root / "verification-venv" / "bin" / "python"
+    assert verification_python.is_file()
+    receipt = json.loads((run_root / "verification-environment.json").read_text(encoding="utf-8"))
+    assert receipt == {
+        "installer": "production",
+        "interpreter": str(verification_python),
+        "imports": ["jsonschema", "local_first_orchestrator", "pytest"],
+        "wheel": str(wheel),
+    }
+    assert (run_root / "verification-wheel-install.log").is_file()
+    assert (run_root / "verification-test-dependencies-install.log").is_file()
+
+
+def test_authorized_runner_creates_a_blocked_anchor_and_arms_native_fallback_before_config_or_enrollment():
+    script = (Path(__file__).parents[1] / "scripts" / "m7-typed-planner-authorized-runner.sh").read_text(encoding="utf-8")
+    help_probe = 'run_cli kanban --board "$BOARD" create --help'
+    anchor_create = '--initial-status blocked --json | json_field id'
+    assert help_probe in script
+    assert anchor_create in script
+    assert script.index(help_probe) < script.index(anchor_create)
+    armed = 'scope_task "$ANCHOR"\nCLEANUP_ARMED=1\nassert_pre_enrollment_release_guard'
+    assert script.index(anchor_create) < script.index(armed)
+    assert script.index(armed) < script.index('CONFIG="$RUN_ROOT/state/local-first.json"')
+    assert 'ready/running task observed before explicit release authority' in script
+    assert '[[ -n ${CONFIG:-} && -f $CONFIG ]]' in script
 
 
 def test_execute_mode_requires_parent_authorization_before_any_cli_invocation(tmp_path):
